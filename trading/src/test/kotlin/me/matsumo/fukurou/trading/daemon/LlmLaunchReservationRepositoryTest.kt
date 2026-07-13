@@ -14,6 +14,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * LLM 起動予約の既定 hourly / daily 境界を検証するテスト。
@@ -246,6 +247,107 @@ class LlmLaunchReservationRepositoryTest {
             LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
             eighthOutcome,
         )
+    }
+
+    @Test
+    fun criticalHourlyOverGuaranteeCannotConsumeTheOtherCriticalReserve() = runBlocking {
+        listOf(
+            LlmDaemonTriggerKind.ENTRY_FILL to LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE,
+            LlmDaemonTriggerKind.STOP_PROXIMITY to LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE,
+        ).forEach { (overGuaranteeKind, expectedReason) ->
+            val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+            val now = launchBudgetFixedInstant()
+            repeat(5) { index ->
+                reserveAndFinishLaunchBudget(
+                    repository = repository,
+                    invocationId = "normal-$overGuaranteeKind-$index",
+                    config = LlmRunnerConfig(),
+                    reservedAt = now.plusSeconds(index.toLong()),
+                )
+            }
+            reserveAndFinishLaunchBudget(
+                repository = repository,
+                invocationId = "guaranteed-$overGuaranteeKind",
+                config = LlmRunnerConfig(),
+                reservedAt = now.plusSeconds(5),
+                triggerKind = overGuaranteeKind,
+            )
+
+            val outcome = repository.tryReserve(
+                launchBudgetRequest(
+                    invocationId = "over-guarantee-$overGuaranteeKind",
+                    config = LlmRunnerConfig(),
+                    reservedAt = now.plusSeconds(6),
+                    triggerKind = overGuaranteeKind,
+                ),
+            ).getOrThrow()
+
+            assertEquals(expectedReason, assertIs<LlmLaunchReservationOutcome.Rejected>(outcome).reason)
+        }
+    }
+
+    @Test
+    fun defaultHourlyGuaranteesHoldForEveryCompleteCriticalOrderPermutation() = runBlocking {
+        val now = launchBudgetFixedInstant()
+        for (entryPosition in 0 until 7) {
+            for (stopPosition in 0 until 7) {
+                if (entryPosition == stopPosition) continue
+                val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+                repeat(7) { index ->
+                    val triggerKind = when (index) {
+                        entryPosition -> LlmDaemonTriggerKind.ENTRY_FILL
+                        stopPosition -> LlmDaemonTriggerKind.STOP_PROXIMITY
+                        else -> LlmDaemonTriggerKind.FLAT_HEARTBEAT
+                    }
+                    reserveAndFinishLaunchBudget(
+                        repository = repository,
+                        invocationId = "permutation-$entryPosition-$stopPosition-$index",
+                        config = LlmRunnerConfig(),
+                        reservedAt = now.plusSeconds(index.toLong()),
+                        triggerKind = triggerKind,
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun healthBlockerAfterReservationRejectsClaimAndNotRequiredChildAdmission() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val reflectionRepository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val now = launchBudgetFixedInstant()
+        repository.tryReserve(
+            launchBudgetRequest(
+                invocationId = "health-claimed",
+                config = LlmRunnerConfig(),
+                reservedAt = now,
+            ),
+        ).getOrThrow()
+        reflectionRepository.tryReserve(
+            launchBudgetRequest(
+                invocationId = "health-reflection",
+                config = LlmRunnerConfig(),
+                reservedAt = now,
+                triggerKind = LlmDaemonTriggerKind.REFLECTION,
+            ),
+        ).getOrThrow()
+
+        try {
+            LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+            val claim = repository.claimForExecution(
+                LlmExecutionClaimRequest(
+                    invocationId = "health-claimed",
+                    triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                    claimantToken = "health-token",
+                    claimedAt = now,
+                ),
+            )
+
+            assertIs<LlmExecutionClaimOutcome.OutcomeUnknown>(claim)
+            assertTrue(reflectionRepository.validateExecutionAdmission("health-reflection", claimantToken = null).isFailure)
+        } finally {
+            LlmExecutionAdmissionHealth.resetForTest()
+        }
     }
 
     @Test

@@ -11,6 +11,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
@@ -42,6 +44,19 @@ data class LlmExecutionTerminationFence(
 /** current process が観測した child lifecycle fence registry。 */
 object LlmExecutionTerminationFenceRegistry {
     private val fences = ConcurrentHashMap<String, LlmExecutionTerminationFence?>()
+    private val transitionLocks = ConcurrentHashMap<ClaimTransitionKey, Mutex>()
+
+    /** child start と recovery terminal decision を claimant token 単位で直列化する。 */
+    suspend fun <T> withClaimTransition(
+        invocationId: String,
+        claimantToken: String,
+        block: suspend () -> T,
+    ): T {
+        val key = ClaimTransitionKey(invocationId, claimantToken)
+        val mutex = transitionLocks.computeIfAbsent(key) { Mutex() }
+
+        return mutex.withLock { block() }
+    }
 
     /** claim 直後の child 0 状態を登録する。 */
     fun registerNoChildStarted(
@@ -86,10 +101,12 @@ object LlmExecutionTerminationFenceRegistry {
         fences.computeIfPresent(invocationId) { _, current ->
             current.takeUnless { fence -> fence.claimantToken == claimantToken }
         }
+        transitionLocks.remove(ClaimTransitionKey(invocationId, claimantToken))
     }
 
     internal fun resetForTest() {
         fences.clear()
+        transitionLocks.clear()
     }
 }
 
@@ -138,19 +155,23 @@ class LlmExecutionRecoveryService(
             candidates.last().toRecoveryCursor()
         }
 
-        val recoveryRequests = candidates.mapNotNull { candidate ->
-            toRecoveryRequestOrNull(candidate, now)
-        }
-        val recoveredInvocationIds = repository.recoverStaleExecutionClaims(recoveryRequests)
-            .getOrElse { throwable ->
-                LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
-                throw throwable
-            }
+        var recoveredCount = 0
         candidates.forEach { candidate ->
-            completeRecoveryHealth(candidate, candidate.invocationId in recoveredInvocationIds)
+            val claimantToken = candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN
+            LlmExecutionTerminationFenceRegistry.withClaimTransition(candidate.invocationId, claimantToken) {
+                val request = toRecoveryRequestOrNull(candidate, now) ?: return@withClaimTransition
+                val recoveredInvocationIds = repository.recoverStaleExecutionClaims(listOf(request))
+                    .getOrElse { throwable ->
+                        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+                        throw throwable
+                    }
+                val recovered = candidate.invocationId in recoveredInvocationIds
+                completeRecoveryHealth(candidate, recovered)
+                if (recovered) recoveredCount += 1
+            }
         }
 
-        return recoveredInvocationIds.size
+        return recoveredCount
     }
 
     private fun toRecoveryRequestOrNull(
@@ -220,6 +241,8 @@ private data class LlmExecutionRecoveryCursor(
     val claimedAt: java.time.Instant,
     val invocationId: String,
 )
+
+private data class ClaimTransitionKey(val invocationId: String, val claimantToken: String)
 
 private fun LlmExecutionClaimSnapshot.toRecoveryCursor(): LlmExecutionRecoveryCursor {
     return LlmExecutionRecoveryCursor(

@@ -3443,6 +3443,47 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llmLaunchQuotaSaturationBarrierAllowsExactlyOneFinalHourlySlot() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig(
+            maxInvocationsPerHour = 2,
+            entryFillReservePerHour = 0,
+            stopProximityReservePerHour = 0,
+        )
+        reserveAndFinishLlmLaunch(
+            repository = repository,
+            invocationId = "quota-prefill",
+            config = config,
+            reservedAt = fixedInstant(),
+        )
+        val startBarrier = CompletableDeferred<Unit>()
+        val readyCount = AtomicInteger()
+
+        val outcomes = coroutineScope {
+            val contenders = (1..2).map { index ->
+                async(Dispatchers.IO) {
+                    readyCount.incrementAndGet()
+                    startBarrier.await()
+                    repository.tryReserve(
+                        llmLaunchReservationRequest(
+                            invocationId = "quota-contender-$index",
+                            config = config,
+                            reservedAt = fixedInstant().plusSeconds(1),
+                        ),
+                    ).getOrThrow()
+                }
+            }
+            while (readyCount.get() < contenders.size) kotlinx.coroutines.delay(1)
+            startBarrier.complete(Unit)
+            contenders.map { contender -> contender.await() }
+        }
+
+        assertEquals(1, outcomes.count { outcome -> outcome is LlmLaunchReservationOutcome.Reserved })
+        assertEquals(1, outcomes.count { outcome -> outcome is LlmLaunchReservationOutcome.Rejected })
+    }
+
+    @Test
     fun llm_launch_reservation_atomicClaimHasOneWinnerAcrossOneHundredContenders() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedLlmLaunchReservationRepository(database)
@@ -8163,9 +8204,6 @@ private fun analyzeLlmLaunchReservations(database: ExposedDatabase) {
 
 private fun explainActiveReservationQuery(database: ExposedDatabase, activeSince: Instant): String {
     return exposedTransaction(database) {
-        jdbcConnection().createStatement().use { statement ->
-            statement.execute("SET LOCAL enable_seqscan = off")
-        }
         jdbcConnection().prepareStatement("EXPLAIN (ANALYZE, BUFFERS) $SELECT_ACTIVE_LLM_LAUNCH_RESERVATION_SQL").use { statement ->
             statement.setBoolean(1, false)
             statement.setString(2, LlmDaemonTriggerKind.REFLECTION.name)

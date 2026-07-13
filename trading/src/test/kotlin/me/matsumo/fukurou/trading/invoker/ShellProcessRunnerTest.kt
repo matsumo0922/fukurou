@@ -56,7 +56,7 @@ class ShellProcessRunnerTest {
         val result = ShellProcessRunner().run(command).getOrThrow()
 
         assertEquals(ProcessRunStatus.EXITED, result.status)
-        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
+        assertEquals(expectedTerminationProof(), result.processTreeTerminationProof)
         assertEquals(0, result.exitCode)
         assertEquals("created\n", result.stdout)
         assertTrue(Files.isDirectory(workingDirectory))
@@ -82,7 +82,7 @@ class ShellProcessRunnerTest {
         val result = ShellProcessRunner().run(command).getOrThrow()
 
         assertEquals(ProcessRunStatus.EXITED, result.status)
-        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
+        assertEquals(expectedTerminationProof(), result.processTreeTerminationProof)
         assertEquals(0, result.exitCode)
         assertEquals("existing\n", result.stdout)
         assertTrue(Files.isDirectory(workingDirectory))
@@ -217,7 +217,7 @@ class ShellProcessRunnerTest {
     }
 
     @Test
-    fun run_normalRootExitWithLiveDescendantLeavesTerminationProofUncertain() = runBlocking {
+    fun run_normalRootExitWithLiveDescendantCleansLinuxProcessGroupBeforeProvenExit() = runBlocking {
         val shellPath = Path.of("/bin/sh")
         if (!Files.isExecutable(shellPath)) return@runBlocking
         if (!canInspectProcessTrees()) return@runBlocking
@@ -239,8 +239,12 @@ class ShellProcessRunnerTest {
 
         try {
             assertEquals(ProcessRunStatus.EXITED, result.status)
-            assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
-            assertTrue(isProcessAlive(childPid))
+            assertEquals(expectedTerminationProof(), result.processTreeTerminationProof)
+            if (Files.isExecutable(Path.of("/usr/bin/setsid"))) {
+                assertFalse(waitForProcessExit(childPid))
+            } else {
+                assertTrue(isProcessAlive(childPid))
+            }
         } finally {
             ProcessHandle.of(childPid).ifPresent(ProcessHandle::destroyForcibly)
         }

@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -217,6 +218,42 @@ class LlmExecutionRecoveryServiceTest {
         )
         assertFalse(isLinuxProcessRunning(childPid))
         assertTrue(repository.tryReserve(launchRequest("after-recovery", claimedAt.plusSeconds(601))).isSuccess)
+    }
+
+    @Test
+    fun childStartLeaseWins_recoveryCannotCommitNoChildStarted() = runBlocking {
+        val claimedAt = RECOVERY_INSTANT
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        reserve(repository, "child-start-lease", claimedAt)
+        claim(repository, "child-start-lease", claimedAt)
+        LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
+            invocationId = "child-start-lease",
+            claimantToken = CLAIM_TOKEN,
+            observedAt = claimedAt,
+        )
+        val leaseAcquired = CompletableDeferred<Unit>()
+        val allowChildStart = CompletableDeferred<Unit>()
+        val runnerTransition = async {
+            LlmExecutionTerminationFenceRegistry.withClaimTransition("child-start-lease", CLAIM_TOKEN) {
+                leaseAcquired.complete(Unit)
+                allowChildStart.await()
+                LlmExecutionTerminationFenceRegistry.markChildMayBeRunning("child-start-lease", CLAIM_TOKEN)
+            }
+        }
+        leaseAcquired.await()
+        val recovery = async { recoveryService(repository, claimedAt.plusSeconds(600)).tick().getOrThrow() }
+
+        delay(50)
+        assertFalse(recovery.isCompleted)
+        allowChildStart.complete(Unit)
+        runnerTransition.await()
+
+        assertEquals(0, recovery.await())
+        assertEquals(
+            LlmLaunchReservationStatus.RUNNING,
+            repository.findExecutionClaim("child-start-lease").getOrThrow()?.status,
+        )
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
     }
 }
 

@@ -1,19 +1,25 @@
+@file:Suppress("ImportOrdering")
+
 package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
+import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import java.nio.file.Path
+import java.time.Clock
 import java.time.Duration
-import java.time.Instant
 import java.util.UUID
 import kotlin.system.exitProcess
 
@@ -73,25 +79,11 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
     )
 
     try {
-        val invocationId = UUID.randomUUID().toString()
-        val reservation = tradingRuntime.launchReservationRepository.tryReserve(
-            LlmLaunchReservationRequest(
-                invocationId = invocationId,
-                triggerKind = LlmDaemonTriggerKind.MANUAL,
-                triggerKey = "direct:$invocationId",
-                reservedAt = Instant.now(),
-                runnerConfig = tradingConfig.runner,
-                hourlyWindow = Duration.ofHours(1),
-                dailyWindow = Duration.ofHours(24),
-                activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
-            ),
-        ).getOrThrow()
-        check(reservation is LlmLaunchReservationOutcome.Reserved) {
-            "LLM launch reservation rejected: ${(reservation as LlmLaunchReservationOutcome.Rejected).reason.name}"
-        }
-        val runner = OneShotLlmRunner(
-            tradingRuntime = tradingRuntime,
+        return launchOneShotRunnerWithRuntime(
+            environment = environment,
             tradingConfig = tradingConfig,
+            tradingRuntime = tradingRuntime,
+            runtimeConfigSnapshot = runtimeConfigResolution.auditSnapshot,
             llmInvoker = ShellLlmInvoker(
                 commandRenderer = DefaultLlmCommandRenderer(
                     config = LlmCommandRendererConfig.fromEnvironment(
@@ -100,30 +92,64 @@ private suspend fun launchOneShotRunner(environment: Map<String, String>): OneSh
                 ),
                 processRunner = ShellProcessRunner(tradingConfig.runner.processTerminationGrace),
             ),
-            parentEnvironment = environment,
-            runtimeConfigSnapshot = runtimeConfigResolution.auditSnapshot,
+            invocationId = UUID.randomUUID().toString(),
         )
-        val repositoryRoot = Path.of(environment["FUKUROU_REPOSITORY_ROOT"] ?: ".")
-            .toAbsolutePath()
-            .normalize()
-        val workingDirectory = Path.of(environment["FUKUROU_LLM_WORKING_DIRECTORY"] ?: ".")
-            .toAbsolutePath()
-            .normalize()
-        val request = OneShotRunnerRequest(
-            repositoryRoot = repositoryRoot,
-            workingDirectory = workingDirectory,
-            mcpJarPath = environment[FUKUROU_MCP_JAR_PATH_ENV] ?: "mcp/build/libs/fukurou-mcp-all.jar",
-            cliConfig = OneShotRunnerCliConfig.fromEnvironment(environment),
-            marketSnapshotId = environment["FUKUROU_MARKET_SNAPSHOT_ID"],
-            proposerAssignment = tradingConfig.llmRoleAssignments.proposer,
-            falsifierAssignment = tradingConfig.llmRoleAssignments.falsifier,
-            invocationId = invocationId,
-            triggerKind = LlmDaemonTriggerKind.MANUAL,
-        )
-        return runner.runOneShot(request).getOrThrow()
     } finally {
         tradingRuntime.close()
     }
+}
+
+@Suppress("LongMethod", "LongParameterList")
+internal suspend fun launchOneShotRunnerWithRuntime(
+    environment: Map<String, String>,
+    tradingConfig: TradingBotConfig,
+    tradingRuntime: TradingRuntime,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+    llmInvoker: LlmInvoker,
+    invocationId: String,
+    clock: Clock = Clock.systemUTC(),
+): OneShotRunnerResult {
+    val reservation = tradingRuntime.launchReservationRepository.tryReserve(
+        LlmLaunchReservationRequest(
+            invocationId = invocationId,
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+            triggerKey = "direct:$invocationId",
+            reservedAt = clock.instant(),
+            runnerConfig = tradingConfig.runner,
+            hourlyWindow = Duration.ofHours(1),
+            dailyWindow = Duration.ofHours(24),
+            activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
+        ),
+    ).getOrThrow()
+    check(reservation is LlmLaunchReservationOutcome.Reserved) {
+        "LLM launch reservation rejected: ${(reservation as LlmLaunchReservationOutcome.Rejected).reason.name}"
+    }
+    val runner = OneShotLlmRunner(
+        tradingRuntime = tradingRuntime,
+        tradingConfig = tradingConfig,
+        llmInvoker = llmInvoker,
+        parentEnvironment = environment,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
+        clock = clock,
+    )
+    val repositoryRoot = Path.of(environment["FUKUROU_REPOSITORY_ROOT"] ?: ".")
+        .toAbsolutePath()
+        .normalize()
+    val workingDirectory = Path.of(environment["FUKUROU_LLM_WORKING_DIRECTORY"] ?: ".")
+        .toAbsolutePath()
+        .normalize()
+    val request = OneShotRunnerRequest(
+        repositoryRoot = repositoryRoot,
+        workingDirectory = workingDirectory,
+        mcpJarPath = environment[FUKUROU_MCP_JAR_PATH_ENV] ?: "mcp/build/libs/fukurou-mcp-all.jar",
+        cliConfig = OneShotRunnerCliConfig.fromEnvironment(environment),
+        marketSnapshotId = environment["FUKUROU_MARKET_SNAPSHOT_ID"],
+        proposerAssignment = tradingConfig.llmRoleAssignments.proposer,
+        falsifierAssignment = tradingConfig.llmRoleAssignments.falsifier,
+        invocationId = invocationId,
+        triggerKind = LlmDaemonTriggerKind.MANUAL,
+    )
+    return runner.runOneShot(request).getOrThrow()
 }
 
 private fun requireOneShotLaunchAllowed(environment: Map<String, String>) {

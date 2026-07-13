@@ -221,9 +221,10 @@ class ExposedLlmLaunchReservationRepository(
     override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
         return withContext(Dispatchers.IO) {
             runCatching {
-                check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution admission is fail-closed." }
-                exposedTransaction(database) {
-                    tryReserveLlmLaunchInTransaction(request)
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    exposedTransaction(database) {
+                        tryReserveLlmLaunchInTransaction(request)
+                    }
                 }
             }
         }
@@ -242,8 +243,9 @@ class ExposedLlmLaunchReservationRepository(
     override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
         return withContext(Dispatchers.IO) {
             try {
-                check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution claim is fail-closed." }
-                exposedTransaction(database) { claimLlmLaunchInTransaction(request) }
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    exposedTransaction(database) { claimLlmLaunchInTransaction(request) }
+                }
             } catch (throwable: Throwable) {
                 LlmExecutionClaimOutcome.OutcomeUnknown(throwable)
             }
@@ -253,6 +255,26 @@ class ExposedLlmLaunchReservationRepository(
     override suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> {
         return withContext(Dispatchers.IO) {
             runCatching { exposedTransaction(database) { selectExecutionClaim(invocationId) } }
+        }
+    }
+
+    override suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    exposedTransaction(database) {
+                        val snapshot = selectExecutionClaim(invocationId)
+                        if (snapshot?.status != LlmLaunchReservationStatus.RUNNING) return@exposedTransaction false
+
+                        if (claimantToken == null) {
+                            snapshot.claimState == LlmExecutionClaimState.NOT_REQUIRED
+                        } else {
+                            snapshot.claimState == LlmExecutionClaimState.CLAIMED &&
+                                snapshot.claimantToken == claimantToken
+                        }
+                    }
+                }
+            }
         }
     }
 

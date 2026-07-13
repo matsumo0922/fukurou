@@ -42,9 +42,14 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -1921,6 +1926,81 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun claimOutcomeUnknownRetry_retainsOriginalActiveSinceAndDoesNotLaunchStaleReservation() = runBlocking {
+        val expectedActiveSince = fixedInstant().minus(Duration.ofMinutes(30))
+        lateinit var claimRepository: OutcomeUnknownClaimRepository
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                claimRepository = OutcomeUnknownClaimRepository(runtime.launchReservationRepository)
+                runtime.copy(launchReservationRepository = claimRepository)
+            },
+        ) { cleanExit() }
+        val request = defaultRequest().copy(
+            invocationId = "claim-outcome-unknown-stale",
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        )
+
+        try {
+            val result = fixture.runOneShot(
+                request = request,
+                reservedAt = expectedActiveSince.minusMillis(1),
+            )
+
+            assertTrue(result.isFailure)
+            assertEquals(2, claimRepository.requests.size)
+            assertEquals(expectedActiveSince, claimRepository.requests[0].activeSince)
+            assertEquals(expectedActiveSince, claimRepository.requests[1].activeSince)
+            assertTrue(fixture.processRunner.launches.isEmpty())
+        } finally {
+            LlmExecutionAdmissionHealth.resetForTest()
+            LlmExecutionTerminationFenceRegistry.resetForTest()
+        }
+    }
+
+    @Test
+    fun cancellationAtClaimCommitBoundary_terminalizesReservationWithoutChildLaunch() = runBlocking {
+        lateinit var claimRepository: ClaimBoundaryRepository
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                claimRepository = ClaimBoundaryRepository(runtime.launchReservationRepository)
+                runtime.copy(launchReservationRepository = claimRepository)
+            },
+        ) { cleanExit() }
+        val invocationId = "cancel-at-claim-boundary"
+        fixture.runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:$invocationId",
+                reservedAt = fixedInstant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofDays(1),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+            ),
+        ).getOrThrow()
+        val run = async {
+            fixture.runner.runOneShot(
+                defaultRequest().copy(
+                    invocationId = invocationId,
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+        }
+        claimRepository.claimEntered.await()
+
+        run.cancel()
+        claimRepository.allowClaimCommit.complete(Unit)
+
+        assertFailsWith<CancellationException> { run.await() }
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertEquals(
+            LlmLaunchReservationStatus.FAILED,
+            fixture.runtime.launchReservationRepository.findExecutionClaim(invocationId).getOrThrow()?.status,
+        )
+    }
+
+    @Test
     fun daemonTickLaunch_recordsTriggerKindInLlmRun() = runBlocking {
         val tradingConfig = TradingBotConfig(
             daemon = LlmDaemonConfig(launchEnabled = true),
@@ -2141,6 +2221,36 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
+}
+
+private class OutcomeUnknownClaimRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    val requests = mutableListOf<LlmExecutionClaimRequest>()
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        requests += request
+
+        return if (requests.size == 1) {
+            LlmExecutionClaimOutcome.OutcomeUnknown(IllegalStateException("claim commit outcome unknown"))
+        } else {
+            LlmExecutionClaimOutcome.Rejected(LlmExecutionClaimRejectionReason.TERMINAL)
+        }
+    }
+}
+
+private class ClaimBoundaryRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    val claimEntered = CompletableDeferred<Unit>()
+    val allowClaimCommit = CompletableDeferred<Unit>()
+
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        claimEntered.complete(Unit)
+        allowClaimCommit.await()
+
+        return delegate.claimForExecution(request)
+    }
 }
 
 /**

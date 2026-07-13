@@ -8,6 +8,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -340,14 +341,13 @@ class OneShotLlmRunner(
         llmInvoker = llmInvoker,
         invocationAuditor = invocationAuditor,
         beforeInvoke = { request ->
-            requireLiveClaim(
-                request.invocationId,
-                requireNotNull(activeClaimantTokens[request.invocationId]),
-            )
-            LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(
-                request.invocationId,
-                requireNotNull(activeClaimantTokens[request.invocationId]),
-            )
+            val claimantToken = requireNotNull(activeClaimantTokens[request.invocationId])
+            LlmExecutionTerminationFenceRegistry.withClaimTransition(request.invocationId, claimantToken) {
+                requireLiveClaim(request.invocationId, claimantToken)
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(request.invocationId, claimantToken)
+                }
+            }
         },
     )
     private val executionPolicy = OneShotExecutionPolicy.from(tradingConfig.runner)
@@ -395,10 +395,19 @@ class OneShotLlmRunner(
                 return Result.failure(IllegalStateException(claimOutcome.reason.wireCode))
             }
             is LlmExecutionClaimOutcome.OutcomeUnknown -> {
-                return handleClaimOutcomeUnknown(invocationId, triggerKind, claimantToken, claimOutcome.cause)
+                return handleClaimOutcomeUnknown(
+                    invocationId = invocationId,
+                    triggerKind = triggerKind,
+                    claimantToken = claimantToken,
+                    activeSince = claimedAt.minus(tradingConfig.daemon.launchReservationStaleAfter),
+                    cause = claimOutcome.cause,
+                )
             }
             is LlmExecutionClaimOutcome.Claimed -> {
-                runCatching { appendClaimPreflightAudit(invocationId, triggerKind, "claimed", true) }
+                runCatching {
+                    currentCoroutineContext().ensureActive()
+                    appendClaimPreflightAudit(invocationId, triggerKind, "claimed", true)
+                }
                     .getOrElse { auditFailure ->
                         withContext(NonCancellable) {
                             withTimeout(executionPolicy.persistenceTerminalTimeout.toMillis()) {
@@ -470,8 +479,12 @@ class OneShotLlmRunner(
                 withTimeout(deadlineRemaining.toMillis()) {
                     runCatching {
                         val preFilterDecision = request.preFilter?.let { preFilter ->
-                            requireLiveClaim(invocationId, claimantToken)
-                            LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(invocationId, claimantToken)
+                            LlmExecutionTerminationFenceRegistry.withClaimTransition(invocationId, claimantToken) {
+                                requireLiveClaim(invocationId, claimantToken)
+                                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                                    LlmExecutionTerminationFenceRegistry.markChildMayBeRunning(invocationId, claimantToken)
+                                }
+                            }
                             preFilter.invoke()
                         }
                         if (preFilterDecision == LlmDaemonPreFilterDecision.SKIP_NO_CHANGE) {
@@ -533,7 +546,8 @@ class OneShotLlmRunner(
             Result.success(result)
         } finally {
             heartbeatJob.cancelAndJoin()
-            when (LlmProcessTreeTerminationRegistry.find(invocationId)) {
+            val processTreeTerminationProof = LlmProcessTreeTerminationRegistry.find(invocationId)
+            when (processTreeTerminationProof) {
                 ProcessTreeTerminationProof.PROVEN_EXITED ->
                     LlmExecutionTerminationFenceRegistry.markProcessTreeExited(
                         invocationId = invocationId,
@@ -558,19 +572,20 @@ class OneShotLlmRunner(
                     ).getOrThrow()
                 }
             }
-            LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
-            LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
-            LlmProcessTreeTerminationRegistry.resolve(invocationId)
+            if (processTreeTerminationProof != ProcessTreeTerminationProof.UNCERTAIN) {
+                LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
+                LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
+                LlmProcessTreeTerminationRegistry.resolve(invocationId)
+            }
             activeClaimantTokens.remove(invocationId, claimantToken)
         }
     }
 
     private suspend fun requireLiveClaim(invocationId: String, claimantToken: String) {
-        check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution admission became unhealthy." }
-        val snapshot = tradingRuntime.launchReservationRepository.findExecutionClaim(invocationId).getOrThrow()
-        check(snapshot?.status == LlmLaunchReservationStatus.RUNNING) { "LLM execution reservation is terminal." }
-        check(snapshot.claimState == LlmExecutionClaimState.CLAIMED) { "LLM execution claim is no longer active." }
-        check(snapshot.claimantToken == claimantToken) { "LLM execution claimant token changed." }
+        check(
+            tradingRuntime.launchReservationRepository.validateExecutionAdmission(invocationId, claimantToken)
+                .getOrThrow(),
+        ) { "LLM execution claim is no longer admitted." }
     }
 
     private suspend fun requireTerminalLlmRun(invocationId: String) {
@@ -598,6 +613,7 @@ class OneShotLlmRunner(
         invocationId: String,
         triggerKind: LlmDaemonTriggerKind,
         claimantToken: String,
+        activeSince: java.time.Instant,
         cause: Throwable,
     ): Result<OneShotRunnerResult> {
         registerNoChildStartedFence(invocationId, claimantToken, clock.instant())
@@ -620,6 +636,7 @@ class OneShotLlmRunner(
                         triggerKind = triggerKind,
                         claimantToken = claimantToken,
                         claimedAt = clock.instant(),
+                        activeSince = activeSince,
                     ),
                 )
             ) {

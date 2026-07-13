@@ -16,6 +16,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
@@ -46,44 +47,46 @@ internal class EvaluationReportPersistence(
 
     /** request identity、revision number、共通 LLM reservation または rejection を atomic に保存する。 */
     fun admit(job: EvaluationReportJobResponse, scopeKey: String): Result<EvaluationReportAdmission> = runCatching {
-        exposedTransaction(database) {
-            val now = clock.instant()
-            val numberedJob = job.copy(revisionNumber = nextRevisionNumberInTransaction())
-            val reportRateExceeded = count(
-                "SELECT COUNT(*) FROM evaluation_report_jobs WHERE requested_at >= ?",
-                now.minus(Duration.ofHours(1)).toEpochMilli(),
-            ) >= 3L
-            val outcome = if (reportRateExceeded) {
-                LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT)
-            } else {
-                tryReserveLlmLaunchInTransaction(
-                    LlmLaunchReservationRequest(
-                        invocationId = numberedJob.jobId,
-                        triggerKind = LlmDaemonTriggerKind.EVALUATION_REPORT,
-                        triggerKey = "evaluation-report:$scopeKey",
-                        reservedAt = now,
-                        runnerConfig = runnerConfig,
-                        hourlyWindow = Duration.ofHours(1),
-                        dailyWindow = Duration.ofDays(1),
-                        activeReservationStaleAfter = staleAfter,
-                    ),
-                )
-            }
-            val persistedJob = when (outcome) {
-                is LlmLaunchReservationOutcome.Reserved -> numberedJob
-                is LlmLaunchReservationOutcome.Rejected -> numberedJob.copy(
-                    status = "REJECTED",
-                    stage = "REJECTED",
-                    failureCode = outcome.reason.name,
-                    failureMessage = "Report admission was rejected by the shared LLM launch policy.",
-                    activeInvocationId = outcome.activeReservation?.invocationId,
-                    retryAfterSeconds = retryAfterSeconds(outcome.reason),
-                )
-            }
-            insertJob(persistedJob, scopeKey, now.toEpochMilli())
-            insertJobEvent(persistedJob, now.toEpochMilli())
+        LlmExecutionAdmissionHealth.withHealthyAdmission {
+            exposedTransaction(database) {
+                val now = clock.instant()
+                val numberedJob = job.copy(revisionNumber = nextRevisionNumberInTransaction())
+                val reportRateExceeded = count(
+                    "SELECT COUNT(*) FROM evaluation_report_jobs WHERE requested_at >= ?",
+                    now.minus(Duration.ofHours(1)).toEpochMilli(),
+                ) >= 3L
+                val outcome = if (reportRateExceeded) {
+                    LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT)
+                } else {
+                    tryReserveLlmLaunchInTransaction(
+                        LlmLaunchReservationRequest(
+                            invocationId = numberedJob.jobId,
+                            triggerKind = LlmDaemonTriggerKind.EVALUATION_REPORT,
+                            triggerKey = "evaluation-report:$scopeKey",
+                            reservedAt = now,
+                            runnerConfig = runnerConfig,
+                            hourlyWindow = Duration.ofHours(1),
+                            dailyWindow = Duration.ofDays(1),
+                            activeReservationStaleAfter = staleAfter,
+                        ),
+                    )
+                }
+                val persistedJob = when (outcome) {
+                    is LlmLaunchReservationOutcome.Reserved -> numberedJob
+                    is LlmLaunchReservationOutcome.Rejected -> numberedJob.copy(
+                        status = "REJECTED",
+                        stage = "REJECTED",
+                        failureCode = outcome.reason.name,
+                        failureMessage = "Report admission was rejected by the shared LLM launch policy.",
+                        activeInvocationId = outcome.activeReservation?.invocationId,
+                        retryAfterSeconds = retryAfterSeconds(outcome.reason),
+                    )
+                }
+                insertJob(persistedJob, scopeKey, now.toEpochMilli())
+                insertJobEvent(persistedJob, now.toEpochMilli())
 
-            EvaluationReportAdmission(persistedJob, outcome)
+                EvaluationReportAdmission(persistedJob, outcome)
+            }
         }
     }
 
@@ -101,6 +104,24 @@ internal class EvaluationReportPersistence(
                 check(statement.executeUpdate() == 1)
             }
             insertJobEvent(job, clock.instant().toEpochMilli())
+        }
+    }
+
+    /** NOT_REQUIRED reservation と process-local health を child start 直前に検証する。 */
+    fun validateExecutionAdmission(invocationId: String): Result<Boolean> = runCatching {
+        LlmExecutionAdmissionHealth.withHealthyAdmission {
+            exposedTransaction(database) {
+                jdbcConnection().prepareStatement(
+                    "SELECT status, execution_claim_state FROM llm_launch_reservations WHERE invocation_id=?",
+                ).use { statement ->
+                    statement.setObject(1, UUID.fromString(invocationId))
+                    statement.executeQuery().use { rows ->
+                        rows.next() &&
+                            rows.getString("status") == LlmLaunchReservationStatus.RUNNING.name &&
+                            rows.getString("execution_claim_state") == "NOT_REQUIRED"
+                    }
+                }
+            }
         }
     }
 

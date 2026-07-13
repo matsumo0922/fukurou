@@ -336,6 +336,11 @@ interface LlmLaunchReservationRepository {
         return Result.failure(UnsupportedOperationException("Execution claim lookup is not implemented."))
     }
 
+    /** health gate と reservation ownership を同じ repository boundary で検証する。 */
+    suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        return findExecutionClaim(invocationId).map { snapshot -> snapshot.isLiveAdmissionFor(claimantToken) }
+    }
+
     /** live owner の lease heartbeat を conditional update する。 */
     suspend fun heartbeatExecutionClaim(
         invocationId: String,
@@ -407,7 +412,6 @@ class InMemoryLlmLaunchReservationRepository(
 
     override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
         return runCatching {
-            check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution admission is fail-closed." }
             mutex.withLock {
                 tryReserveLocked(request)
             }
@@ -454,28 +458,31 @@ class InMemoryLlmLaunchReservationRepository(
 
     override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
         return try {
-            check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution claim is fail-closed." }
             mutex.withLock {
-                val index = reservations.indexOfFirst { it.invocationId == request.invocationId }
-                if (index < 0) {
-                    return@withLock LlmExecutionClaimOutcome.Rejected(
-                        LlmExecutionClaimRejectionReason.RESERVATION_MISSING,
-                    )
-                }
-                val reservation = reservations[index]
-                val rejection = reservation.claimRejection(request.triggerKind)
-                    ?: LlmExecutionClaimRejectionReason.TERMINAL.takeIf {
-                        reservation.reservedAt.isBefore(request.activeSince)
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    val index = reservations.indexOfFirst { it.invocationId == request.invocationId }
+                    if (index < 0) {
+                        return@withHealthyAdmission LlmExecutionClaimOutcome.Rejected(
+                            LlmExecutionClaimRejectionReason.RESERVATION_MISSING,
+                        )
                     }
-                if (rejection != null) return@withLock LlmExecutionClaimOutcome.Rejected(rejection)
+                    val reservation = reservations[index]
+                    val rejection = reservation.claimRejection(request.triggerKind)
+                        ?: LlmExecutionClaimRejectionReason.TERMINAL.takeIf {
+                            reservation.reservedAt.isBefore(request.activeSince)
+                        }
+                    if (rejection != null) {
+                        return@withHealthyAdmission LlmExecutionClaimOutcome.Rejected(rejection)
+                    }
 
-                reservations[index] = reservation.copy(
-                    claimState = LlmExecutionClaimState.CLAIMED,
-                    claimantToken = request.claimantToken,
-                    claimedAt = request.claimedAt,
-                    heartbeatAt = request.claimedAt,
-                )
-                LlmExecutionClaimOutcome.Claimed(request.claimedAt)
+                    reservations[index] = reservation.copy(
+                        claimState = LlmExecutionClaimState.CLAIMED,
+                        claimantToken = request.claimantToken,
+                        claimedAt = request.claimedAt,
+                        heartbeatAt = request.claimedAt,
+                    )
+                    LlmExecutionClaimOutcome.Claimed(request.claimedAt)
+                }
             }
         } catch (throwable: Throwable) {
             LlmExecutionClaimOutcome.OutcomeUnknown(throwable)
@@ -484,6 +491,18 @@ class InMemoryLlmLaunchReservationRepository(
 
     override suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> = runCatching {
         mutex.withLock { reservations.firstOrNull { it.invocationId == invocationId }?.toClaimSnapshot() }
+    }
+
+    override suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        return runCatching {
+            mutex.withLock {
+                LlmExecutionAdmissionHealth.withHealthyAdmission {
+                    reservations.firstOrNull { it.invocationId == invocationId }
+                        ?.toClaimSnapshot()
+                        .isLiveAdmissionFor(claimantToken)
+                }
+            }
+        }
     }
 
     override suspend fun heartbeatExecutionClaim(
@@ -653,35 +672,37 @@ class InMemoryLlmLaunchReservationRepository(
             return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
         }
 
-        activeReservation(request)?.let { active ->
-            return LlmLaunchReservationOutcome.Rejected(
-                LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
-                active.toActive(),
+        return LlmExecutionAdmissionHealth.withHealthyAdmission {
+            activeReservation(request)?.let { active ->
+                return@withHealthyAdmission LlmLaunchReservationOutcome.Rejected(
+                    LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION,
+                    active.toActive(),
+                )
+            }
+
+            val hourlyUsage = usageSince(request.reservedAt.minus(request.hourlyWindow))
+            val dailyUsage = usageSince(request.reservedAt.minus(request.dailyWindow))
+
+            launchBudgetRejection(request, hourlyUsage, dailyUsage)?.let { rejectionReason ->
+                return@withHealthyAdmission LlmLaunchReservationOutcome.Rejected(rejectionReason)
+            }
+
+            reservations += LlmLaunchReservationRecord(
+                invocationId = request.invocationId,
+                triggerKind = request.triggerKind,
+                triggerKey = request.triggerKey,
+                status = LlmLaunchReservationStatus.RUNNING,
+                reservedAt = request.reservedAt,
+                finishedAt = null,
+                reason = null,
+                claimState = request.triggerKind.executionClaimState(),
+                claimantToken = null,
+                claimedAt = null,
+                heartbeatAt = null,
             )
+
+            LlmLaunchReservationOutcome.Reserved(request.invocationId)
         }
-
-        val hourlyUsage = usageSince(request.reservedAt.minus(request.hourlyWindow))
-        val dailyUsage = usageSince(request.reservedAt.minus(request.dailyWindow))
-
-        launchBudgetRejection(request, hourlyUsage, dailyUsage)?.let { rejectionReason ->
-            return LlmLaunchReservationOutcome.Rejected(rejectionReason)
-        }
-
-        reservations += LlmLaunchReservationRecord(
-            invocationId = request.invocationId,
-            triggerKind = request.triggerKind,
-            triggerKey = request.triggerKey,
-            status = LlmLaunchReservationStatus.RUNNING,
-            reservedAt = request.reservedAt,
-            finishedAt = null,
-            reason = null,
-            claimState = request.triggerKind.executionClaimState(),
-            claimantToken = null,
-            claimedAt = null,
-            heartbeatAt = null,
-        )
-
-        return LlmLaunchReservationOutcome.Reserved(request.invocationId)
     }
 
     private fun usageSince(since: Instant): LlmLaunchUsage {
@@ -693,6 +714,16 @@ class InMemoryLlmLaunchReservationRepository(
                 it.triggerKind == LlmDaemonTriggerKind.STOP_PROXIMITY
             }.distinctBy { it.invocationId }.size,
         )
+    }
+}
+
+private fun LlmExecutionClaimSnapshot?.isLiveAdmissionFor(claimantToken: String?): Boolean {
+    if (this?.status != LlmLaunchReservationStatus.RUNNING) return false
+
+    return if (claimantToken == null) {
+        claimState == LlmExecutionClaimState.NOT_REQUIRED
+    } else {
+        claimState == LlmExecutionClaimState.CLAIMED && this.claimantToken == claimantToken
     }
 }
 
