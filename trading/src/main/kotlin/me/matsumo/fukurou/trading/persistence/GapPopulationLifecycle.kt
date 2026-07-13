@@ -104,7 +104,7 @@ fun JdbcTransaction.selectGapPopulationResumeMode(): GapPopulationResumeMode {
     if (!relationExistsForGapPopulation("gap_population_unattributed_containments")) return GapPopulationResumeMode.FULL
     return prepare(
         "SELECT EXISTS(SELECT 1 FROM market_data_gap_recovery_progress " +
-            "WHERE phase IN ('UNATTRIBUTED_SCANNING','UNATTRIBUTED_TERMINATING'))," +
+            "WHERE phase IN ('CAPTURING','UNATTRIBUTED_SCANNING','UNATTRIBUTED_TERMINATING'))," +
             "EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state='QUARANTINED')," +
             "EXISTS(SELECT 1 FROM gap_population_unattributed_containments WHERE state IN ('DISCOVERED','TERMINALIZING'))," +
             "EXISTS(SELECT 1 FROM gap_population_unattributed_containment_works WHERE consumed_at IS NULL)",

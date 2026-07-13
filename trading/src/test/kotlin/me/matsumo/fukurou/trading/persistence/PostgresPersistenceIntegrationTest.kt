@@ -1198,6 +1198,9 @@ class PostgresPersistenceIntegrationTest {
                 MarketDataGapReason.PROCESS_RESTART,
                 fixedInstant().plusSeconds(1),
             ).getOrThrow()
+            exposedTransaction(database) {
+                assertEquals(GapPopulationResumeMode.STOPPED, selectGapPopulationResumeMode())
+            }
 
             assertTrue(
                 runCatching {
@@ -1208,6 +1211,7 @@ class PostgresPersistenceIntegrationTest {
                 }.isFailure,
             )
             exposedTransaction(database) {
+                assertEquals(GapPopulationResumeMode.STOPPED, selectGapPopulationResumeMode())
                 assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containments", 0)
                 assertSqlCount("SELECT COUNT(*) FROM gap_population_unattributed_containment_works", 0)
                 assertSqlCount(
