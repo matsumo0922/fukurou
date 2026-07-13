@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.daemon
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
@@ -538,7 +539,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun eventTriggerLaunchesWithinFifteenMinuteBudget() = runBlocking {
+    fun holdingEventTriggerLaunchesWithinFifteenMinuteBudget() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(10))
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
@@ -552,6 +553,7 @@ class LlmDaemonSchedulerTest {
                     ),
                 ),
             ),
+            hasOpenRisk = true,
         )
 
         val heartbeatResult = fixture.scheduler.tick()
@@ -565,7 +567,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun eventTriggerUsesSameHourlyBudgetWhenCapIsLowered() = runBlocking {
+    fun holdingEventTriggerUsesSameHourlyBudgetWhenCapIsLowered() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofMinutes(10))
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
@@ -580,6 +582,7 @@ class LlmDaemonSchedulerTest {
                     ),
                 ),
             ),
+            hasOpenRisk = true,
         )
 
         val heartbeatResult = fixture.scheduler.tick()
@@ -593,6 +596,39 @@ class LlmDaemonSchedulerTest {
         assertEquals("max_invocations_per_hour_exceeded", eventResult.reason)
         assertEquals(1, fixture.launches.size)
         assertTrue(skipEvents.any { event -> event.payload.contains("max_invocations_per_hour_exceeded") })
+    }
+
+    @Test
+    fun holdingEconomicEventRetriesAfterReservationPrecheckRejection() = runBlocking {
+        val riskStateRepository = InMemoryRiskStateRepository()
+        val backingRepository = InMemoryLlmLaunchReservationRepository(riskStateRepository)
+        val reservations = RejectFirstEconomicReservationRepository(backingRepository)
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "fomc-20260729",
+                        eventName = "FOMC",
+                        eventAt = fixedInstant(),
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofHours(1),
+                    ),
+                ),
+            ),
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            idGenerator = { UUID.randomUUID() },
+            hasOpenRisk = true,
+        )
+
+        val rejected = fixture.scheduler.tick()
+        val retried = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Skipped>(rejected)
+        assertEquals("max_invocations_per_hour_exceeded", rejected.reason)
+        assertIs<LlmDaemonTickResult.Launched>(retried)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, retried.triggerKind)
+        assertEquals(1, fixture.launches.size)
     }
 
     @Test
@@ -623,6 +659,17 @@ class LlmDaemonSchedulerTest {
             executedAt = fixedInstant(),
         )
         val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "fomc-20260729",
+                        eventName = "FOMC",
+                        eventAt = fixedInstant(),
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofHours(1),
+                    ),
+                ),
+            ),
             hasOpenRisk = true,
             entryFillReader = entryFillReader,
         )
@@ -636,7 +683,7 @@ class LlmDaemonSchedulerTest {
         assertIs<LlmDaemonTickResult.Launched>(firstResult)
         assertEquals(LlmDaemonTriggerKind.ENTRY_FILL, firstResult.triggerKind)
         assertIs<LlmDaemonTickResult.Launched>(duplicateResult)
-        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, duplicateResult.triggerKind)
+        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, duplicateResult.triggerKind)
         assertEquals(2, fixture.launches.size)
         assertEquals(1, fixture.entryFillLaunchCount())
         assertEquals("entry-fill", payload.stringValue("triggerKey"))
@@ -809,6 +856,7 @@ class LlmDaemonSchedulerTest {
                     ),
                 ),
             ),
+            hasOpenRisk = true,
             preFilter = preFilter,
         )
 
@@ -927,6 +975,7 @@ class LlmDaemonSchedulerTest {
                     ),
                 ),
             ),
+            hasOpenRisk = true,
             launchHandler = { request ->
                 launchStarted.complete(Unit)
                 releaseLaunch.await()
@@ -1047,7 +1096,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun failedEconomicEventLaunchCanRetryWithinSameWindow() = runBlocking {
+    fun failedEconomicEventLaunchDoesNotRetryWithinSameWindow() = runBlocking {
         var runnerCallCount = 0
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
@@ -1061,6 +1110,7 @@ class LlmDaemonSchedulerTest {
                     ),
                 ),
             ),
+            hasOpenRisk = true,
             launchHandler = { request ->
                 runnerCallCount += 1
 
@@ -1079,7 +1129,78 @@ class LlmDaemonSchedulerTest {
         assertIs<LlmDaemonTickResult.Failed>(failedResult)
         assertIs<LlmDaemonTickResult.Launched>(retriedResult)
         assertEquals(2, fixture.launches.size)
-        assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, retriedResult.triggerKind)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, retriedResult.triggerKind)
+        assertEquals(
+            1,
+            fixture.launches.count { request -> request.triggerKind == LlmDaemonTriggerKind.ECONOMIC_EVENT },
+        )
+    }
+
+    @Test
+    fun cancelledEconomicEventLaunchDoesNotRetryAfterSchedulerRestart() = runBlocking {
+        val clock = MutableClock(fixedInstant())
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val reservations = InMemoryLlmLaunchReservationRepository(riskStateRepository)
+        val config = tradingConfig(
+            events = listOf(
+                EconomicEventBlackout(
+                    eventId = "fomc-cancel",
+                    eventName = "FOMC",
+                    eventAt = fixedInstant(),
+                    blackoutBefore = Duration.ZERO,
+                    blackoutAfter = Duration.ofHours(1),
+                ),
+            ),
+        )
+        val fixture = schedulerFixture(
+            tradingConfig = config,
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            idGenerator = { UUID.randomUUID() },
+            hasOpenRisk = true,
+            launchHandler = { throw CancellationException("scheduler cancelled") },
+        )
+
+        val cancellation = runCatching { fixture.scheduler.tick() }.exceptionOrNull()
+        val restartedFixture = schedulerFixture(
+            tradingConfig = config,
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            idGenerator = { UUID.randomUUID() },
+            hasOpenRisk = true,
+        )
+        val restartedResult = restartedFixture.scheduler.tick()
+        val triggerKey = "economic-event:fomc-cancel:${fixedInstant()}"
+        val duplicate = reservations.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = "cancel-retry",
+                triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+                triggerKey = triggerKey,
+                reservedAt = clock.instant(),
+                runnerConfig = config.runner,
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofHours(24),
+                activeReservationStaleAfter = config.daemon.launchReservationStaleAfter,
+                populationScope = LlmLaunchReservationPopulationScope(
+                    kind = "SYMBOL",
+                    mode = TradingMode.PAPER,
+                    symbol = TradingSymbol.BTC,
+                ),
+                singleAttemptKey = "ECONOMIC_EVENT:$triggerKey",
+            ),
+        ).getOrThrow()
+
+        assertIs<CancellationException>(cancellation)
+        assertIs<LlmDaemonTickResult.Launched>(restartedResult)
+        assertEquals(LlmDaemonTriggerKind.HOLDING_DENSE_CHECK, restartedResult.triggerKind)
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED),
+            duplicate,
+        )
+        assertEquals(1, fixture.launches.count { request -> request.triggerKind == LlmDaemonTriggerKind.ECONOMIC_EVENT })
+        assertEquals(0, restartedFixture.launches.count { request -> request.triggerKind == LlmDaemonTriggerKind.ECONOMIC_EVENT })
     }
 
     @Test
@@ -1226,6 +1347,17 @@ class LlmDaemonSchedulerTest {
             ),
         )
         val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                events = listOf(
+                    EconomicEventBlackout(
+                        eventId = "fomc-20260729",
+                        eventName = "FOMC",
+                        eventAt = fixedInstant(),
+                        blackoutBefore = Duration.ZERO,
+                        blackoutAfter = Duration.ofHours(1),
+                    ),
+                ),
+            ),
             hasOpenRisk = true,
             positionsReader = positionsReader,
         )
@@ -1347,7 +1479,7 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun flatPriorityChoosesEconomicEventBeforePriceMove() = runBlocking {
+    fun flatBlackoutSkipsEconomicEventAndHeartbeatBeforeReservation() = runBlocking {
         val eventAt = fixedInstant().plus(Duration.ofSeconds(300))
         val fixture = schedulerFixture(
             tradingConfig = tradingConfig(
@@ -1368,8 +1500,16 @@ class LlmDaemonSchedulerTest {
 
         val result = fixture.scheduler.tick()
 
-        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals("economic_event_blackout_flat", result.reason)
         assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, result.triggerKind)
+        assertEquals(1, fixture.launches.size)
+        assertTrue(
+            fixture.eventLog.events().any { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_SKIPPED &&
+                    event.payload.contains("economic_event_blackout_flat")
+            },
+        )
     }
 
     @Test
@@ -1818,6 +1958,28 @@ private class RaceRejectingReservationRepository(
         requestTriggerKind: LlmDaemonTriggerKind,
         activeSince: Instant,
     ): Result<LlmActiveLaunchReservation?> = Result.success(null)
+}
+
+/** ECONOMIC_EVENT の最初の admission だけ reservation 前に拒否する repository。 */
+private class RejectFirstEconomicReservationRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+
+    private var rejected = false
+
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
+        if (request.triggerKind == LlmDaemonTriggerKind.ECONOMIC_EVENT && !rejected) {
+            rejected = true
+
+            return Result.success(
+                LlmLaunchReservationOutcome.Rejected(
+                    LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,
+                ),
+            )
+        }
+
+        return delegate.tryReserve(request)
+    }
 }
 
 /**

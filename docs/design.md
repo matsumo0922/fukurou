@@ -1370,6 +1370,8 @@ LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し p
 
 `PRICE_MOVE` は GMO ticker の5分 window 変化率が1%以上のとき、`STOP_PROXIMITY` は保有中 LONG position の残り R が0.3以下のとき、`ENTRY_FILL` は paper entry の BUY execution を検出したときに daemon reservation 経路で発火する。ticker が取得不能・stale・timestamp parse 不能な tick では市場系 trigger だけを見送り、flat heartbeat / holding dense check は fallback として残す。`ENTRY_FILL` は同じ fill と cooldown 内の fill burst を後追い発火せず、runner の hourly / daily cap を消費する。`daemon.preFilterEnabled` が true のとき、flat heartbeat / holding dense check は full LLM 起動前に `claude-haiku-4-5-20251001` で deterministic market snapshot の有意変化を判定し、NO の場合は `pre_filter_no_change` として full run を省略する。pre-filter は軽量でも LLM 呼び出しのため予約済み invocation と hourly / daily cap を消費し、価格急変、STOP 接近、entry fill、経済イベントには適用せず、失敗時は full run へ進む。
 
+[確定] active economic-event blackout中のflat tickはheartbeatとevent full runをreservation前にskipする。holding tickは`ENTRY_FILL`、`STOP_PROXIMITY`、`ECONOMIC_EVENT`の順にposition managementを優先する。`ECONOMIC_EVENT`の1 attemptはsuccessful completionではなく`ECONOMIC_EVENT:<triggerKey>`のreservation取得で確定し、nullable `single_attempt_key`のpartial unique indexとconflict-safe insertをDB上のlinearization pointにする。reservation前のquota、concurrency、infrastructure rejectionはwindow内で再試行し、reservation後のfailure、cancellation、restart recoveryは同じeventを再起動しない。
+
 ### 6.2 daemonの責務
 
 [確定] daemonが唯一のマクロ・スケジューラである。`schedule_next_check` のようなLLM自己スケジュールは採用しない。

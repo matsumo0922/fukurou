@@ -22,6 +22,56 @@ import kotlin.test.assertTrue
 class LlmLaunchReservationRepositoryTest {
 
     @Test
+    fun parallelEconomicEventReservation_hasOneAttemptAndFailureDoesNotReopenIt() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val now = launchBudgetFixedInstant()
+        val triggerKey = "economic-event:fomc-20260729:$now"
+
+        val outcomes = coroutineScope {
+            (0 until 100).map { index ->
+                async {
+                    repository.tryReserve(
+                        economicEventRequest(
+                            invocationId = "event-race-$index",
+                            triggerKey = triggerKey,
+                            reservedAt = now,
+                        ),
+                    ).getOrThrow()
+                }
+            }.awaitAll()
+        }
+        val winner = assertIs<LlmLaunchReservationOutcome.Reserved>(
+            outcomes.single { it is LlmLaunchReservationOutcome.Reserved },
+        )
+
+        assertEquals(
+            99,
+            outcomes.count { outcome ->
+                outcome == LlmLaunchReservationOutcome.Rejected(
+                    LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED,
+                )
+            },
+        )
+
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = winner.invocationId,
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "runner_failed",
+                finishedAt = now.plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val retry = repository.tryReserve(
+            economicEventRequest("event-retry", triggerKey, now.plusSeconds(2)),
+        ).getOrThrow()
+
+        assertEquals(
+            LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED),
+            retry,
+        )
+    }
+
+    @Test
     fun parallelExecutionClaim_hasOneWinnerAndLoserCannotFinishWinner() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val now = launchBudgetFixedInstant()
@@ -566,6 +616,29 @@ private fun launchBudgetRequest(
             mode = me.matsumo.fukurou.trading.domain.TradingMode.PAPER,
             symbol = me.matsumo.fukurou.trading.domain.TradingSymbol.BTC,
         ),
+    )
+}
+
+private fun economicEventRequest(
+    invocationId: String,
+    triggerKey: String,
+    reservedAt: Instant,
+): LlmLaunchReservationRequest {
+    return LlmLaunchReservationRequest(
+        invocationId = invocationId,
+        triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+        triggerKey = triggerKey,
+        reservedAt = reservedAt,
+        runnerConfig = LlmRunnerConfig(),
+        hourlyWindow = Duration.ofHours(1),
+        dailyWindow = Duration.ofHours(24),
+        activeReservationStaleAfter = Duration.ofMinutes(30),
+        populationScope = LlmLaunchReservationPopulationScope(
+            kind = "SYMBOL",
+            mode = me.matsumo.fukurou.trading.domain.TradingMode.PAPER,
+            symbol = me.matsumo.fukurou.trading.domain.TradingSymbol.BTC,
+        ),
+        singleAttemptKey = "ECONOMIC_EVENT:$triggerKey",
     )
 }
 

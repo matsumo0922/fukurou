@@ -252,7 +252,7 @@ class LlmDaemonScheduler(
         }
     }
 
-    @Suppress("LongMethod")
+    @Suppress("LongMethod", "CyclomaticComplexMethod")
     private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
         if (!daemonConfig.launchEnabled) {
             appendSkip(
@@ -318,6 +318,8 @@ class LlmDaemonScheduler(
             return LlmDaemonTickResult.InfrastructureSuppressed(scheduledSuppression, null)
         }
 
+        skipFlatEconomicEventBlackout(hasOpenRisk, observedAt)?.let { result -> return result }
+
         val trigger = selectTrigger(hasOpenRisk, observedAt)
             ?: return LlmDaemonTickResult.Skipped(DAEMON_SKIP_NO_TRIGGER, null)
 
@@ -362,6 +364,24 @@ class LlmDaemonScheduler(
         return reserveAndLaunch(trigger, openRisk)
     }
 
+    private suspend fun skipFlatEconomicEventBlackout(
+        hasOpenRisk: Boolean,
+        observedAt: Instant,
+    ): LlmDaemonTickResult.Skipped? {
+        if (hasOpenRisk || activeEconomicEvent(observedAt) == null) return null
+
+        appendSkip(
+            reason = DAEMON_SKIP_ECONOMIC_EVENT_BLACKOUT_FLAT,
+            trigger = economicEventTrigger(observedAt),
+            observedAt = observedAt,
+        ).getOrThrow()
+
+        return LlmDaemonTickResult.Skipped(
+            reason = DAEMON_SKIP_ECONOMIC_EVENT_BLACKOUT_FLAT,
+            triggerKind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
+        )
+    }
+
     private suspend fun reserveAndLaunch(
         trigger: LlmDaemonTrigger,
         openRisk: LlmDaemonOpenRiskSnapshot,
@@ -382,6 +402,7 @@ class LlmDaemonScheduler(
                 mode = tradingConfig.mode,
                 symbol = tradingConfig.symbol,
             ),
+            singleAttemptKey = trigger.singleAttemptKey(),
         )
         val reservationSuppression = launchAvailability.scheduledSuppressionAt(observedAt)
         if (reservationSuppression != null) {
@@ -526,14 +547,9 @@ class LlmDaemonScheduler(
 
             return entryFillTrigger.triggerIfDue(observedAt)
                 ?: stopProximityTriggerIfDue(marketEvaluation, observedAt)
+                ?: eventTriggerIfDue(observedAt)
                 ?: priceMoveTriggerIfDue(marketEvaluation, observedAt)
                 ?: holdingTriggerIfDue(observedAt)
-        }
-
-        val eventTrigger = eventTriggerIfDue(observedAt)
-
-        if (eventTrigger != null) {
-            return eventTrigger
         }
 
         val marketEvaluation = marketEvaluationIfNeeded(false, observedAt)
@@ -781,19 +797,28 @@ class LlmDaemonScheduler(
     }
 
     private suspend fun eventTriggerIfDue(observedAt: Instant): LlmDaemonTrigger? {
-        val activeEvent = tradingConfig.safetyFloor.economicEventBlackouts
-            .firstOrNull { event -> event.contains(observedAt) }
-            ?: return null
-        val trigger = LlmDaemonTrigger(
+        val trigger = economicEventTrigger(observedAt) ?: return null
+        val alreadyAttempted = launchReservationRepository.latestReservedAt(trigger.key).getOrThrow() != null
+
+        return if (alreadyAttempted) null else trigger
+    }
+
+    private fun economicEventTrigger(observedAt: Instant): LlmDaemonTrigger? {
+        val activeEvent = activeEconomicEvent(observedAt) ?: return null
+
+        return LlmDaemonTrigger(
             kind = LlmDaemonTriggerKind.ECONOMIC_EVENT,
             key = "economic-event:${activeEvent.eventId}:${activeEvent.eventAt}",
             eventName = activeEvent.eventName,
             details = null,
         )
-        val alreadyCompletedForEvent = launchReservationRepository.latestFinishedReservedAt(trigger.key)
-            .getOrThrow() != null
+    }
 
-        return if (alreadyCompletedForEvent) null else trigger
+    private fun activeEconomicEvent(observedAt: Instant) = tradingConfig.safetyFloor.economicEventBlackouts
+        .firstOrNull { event -> event.contains(observedAt) }
+
+    private fun LlmDaemonTrigger.singleAttemptKey(): String? {
+        return if (kind == LlmDaemonTriggerKind.ECONOMIC_EVENT) "${kind.name}:$key" else null
     }
 
     private suspend fun flatHeartbeatTriggerIfDue(observedAt: Instant): LlmDaemonTrigger? {
@@ -1316,6 +1341,9 @@ private const val PRICE_SAMPLE_BUFFER_LIMIT = 1024
  * 通常 cadence 待ちで起動しなかった理由。
  */
 private const val DAEMON_SKIP_NO_TRIGGER = "no_trigger_due"
+
+/** flat blackout 中は entry 不可の full run と heartbeat を起動しない。 */
+private const val DAEMON_SKIP_ECONOMIC_EVENT_BLACKOUT_FLAT = "economic_event_blackout_flat"
 
 /**
  * daemon tick 失敗で起動しなかった理由。

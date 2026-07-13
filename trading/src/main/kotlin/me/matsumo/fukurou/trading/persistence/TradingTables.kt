@@ -943,6 +943,9 @@ object LlmLaunchReservationsTable : Table("llm_launch_reservations") {
      */
     val triggerKey = varchar("trigger_key", length = 256)
 
+    /** 1 trigger 1 reservation を保証する一意 key。対象外と legacy row は NULL。 */
+    val singleAttemptKey = text("single_attempt_key").nullable()
+
     /**
      * 予約状態。
      */

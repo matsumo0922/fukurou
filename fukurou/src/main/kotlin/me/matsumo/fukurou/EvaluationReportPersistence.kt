@@ -556,6 +556,7 @@ internal data class EvaluationReportAdmission(
 internal data class EvaluationReportJobEvent(val status: String, val stage: String, val code: String?, val occurredAt: Long)
 
 private fun retryAfterSeconds(reason: LlmLaunchReservationRejectionReason): Long = when (reason) {
+    LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED -> Duration.ofDays(1).seconds
     LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> 15
     LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT,
     LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,

@@ -415,6 +415,34 @@ private const val ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL = """
     ON llm_launch_reservations (status, reserved_at)
 """
 
+/** 既存 ECONOMIC_EVENT history の canonical 1 row だけへ single-attempt key を付与する SQL。 */
+private const val BACKFILL_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_SQL = """
+    WITH ranked AS (
+        SELECT invocation_id, trigger_key,
+            ROW_NUMBER() OVER (PARTITION BY trigger_key ORDER BY reserved_at ASC, invocation_id ASC) AS row_number
+        FROM llm_launch_reservations
+        WHERE trigger_kind = 'ECONOMIC_EVENT'
+    )
+    UPDATE llm_launch_reservations AS reservation
+    SET single_attempt_key = 'ECONOMIC_EVENT:' || ranked.trigger_key
+    FROM ranked
+    WHERE reservation.invocation_id = ranked.invocation_id
+        AND ranked.row_number = 1
+        AND reservation.single_attempt_key IS NULL
+        AND NOT EXISTS (
+            SELECT 1
+            FROM llm_launch_reservations AS canonical
+            WHERE canonical.single_attempt_key = 'ECONOMIC_EVENT:' || ranked.trigger_key
+        )
+"""
+
+/** single-attempt key の non-null rowだけを一意にする partial index。 */
+private const val ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_launch_reservations_single_attempt_key_unique
+    ON llm_launch_reservations (single_attempt_key)
+    WHERE single_attempt_key IS NOT NULL
+"""
+
 /** stale claim recovery の bounded scan index を作る SQL。 */
 private const val ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL = """
     CREATE INDEX IF NOT EXISTS idx_llm_res_running_claimed_recovery
@@ -587,10 +615,22 @@ private const val VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL = """
             'idx_llm_launch_reservations_invocation_id_unique',
             'idx_llm_launch_reservations_trigger_key_reserved_at',
             'idx_llm_launch_reservations_status_reserved_at',
+            'idx_llm_launch_reservations_single_attempt_key_unique',
             'idx_llm_res_running_claimed_recovery',
             'idx_llm_res_running_nonclaimed_recent'
         )
-    HAVING COUNT(*) = 5
+    HAVING COUNT(*) = 6
+"""
+
+/** single-attempt unique index の column / predicate を確認する SQL。 */
+private const val VERIFY_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND tablename = 'llm_launch_reservations'
+        AND indexname = 'idx_llm_launch_reservations_single_attempt_key_unique'
+        AND indexdef ILIKE 'CREATE UNIQUE INDEX%USING btree (single_attempt_key)%'
+        AND indexdef ILIKE '%WHERE (single_attempt_key IS NOT NULL)'
 """
 
 /**
@@ -750,6 +790,7 @@ private const val VERIFY_LLM_LAUNCH_RESERVATIONS_SCHEMA_SQL = """
         invocation_id,
         trigger_kind,
         trigger_key,
+        single_attempt_key,
         status,
         reserved_at,
         finished_at,
@@ -1232,6 +1273,8 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_TRIGGER_KEY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_STATUS_RESERVED_AT_INDEX_SQL)
+    executeUpdate(BACKFILL_LLM_LAUNCH_SINGLE_ATTEMPT_KEY_SQL)
+    executeUpdate(ENSURE_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
@@ -1321,6 +1364,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifyExistsBySql(
         sql = VERIFY_LLM_LAUNCH_INDEX_COUNT_SQL,
         missingMessage = "llm_launch_reservations indexes were not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_LLM_LAUNCH_SINGLE_ATTEMPT_UNIQUE_INDEX_SQL,
+        missingMessage = "llm_launch_reservations single-attempt unique index was not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_EXECUTIONS_SCHEMA_SQL,

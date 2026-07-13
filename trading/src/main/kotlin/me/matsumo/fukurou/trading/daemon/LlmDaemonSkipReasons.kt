@@ -13,8 +13,10 @@ internal const val LLM_DAEMON_SKIP_SOFT_HALT_FLAT = "soft_halt_flat"
 /**
  * 起動予約の拒否理由を API / audit の skip reason に変換する。
  */
+@Suppress("CyclomaticComplexMethod")
 internal fun LlmLaunchReservationRejectionReason.toDaemonSkipReason(): String {
     return when (this) {
+        LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED -> "trigger_already_attempted"
         LlmLaunchReservationRejectionReason.HARD_HALT -> LLM_DAEMON_SKIP_HARD_HALT
         LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> "concurrent_invocation"
         LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT -> "report_rate_limit"

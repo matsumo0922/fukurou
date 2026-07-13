@@ -48,6 +48,7 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
         invocation_id,
         trigger_kind,
         trigger_key,
+        single_attempt_key,
         status,
         reserved_at,
         finished_at,
@@ -60,8 +61,18 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
         population_cohort,
         population_execution_semantics_version
     )
-    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?,
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?,
         COALESCE(?::uuid,(SELECT scope_account_epoch_id FROM gap_population_control WHERE id=1)), ?, ?)
+    ON CONFLICT (single_attempt_key) WHERE single_attempt_key IS NOT NULL DO NOTHING
+    RETURNING invocation_id
+"""
+
+/** single-attempt key の予約取得済み判定 SQL。 */
+private const val SELECT_SINGLE_ATTEMPT_EXISTS_SQL = """
+    SELECT 1
+    FROM llm_launch_reservations
+    WHERE single_attempt_key = ?
+    LIMIT 1
 """
 
 /**
@@ -522,6 +533,10 @@ fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
     }
 
+    if (request.singleAttemptKey != null && singleAttemptExists(request.singleAttemptKey)) {
+        return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED)
+    }
+
     val activeSince = request.reservedAt.minus(request.activeReservationStaleAfter)
     val activeReservation = selectBlockingActiveReservation(request.triggerKind, activeSince)
 
@@ -541,7 +556,9 @@ fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
         return LlmLaunchReservationOutcome.Rejected(rejectionReason)
     }
 
-    insertReservation(request)
+    if (!insertReservation(request)) {
+        return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED)
+    }
 
     return LlmLaunchReservationOutcome.Reserved(request.invocationId)
 }
@@ -576,22 +593,30 @@ private fun JdbcTransaction.selectBlockingActiveReservation(
     }
 }
 
-private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationRequest) {
+private fun JdbcTransaction.singleAttemptExists(singleAttemptKey: String): Boolean {
+    return jdbcConnection().prepareStatement(SELECT_SINGLE_ATTEMPT_EXISTS_SQL).use { statement ->
+        statement.setString(1, singleAttemptKey)
+        statement.executeQuery().use { resultSet -> resultSet.next() }
+    }
+}
+
+private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationRequest): Boolean {
     jdbcConnection().prepareStatement(INSERT_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
         statement.setString(2, request.invocationId)
         statement.setString(3, request.triggerKind.name)
         statement.setString(4, request.triggerKey)
-        statement.setString(5, LlmLaunchReservationStatus.RUNNING.name)
-        statement.setLong(6, request.reservedAt.toEpochMilli())
-        statement.setString(7, request.triggerKind.executionClaimState().name)
-        statement.setString(8, request.populationScope.kind)
-        statement.setString(9, request.populationScope.mode.name)
-        statement.setString(10, request.populationScope.symbol?.apiSymbol)
-        statement.setString(11, request.populationScope.accountEpochId)
-        statement.setString(12, request.populationScope.cohort)
-        statement.setString(13, request.populationScope.executionSemanticsVersion)
-        statement.executeUpdate()
+        statement.setNullableString(5, request.singleAttemptKey)
+        statement.setString(6, LlmLaunchReservationStatus.RUNNING.name)
+        statement.setLong(7, request.reservedAt.toEpochMilli())
+        statement.setString(8, request.triggerKind.executionClaimState().name)
+        statement.setString(9, request.populationScope.kind)
+        statement.setString(10, request.populationScope.mode.name)
+        statement.setString(11, request.populationScope.symbol?.apiSymbol)
+        statement.setString(12, request.populationScope.accountEpochId)
+        statement.setString(13, request.populationScope.cohort)
+        statement.setString(14, request.populationScope.executionSemanticsVersion)
+        statement.executeQuery().use { resultSet -> return resultSet.next() }
     }
 }
 
