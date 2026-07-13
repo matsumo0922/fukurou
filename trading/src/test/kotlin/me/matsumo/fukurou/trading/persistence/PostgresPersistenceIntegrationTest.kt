@@ -143,6 +143,8 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
 import kotlin.test.Test
@@ -4928,9 +4930,15 @@ class PostgresPersistenceIntegrationTest {
             )
         }
 
+        val audits = mutableListOf<EconomicEventAttemptMigrationAudit>()
         val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
-        bootstrap.ensureSchema().getOrThrow()
-        bootstrap.ensureSchema().getOrThrow()
+        EconomicEventAttemptMigrationAuditSink.observer = audits::add
+        try {
+            bootstrap.ensureSchema().getOrThrow()
+            bootstrap.ensureSchema().getOrThrow()
+        } finally {
+            EconomicEventAttemptMigrationAuditSink.observer = null
+        }
 
         val rows = exposedTransaction(database) {
             jdbcConnection().prepareStatement(
@@ -4954,6 +4962,17 @@ class PostgresPersistenceIntegrationTest {
         assertEquals("event-earliest-z" to null, rows[1])
         assertEquals("event-later" to null, rows[2])
         assertEquals(6, selectLlmLaunchReservationIndexCount(database))
+        assertEquals(2, audits.size)
+        assertEquals(3L, audits[0].candidateRowCount)
+        assertEquals(1, audits[0].affectedCanonicalRowCount)
+        assertEquals(EconomicEventAttemptMigrationIndexOutcome.CREATED_AND_VERIFIED, audits[0].indexOutcome)
+        assertTrue(audits[0].transactionCommitted)
+        assertEquals(3L, audits[1].candidateRowCount)
+        assertEquals(0, audits[1].affectedCanonicalRowCount)
+        assertEquals(EconomicEventAttemptMigrationIndexOutcome.EXISTING_AND_VERIFIED, audits[1].indexOutcome)
+        assertTrue(audits[1].transactionCommitted)
+        assertEquals(ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT, audits[0].lockTimeout)
+        assertEquals(ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT, audits[0].statementTimeout)
 
         val retry = ExposedLlmLaunchReservationRepository(database).tryReserve(
             economicEventReservationRequest(
@@ -4966,6 +4985,143 @@ class PostgresPersistenceIntegrationTest {
             LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED),
             retry,
         )
+    }
+
+    @Test
+    fun economicEventMigrationCompletesLargeHistoryWithinMeasuredStatementBudget() = runPostgresTest {
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE TABLE llm_launch_reservations (
+                        id UUID PRIMARY KEY, invocation_id VARCHAR(128) NOT NULL, trigger_kind VARCHAR(64) NOT NULL,
+                        trigger_key VARCHAR(256) NOT NULL, status VARCHAR(32) NOT NULL, reserved_at BIGINT NOT NULL,
+                        finished_at BIGINT NULL, reason TEXT NULL
+                    )
+                """.trimIndent(),
+            )
+            executeUpdate(
+                """
+                    INSERT INTO llm_launch_reservations
+                        (id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason)
+                    SELECT
+                        gen_random_uuid(),
+                        'large-event-' || value,
+                        'ECONOMIC_EVENT',
+                        'economic-event:large-' || ((value - 1) / 10),
+                        'FAILED',
+                        value,
+                        value,
+                        'fixture'
+                    FROM generate_series(1, 100000) AS value
+                """.trimIndent(),
+            )
+        }
+        val audits = mutableListOf<EconomicEventAttemptMigrationAudit>()
+        EconomicEventAttemptMigrationAuditSink.observer = audits::add
+
+        try {
+            TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        } finally {
+            EconomicEventAttemptMigrationAuditSink.observer = null
+        }
+
+        val audit = audits.single()
+        assertEquals(100_000L, audit.candidateRowCount)
+        assertEquals(10_000, audit.affectedCanonicalRowCount)
+        assertEquals(EconomicEventAttemptMigrationIndexOutcome.CREATED_AND_VERIFIED, audit.indexOutcome)
+        assertTrue(audit.transactionCommitted)
+        assertTrue(audit.elapsed < audit.statementTimeout, "migration audit=$audit")
+        assertEquals(10_000, selectNonNullSingleAttemptKeyCount(database))
+    }
+
+    @Test
+    fun economicEventMigrationStatementTimeoutRollsBackCanonicalBackfillAndIndex() = runPostgresTest {
+        createEconomicEventMigrationFixture(database, invocationId = "statement-timeout-event")
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE FUNCTION delay_single_attempt_backfill() RETURNS trigger AS ${'$'}${'$'}
+                    BEGIN
+                        PERFORM pg_sleep(6);
+                        RETURN NEW;
+                    END;
+                    ${'$'}${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            executeUpdate(
+                """
+                    CREATE TRIGGER delay_single_attempt_backfill
+                    BEFORE UPDATE OF single_attempt_key ON llm_launch_reservations
+                    FOR EACH ROW EXECUTE FUNCTION delay_single_attempt_backfill()
+                """.trimIndent(),
+            )
+        }
+        val audits = mutableListOf<EconomicEventAttemptMigrationAudit>()
+        EconomicEventAttemptMigrationAuditSink.observer = audits::add
+
+        val result = try {
+            TradingPersistenceBootstrap(database, fixedClock()).ensureSchema()
+        } finally {
+            EconomicEventAttemptMigrationAuditSink.observer = null
+        }
+
+        val audit = audits.single()
+        assertTrue(result.isFailure)
+        assertEquals(1L, audit.candidateRowCount)
+        assertNull(audit.affectedCanonicalRowCount)
+        assertEquals(EconomicEventAttemptMigrationIndexOutcome.NOT_ATTEMPTED, audit.indexOutcome)
+        assertFalse(audit.transactionCommitted)
+        assertTrue(
+            audit.elapsed >= ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.minusSeconds(1),
+            "migration audit=$audit",
+        )
+        assertTrue(
+            audit.elapsed < ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.plusSeconds(3),
+            "migration audit=$audit",
+        )
+        assertEquals(0, selectNonNullSingleAttemptKeyCount(database))
+        assertFalse(singleAttemptIndexExists(database))
+    }
+
+    @Test
+    fun economicEventMigrationLockTimeoutRollsBackWithoutAcceptingPartialSchema() = runPostgresTest {
+        createEconomicEventMigrationFixture(database, invocationId = "lock-timeout-event")
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.prepareStatement(
+            "SELECT invocation_id FROM llm_launch_reservations WHERE invocation_id = ? FOR UPDATE",
+        ).use { statement ->
+            statement.setString(1, "lock-timeout-event")
+            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+        }
+        val audits = mutableListOf<EconomicEventAttemptMigrationAudit>()
+        EconomicEventAttemptMigrationAuditSink.observer = audits::add
+
+        val result = try {
+            TradingPersistenceBootstrap(database, fixedClock()).ensureSchema()
+        } finally {
+            EconomicEventAttemptMigrationAuditSink.observer = null
+            lockConnection.rollback()
+            lockConnection.close()
+        }
+
+        val audit = audits.single()
+        assertTrue(result.isFailure)
+        assertEquals(1L, audit.candidateRowCount)
+        assertNull(audit.affectedCanonicalRowCount)
+        assertEquals(EconomicEventAttemptMigrationIndexOutcome.NOT_ATTEMPTED, audit.indexOutcome)
+        assertFalse(audit.transactionCommitted)
+        assertTrue(
+            audit.elapsed >= ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.minusMillis(500),
+            "migration audit=$audit",
+        )
+        assertTrue(
+            audit.elapsed < ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT.plusSeconds(3),
+            "migration audit=$audit",
+        )
+        assertEquals(0, selectNonNullSingleAttemptKeyCount(database))
+        assertFalse(singleAttemptIndexExists(database))
+        assertTrue(TradingPersistenceBootstrap(database, fixedClock()).verifySchema().isFailure)
     }
 
     @Test
@@ -5021,6 +5177,112 @@ class PostgresPersistenceIntegrationTest {
             }
         }
         assertEquals(100, nonNullAttemptCount)
+    }
+
+    @Test
+    fun twoPostgresSchedulersLaunchEconomicEventExactlyOnceForOneHundredBarrierRaces() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val eventLog = ExposedCommandEventLog(database)
+
+        repeat(100) { iteration ->
+            val now = fixedInstant().plus(Duration.ofDays(iteration * 2L))
+            val clock = Clock.fixed(now, ZoneOffset.UTC)
+            val eventId = "parallel-scheduler-$iteration"
+            val triggerKey = "economic-event:$eventId:$now"
+            val config = TradingBotConfig(
+                safetyFloor = SafetyFloorConfig(
+                    economicEventBlackouts = listOf(
+                        EconomicEventBlackout(
+                            eventId = eventId,
+                            eventName = "FOMC",
+                            eventAt = now,
+                            blackoutBefore = Duration.ZERO,
+                            blackoutAfter = Duration.ofHours(1),
+                        ),
+                    ),
+                ),
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                ),
+            )
+            val barrier = CyclicBarrier(2)
+            val firstRepository = BarrierBeforeTryReserveRepository(
+                ExposedLlmLaunchReservationRepository(database),
+                barrier,
+            )
+            val secondRepository = BarrierBeforeTryReserveRepository(
+                ExposedLlmLaunchReservationRepository(database),
+                barrier,
+            )
+            val oneShotCallCount = AtomicInteger()
+            val firstScheduler = postgresEconomicEventScheduler(
+                config = config,
+                database = database,
+                repository = firstRepository,
+                eventLog = eventLog,
+                clock = clock,
+                invocationId = UUID(iteration + 1L, 1L),
+                oneShotCallCount = oneShotCallCount,
+            )
+            val secondScheduler = postgresEconomicEventScheduler(
+                config = config,
+                database = database,
+                repository = secondRepository,
+                eventLog = eventLog,
+                clock = clock,
+                invocationId = UUID(iteration + 1L, 2L),
+                oneShotCallCount = oneShotCallCount,
+            )
+
+            val outcomes = coroutineScope {
+                listOf(
+                    async(Dispatchers.IO) { firstScheduler.tick() },
+                    async(Dispatchers.IO) { secondScheduler.tick() },
+                ).map { result -> result.await() }
+            }
+
+            val winner = assertIs<LlmDaemonTickResult.Failed>(
+                outcomes.single { outcome -> outcome is LlmDaemonTickResult.Failed },
+            )
+            val loser = assertIs<LlmDaemonTickResult.Skipped>(
+                outcomes.single { outcome -> outcome is LlmDaemonTickResult.Skipped },
+            )
+            assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, winner.triggerKind)
+            assertEquals(LlmDaemonTriggerKind.ECONOMIC_EVENT, loser.triggerKind)
+            assertEquals("trigger_already_attempted", loser.reason)
+            assertEquals(1, oneShotCallCount.get())
+            assertEquals(1, countSingleAttemptReservations(database, triggerKey))
+            assertEquals(
+                1,
+                countCommandEvents(database, triggerKey, CommandEventType.DAEMON_TRIGGER_LAUNCHED),
+            )
+            assertEquals(
+                1,
+                countCommandEvents(database, triggerKey, CommandEventType.DAEMON_TRIGGER_SKIPPED),
+            )
+            assertTrue(
+                selectCommandEventPayloads(database, triggerKey, CommandEventType.DAEMON_TRIGGER_SKIPPED)
+                    .single()
+                    .contains("trigger_already_attempted"),
+            )
+
+            val restartAttempt = ExposedLlmLaunchReservationRepository(database).tryReserve(
+                economicEventReservationRequest(
+                    invocationId = "scheduler-restart-$iteration",
+                    triggerKey = triggerKey,
+                    reservedAt = now.plusSeconds(1),
+                ),
+            ).getOrThrow()
+            assertEquals(
+                LlmLaunchReservationOutcome.Rejected(
+                    LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED,
+                ),
+                restartAttempt,
+            )
+            assertEquals(1, countSingleAttemptReservations(database, triggerKey))
+            assertEquals(1, oneShotCallCount.get())
+        }
     }
 
     @Test
@@ -8668,6 +8930,200 @@ private fun economicEventReservationRequest(
         ),
         singleAttemptKey = "ECONOMIC_EVENT:$triggerKey",
     )
+}
+
+private fun postgresEconomicEventScheduler(
+    config: TradingBotConfig,
+    database: ExposedDatabase,
+    repository: LlmLaunchReservationRepository,
+    eventLog: ExposedCommandEventLog,
+    clock: Clock,
+    invocationId: UUID,
+    oneShotCallCount: AtomicInteger,
+): LlmDaemonScheduler {
+    return LlmDaemonScheduler(
+        tradingConfig = config,
+        dependencies = LlmDaemonSchedulerDependencies(
+            riskStateRepository = ExposedRiskStateRepository(database),
+            commandEventLog = eventLog,
+            launchReservationRepository = repository,
+            openRiskReader = LlmDaemonOpenRiskReader {
+                Result.success(LlmDaemonOpenRiskSnapshot(1, emptyList(), 0))
+            },
+            tickerReader = LlmDaemonTickerReader {
+                Result.success(LlmDaemonTickerSnapshot(BigDecimal("10000000"), clock.instant()))
+            },
+            positionsReader = LlmDaemonPositionsReader { Result.success(emptyList()) },
+            entryFillReader = LlmDaemonEntryFillReader { Result.success(null) },
+        ),
+        runtime = LlmDaemonSchedulerRuntime(
+            requestBase = postgresOneShotRequest("scheduler-base"),
+            launchOneShot = { request ->
+                val reservedInvocationId = requireNotNull(request.invocationId)
+                val triggerKind = requireNotNull(request.triggerKind)
+                val claimantToken = "postgres-scheduler:$reservedInvocationId"
+                val claim = repository.claimForExecution(
+                    LlmExecutionClaimRequest(
+                        invocationId = reservedInvocationId,
+                        triggerKind = triggerKind,
+                        claimantToken = claimantToken,
+                        claimedAt = clock.instant(),
+                    ),
+                )
+                assertIs<LlmExecutionClaimOutcome.Claimed>(claim)
+                oneShotCallCount.incrementAndGet()
+                repository.finish(
+                    LlmLaunchReservationFinish(
+                        invocationId = reservedInvocationId,
+                        status = LlmLaunchReservationStatus.FAILED,
+                        reason = "parallel_scheduler_fixture",
+                        finishedAt = clock.instant(),
+                        claimantToken = claimantToken,
+                    ),
+                ).getOrThrow()
+
+                Result.failure(IllegalStateException("deterministic scheduler failure after reservation"))
+            },
+            clock = clock,
+            idGenerator = { invocationId },
+        ),
+    )
+}
+
+private fun countSingleAttemptReservations(database: ExposedDatabase, triggerKey: String): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT COUNT(*) FROM llm_launch_reservations WHERE single_attempt_key = ?",
+        ).use { statement ->
+            statement.setString(1, "ECONOMIC_EVENT:$triggerKey")
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private fun createEconomicEventMigrationFixture(database: ExposedDatabase, invocationId: String) {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    exposedTransaction(database) {
+        executeUpdate("DROP INDEX idx_llm_launch_reservations_single_attempt_key_unique")
+        executeUpdate("DELETE FROM llm_launch_reservations")
+        val scope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, single_attempt_key,
+                    status, reserved_at, finished_at, reason,
+                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
+                    population_cohort, population_execution_semantics_version
+                ) VALUES (
+                    gen_random_uuid(), ?, 'ECONOMIC_EVENT', 'economic-event:timeout', NULL, 'FAILED', 1, 2, NULL,
+                    ?, ?, ?, ?, ?, ?
+                )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.setString(2, scope.kind)
+            statement.setString(3, scope.mode)
+            statement.setString(4, scope.symbol)
+            statement.setObject(5, scope.accountEpochId)
+            statement.setString(6, scope.cohort)
+            statement.setString(7, scope.executionSemanticsVersion)
+            statement.executeUpdate()
+        }
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, single_attempt_key,
+                    status, reserved_at, finished_at, reason,
+                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
+                    population_cohort, population_execution_semantics_version
+                )
+                SELECT
+                    gen_random_uuid(), 'migration-lock-holder', 'MANUAL', 'manual:lock-holder', NULL,
+                    'FAILED', 3, 4, NULL,
+                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
+                    population_cohort, population_execution_semantics_version
+                FROM llm_launch_reservations
+                WHERE invocation_id = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun selectNonNullSingleAttemptKeyCount(database: ExposedDatabase): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT COUNT(*) FROM llm_launch_reservations WHERE single_attempt_key IS NOT NULL",
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private fun singleAttemptIndexExists(database: ExposedDatabase): Boolean {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                        AND tablename = 'llm_launch_reservations'
+                        AND indexname = 'idx_llm_launch_reservations_single_attempt_key_unique'
+                )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next())
+                resultSet.getBoolean(1)
+            }
+        }
+    }
+}
+
+private fun countCommandEvents(
+    database: ExposedDatabase,
+    triggerKey: String,
+    eventType: CommandEventType,
+): Int = selectCommandEventPayloads(database, triggerKey, eventType).size
+
+private fun selectCommandEventPayloads(
+    database: ExposedDatabase,
+    triggerKey: String,
+    eventType: CommandEventType,
+): List<String> {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "SELECT payload FROM command_event_log WHERE client_request_id = ? AND event_type = ? ORDER BY ts, id",
+        ).use { statement ->
+            statement.setString(1, triggerKey)
+            statement.setString(2, eventType.name)
+            statement.executeQuery().use { resultSet ->
+                buildList {
+                    while (resultSet.next()) add(resultSet.getString(1))
+                }
+            }
+        }
+    }
+}
+
+/** scheduler pre-read 後かつ DB reservation 前で2 instanceを同期する test decorator。 */
+private class BarrierBeforeTryReserveRepository(
+    private val delegate: LlmLaunchReservationRepository,
+    private val barrier: CyclicBarrier,
+) : LlmLaunchReservationRepository by delegate {
+    override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
+        barrier.await(10, TimeUnit.SECONDS)
+
+        return delegate.tryReserve(request)
+    }
 }
 
 private fun llmRunStart(invocationId: String, startedAt: Instant): LlmRunStart {
