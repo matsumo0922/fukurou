@@ -146,7 +146,7 @@ class LifecycleMutationSqlInventoryTest {
 
         assertTrue("SET LOCAL lock_timeout='2s'" in lifecycle)
         assertTrue("SET LOCAL statement_timeout='5s'" in lifecycle)
-        assertTrue("GAP_POPULATION_INVOCATION_LIMIT" in lifecycle)
+        assertTrue("GAP_POPULATION_PASS_SIZE = 1_000" in lifecycle)
         assertTrue("recoverGapPopulationPass(recoveredAt)" in integrityRepository)
         assertTrue("recoverStaleSession(clock.instant())" in maintenanceWorker)
         assertTrue("recoverStaleSessionWithSummary(Instant.now())" in standalone)
