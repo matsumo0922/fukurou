@@ -43,7 +43,8 @@ class ShellProcessRunner(
 
     private suspend fun runProcess(command: RenderedLlmCommand): ProcessRunResult {
         return coroutineScope {
-            val process = startProcess(command)
+            val startedProcess = startProcess(command)
+            val process = startedProcess.process
 
             try {
                 val stdout = async(Dispatchers.IO) { process.inputStream.bufferedReader().readText() }
@@ -58,14 +59,14 @@ class ShellProcessRunner(
                 }
 
                 if (exitCode == null) {
-                    destroyProcessTreeNonCancellable(process).getOrThrow()
+                    val terminationProof = destroyProcessTreeNonCancellable(startedProcess).getOrThrow()
 
                     return@coroutineScope ProcessRunResult(
                         status = ProcessRunStatus.TIMED_OUT,
                         exitCode = null,
                         stdout = stdout.await(),
                         stderr = stderr.await(),
-                        processTreeTerminationProof = ProcessTreeTerminationProof.PROVEN_EXITED,
+                        processTreeTerminationProof = terminationProof,
                     )
                 }
 
@@ -77,30 +78,49 @@ class ShellProcessRunner(
                     processTreeTerminationProof = ProcessTreeTerminationProof.UNCERTAIN,
                 )
             } catch (throwable: CancellationException) {
-                val destroyResult = destroyProcessTreeNonCancellable(process)
+                val destroyResult = destroyProcessTreeNonCancellable(startedProcess)
                 destroyResult.exceptionOrNull()?.let { destroyFailure -> throwable.addSuppressed(destroyFailure) }
 
-                if (destroyResult.isSuccess) throw ProcessTreeTerminationProvenCancellationException(throwable)
+                if (destroyResult.getOrNull() == ProcessTreeTerminationProof.PROVEN_EXITED) {
+                    throw ProcessTreeTerminationProvenCancellationException(throwable)
+                }
                 throw throwable
             }
         }
     }
 
-    private fun startProcess(command: RenderedLlmCommand): Process {
+    private fun startProcess(command: RenderedLlmCommand): StartedProcess {
         Files.createDirectories(command.workingDirectory)
 
-        val builder = ProcessBuilder(listOf(command.executable) + command.args)
+        val useProcessGroup = Files.isExecutable(Path.of(LINUX_SETSID_PATH))
+        val processCommand = if (useProcessGroup) {
+            listOf(LINUX_SETSID_PATH, command.executable) + command.args
+        } else {
+            listOf(command.executable) + command.args
+        }
+        val builder = ProcessBuilder(processCommand)
             .directory(command.workingDirectory.toFile())
         val environment = builder.environment()
 
         environment.clear()
         environment.putAll(command.environment)
 
-        return builder.start()
+        val process = builder.start()
+        return StartedProcess(
+            process = process,
+            processGroupId = process.pid().takeIf { useProcessGroup },
+        )
     }
 
-    private suspend fun destroyProcessTree(process: Process) {
-        withContext(Dispatchers.IO) {
+    private suspend fun destroyProcessTree(startedProcess: StartedProcess): ProcessTreeTerminationProof {
+        return withContext(Dispatchers.IO) {
+            val process = startedProcess.process
+            val processGroupId = startedProcess.processGroupId
+            if (processGroupId != null) {
+                terminateLinuxProcessGroup(process, processGroupId)
+                return@withContext ProcessTreeTerminationProof.PROVEN_EXITED
+            }
+
             val descendants = process.descendantsDeepestFirst()
 
             descendants.forEach { descendant -> runCatching { descendant.destroy() } }
@@ -122,15 +142,52 @@ class ShellProcessRunner(
             check(processExited && processTreeExited) {
                 "LLM process tree did not exit after TERM/KILL sequence."
             }
+            ProcessTreeTerminationProof.UNCERTAIN
         }
     }
 
-    private suspend fun destroyProcessTreeNonCancellable(process: Process): Result<Unit> {
+    private suspend fun destroyProcessTreeNonCancellable(
+        process: StartedProcess,
+    ): Result<ProcessTreeTerminationProof> {
         return withContext(NonCancellable) {
             runCatching {
                 destroyProcessTree(process)
             }
         }
+    }
+
+    private fun terminateLinuxProcessGroup(process: Process, processGroupId: Long) {
+        signalProcessGroup(processGroupId, "TERM")
+        val gracefulDeadline = System.nanoTime() + terminationGrace.toNanos()
+        while (isLinuxProcessGroupRunning(processGroupId) && System.nanoTime() < gracefulDeadline) {
+            Thread.sleep(PROCESS_TREE_EXIT_POLL_MILLIS)
+        }
+        if (isLinuxProcessGroupRunning(processGroupId)) signalProcessGroup(processGroupId, "KILL")
+
+        val processExited = process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
+        check(processExited && !isLinuxProcessGroupRunning(processGroupId)) {
+            "LLM Linux process group did not exit after TERM/KILL sequence."
+        }
+    }
+
+    private fun signalProcessGroup(processGroupId: Long, signal: String) {
+        val signalProcess = ProcessBuilder(
+            LINUX_KILL_PATH,
+            "-$signal",
+            "--",
+            "-$processGroupId",
+        ).start()
+        signalProcess.outputStream.close()
+        signalProcess.waitFor(PROCESS_GROUP_SIGNAL_WAIT_SECONDS, TimeUnit.SECONDS)
+    }
+
+    private fun isLinuxProcessGroupRunning(processGroupId: Long): Boolean {
+        return runCatching {
+            Files.list(Path.of(LINUX_PROC_ROOT)).use { entries ->
+                entries.filter { entry -> entry.fileName.toString().all(Char::isDigit) }
+                    .anyMatch { entry -> entry.runningProcessGroupIdOrNull() == processGroupId }
+            }
+        }.getOrDefault(true)
     }
 
     private suspend fun writeStdin(process: Process, stdin: String?) {
@@ -210,6 +267,19 @@ class ShellProcessRunner(
     }
 }
 
+private data class StartedProcess(
+    val process: Process,
+    val processGroupId: Long?,
+)
+
+private fun Path.runningProcessGroupIdOrNull(): Long? {
+    val stat = runCatching { Files.readString(resolve("stat")) }.getOrNull() ?: return null
+    val fields = stat.substringAfterLast(") ", missingDelimiterValue = "").split(' ')
+    if (fields.size < 3 || fields[0] == "Z") return null
+
+    return fields[2].toLongOrNull()
+}
+
 private fun Process.descendantsDeepestFirst(): List<ProcessHandle> {
     var lastFailure: Throwable? = null
     repeat(PROCESS_TREE_ENUMERATION_ATTEMPTS) {
@@ -266,6 +336,10 @@ private fun ProcessHandle.awaitExitQuietly() {
 private const val PROCESS_TREE_KILL_WAIT_SECONDS = 2L
 private const val PROCESS_TREE_ENUMERATION_ATTEMPTS = 20
 private const val PROCESS_TREE_EXIT_POLL_MILLIS = 10L
+private const val PROCESS_GROUP_SIGNAL_WAIT_SECONDS = 2L
+private const val LINUX_SETSID_PATH = "/usr/bin/setsid"
+private const val LINUX_KILL_PATH = "/bin/kill"
+private const val LINUX_PROC_ROOT = "/proc"
 private const val PRODUCTION_LLM_LAUNCHER = "/usr/local/libexec/fukurou-llm-agent-launcher"
 private const val CLEANUP_MODE = "cleanup"
 private const val CODEX_HOME_PREFIX = "fukurou-codex-home-"
