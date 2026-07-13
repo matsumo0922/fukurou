@@ -2278,11 +2278,19 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                 "SELECT count(*) FROM information_schema.role_usage_grants WHERE grantee='$MCP_TEST_ROLE' AND object_schema='public'",
                 0,
             )
+            assertSqlCount(
+                statement,
+                "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='$MCP_TEST_ROLE' " +
+                    "AND table_name IN ('gap_population_control','market_data_gap_work','market_data_gap_work_evidence'," +
+                    "'market_data_gap_population_generations','market_data_gap_population_members'," +
+                    "'market_data_gap_terminal_journal','market_data_gap_recovery_progress')",
+                0,
+            )
         }
     }
     mcpTestConnection(container).use { connection ->
         connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE')").use { rows ->
+            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_table_privilege(current_user, 'orders', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE'), has_function_privilege(current_user, 'public.acquire_gap_population_generation_token()', 'EXECUTE')").use { rows ->
                 assertTrue(rows.next())
                 assertEquals(true, rows.getBoolean(1))
                 assertEquals(true, rows.getBoolean(2))
@@ -2292,6 +2300,7 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                 assertEquals(false, rows.getBoolean(6))
                 assertEquals(true, rows.getBoolean(7))
                 assertEquals(true, rows.getBoolean(8))
+                assertEquals(true, rows.getBoolean(9))
             }
         }
     }

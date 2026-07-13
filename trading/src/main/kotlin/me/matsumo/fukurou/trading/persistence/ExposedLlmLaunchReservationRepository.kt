@@ -92,6 +92,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     tryReserveLlmLaunchInTransaction(request)
                 }
             }
@@ -102,6 +103,7 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     finishLlmLaunchInTransaction(finish)
                 }
             }

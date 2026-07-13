@@ -4,7 +4,6 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
@@ -14,6 +13,8 @@ import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
+
+private const val MAX_GAP_RECOVERY_PASSES = 10_000
 
 /** PostgreSQL を正本とする market-data integrity repository。 */
 class ExposedMarketDataIntegrityRepository(
@@ -108,6 +109,7 @@ class ExposedMarketDataIntegrityRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     applyMarketDataGap(sessionId, reason, detectedAt, detail)
                 }
             }
@@ -123,6 +125,7 @@ class ExposedMarketDataIntegrityRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     markMarketDataGap(sessionId, reason, detectedAt, detail)
                     Unit
                 }
@@ -138,8 +141,11 @@ class ExposedMarketDataIntegrityRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     val gapId = requireNotNull(selectGapId(sessionId)) { "market-data gap was not found." }
-                    applyGapImpact(gapId, reason, detectedAt)
+                    ensureGapWork(sessionId, gapId, reason, detectedAt, null)
+                    recoverGapPopulationPass(detectedAt)
+                    Unit
                 }
             }
         }
@@ -149,8 +155,9 @@ class ExposedMarketDataIntegrityRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     selectConnectedMarketDataSessionIds().forEach { sessionId ->
-                        applyMarketDataGap(
+                        markMarketDataGap(
                             sessionId = sessionId,
                             reason = MarketDataGapReason.PROCESS_RESTART,
                             detectedAt = recoveredAt,
@@ -158,9 +165,18 @@ class ExposedMarketDataIntegrityRepository(
                         )
                     }
                     selectUnappliedMarketDataGaps().forEach { gap ->
-                        applyGapImpact(gap.id, gap.reason, recoveredAt)
+                        val sessionId = selectGapSessionId(gap.id)
+                        ensureGapWork(sessionId, gap.id, gap.reason, recoveredAt, null)
                     }
                 }
+                var summary: GapPopulationRecoverySummary
+                var passes = 0
+                do {
+                    summary = exposedTransaction(database) { recoverGapPopulationPass(recoveredAt) }
+                    passes += 1
+                    check(passes <= MAX_GAP_RECOVERY_PASSES) { "gap population recovery did not converge." }
+                } while (summary.remaining > 0)
+                Unit
             }
         }
     }
@@ -269,7 +285,8 @@ private fun JdbcTransaction.applyMarketDataGap(
     detail: String?,
 ) {
     val gapId = markMarketDataGap(sessionId, reason, detectedAt, detail)
-    applyGapImpact(gapId, reason, detectedAt)
+    ensureGapWork(sessionId, gapId, reason, detectedAt, detail)
+    recoverGapPopulationPass(detectedAt)
 }
 
 private fun JdbcTransaction.markMarketDataGap(
@@ -278,7 +295,10 @@ private fun JdbcTransaction.markMarketDataGap(
     detectedAt: Instant,
     detail: String?,
 ): UUID {
-    selectGapId(sessionId)?.let { gapId -> return gapId }
+    selectGapId(sessionId)?.let { gapId ->
+        ensureGapWork(sessionId, gapId, reason, detectedAt, detail)
+        return gapId
+    }
 
     val sessionUpdated = prepare(
         """
@@ -308,7 +328,41 @@ private fun JdbcTransaction.markMarketDataGap(
         statement.setLong(5, detectedAt.toEpochMilli())
         statement.executeUpdate()
     }
+    ensureGapWork(sessionId, gapId, reason, detectedAt, detail)
     return gapId
+}
+
+private fun JdbcTransaction.ensureGapWork(
+    sessionId: UUID,
+    gapId: UUID,
+    reason: MarketDataGapReason,
+    detectedAt: Instant,
+    detail: String?,
+) {
+    enqueueGapPopulationWork(
+        identity = GapSourceWorkIdentity(
+            provider = "GMO_COIN",
+            symbol = "BTC_JPY",
+            channel = "TRADES",
+            sessionId = sessionId,
+            sourceKind = "SESSION_LIFECYCLE",
+            sourceEpisode = "0",
+        ),
+        gapId = gapId,
+        reason = reason.name,
+        detail = detail,
+        detectedAt = detectedAt,
+    )
+}
+
+private fun JdbcTransaction.selectGapSessionId(gapId: UUID): UUID {
+    return prepare("SELECT session_id FROM market_data_gaps WHERE id=?").use { statement ->
+        statement.setObject(1, gapId)
+        statement.executeQuery().use { rows ->
+            require(rows.next()) { "market-data gap was not found." }
+            rows.getObject(1, UUID::class.java)
+        }
+    }
 }
 
 private fun JdbcTransaction.selectGapId(sessionId: UUID): UUID? {
@@ -318,140 +372,5 @@ private fun JdbcTransaction.selectGapId(sessionId: UUID): UUID? {
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.getObject("id", UUID::class.java) else null
         }
-    }
-}
-
-private fun JdbcTransaction.applyGapImpact(
-    gapId: UUID,
-    reason: MarketDataGapReason,
-    detectedAt: Instant,
-) {
-    val alreadyApplied = prepare("SELECT impact_applied_at FROM market_data_gaps WHERE id = ? FOR UPDATE").use { statement ->
-        statement.setObject(1, gapId)
-        statement.executeQuery().use { resultSet ->
-            require(resultSet.next()) { "market-data gap was not found." }
-            resultSet.getObject("impact_applied_at") != null
-        }
-    }
-    if (alreadyApplied) return
-
-    insertOrderAndRunExclusions(gapId, reason, detectedAt)
-    insertPositionAndRunExclusions(gapId, reason, detectedAt)
-    prepare(
-        """
-            UPDATE orders
-            SET status = 'CANCELED',
-                reason_ja = ?,
-                canceled_at = ?,
-                cancel_reason = ?,
-                updated_at = ?
-            WHERE status IN ('OPEN', 'PENDING_CANCEL')
-                AND side = 'BUY'
-                AND position_id IS NULL
-        """,
-    ).use { statement ->
-        statement.setString(1, "market-data gap: ${reason.name}")
-        statement.setLong(2, detectedAt.toEpochMilli())
-        statement.setString(3, PaperOrderCancelReason.MARKET_DATA_GAP.wireCode)
-        statement.setLong(4, detectedAt.toEpochMilli())
-        statement.executeUpdate()
-    }
-    prepare("UPDATE market_data_gaps SET impact_applied_at = ? WHERE id = ?").use { statement ->
-        statement.setLong(1, detectedAt.toEpochMilli())
-        statement.setObject(2, gapId)
-        statement.executeUpdate()
-    }
-}
-
-private fun JdbcTransaction.insertOrderAndRunExclusions(
-    gapId: UUID,
-    reason: MarketDataGapReason,
-    at: Instant,
-) {
-    insertExclusionsFromQuery(
-        gapId,
-        reason,
-        at,
-        "ORDER",
-        "SELECT id::text FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL') AND side = 'BUY' AND position_id IS NULL",
-    )
-    insertExclusionsFromQuery(
-        gapId,
-        reason,
-        at,
-        "DECISION_RUN",
-        """
-            SELECT DISTINCT decision_run_id FROM orders
-            WHERE status IN ('OPEN', 'PENDING_CANCEL')
-                AND side = 'BUY'
-                AND position_id IS NULL
-                AND decision_run_id IS NOT NULL
-        """,
-    )
-}
-
-private fun JdbcTransaction.insertPositionAndRunExclusions(
-    gapId: UUID,
-    reason: MarketDataGapReason,
-    at: Instant,
-) {
-    insertExclusionsFromQuery(
-        gapId,
-        reason,
-        at,
-        "POSITION",
-        "SELECT id::text FROM positions WHERE status = 'OPEN'",
-    )
-    insertExclusionsFromQuery(
-        gapId,
-        reason,
-        at,
-        "DECISION_RUN",
-        "SELECT DISTINCT decision_run_id FROM positions WHERE status = 'OPEN' AND decision_run_id IS NOT NULL",
-    )
-    insertExclusionsFromQuery(
-        gapId,
-        reason,
-        at,
-        "DECISION_RUN",
-        """
-            SELECT DISTINCT entry.decision_run_id
-            FROM orders entry
-            INNER JOIN positions affected ON affected.trade_group_id = entry.trade_group_id
-            WHERE affected.status = 'OPEN'
-                AND entry.status = 'FILLED'
-                AND entry.side = 'BUY'
-                AND entry.decision_run_id IS NOT NULL
-        """,
-    )
-}
-
-private fun JdbcTransaction.insertExclusionsFromQuery(
-    gapId: UUID,
-    reason: MarketDataGapReason,
-    at: Instant,
-    entityType: String,
-    entityQuery: String,
-) {
-    prepare(
-        """
-            INSERT INTO evaluation_exclusions (id, gap_id, entity_type, entity_id, reason, created_at)
-            SELECT gen_random_uuid(), ?, ?, affected.entity_id, ?, ?
-            FROM ($entityQuery) affected(entity_id)
-            WHERE NOT EXISTS (
-                SELECT 1 FROM evaluation_exclusions existing
-                WHERE existing.gap_id = ?
-                    AND existing.entity_type = ?
-                    AND existing.entity_id = affected.entity_id
-            )
-        """,
-    ).use { statement ->
-        statement.setObject(1, gapId)
-        statement.setString(2, entityType)
-        statement.setString(3, reason.name)
-        statement.setLong(4, at.toEpochMilli())
-        statement.setObject(5, gapId)
-        statement.setString(6, entityType)
-        statement.executeUpdate()
     }
 }

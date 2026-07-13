@@ -110,6 +110,7 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
+import me.matsumo.fukurou.trading.runner.runPaperMarketRecoveryCommand
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
@@ -849,6 +850,413 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectRecentSafetyDenialIndexCount(database))
         assertEquals(3, selectEquitySnapshotIndexCount(database))
         assertEquals(1, selectEquitySnapshotCountByReason(database, EquitySnapshotReason.BOOTSTRAP))
+    }
+
+    @Test
+    fun gap_population_trigger_rejects_raw_creation_and_production_repository_assigns_birth() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        val rawInsert = runCatching {
+            exposedTransaction(database) {
+                prepare(
+                    """
+                    INSERT INTO llm_runs (invocation_id, mode, symbol, status, started_at)
+                    VALUES ('raw-without-token', 'PAPER', 'BTC', 'RUNNING', 1)
+                    """.trimIndent(),
+                ).use { statement -> statement.executeUpdate() }
+            }
+        }
+        assertTrue(rawInsert.isFailure)
+
+        ExposedLlmRunRepository(database).insertRunning(
+            LlmRunStart(
+                invocationId = "token-aware-production-path",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+
+        val birthSequence = exposedTransaction(database) {
+            prepare("SELECT birth_sequence FROM llm_runs WHERE invocation_id='token-aware-production-path'").use { statement ->
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getLong(1)
+                }
+            }
+        }
+        assertTrue(birthSequence > 0)
+    }
+
+    @Test
+    fun production_gap_path_captures_pre_c_null_population_without_rewriting_reason() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        ExposedLlmRunRepository(database).insertRunning(
+            LlmRunStart(
+                invocationId = "legacy-pre-c-run",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        exposedTransaction(database) {
+            prepare("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='legacy-pre-c-run'").use { statement ->
+                assertEquals(1, statement.executeUpdate())
+            }
+        }
+
+        val sessionId = UUID.randomUUID()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.recordGap(
+            sessionId = sessionId,
+            reason = MarketDataGapReason.PROCESS_RESTART,
+            detectedAt = fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+
+        exposedTransaction(database) {
+            val memberCount = prepare(
+                "SELECT COUNT(*) FROM market_data_gap_population_members " +
+                    "WHERE entity_type='LLM_RUN' AND entity_id='legacy-pre-c-run' AND birth_sequence IS NULL",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+            val reason = prepare("SELECT reason FROM market_data_gaps WHERE session_id=?").use { statement ->
+                statement.setObject(1, sessionId)
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getString(1)
+                }
+            }
+            val workState = prepare("SELECT state FROM market_data_gap_work WHERE session_id=?").use { statement ->
+                statement.setObject(1, sessionId)
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getString(1)
+                }
+            }
+
+            assertEquals(1, memberCount)
+            assertEquals(MarketDataGapReason.PROCESS_RESTART.name, reason)
+            assertEquals("APPLIED", workState)
+        }
+    }
+
+    @Test
+    fun queued_gap_uses_enqueue_upper_and_terminal_journal_without_leaking_into_active_generation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(
+            sessionId = sessionId,
+            reason = MarketDataGapReason.DISCONNECTED,
+            detectedAt = fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+
+        val invocationId = "queued-terminal-run"
+        val startedAt = fixedInstant().plusSeconds(2)
+        val llmRepository = ExposedLlmRunRepository(database)
+        llmRepository.insertRunning(
+            LlmRunStart(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = startedAt,
+            ),
+        ).getOrThrow()
+
+        val queuedWorkId = exposedTransaction(database) {
+            val gapId = prepare("SELECT id FROM market_data_gaps WHERE session_id=?").use { statement ->
+                statement.setObject(1, sessionId)
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getObject(1, UUID::class.java)
+                }
+            }
+            val identity = GapSourceWorkIdentity(
+                provider = "GMO_COIN",
+                symbol = "BTC_JPY",
+                channel = "TRADES",
+                sessionId = sessionId,
+                sourceKind = "EVENT_SEQUENCE",
+                sourceEpisode = "2",
+            )
+            val first = enqueueGapPopulationWork(
+                identity = identity,
+                gapId = gapId,
+                reason = MarketDataGapReason.SEQUENCE_GAP.name,
+                detail = "fixture",
+                detectedAt = fixedInstant().plusSeconds(2),
+            )
+            val retry = enqueueGapPopulationWork(
+                identity = identity,
+                gapId = gapId,
+                reason = MarketDataGapReason.DATABASE_FAILURE.name,
+                detail = "response-loss retry",
+                detectedAt = fixedInstant().plusSeconds(3),
+            )
+            assertEquals(first, retry)
+            first
+        }
+
+        llmRepository.finish(
+            LlmRunFinish(
+                invocationId = invocationId,
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                status = LLM_RUN_STATUS_FAILED,
+                startedAt = startedAt,
+                finishedAt = startedAt.plusSeconds(1),
+                errorMessage = "fixture",
+            ),
+        ).getOrThrow()
+
+        repository.recoverStaleSession(fixedInstant().plusSeconds(5)).getOrThrow()
+
+        exposedTransaction(database) {
+            val activeMemberCount = prepare(
+                """
+                SELECT COUNT(*) FROM market_data_gap_population_members member
+                JOIN market_data_gap_work work ON work.id=member.work_id
+                WHERE work.source_kind='SESSION_LIFECYCLE' AND member.entity_id=?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, invocationId)
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+            val queuedMemberCount = prepare(
+                "SELECT COUNT(*) FROM market_data_gap_population_members WHERE work_id=? AND entity_id=?",
+            ).use { statement ->
+                statement.setObject(1, queuedWorkId)
+                statement.setString(2, invocationId)
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+            val workCount = prepare(
+                "SELECT COUNT(*) FROM market_data_gap_work WHERE source_kind='EVENT_SEQUENCE' AND source_episode='2'",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+
+            assertEquals(0, activeMemberCount)
+            assertEquals(1, queuedMemberCount)
+            assertEquals(1, workCount)
+        }
+    }
+
+    @Test
+    fun gap_population_birth_boundaries_are_inclusive_and_deduplicated() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRepository = ExposedLlmRunRepository(database)
+        listOf("birth-null", "birth-zero", "birth-upper").forEach { invocationId ->
+            llmRepository.insertRunning(
+                LlmRunStart(
+                    invocationId = invocationId,
+                    mode = TradingMode.PAPER,
+                    symbol = TradingSymbol.BTC,
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                    startedAt = fixedInstant(),
+                ),
+            ).getOrThrow()
+        }
+        exposedTransaction(database) {
+            prepare("UPDATE llm_runs SET birth_sequence=NULL WHERE invocation_id='birth-null'").use { statement ->
+                assertEquals(1, statement.executeUpdate())
+            }
+            prepare("UPDATE llm_runs SET birth_sequence=0 WHERE invocation_id='birth-zero'").use { statement ->
+                assertEquals(1, statement.executeUpdate())
+            }
+        }
+
+        val sessionId = UUID.randomUUID()
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(
+            sessionId = sessionId,
+            reason = MarketDataGapReason.DISCONNECTED,
+            detectedAt = fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+        llmRepository.insertRunning(
+            LlmRunStart(
+                invocationId = "birth-upper-plus-one",
+                mode = TradingMode.PAPER,
+                symbol = TradingSymbol.BTC,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                startedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+
+        repository.recoverStaleSession(fixedInstant().plusSeconds(3)).getOrThrow()
+
+        exposedTransaction(database) {
+            val members = prepare(
+                "SELECT entity_id, COUNT(*) FROM market_data_gap_population_members " +
+                    "WHERE entity_type='LLM_RUN' GROUP BY entity_id",
+            ).use { statement ->
+                statement.executeQuery().use { rows -> buildMap { while (rows.next()) put(rows.getString(1), rows.getInt(2)) } }
+            }
+            assertEquals(1, members["birth-null"])
+            assertEquals(1, members["birth-zero"])
+            assertEquals(1, members["birth-upper"])
+            assertFalse("birth-upper-plus-one" in members)
+        }
+    }
+
+    @Test
+    fun gap_population_control_lock_stress_preserves_one_thousand_members() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRepository = ExposedLlmRunRepository(database)
+        repeat(1_000) { index ->
+            llmRepository.insertRunning(
+                LlmRunStart(
+                    invocationId = "gap-lock-stress-$index",
+                    mode = TradingMode.PAPER,
+                    symbol = TradingSymbol.BTC,
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                    startedAt = fixedInstant(),
+                ),
+            ).getOrThrow()
+        }
+
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        val sessionId = UUID.randomUUID()
+        repository.beginSession(sessionId, fixedInstant()).getOrThrow()
+        repository.markDisconnected(
+            sessionId = sessionId,
+            reason = MarketDataGapReason.DISCONNECTED,
+            detectedAt = fixedInstant().plusSeconds(1),
+        ).getOrThrow()
+
+        coroutineScope {
+            val start = CompletableDeferred<Unit>()
+            val terminalWriter = async(Dispatchers.IO) {
+                start.await()
+                repeat(1_000) { index ->
+                    llmRepository.finish(
+                        LlmRunFinish(
+                            invocationId = "gap-lock-stress-$index",
+                            mode = TradingMode.PAPER,
+                            symbol = TradingSymbol.BTC,
+                            triggerKind = LlmDaemonTriggerKind.MANUAL,
+                            status = LLM_RUN_STATUS_FAILED,
+                            startedAt = fixedInstant(),
+                            finishedAt = fixedInstant().plusSeconds(2),
+                            errorMessage = "stress fixture",
+                        ),
+                    ).getOrThrow()
+                }
+            }
+            val recoveryWriter = async(Dispatchers.IO) {
+                start.await()
+                repository.recoverStaleSession(fixedInstant().plusSeconds(3)).getOrThrow()
+            }
+            start.complete(Unit)
+            terminalWriter.await()
+            recoveryWriter.await()
+        }
+
+        repository.recoverStaleSession(fixedInstant().plusSeconds(4)).getOrThrow()
+        exposedTransaction(database) {
+            val memberCount = prepare(
+                "SELECT COUNT(*) FROM market_data_gap_population_members " +
+                    "WHERE entity_type='LLM_RUN' AND entity_id LIKE 'gap-lock-stress-%'",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+            val terminalCount = prepare(
+                "SELECT COUNT(*) FROM llm_runs " +
+                    "WHERE invocation_id LIKE 'gap-lock-stress-%' AND status='FAILED'",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+
+            assertEquals(1_000, memberCount)
+            assertEquals(1_000, terminalCount)
+        }
+    }
+
+    @Test
+    fun standalone_recovery_command_uses_token_aware_fixture_and_converges_stale_session() = runPostgresTest {
+        val config = tradingDatabaseConfig()
+        val environment = mapOf(
+            "DB_URL" to config.url,
+            "DB_USER" to config.user,
+            "DB_PASSWORD" to config.password,
+            "FUKUROU_FIXTURE_DATABASE" to "true",
+        )
+        val output = mutableListOf<String>()
+        val fixtureExitCode = runPaperMarketRecoveryCommand(
+            arguments = arrayOf("FIXTURE_CREATE", "standalone-recovery-fixture"),
+            environment = environment,
+            stdout = output::add,
+            stderr = output::add,
+        )
+        assertEquals(0, fixtureExitCode)
+
+        val repository = ExposedMarketDataIntegrityRepository(database)
+        repository.beginSession(UUID.randomUUID(), fixedInstant()).getOrThrow()
+        val recoveryExitCode = runPaperMarketRecoveryCommand(
+            arguments = arrayOf("RECOVER"),
+            environment = environment,
+            stdout = output::add,
+            stderr = output::add,
+        )
+
+        assertEquals(0, recoveryExitCode)
+        assertTrue(output.any { line -> "APPLIED_OR_EXPLICIT_UNKNOWN" in line })
+        exposedTransaction(database) {
+            val fixtureBirth = prepare(
+                "SELECT birth_sequence FROM llm_runs WHERE invocation_id='standalone-recovery-fixture'",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getLong(1)
+                }
+            }
+            val connectedCount = prepare(
+                "SELECT COUNT(*) FROM market_data_sessions WHERE state='CONNECTED'",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+            val recoverableWorkCount = prepare(
+                "SELECT COUNT(*) FROM market_data_gap_work " +
+                    "WHERE state IN ('QUEUED','CAPTURING','SEALED','APPLYING')",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    rows.getInt(1)
+                }
+            }
+
+            assertTrue(fixtureBirth > 0)
+            assertEquals(0, connectedCount)
+            assertEquals(0, recoverableWorkCount)
+        }
     }
 
     @Test
@@ -4600,6 +5008,7 @@ class PostgresPersistenceIntegrationTest {
         val period = EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1))
 
         exposedTransaction(database) {
+            acquireGapPopulationGenerationToken()
             prepare(
                 """
                     INSERT INTO positions (
@@ -5675,6 +6084,7 @@ class PostgresPersistenceIntegrationTest {
         val approved = approvedPostgresEntryCommand(runtime.decisionRepository, entryCommand)
         val restingOrderId = UUID.randomUUID()
         exposedTransaction(database) {
+            acquireGapPopulationGenerationToken()
             jdbcConnection().prepareStatement(
                 """INSERT INTO orders
                     (id, intent_id, mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
@@ -5957,6 +6367,7 @@ class PostgresPersistenceIntegrationTest {
             runtime.decisionMaterialStateRepository.findOpenEpisodeContext("BTC").getOrThrow()?.priceMoveThresholdRatio,
         )
         exposedTransaction(database) {
+            acquireGapPopulationGenerationToken()
             jdbcConnection().prepareStatement(
                 """INSERT INTO orders
                     (id, intent_id, mode, symbol, side, order_type, status, size_btc, limit_price_jpy,
@@ -7536,6 +7947,7 @@ private fun JdbcTransaction.insertBackfillPosition(
     status: String,
     currentPriceJpy: BigDecimal,
 ) {
+    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_BACKFILL_POSITION_SQL).use { statement ->
         statement.setObject(1, positionId)
         statement.setObject(2, UUID.randomUUID())
@@ -7637,6 +8049,7 @@ private fun insertDecisionRunScanFixture(
     runningSequence: Int,
 ) {
     exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(INSERT_DECISION_RUN_SCAN_FIXTURE_SQL).use { statement ->
             statement.setInt(1, runningSequence)
             statement.setString(2, LLM_RUN_STATUS_RUNNING)
@@ -7696,6 +8109,7 @@ private fun JdbcTransaction.insertObsidianClosedPosition(
     decisionRunId: String,
     closedAt: Instant,
 ) {
+    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_OBSIDIAN_CLOSED_POSITION_SQL).use { statement ->
         statement.setObject(1, positionId)
         statement.setObject(2, tradeGroupId)
@@ -7738,6 +8152,7 @@ private fun JdbcTransaction.insertTestPosition(
     tradeGroupId: UUID,
     mode: String,
 ) {
+    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_TEST_POSITION_SQL).use { statement ->
         statement.setObject(1, positionId)
         statement.setObject(2, tradeGroupId)
@@ -7755,6 +8170,7 @@ private fun JdbcTransaction.insertTestOrder(
     tradeGroupId: UUID,
     mode: String,
 ) {
+    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_TEST_ORDER_SQL).use { statement ->
         statement.setObject(1, UUID.randomUUID())
         statement.setObject(2, positionId)
@@ -7802,6 +8218,7 @@ private fun JdbcTransaction.insertActivityContextOrder(
     reasonJa: String,
     decisionRunId: String?,
 ) {
+    acquireGapPopulationGenerationToken()
     jdbcConnection().prepareStatement(INSERT_ACTIVITY_CONTEXT_ORDER_SQL).use { statement ->
         statement.setObject(1, orderId)
         statement.setObject(2, intentId)

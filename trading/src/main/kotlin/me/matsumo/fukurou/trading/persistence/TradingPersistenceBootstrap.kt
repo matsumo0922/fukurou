@@ -988,6 +988,8 @@ class TradingPersistenceBootstrap(
                     withLogs = false,
                 )
                 ensureRuntimeSchemaObjects()
+                ensureGapPopulationLifecycleSchema()
+                acquireGapPopulationGenerationToken()
                 val now = Instant.now(clock)
 
                 jdbcConnection().prepareStatement(
@@ -1190,6 +1192,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects() {
  */
 private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
     verifyRuntimeConfigSchema()
+    verifyGapPopulationLifecycleSchema()
     verifyAccountRuntimeSchemaObjects()
     verifyLedgerRuntimeSchemaObjects()
     verifyDecisionRuntimeSchemaObjects()
@@ -1416,6 +1419,7 @@ internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Durati
 
 /** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
 internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(now: Instant, threshold: Duration): Int {
+    acquireGapPopulationGenerationToken()
     val cutoff = now.minus(threshold)
     val reservations = selectRunningLlmReservationsForUpdate()
     val runs = selectLifecycleRunsForUpdate()

@@ -443,6 +443,7 @@ class ExposedDecisionRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    acquireGapPopulationGenerationToken()
                     insertDecisionSubmission(submission, clock.instant(), maxTradePlanRevisions)
                 }
             }
