@@ -4040,7 +4040,11 @@ class PostgresPersistenceIntegrationTest {
 
         assertFailsWith<IllegalStateException> {
             exposedTransaction(database) {
-                recoverStaleLlmRunLifecycle(fixedInstant(), Duration.ofMinutes(9))
+                recoverStaleLlmRunLifecycle(
+                    invocationId = "rollback-run",
+                    now = fixedInstant(),
+                    threshold = Duration.ofMinutes(9),
+                )
                 error("force rollback")
             }
         }
@@ -4539,6 +4543,48 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun bootstrap_previousEpochReservationRecoversWithImmutableEntityScope() = runPostgresTest {
+        val now = fixedInstant()
+        val bootstrap = TradingPersistenceBootstrap(
+            database = database,
+            clock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC),
+            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
+        )
+        bootstrap.ensureSchema().getOrThrow()
+        val previousScope = insertAdditionalPaperAccountEpoch(database, now.minusSeconds(1))
+        insertClaimedLlmReservationFixture(
+            database = database,
+            invocationId = "previous-epoch-bootstrap-recovery",
+            scope = previousScope,
+            reservedAt = now,
+            claimantToken = "previous-epoch-bootstrap-token",
+        )
+        insertRunningLlmRunFixture(
+            database = database,
+            invocationId = "previous-epoch-bootstrap-recovery",
+            scope = previousScope,
+            startedAt = now,
+        )
+
+        assertEquals(1, bootstrap.recoverPreviousGeneration().getOrThrow())
+
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val runRepository = ExposedLlmRunRepository(database)
+        val recovered = requireNotNull(
+            repository.findExecutionClaim("previous-epoch-bootstrap-recovery").getOrThrow(),
+        )
+        assertEquals(LlmLaunchReservationStatus.FAILED, recovered.status)
+        assertEquals(
+            LLM_RUN_STATUS_FAILED,
+            runRepository.findByInvocationId("previous-epoch-bootstrap-recovery").getOrThrow()?.status,
+        )
+        assertTrue(
+            selectRecoveryAuditPayload(database, "previous-epoch-bootstrap-recovery")
+                .contains("previous_process_generation_ended"),
+        )
+    }
+
+    @Test
     fun currentProcessRecovery_failsRunAndPersistsFenceAuditInSameTransaction() = runPostgresTest {
         val now = fixedInstant()
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
@@ -4589,6 +4635,53 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(auditPayload.contains("12345678"))
         assertTrue(auditPayload.contains(Regex("\"runRecovered\"\\s*:\\s*true")))
         assertTrue(auditPayload.contains(Regex("\"reservationRecovered\"\\s*:\\s*true")))
+    }
+
+    @Test
+    fun currentProcessBatchRecoveryHandlesMixedCurrentAndPreviousEpochScopes() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val currentScope = exposedTransaction(database) { fixtureGapPopulationScope(TradingMode.PAPER.name) }
+        val previousScope = insertAdditionalPaperAccountEpoch(database, now.minusSeconds(1))
+        val fixtures = listOf(
+            Triple("mixed-current-recovery", currentScope, "mixed-current-token"),
+            Triple("mixed-previous-recovery", previousScope, "mixed-previous-token"),
+        )
+        fixtures.forEach { (invocationId, scope, claimantToken) ->
+            insertClaimedLlmReservationFixture(
+                database = database,
+                invocationId = invocationId,
+                scope = scope,
+                reservedAt = now,
+                claimantToken = claimantToken,
+            )
+        }
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val requests = fixtures.map { (invocationId, _, claimantToken) ->
+            val snapshot = requireNotNull(repository.findExecutionClaim(invocationId).getOrThrow())
+            LlmExecutionRecoveryRequest(
+                invocationId = invocationId,
+                claimState = LlmExecutionClaimState.CLAIMED,
+                claimantToken = claimantToken,
+                observedHeartbeatAt = snapshot.heartbeatAt,
+                observedReservedAt = snapshot.reservedAt,
+                finishedAt = now.plusSeconds(600),
+                reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
+                terminationFence = "PROCESS_TREE_EXITED",
+            )
+        }
+
+        assertEquals(
+            fixtures.mapTo(mutableSetOf()) { fixture -> fixture.first },
+            repository.recoverStaleExecutionClaims(requests).getOrThrow(),
+        )
+        fixtures.forEach { (invocationId, _, _) ->
+            assertEquals(
+                LlmLaunchReservationStatus.FAILED,
+                repository.findExecutionClaim(invocationId).getOrThrow()?.status,
+            )
+            assertTrue(selectRecoveryAuditPayload(database, invocationId).contains("current_process_periodic_scan"))
+        }
     }
 
     @Test
@@ -8231,6 +8324,97 @@ private suspend fun appendLlmLaunchAudit(
             occurredAt = occurredAt,
         ),
     ).getOrThrow()
+}
+
+private fun insertAdditionalPaperAccountEpoch(database: ExposedDatabase, createdAt: Instant): GapPopulationScope {
+    val epochId = UUID.randomUUID()
+    exposedTransaction(database) {
+        prepare(
+            "INSERT INTO paper_account_epochs " +
+                "(id,kind,initial_cash_jpy,runtime_config_hash,reason,actor,created_at) " +
+                "VALUES (?,'CONFIG_ACTIVATED',1000000,'scope-recovery-test','test','test',?)",
+        ).use { statement ->
+            statement.setObject(1, epochId)
+            statement.setLong(2, createdAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+
+    return GapPopulationScope(
+        kind = "SYMBOL",
+        mode = TradingMode.PAPER.name,
+        symbol = TradingSymbol.BTC.apiSymbol,
+        accountEpochId = epochId,
+        cohort = "CURRENT",
+        executionSemanticsVersion = "PAPER_WS_V1",
+    )
+}
+
+private fun insertClaimedLlmReservationFixture(
+    database: ExposedDatabase,
+    invocationId: String,
+    scope: GapPopulationScope,
+    reservedAt: Instant,
+    claimantToken: String,
+) {
+    exposedTransaction(database) {
+        acquireGapPopulationGenerationToken(scope)
+        prepare(
+            """
+            INSERT INTO llm_launch_reservations (
+                id,invocation_id,trigger_kind,trigger_key,status,reserved_at,finished_at,reason,
+                execution_claim_state,execution_claim_token,execution_claimed_at,execution_claim_heartbeat_at,
+                population_scope_kind,population_mode,population_symbol,population_account_epoch_id,
+                population_cohort,population_execution_semantics_version
+            ) VALUES (?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?,?,?,?)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setString(2, invocationId)
+            statement.setString(3, LlmDaemonTriggerKind.FLAT_HEARTBEAT.name)
+            statement.setString(4, "test:flat_heartbeat:$invocationId")
+            statement.setString(5, LlmLaunchReservationStatus.RUNNING.name)
+            statement.setLong(6, reservedAt.toEpochMilli())
+            statement.setString(7, LlmExecutionClaimState.CLAIMED.name)
+            statement.setString(8, claimantToken)
+            statement.setLong(9, reservedAt.toEpochMilli())
+            statement.setLong(10, reservedAt.toEpochMilli())
+            statement.setString(11, scope.kind)
+            statement.setString(12, scope.mode)
+            statement.setString(13, scope.symbol)
+            statement.setObject(14, scope.accountEpochId)
+            statement.setString(15, scope.cohort)
+            statement.setString(16, scope.executionSemanticsVersion)
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun insertRunningLlmRunFixture(
+    database: ExposedDatabase,
+    invocationId: String,
+    scope: GapPopulationScope,
+    startedAt: Instant,
+) {
+    exposedTransaction(database) {
+        acquireGapPopulationGenerationToken(scope)
+        prepare(
+            """
+            INSERT INTO llm_runs (
+                invocation_id,mode,symbol,trigger_kind,status,started_at,finished_at,error_message,
+                terminal_cause,runtime_config_version_id,runtime_config_hash
+            ) VALUES (?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.setString(2, scope.mode)
+            statement.setString(3, scope.symbol)
+            statement.setString(4, LlmDaemonTriggerKind.FLAT_HEARTBEAT.name)
+            statement.setString(5, LLM_RUN_STATUS_RUNNING)
+            statement.setLong(6, startedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
 }
 
 private fun llmLaunchReservationRequest(

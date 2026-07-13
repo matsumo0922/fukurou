@@ -353,21 +353,7 @@ class ExposedLlmLaunchReservationRepository(
                         "LLM_RESERVATION",
                         reservationId(request.invocationId),
                     )
-                    jdbcConnection().prepareStatement(RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL).use { statement ->
-                        statement.setLong(1, request.finishedAt.toEpochMilli())
-                        statement.setString(2, request.reason)
-                        statement.setString(3, request.invocationId)
-                        statement.setString(4, request.claimState.name)
-                        statement.setLong(5, request.observedReservedAt.toEpochMilli())
-                        statement.setNullableString(6, request.claimantToken)
-                        statement.setNullableLong(7, request.observedHeartbeatAt?.toEpochMilli())
-                        val recovered = statement.executeUpdate() == 1
-                        if (recovered) {
-                            val runRecovered = recoverCurrentProcessLlmRun(request)
-                            insertRecoveryEvent(request, runRecovered)
-                        }
-                        recovered
-                    }
+                    recoverStaleExecutionClaimInTransaction(request)
                 }
             }
         }
@@ -380,30 +366,16 @@ class ExposedLlmLaunchReservationRepository(
 
         return withContext(Dispatchers.IO) {
             runCatching {
-                exposedTransaction(database) {
-                    acquireGapPopulationGenerationTokenForEntity(
-                        "LLM_RESERVATION",
-                        reservationId(requests.first().invocationId),
-                    )
-                    jdbcConnection().prepareStatement(batchRecoverySql(requests.size)).use { statement ->
-                        statement.queryTimeout = RECOVERY_SELECT_TIMEOUT_SECONDS
-                        var parameterIndex = 1
-                        requests.forEach { request ->
-                            statement.setString(parameterIndex++, request.invocationId)
-                            statement.setString(parameterIndex++, request.claimState.name)
-                            statement.setLong(parameterIndex++, request.observedReservedAt.toEpochMilli())
-                            statement.setNullableString(parameterIndex++, request.claimantToken)
-                            statement.setNullableLong(parameterIndex++, request.observedHeartbeatAt?.toEpochMilli())
-                            statement.setLong(parameterIndex++, request.finishedAt.toEpochMilli())
-                            statement.setString(parameterIndex++, request.reason)
-                            statement.setString(parameterIndex++, request.terminationFence)
-                            statement.setObject(parameterIndex++, UUID.randomUUID())
+                buildSet {
+                    requests.forEach { request ->
+                        val recovered = exposedTransaction(database) {
+                            acquireGapPopulationGenerationTokenForEntity(
+                                "LLM_RESERVATION",
+                                reservationId(request.invocationId),
+                            )
+                            recoverStaleExecutionClaimInTransaction(request)
                         }
-                        statement.executeQuery().use { resultSet ->
-                            buildSet {
-                                while (resultSet.next()) add(resultSet.getString(1))
-                            }
-                        }
+                        if (recovered) add(request.invocationId)
                     }
                 }
             }
@@ -458,73 +430,23 @@ class ExposedLlmLaunchReservationRepository(
     }
 }
 
-@Suppress("LongMethod")
-private fun batchRecoverySql(requestCount: Int): String {
-    require(requestCount > 0) { "batch recovery requires at least one request." }
-    val rows = List(requestCount) { "(?, ?, ?, ?, ?, ?, ?, ?, ?)" }.joinToString(", ")
-
-    return """
-        WITH candidates (
-            invocation_id, claim_state, observed_reserved_at, claimant_token,
-            observed_heartbeat_at, finished_at, reason, termination_fence, event_id
-        ) AS (VALUES $rows),
-        recovered_reservations AS (
-            UPDATE llm_launch_reservations AS reservation
-            SET status = 'FAILED', finished_at = candidate.finished_at, reason = candidate.reason
-            FROM candidates AS candidate
-            WHERE reservation.invocation_id = candidate.invocation_id
-                AND reservation.status = 'RUNNING'
-                AND reservation.execution_claim_state = candidate.claim_state
-                AND reservation.reserved_at = candidate.observed_reserved_at
-                AND reservation.execution_claim_token IS NOT DISTINCT FROM candidate.claimant_token
-                AND reservation.execution_claim_heartbeat_at IS NOT DISTINCT FROM candidate.observed_heartbeat_at
-            RETURNING reservation.invocation_id, candidate.claim_state, candidate.claimant_token,
-                candidate.observed_heartbeat_at, candidate.finished_at, candidate.reason,
-                candidate.termination_fence, candidate.event_id
-        ),
-        recovered_runs AS (
-            UPDATE llm_runs AS run
-            SET status = '$LLM_RUN_STATUS_FAILED',
-                finished_at = recovered.finished_at,
-                error_message = recovered.reason,
-                terminal_cause = '${LlmRunTerminalCause.RUNNER_FAILED.name}'
-            FROM recovered_reservations AS recovered
-            WHERE run.invocation_id = recovered.invocation_id
-                AND run.status = '$LLM_RUN_STATUS_RUNNING'
-                AND run.finished_at IS NULL
-            RETURNING run.invocation_id
-        ),
-        recovery_events AS (
-            INSERT INTO command_event_log (
-                id, decision_run_id, tool_call_id, client_request_id, tool_name, event_type,
-                payload, ts, llm_provider, prompt_hash, system_prompt_version, market_snapshot_id,
-                runtime_config_version_id, runtime_config_hash
-            )
-            SELECT recovered.event_id, recovered.invocation_id, NULL, recovered.invocation_id,
-                'llm_execution_recovery', '${CommandEventType.LLM_INVOCATION_RECOVERED.name}',
-                jsonb_build_object(
-                    'source', 'current_process_periodic_scan',
-                    'invocationId', recovered.invocation_id,
-                    'executionClaimState', recovered.claim_state,
-                    'claimantTokenFingerprint', RIGHT(recovered.claimant_token, 8),
-                    'observedHeartbeatAt', recovered.observed_heartbeat_at,
-                    'terminationFence', recovered.termination_fence,
-                    'llmRunExists', EXISTS (
-                        SELECT 1 FROM llm_runs WHERE invocation_id = recovered.invocation_id
-                    ),
-                    'runRecovered', EXISTS (
-                        SELECT 1 FROM recovered_runs WHERE invocation_id = recovered.invocation_id
-                    ),
-                    'reservationRecovered', TRUE,
-                    'terminalCause', '${LlmRunTerminalCause.RUNNER_FAILED.name}',
-                    'recoveredAt', recovered.finished_at
-                )::text,
-                recovered.finished_at, NULL, NULL, NULL, NULL, NULL, NULL
-            FROM recovered_reservations AS recovered
-            RETURNING decision_run_id
-        )
-        SELECT invocation_id FROM recovered_reservations
-    """.trimIndent()
+private fun JdbcTransaction.recoverStaleExecutionClaimInTransaction(request: LlmExecutionRecoveryRequest): Boolean {
+    return jdbcConnection().prepareStatement(RECOVER_STALE_LLM_EXECUTION_CLAIM_SQL).use { statement ->
+        statement.queryTimeout = RECOVERY_SELECT_TIMEOUT_SECONDS
+        statement.setLong(1, request.finishedAt.toEpochMilli())
+        statement.setString(2, request.reason)
+        statement.setString(3, request.invocationId)
+        statement.setString(4, request.claimState.name)
+        statement.setLong(5, request.observedReservedAt.toEpochMilli())
+        statement.setNullableString(6, request.claimantToken)
+        statement.setNullableLong(7, request.observedHeartbeatAt?.toEpochMilli())
+        val recovered = statement.executeUpdate() == 1
+        if (recovered) {
+            val runRecovered = recoverCurrentProcessLlmRun(request)
+            insertRecoveryEvent(request, runRecovered)
+        }
+        recovered
+    }
 }
 
 private fun JdbcTransaction.recoverCurrentProcessLlmRun(request: LlmExecutionRecoveryRequest): Boolean {
