@@ -318,11 +318,11 @@ int main(int argc, char **argv, char **envp) {
         clean_env[output++] = "FUKUROU_CANARY_LLM_LAUNCH_FDS=0,1,2";
         clean_env[output] = NULL;
         char *const canary_args[] = {"node", CANARY_CLIENT, argv[2], argv[3], argc == 5 ? argv[4] : NULL, NULL};
-        _exit(fukurou_supervisor_proxy(FUKUROU_LAUNCH_CANARY, canary_args, clean_env, 3));
+        _exit(fukurou_supervisor_proxy(FUKUROU_PROFILE_FOUNDATION_CANARY_V1, canary_args, clean_env, 3));
     } else {
-        enum fukurou_launch_kind kind = strcmp(argv[1], "claude") == 0
-            ? FUKUROU_LAUNCH_CLAUDE : FUKUROU_LAUNCH_CODEX;
-        _exit(fukurou_supervisor_proxy(kind, &argv[1], clean_env, 3));
+        enum fukurou_launch_profile profile = strcmp(argv[1], "claude") == 0
+            ? FUKUROU_PROFILE_CLAUDE_CURRENT_V1 : FUKUROU_PROFILE_CODEX_CURRENT_V1;
+        _exit(fukurou_supervisor_proxy(profile, &argv[1], clean_env, 3));
     }
     fail(strerror(errno));
 }

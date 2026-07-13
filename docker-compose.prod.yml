@@ -6,7 +6,7 @@ name: fukurou
 services:
   # アプリ本体。外部公開ポートは持たず、cloudflared 経由でのみ到達させる。
   ktor:
-    image: ghcr.io/matsumo0922/fukurou:${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}
+    image: ${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}
     container_name: fukurou-ktor
     restart: unless-stopped
     read_only: true

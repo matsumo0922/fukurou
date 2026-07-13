@@ -4,196 +4,211 @@ set -Eeuo pipefail
 readonly POSTGRES_CONTAINER="${FUKUROU_POSTGRES_CONTAINER:-fukurou-postgres}"
 readonly APPLICATION_CONTAINER="${FUKUROU_APPLICATION_CONTAINER:-fukurou-ktor}"
 readonly FOUNDATION_SQL="${FUKUROU_FOUNDATION_SQL:-/usr/local/share/fukurou/deploy-foundation-v1.sql}"
+readonly FOUNDATION_INDEX_SQL="${FUKUROU_FOUNDATION_INDEX_SQL:-/usr/local/share/fukurou/deploy-foundation-v1-indexes.sql}"
 
-fail() {
-  echo "fukurou-deploy-db: $*" >&2
-  exit 1
-}
-
-require_root() {
-  [[ "$(id -u)" == "0" ]] || fail "root is required"
-}
-
-postgres_env() {
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}"
-}
-
-postgres_value() {
-  local key="$1"
-  postgres_env | awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
-}
-
+fail() { echo "fukurou-deploy-db: $*" >&2; exit 1; }
+require_root() { [[ "$(id -u)" == "0" ]] || fail "root is required"; }
+postgres_env() { docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}"; }
+postgres_value() { postgres_env | awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'; }
 application_value() {
-  local key="$1"
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${APPLICATION_CONTAINER}" \
-    | awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${APPLICATION_CONTAINER}" 2>/dev/null \
+    | awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
 }
-
 psql_exec() {
   local user database
-  user="$(postgres_value POSTGRES_USER)"
-  database="$(postgres_value POSTGRES_DB)"
+  user="$(postgres_value POSTGRES_USER)"; database="$(postgres_value POSTGRES_DB)"
   [[ -n "${user}" && -n "${database}" ]] || fail "PostgreSQL identity is unavailable"
-
   docker exec -i "${POSTGRES_CONTAINER}" psql -X -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" "$@"
 }
-
-validate_deployment_id() {
-  [[ "$1" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || fail "invalid deployment id"
-}
-
-validate_generation() {
-  [[ "$1" =~ ^[0-9]+$ ]] || fail "invalid generation"
-}
+validate_deployment_id() { [[ "$1" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || fail "invalid deployment id"; }
+validate_generation() { [[ "$1" =~ ^[0-9]+$ && "$1" -le 9223372036854775807 ]] || fail "invalid generation"; }
+validate_hash() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"; }
 
 install_foundation() {
   [[ -f "${FOUNDATION_SQL}" ]] || fail "foundation migration is missing"
-  local mcp_role
-  mcp_role="$(application_value FUKUROU_MCP_DB_USER)"
-  [[ -n "${mcp_role}" ]] || mcp_role="fukurou_mcp"
-  psql_exec --set=mcp_role="${mcp_role}" < "${FOUNDATION_SQL}"
+  local mcp_role; mcp_role="$(application_value FUKUROU_MCP_DB_USER)"; [[ -n "${mcp_role}" ]] || mcp_role="fukurou_mcp"
+  timeout 60 psql_exec --set=mcp_role="${mcp_role}" < "${FOUNDATION_SQL}"
+}
+install_indexes() {
+  [[ -f "${FOUNDATION_INDEX_SQL}" ]] || fail "foundation index migration is missing"
+  timeout 300 psql_exec < "${FOUNDATION_INDEX_SQL}"
 }
 
-set_maintenance() {
-  local deployment_id="$1" generation="$2" enabled="$3"
-  validate_deployment_id "${deployment_id}"
-  validate_generation "${generation}"
+database_timestamp() { psql_exec -Atc "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"; }
 
-  psql_exec \
-    --set=deployment_id="${deployment_id}" \
-    --set=generation="${generation}" \
-    --set=enabled="${enabled}" <<'SQL'
+maintenance_cas() {
+  local expected_generation="$1" expected_enabled="$2" expected_deployment="$3"
+  local next_generation="$4" next_enabled="$5" next_deployment="$6"
+  validate_generation "${expected_generation}"; validate_generation "${next_generation}"
+  validate_deployment_id "${next_deployment}"
+  psql_exec -At --set=expected_generation="${expected_generation}" --set=expected_enabled="${expected_enabled}" \
+    --set=expected_deployment="${expected_deployment}" --set=next_generation="${next_generation}" \
+    --set=next_enabled="${next_enabled}" --set=next_deployment="${next_deployment}" <<'SQL'
 BEGIN;
-INSERT INTO llm_launch_maintenance(singleton, generation, enabled, deployment_id, updated_at)
-VALUES (TRUE, :'generation'::bigint, :'enabled'::boolean, :'deployment_id', clock_timestamp())
-ON CONFLICT (singleton) DO UPDATE
-SET generation = EXCLUDED.generation,
-    enabled = EXCLUDED.enabled,
-    deployment_id = EXCLUDED.deployment_id,
-    updated_at = EXCLUDED.updated_at
-WHERE llm_launch_maintenance.generation <= EXCLUDED.generation;
-SELECT CASE WHEN generation = :'generation'::bigint AND enabled = :'enabled'::boolean THEN 1 ELSE 1/0 END
-FROM llm_launch_maintenance WHERE singleton = TRUE;
+SET LOCAL lock_timeout = '500ms';
+SET LOCAL statement_timeout = '2s';
+WITH changed AS (
+    UPDATE llm_launch_maintenance
+    SET generation = :'next_generation'::bigint,
+        enabled = :'next_enabled'::boolean,
+        deployment_id = NULLIF(:'next_deployment', ''),
+        updated_at = clock_timestamp()
+    WHERE singleton = TRUE
+      AND generation = :'expected_generation'::bigint
+      AND enabled = :'expected_enabled'::boolean
+      AND COALESCE(deployment_id, '') = :'expected_deployment'
+    RETURNING generation, enabled, COALESCE(deployment_id, '') AS deployment_id
+)
+SELECT CASE WHEN COUNT(*) = 1 THEN 1 ELSE 1/0 END FROM changed;
 COMMIT;
 SQL
 }
 
-open_gap() {
-  local deployment_id="$1" opened_at="$2" payload_hash="$3"
-  validate_deployment_id "${deployment_id}"
-  [[ "${payload_hash}" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"
-
-  psql_exec \
-    --set=deployment_id="${deployment_id}" \
-    --set=opened_at="${opened_at}" \
-    --set=payload_hash="${payload_hash}" <<'SQL'
-INSERT INTO infrastructure_gaps(id, deployment_id, reason, opened_at, payload_hash)
-VALUES (
-    md5(:'deployment_id' || ':OPEN_INFRASTRUCTURE_GAP')::uuid,
-    :'deployment_id',
-    'DEPLOY_MAINTENANCE',
-    :'opened_at'::timestamptz,
-    :'payload_hash'
+append_gap() {
+  local deployment_id="$1" boundary="$2" occurred_at="$3" payload_hash="$4"
+  validate_deployment_id "${deployment_id}"; validate_hash "${payload_hash}"
+  [[ "${boundary}" == "OPEN" || "${boundary}" == "CLOSE" ]] || fail "invalid boundary"
+  psql_exec -At --set=deployment_id="${deployment_id}" --set=boundary="${boundary}" \
+    --set=occurred_at="${occurred_at}" --set=payload_hash="${payload_hash}" <<'SQL'
+BEGIN;
+SET LOCAL lock_timeout = '500ms';
+SET LOCAL statement_timeout = '2s';
+WITH identity AS (
+    SELECT
+        md5('fukurou-gap-v1:' || :'deployment_id')::uuid AS gap_id,
+        md5('fukurou-gap-v1:' || :'deployment_id' || ':' || :'boundary')::uuid AS event_id
+), inserted AS (
+    INSERT INTO infrastructure_gap_events(event_id, gap_id, deployment_id, boundary, reason, occurred_at, payload_hash)
+    SELECT event_id, gap_id, :'deployment_id', :'boundary', 'DEPLOY_MAINTENANCE', :'occurred_at'::timestamptz, :'payload_hash'
+    FROM identity
+    ON CONFLICT DO NOTHING
+    RETURNING payload_hash
+), verified AS (
+    SELECT payload_hash FROM inserted
+    UNION ALL
+    SELECT payload_hash
+    FROM infrastructure_gap_events
+    WHERE deployment_id = :'deployment_id' AND boundary = :'boundary'
+      AND payload_hash = :'payload_hash'
 )
-ON CONFLICT (deployment_id) DO UPDATE
-SET deployment_id = EXCLUDED.deployment_id
-WHERE infrastructure_gaps.payload_hash = EXCLUDED.payload_hash;
-SELECT CASE WHEN payload_hash = :'payload_hash' THEN 1 ELSE 1/0 END
-FROM infrastructure_gaps WHERE deployment_id = :'deployment_id';
-SQL
-}
-
-close_gap() {
-  local deployment_id="$1" closed_at="$2" payload_hash="$3"
-  validate_deployment_id "${deployment_id}"
-  [[ "${payload_hash}" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"
-
-  psql_exec \
-    --set=deployment_id="${deployment_id}" \
-    --set=closed_at="${closed_at}" \
-    --set=payload_hash="${payload_hash}" <<'SQL'
-UPDATE infrastructure_gaps
-SET closed_at = COALESCE(closed_at, :'closed_at'::timestamptz)
-WHERE deployment_id = :'deployment_id' AND payload_hash = :'payload_hash';
-SELECT CASE WHEN closed_at IS NOT NULL AND payload_hash = :'payload_hash' THEN 1 ELSE 1/0 END
-FROM infrastructure_gaps WHERE deployment_id = :'deployment_id';
+SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 1/0 END FROM verified;
+COMMIT;
 SQL
 }
 
 snapshot() {
-  psql_exec -At <<'SQL' 2>/dev/null || printf '|||0|f|\n'
+  local has_foundation has_maintenance has_pid has_runtime install_kind maintenance pid_summary base
+  has_foundation="$(psql_exec -Atc "SELECT to_regclass('public.infrastructure_gap_events') IS NOT NULL")"
+  has_maintenance="$(psql_exec -Atc "SELECT to_regclass('public.llm_launch_maintenance') IS NOT NULL")"
+  has_pid="$(psql_exec -Atc "SELECT to_regclass('public.llm_pid_registrations') IS NOT NULL")"
+  has_runtime="$(psql_exec -Atc "SELECT to_regclass('public.runtime_config_versions') IS NOT NULL AND to_regclass('public.runtime_config_values') IS NOT NULL")"
+  install_kind="PRE_FOUNDATION"; [[ "${has_foundation}" == "t" && "${has_maintenance}" == "t" && "${has_pid}" == "t" ]] && install_kind="FOUNDATION_V1"
+  maintenance='{"generation":0,"enabled":false,"deploymentId":""}'
+  if [[ "${has_maintenance}" == "t" ]]; then
+    maintenance="$(psql_exec -Atc "SELECT jsonb_build_object('generation',generation,'enabled',enabled,'deploymentId',COALESCE(deployment_id,'')) FROM llm_launch_maintenance WHERE singleton=TRUE")"
+  fi
+  pid_summary='{"active":0,"total":0}'
+  if [[ "${has_pid}" == "t" ]]; then
+    pid_summary="$(psql_exec -Atc "SELECT jsonb_build_object('active',count(*) FILTER (WHERE state<>'TERMINAL'),'total',count(*)) FROM llm_pid_registrations")"
+  fi
+  if [[ "${has_runtime}" != "t" ]]; then
+    base="$(psql_exec -Atc "SELECT jsonb_build_object('captureDbTimestamp',to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),'runtimeConfigVersion','','runtimeConfigHash','','preFilterActive','','foundationCatalogFingerprint',md5(COALESCE((SELECT string_agg(relname || ':' || relkind,E'\\n' ORDER BY relname) FROM pg_class WHERE relname LIKE 'infrastructure_gap_events%' OR relname LIKE 'llm_pid_registrations%' OR relname='llm_launch_maintenance'),'')))::text")"
+  else
+    base="$(psql_exec -At <<'SQL'
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL statement_timeout = '5s';
 WITH active_config AS (
     SELECT id FROM runtime_config_versions WHERE status = 'ACTIVE' LIMIT 1
 ), config_snapshot AS (
-    SELECT
-        active_config.id::text AS version_id,
+    SELECT active_config.id::text AS version_id,
         md5(COALESCE(string_agg(config_key || '=' || config_value, E'\n' ORDER BY config_key), '')) AS config_hash,
         MAX(config_value) FILTER (WHERE config_key = 'daemon.preFilterEnabled') AS pre_filter
-    FROM active_config
-    LEFT JOIN runtime_config_values ON runtime_config_values.version_id = active_config.id
+    FROM active_config LEFT JOIN runtime_config_values ON runtime_config_values.version_id = active_config.id
     GROUP BY active_config.id
-), maintenance AS (
-    SELECT generation, enabled FROM llm_launch_maintenance WHERE singleton = TRUE
+), catalog AS (
+    SELECT COALESCE(string_agg(c.relname || ':' || c.relkind || ':' || COALESCE(pg_get_expr(i.indpred, i.indrelid), ''), E'\n' ORDER BY c.relname), '') value
+    FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid = c.oid
+    WHERE c.relname LIKE 'infrastructure_gap_events%' OR c.relname LIKE 'llm_pid_registrations%' OR c.relname = 'llm_launch_maintenance'
 )
-SELECT
-    COALESCE(config_snapshot.version_id, '') || '|' ||
-    COALESCE(config_snapshot.config_hash, '') || '|' ||
-    COALESCE(config_snapshot.pre_filter, '') || '|' ||
-    COALESCE(maintenance.generation, 0) || '|' ||
-    COALESCE(maintenance.enabled, FALSE)
-FROM config_snapshot FULL JOIN maintenance ON TRUE;
+SELECT jsonb_build_object(
+    'captureDbTimestamp', to_char(transaction_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+    'runtimeConfigVersion', COALESCE(config_snapshot.version_id, ''),
+    'runtimeConfigHash', COALESCE(config_snapshot.config_hash, ''),
+    'preFilterActive', COALESCE(config_snapshot.pre_filter, ''),
+    'foundationCatalogFingerprint', md5(catalog.value)
+)::text
+FROM config_snapshot FULL JOIN catalog ON TRUE;
+COMMIT;
 SQL
+    )"
+  fi
+  jq -c --arg installKind "${install_kind}" --argjson maintenance "${maintenance}" --argjson pidRegistrations "${pid_summary}" \
+    '. + {installKind:$installKind,maintenance:$maintenance,pidRegistrations:$pidRegistrations}' <<<"${base}"
 }
 
 active_launch_count() {
   psql_exec -At <<'SQL'
-SELECT COUNT(*)
-FROM llm_launch_reservations
-WHERE status = 'RUNNING';
+SELECT (SELECT COUNT(*) FROM llm_launch_reservations WHERE status = 'RUNNING')
+     + (SELECT COUNT(*) FROM llm_pid_registrations WHERE state IN ('SPAWN_RESERVED', 'ACTIVE'));
 SQL
 }
 
 interrupt_active_launches() {
-  local deployment_id="$1"
-  validate_deployment_id "${deployment_id}"
-
+  local deployment_id="$1"; validate_deployment_id "${deployment_id}"
   psql_exec --set=deployment_id="${deployment_id}" <<'SQL'
 BEGIN;
 WITH interrupted AS (
-    UPDATE llm_launch_reservations
-    SET status = 'FAILED',
-        finished_at = (extract(epoch FROM clock_timestamp()) * 1000)::bigint,
-        reason = 'DEPLOY_MAINTENANCE_INTERRUPTED:' || :'deployment_id'
-    WHERE status = 'RUNNING'
-    RETURNING invocation_id
+    UPDATE llm_launch_reservations SET status='FAILED', finished_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,
+        reason='DEPLOY_MAINTENANCE_INTERRUPTED:' || :'deployment_id'
+    WHERE status='RUNNING' RETURNING invocation_id
+), runs AS (
+    UPDATE llm_runs SET status='FAILED', finished_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,
+        error_message='LLM run was interrupted by deployment maintenance.', terminal_cause='RESTART_INTERRUPTED'
+    WHERE status='RUNNING' AND invocation_id IN (SELECT invocation_id FROM interrupted)
 )
-UPDATE llm_runs
-SET status = 'FAILED',
-    finished_at = (extract(epoch FROM clock_timestamp()) * 1000)::bigint,
-    error_message = 'LLM run was interrupted by deployment maintenance.',
-    terminal_cause = 'RESTART_INTERRUPTED'
-WHERE status = 'RUNNING'
-  AND invocation_id IN (SELECT invocation_id FROM interrupted);
+UPDATE llm_pid_registrations SET state='TERMINAL', terminal_reason='DEPLOY_MAINTENANCE_INTERRUPTED',
+    terminal_at=clock_timestamp(), updated_at=clock_timestamp()
+WHERE state IN ('SPAWN_RESERVED','ACTIVE');
+COMMIT;
+SQL
+}
+
+cleanup_terminal_pid_registrations() {
+  psql_exec -At <<'SQL'
+BEGIN;
+SET LOCAL lock_timeout = '250ms';
+SET LOCAL statement_timeout = '1s';
+WITH expired AS (
+    SELECT registration_id
+    FROM llm_pid_registrations
+    WHERE state = 'TERMINAL' AND terminal_at < clock_timestamp() - interval '24 hours'
+    ORDER BY terminal_at, registration_id
+    LIMIT 1000
+    FOR UPDATE SKIP LOCKED
+), deleted AS (
+    DELETE FROM llm_pid_registrations registration
+    USING expired
+    WHERE registration.registration_id = expired.registration_id
+    RETURNING 1
+)
+SELECT COUNT(*) FROM deleted;
 COMMIT;
 SQL
 }
 
 main() {
-  require_root
-  local operation="${1:-}"
-  shift || true
-
+  require_root; local operation="${1:-}"; shift || true
   case "${operation}" in
-    install-foundation) [[ "$#" == "0" ]] || fail "unexpected arguments"; install_foundation ;;
-    set-maintenance) [[ "$#" == "2" ]] || fail "expected deployment id and generation"; set_maintenance "$1" "$2" true ;;
-    clear-maintenance) [[ "$#" == "2" ]] || fail "expected deployment id and generation"; set_maintenance "$1" "$2" false ;;
-    open-gap) [[ "$#" == "3" ]] || fail "expected deployment id, timestamp, and hash"; open_gap "$1" "$2" "$3" ;;
-    close-gap) [[ "$#" == "3" ]] || fail "expected deployment id, timestamp, and hash"; close_gap "$1" "$2" "$3" ;;
-    active-launch-count) [[ "$#" == "0" ]] || fail "unexpected arguments"; active_launch_count ;;
-    interrupt-active-launches) [[ "$#" == "1" ]] || fail "expected deployment id"; interrupt_active_launches "$1" ;;
-    snapshot) [[ "$#" == "0" ]] || fail "unexpected arguments"; snapshot ;;
+    install-foundation) [[ "$#" == 0 ]] || fail "unexpected arguments"; install_foundation ;;
+    install-indexes) [[ "$#" == 0 ]] || fail "unexpected arguments"; install_indexes ;;
+    timestamp) [[ "$#" == 0 ]] || fail "unexpected arguments"; database_timestamp ;;
+    maintenance-cas) [[ "$#" == 6 ]] || fail "expected old/new tuples"; maintenance_cas "$@" ;;
+    append-gap) [[ "$#" == 4 ]] || fail "expected deployment id, boundary, timestamp, hash"; append_gap "$@" ;;
+    active-launch-count) [[ "$#" == 0 ]] || fail "unexpected arguments"; active_launch_count ;;
+    interrupt-active-launches) [[ "$#" == 1 ]] || fail "expected deployment id"; interrupt_active_launches "$1" ;;
+    cleanup-terminal-pids) [[ "$#" == 0 ]] || fail "unexpected arguments"; cleanup_terminal_pid_registrations ;;
+    snapshot) [[ "$#" == 0 ]] || fail "unexpected arguments"; snapshot ;;
     *) fail "unsupported operation" ;;
   esac
 }
-
 main "$@"

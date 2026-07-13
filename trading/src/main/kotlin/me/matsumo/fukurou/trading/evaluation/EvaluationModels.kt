@@ -105,6 +105,8 @@ data class EvaluationExclusionSummary(
     val infrastructureGaps: List<EvaluationInfrastructureGap> = emptyList(),
     val infrastructureAffectedTradeCount: Int = 0,
     val infrastructureAttributionMissingCount: Int = 0,
+    val populationByEntityType: Map<String, EvaluationPopulationCounts> = emptyMap(),
+    val populationTruncated: Boolean = false,
 )
 
 /** evaluation API に加算する root-owned infrastructure gap。 */
@@ -494,6 +496,8 @@ data class LlmPhaseUsageFact(
     val phase: String?,
     val occurredAt: Instant,
     val usage: LlmUsageDetails?,
+    val populationStatus: EvaluationPopulationStatus = EvaluationPopulationStatus.ATTRIBUTION_MISSING,
+    val representativeGapId: String? = null,
 )
 
 /**

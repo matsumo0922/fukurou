@@ -12,11 +12,12 @@ readonly COMPOSE_FILE="${REPO_DIR}/docker-compose.prod.yml"
 readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
 readonly IMAGE_REPOSITORY="ghcr.io/matsumo0922/fukurou"
 readonly PUBLIC_KEY="${FUKUROU_DEPLOY_PUBLIC_KEY:-/usr/local/share/fukurou/deploy-public-key.pem}"
+readonly INSTALLED_CATALOG="${FUKUROU_DEPLOY_CATALOG:-/usr/local/share/fukurou/deploy-capability-catalog-v1.json}"
+readonly CATALOG_LEDGER="${FUKUROU_DEPLOY_CATALOG_LEDGER:-${DEPLOY_ROOT}/deploy-catalog-ledger}"
 readonly DB_HELPER="${FUKUROU_DEPLOY_DB_HELPER:-/usr/local/libexec/fukurou-deploy-db}"
 readonly SUPERVISOR_BINARY="/usr/local/libexec/fukurou-runtime-supervisor"
 readonly CANARY_PRIVATE_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519"
 readonly CANARY_PUBLIC_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519.pub"
-readonly CAPABILITY_HASH="84812e517a2d5de63abb713b0846c0a3583f21a6dd22f5d93f9f86fdc4291b6c"
 readonly IMAGE_RETENTION_COUNT="${FUKUROU_IMAGE_RETENTION_COUNT:-10}"
 readonly APPLICATION_UID=10001
 readonly APPLICATION_GID=10001
@@ -24,6 +25,18 @@ readonly APPLICATION_GID=10001
 fail() {
   echo "deploy-fukurou: $*" >&2
   return 1
+}
+
+on_signal() {
+  local signal_name="$1" code="$2"
+  SIGNAL_NAME="${signal_name}"
+  journal_state SIGNAL_RECEIVED "{\"signal\":\"${signal_name}\"}" 2>/dev/null || true
+  (exit "${code}")
+  rollback_on_error
+}
+
+check_forward_deadline() {
+  [[ "${SECONDS}" -lt "${FORWARD_DEADLINE_SECONDS}" ]] || fail "FORWARD_DEADLINE_EXCEEDED"
 }
 
 usage() {
@@ -69,10 +82,11 @@ validate_signed_bundle() {
     -in <(printf '%s' "${bundle_json}") \
     -sigfile <(printf '%s' "${signature_base64}" | base64 -d) >/dev/null 2>&1 || fail "INVALID_BUNDLE_SIGNATURE"
 
-  local candidate_sha minimum_version capability_hash executor_hash public_key_hash self_hash installed_key_hash
+  local candidate_sha minimum_version executor_hash public_key_hash self_hash installed_key_hash
   candidate_sha="$(jq -er '.candidateSha' <<<"${bundle_json}")"
   minimum_version="$(jq -er '.minimumContractVersion' <<<"${bundle_json}")"
-  capability_hash="$(jq -er '.capabilityHash' <<<"${bundle_json}")"
+  CANDIDATE_CATALOG="$(jq -cS '.capabilityCatalog' <<<"${bundle_json}")"
+  CANDIDATE_CATALOG_HASH="$(jq -er '.capabilityCatalogHash' <<<"${bundle_json}")"
   executor_hash="$(jq -er '.executorSha256' <<<"${bundle_json}")"
   public_key_hash="$(jq -er '.publicKeySha256' <<<"${bundle_json}")"
   DEPLOYMENT_ID="$(jq -er '.deploymentId' <<<"${bundle_json}")"
@@ -80,7 +94,7 @@ validate_signed_bundle() {
 
   [[ "${candidate_sha}" == "${DEPLOY_SHA}" ]] || fail "BUNDLE_SHA_MISMATCH"
   [[ "${minimum_version}" == "${CONTRACT_VERSION}" ]] || fail "CONTRACT_VERSION_MISMATCH"
-  [[ "${capability_hash}" == "${CAPABILITY_HASH}" ]] || fail "CAPABILITY_HASH_MISMATCH"
+  [[ "$(printf '%s' "${CANDIDATE_CATALOG}" | sha256sum | awk '{print $1}')" == "${CANDIDATE_CATALOG_HASH}" ]] || fail "CAPABILITY_CATALOG_HASH_MISMATCH"
   [[ "${DEPLOYMENT_ID}" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || fail "INVALID_DEPLOYMENT_ID"
   [[ "${CANDIDATE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "INVALID_CANDIDATE_DIGEST"
 
@@ -89,9 +103,8 @@ validate_signed_bundle() {
   [[ "${executor_hash}" == "${self_hash}" ]] || fail "INSTALLED_EXECUTOR_HASH_MISMATCH"
   [[ "${public_key_hash}" == "${installed_key_hash}" ]] || fail "INSTALLED_PUBLIC_KEY_HASH_MISMATCH"
 
-  jq -e --arg hash "${CAPABILITY_HASH}" '
+  jq -e '
     .minimumContractVersion == 1 and
-    .capabilityHash == $hash and
     (.requiredCapabilities | sort) == ([
       "CREATE_DIR_V1", "DB_MAINTENANCE_V1", "DB_MIGRATION_V1",
       "INSTALL_SECRET_REF_V1", "RUN_COMPOSE_PROJECT_V1", "SMOKE_HOOK_V1"
@@ -109,6 +122,27 @@ validate_signed_bundle() {
       {"capability":"DB_MAINTENANCE_V1","operationId":"CLEAR_LAUNCH_MAINTENANCE"}
     ])
   ' <<<"${bundle_json}" >/dev/null || fail "INVALID_TYPED_OPERATION_SET"
+
+  [[ -f "${INSTALLED_CATALOG}" && ! -L "${INSTALLED_CATALOG}" ]] || fail "INSTALLED_CAPABILITY_CATALOG_MISSING"
+  local installed_canonical installed_hash parent_hash candidate_version installed_version
+  installed_canonical="$(jq -cS . "${INSTALLED_CATALOG}")"
+  installed_hash="$(printf '%s' "${installed_canonical}" | sha256sum | awk '{print $1}')"
+  parent_hash="$(jq -er '.parentCatalogHash // ""' <<<"${CANDIDATE_CATALOG}")"
+  candidate_version="$(jq -er '.catalogVersion' <<<"${CANDIDATE_CATALOG}")"
+  installed_version="$(jq -er '.catalogVersion' <<<"${installed_canonical}")"
+  if [[ "${CANDIDATE_CATALOG_HASH}" != "${installed_hash}" ]]; then
+    [[ "${parent_hash}" == "${installed_hash}" && "${candidate_version}" -gt "${installed_version}" ]] || fail "CAPABILITY_CATALOG_PARENT_FORK"
+    jq -e --argjson old "${installed_canonical}" '
+      def by_id($array; $field): reduce $array[] as $item ({}; .[$item[$field]] = $item);
+      (by_id(.builtInCapabilities; "capabilityId")) as $newCapabilities |
+      (by_id(.operations; "operationId")) as $newOperations |
+      (by_id(.hooks; "hookId")) as $newHooks |
+      all($old.builtInCapabilities[]; $newCapabilities[.capabilityId] == .) and
+      all($old.operations[]; $newOperations[.operationId] == .) and
+      all($old.hooks[]; $newHooks[.hookId] == .) and
+      all(.builtInCapabilities[]; .capabilityId | IN("CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"))
+    ' <<<"${CANDIDATE_CATALOG}" >/dev/null || fail "CAPABILITY_CATALOG_REDEFINITION"
+  fi
 }
 
 require_initial_state() {
@@ -116,6 +150,7 @@ require_initial_state() {
   [[ -f "${ENV_FILE}" ]] || fail "production environment file is missing"
   [[ -d "${STATE_ROOT}" ]] || fail "deploy state root must be provisioned before executor installation"
   [[ -x "${DB_HELPER}" ]] || fail "installed DB helper is missing"
+  [[ -x "${SUPERVISOR_BINARY}" ]] || fail "installed canonical fence codec is missing"
 }
 
 capture_rollback_state() {
@@ -125,36 +160,68 @@ capture_rollback_state() {
 
   install -d -o root -g root -m 0700 "${temporary_dir}"
 
-  local previous_sha image_digest compose_hash runtime_snapshot
+  local previous_sha compose_hash runtime_snapshot install_kind configured_image image_id image_digest revision
+  local fence_hash="" fence_bytes="" executor_hash public_key_hash installed_catalog_hash
   previous_sha="$(git -C "${REPO_DIR}" rev-parse HEAD)"
-  image_digest="$(docker inspect --format '{{index .RepoDigests 0}}' fukurou-ktor 2>/dev/null || true)"
+  configured_image="$(docker inspect --format '{{.Config.Image}}' fukurou-ktor 2>/dev/null || true)"
+  image_id="$(docker inspect --format '{{.Image}}' fukurou-ktor 2>/dev/null || true)"
+  image_digest="$(docker image inspect --format '{{join .RepoDigests "|"}}' "${image_id}" 2>/dev/null || true)"
+  revision="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor 2>/dev/null | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}' || true)"
   compose_hash="$(sha256sum "${COMPOSE_FILE}" | awk '{print $1}')"
   runtime_snapshot="$(${DB_HELPER} snapshot)"
-  IFS='|' read -r RUNTIME_CONFIG_VERSION RUNTIME_CONFIG_HASH PREFILTER_ACTIVE FENCE_GENERATION MAINTENANCE_ACTIVE <<<"${runtime_snapshot}"
+  install_kind="$(jq -er '.installKind' <<<"${runtime_snapshot}")"
+  [[ "${install_kind}" == "PRE_FOUNDATION" && -z "${configured_image}" ]] && install_kind="FRESH"
+  RUNTIME_CONFIG_VERSION="$(jq -er '.runtimeConfigVersion' <<<"${runtime_snapshot}")"
+  RUNTIME_CONFIG_HASH="$(jq -er '.runtimeConfigHash' <<<"${runtime_snapshot}")"
+  PREFILTER_ACTIVE="$(jq -er '.preFilterActive' <<<"${runtime_snapshot}")"
+  FENCE_GENERATION="$(jq -er '.maintenance.generation' <<<"${runtime_snapshot}")"
+  MAINTENANCE_ACTIVE="$(jq -er '.maintenance.enabled' <<<"${runtime_snapshot}")"
+  MAINTENANCE_DEPLOYMENT_ID="$(jq -er '.maintenance.deploymentId' <<<"${runtime_snapshot}")"
   TARGET_GENERATION="$((FENCE_GENERATION + 1))"
+  [[ "${TARGET_GENERATION}" -le 9223372036854775807 ]] || fail "FENCE_GENERATION_OVERFLOW"
   PREVIOUS_REPO_SHA="${previous_sha}"
   PREVIOUS_IMAGE_DIGEST="${image_digest}"
-  DEPLOY_OPENED_AT="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
-  GAP_PAYLOAD_HASH="$(printf '%s|%s|OPEN_INFRASTRUCTURE_GAP' "${DEPLOYMENT_ID}" "${DEPLOY_OPENED_AT}" | sha256sum | awk '{print $1}')"
+  INSTALL_KIND="${install_kind}"
+  if [[ -f "${FENCE_ROOT}/fence-v1" ]]; then
+    fence_bytes="$(base64 -w0 "${FENCE_ROOT}/fence-v1")"
+    fence_hash="$(sha256sum "${FENCE_ROOT}/fence-v1" | awk '{print $1}')"
+  fi
+  executor_hash="$(sha256sum "$(readlink -f "$0")" | awk '{print $1}')"
+  public_key_hash="$(sha256sum "${PUBLIC_KEY}" | awk '{print $1}')"
+  installed_catalog_hash="$(jq -cS . "${INSTALLED_CATALOG}" | tr -d '\n' | sha256sum | awk '{print $1}')"
 
   install -o root -g root -m 0600 "${COMPOSE_FILE}" "${temporary_dir}/docker-compose.prod.yml"
   jq -n \
     --arg deploymentId "${DEPLOYMENT_ID}" \
-    --arg capturedAt "${DEPLOY_OPENED_AT}" \
+    --arg installKind "${install_kind}" \
+    --arg captureDbTimestamp "$(jq -er '.captureDbTimestamp' <<<"${runtime_snapshot}")" \
     --arg previousRepoSha "${previous_sha}" \
     --arg composeSourceCommit "${previous_sha}" \
     --arg composeSha256 "${compose_hash}" \
-    --arg imageDigest "${image_digest}" \
+    --arg configuredImageReference "${configured_image}" \
+    --arg imageId "${image_id}" \
+    --arg imageRepoDigests "${image_digest}" \
+    --arg revision "${revision}" \
     --arg runtimeConfigVersion "${RUNTIME_CONFIG_VERSION}" \
     --arg runtimeConfigHash "${RUNTIME_CONFIG_HASH}" \
     --arg preFilterActive "${PREFILTER_ACTIVE}" \
-    --arg generation "${FENCE_GENERATION}" \
-    --arg maintenanceActive "${MAINTENANCE_ACTIVE}" \
-    '{deploymentId:$deploymentId,capturedAt:$capturedAt,previousRepoSha:$previousRepoSha,
+    --argjson generation "${FENCE_GENERATION}" \
+    --argjson maintenanceActive "${MAINTENANCE_ACTIVE}" \
+    --arg maintenanceDeploymentId "${MAINTENANCE_DEPLOYMENT_ID}" \
+    --arg fenceBytesBase64 "${fence_bytes}" \
+    --arg fenceSha256 "${fence_hash}" \
+    --arg foundationCatalogFingerprint "$(jq -er '.foundationCatalogFingerprint' <<<"${runtime_snapshot}")" \
+    --arg executorSha256 "${executor_hash}" \
+    --arg publicKeySha256 "${public_key_hash}" \
+    --arg capabilityCatalogHash "${installed_catalog_hash}" \
+    --argjson pidRegistrations "$(jq -c '.pidRegistrations' <<<"${runtime_snapshot}")" \
+    '{deploymentId:$deploymentId,installKind:$installKind,captureDbTimestamp:$captureDbTimestamp,previousRepoSha:$previousRepoSha,
       composeSourceCommit:$composeSourceCommit,composeSources:{"docker-compose.prod.yml":$composeSha256},
-      runningImageRepoDigest:$imageDigest,runtimeConfigVersion:$runtimeConfigVersion,
+      runningContainer:{configuredImageReference:$configuredImageReference,imageId:$imageId,repoDigests:($imageRepoDigests|split("|")|map(select(length>0))),revision:$revision},runtimeConfigVersion:$runtimeConfigVersion,
       runtimeConfigHash:$runtimeConfigHash,preFilterActive:$preFilterActive,
-      launchFenceGeneration:$generation,launchMaintenanceActive:$maintenanceActive}' \
+      launchMaintenance:{generation:$generation,enabled:$maintenanceActive,deploymentId:$maintenanceDeploymentId},
+      launchFence:{bytesBase64:$fenceBytesBase64,sha256:$fenceSha256},foundationCatalogFingerprint:$foundationCatalogFingerprint,
+      pidRegistrations:$pidRegistrations,installed:{executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,capabilityCatalogHash:$capabilityCatalogHash}}' \
     > "${temporary_dir}/state.json"
   chmod 0600 "${temporary_dir}/state.json"
 
@@ -168,29 +235,45 @@ capture_rollback_state() {
 rollback_on_error() {
   local exit_code="$?"
   trap - ERR
-  echo "deploy-fukurou: deployment failed; restoring captured state" >&2
+  if [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]]; then kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true; fi
+  local recovery_deadline=$((SECONDS + 300))
+  echo "deploy-fukurou: deployment failed; entering durable recovery" >&2
+  journal_state RECOVERY_STARTED "{\"failedExitCode\":${exit_code}}" || true
+  revoke_active_canary || { echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_CANARY_NAMESPACE" >&2; exit "${exit_code}"; }
 
-  local current_snapshot current_version
-  current_snapshot="$(${DB_HELPER} snapshot 2>/dev/null || true)"
-  IFS='|' read -r current_version _ <<<"${current_snapshot}"
-  if [[ -n "${RUNTIME_CONFIG_VERSION:-}" && "${current_version}" != "${RUNTIME_CONFIG_VERSION}" ]]; then
-    echo "deploy-fukurou: RUNTIME_CONFIG_CAS_MISMATCH; maintenance remains closed" >&2
+  if ! git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null 2>&1; then
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_REPO" >&2; exit "${exit_code}"
+  fi
+  if [[ "${INSTALL_KIND}" != "FOUNDATION_V1" ]]; then
+    journal_state MANUAL_RECOVERY_REQUIRED "{\"installKind\":\"${INSTALL_KIND}\"}" || true
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_${INSTALL_KIND}" >&2
     exit "${exit_code}"
   fi
 
-  git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null 2>&1 || true
-  if [[ "${PREVIOUS_IMAGE_DIGEST}" == *"@sha256:"* ]]; then
-    docker pull "${PREVIOUS_IMAGE_DIGEST}" >/dev/null 2>&1 || true
-    docker tag "${PREVIOUS_IMAGE_DIGEST}" "${IMAGE_REPOSITORY}:${PREVIOUS_REPO_SHA}" >/dev/null 2>&1 || true
-  fi
-  export FUKUROU_IMAGE_TAG="${PREVIOUS_REPO_SHA}"
-  docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d >/dev/null 2>&1 || true
-
-  local closed_at
-  closed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
-  "${DB_HELPER}" close-gap "${DEPLOYMENT_ID}" "${closed_at}" "${GAP_PAYLOAD_HASH}" >/dev/null 2>&1 || true
-  "${DB_HELPER}" clear-maintenance "${DEPLOYMENT_ID}" "${TARGET_GENERATION}" >/dev/null 2>&1 || true
-  request_supervisor ENABLE "${TARGET_GENERATION}" >/dev/null 2>&1 || true
+  local previous_reference current_snapshot
+  previous_reference="$(jq -er '.runningContainer.configuredImageReference' "${ROLLBACK_STATE_DIR}/state.json")"
+  [[ "${previous_reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || {
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_PREVIOUS_DIGEST" >&2; exit "${exit_code}";
+  }
+  current_snapshot="$(${DB_HELPER} snapshot)" || { echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_DB" >&2; exit "${exit_code}"; }
+  [[ "$(jq -er '.runtimeConfigVersion' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_VERSION}" && \
+      "$(jq -er '.runtimeConfigHash' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_HASH}" ]] || {
+    echo "deploy-fukurou: RUNTIME_CONFIG_CAS_MISMATCH" >&2; exit "${exit_code}";
+  }
+  (( SECONDS < recovery_deadline )) || exit "${exit_code}"
+  timeout 45 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor || exit "${exit_code}"
+  [[ "$(docker inspect --format '{{.State.Pid}}' fukurou-ktor 2>/dev/null || printf 0)" == "0" ]] || exit "${exit_code}"
+  export FUKUROU_IMAGE_REFERENCE="${previous_reference}"
+  timeout 120 docker pull "${previous_reference}" >/dev/null || exit "${exit_code}"
+  timeout 120 docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d --no-build || exit "${exit_code}"
+  [[ "$(docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${previous_reference}" ]] || exit "${exit_code}"
+  [[ "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${PREVIOUS_REPO_SHA}" ]] || exit "${exit_code}"
+  timeout 120 bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done' || exit "${exit_code}"
+  "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}" || exit "${exit_code}"
+  request_supervisor ENABLE "${TARGET_GENERATION}" >/dev/null || exit "${exit_code}"
+  prepare_gap_event CLOSE || exit "${exit_code}"
+  append_prepared_gap_event || exit "${exit_code}"
+  journal_state ROLLED_BACK || true
   exit "${exit_code}"
 }
 
@@ -235,6 +318,64 @@ request_supervisor() {
     | grep -Fx "ACK ${operation} ${generation}"
 }
 
+write_fence_fallback() {
+  "${SUPERVISOR_BINARY}" --fence-write "$1" "$2"
+}
+
+journal_state() {
+  local state="$1" details="${2:-{}}" target="${ROLLBACK_STATE_DIR}/journal.json"
+  jq -cS -n --arg state "${state}" --argjson details "${details}" \
+    --arg at "$(${DB_HELPER} timestamp 2>/dev/null || date --utc +%Y-%m-%dT%H:%M:%S.000000Z)" \
+    '{version:1,state:$state,at:$at,details:$details}' > "${target}.tmp"
+  chmod 0600 "${target}.tmp"; sync -f "${target}.tmp"; mv "${target}.tmp" "${target}"; sync -f "${ROLLBACK_STATE_DIR}"
+}
+
+accept_capability_catalog() {
+  local installed_hash
+  installed_hash="$(jq -cS . "${INSTALLED_CATALOG}" | tr -d '\n' | sha256sum | awk '{print $1}')"
+  [[ "${installed_hash}" != "${CANDIDATE_CATALOG_HASH}" ]] || return 0
+  install -d -o root -g root -m 0700 "${CATALOG_LEDGER}"
+  local ledger_entry="${CATALOG_LEDGER}/${CANDIDATE_CATALOG_HASH}.json" temporary="${INSTALLED_CATALOG}.tmp.$$"
+  printf '%s' "${CANDIDATE_CATALOG}" > "${ledger_entry}.tmp"
+  chmod 0600 "${ledger_entry}.tmp"; sync -f "${ledger_entry}.tmp"; mv "${ledger_entry}.tmp" "${ledger_entry}"; sync -f "${CATALOG_LEDGER}"
+  printf '%s' "${CANDIDATE_CATALOG}" > "${temporary}"
+  chown root:root "${temporary}"; chmod 0444 "${temporary}"; sync -f "${temporary}"; mv "${temporary}" "${INSTALLED_CATALOG}"; sync -f "$(dirname "${INSTALLED_CATALOG}")"
+}
+
+revoke_active_canary() {
+  [[ -n "${ROLLBACK_STATE_DIR:-}" ]] || return 0
+  local audit="${ROLLBACK_STATE_DIR}/canary-audit.json" compose="${ROLLBACK_STATE_DIR}/canary-compose.json"
+  if [[ -f "${compose}" ]]; then
+    timeout 60 docker compose -p "fukurou-canary-${DEPLOYMENT_ID}" -f "${compose}" down --volumes --remove-orphans >/dev/null 2>&1 || return 1
+  fi
+  if [[ -f "${audit}" && "$(jq -r '.state' "${audit}")" != "REVOKED" ]]; then
+    jq --argjson revokedAt "$(date +%s)" '.state="REVOKED"|.result="recovery-revoked"|.revokedAt=$revokedAt' "${audit}" > "${audit}.tmp"
+    chmod 0600 "${audit}.tmp"; sync -f "${audit}.tmp"; mv "${audit}.tmp" "${audit}"; sync -f "${ROLLBACK_STATE_DIR}"
+  fi
+  unlink "${ROLLBACK_STATE_DIR}/canary-token.json" "${ROLLBACK_STATE_DIR}/canary-token.sig" 2>/dev/null || true
+  sync -f "${ROLLBACK_STATE_DIR}"
+}
+
+prepare_gap_event() {
+  local boundary="$1"
+  local occurred_at gap_id event_id payload payload_hash
+  occurred_at="$(${DB_HELPER} timestamp)"
+  gap_id="$(printf 'fukurou-gap-v1:%s' "${DEPLOYMENT_ID}" | md5sum | awk '{print substr($1,1,8)"-"substr($1,9,4)"-"substr($1,13,4)"-"substr($1,17,4)"-"substr($1,21,12)}')"
+  event_id="$(printf 'fukurou-gap-v1:%s:%s' "${DEPLOYMENT_ID}" "${boundary}" | md5sum | awk '{print substr($1,1,8)"-"substr($1,9,4)"-"substr($1,13,4)"-"substr($1,17,4)"-"substr($1,21,12)}')"
+  payload="$(jq -cS -n --arg boundary "${boundary}" --arg deploymentId "${DEPLOYMENT_ID}" --arg eventId "${event_id}" \
+    --arg gapId "${gap_id}" --arg occurredAt "${occurred_at}" \
+    '{boundary:$boundary,deploymentId:$deploymentId,eventId:$eventId,gapId:$gapId,occurredAt:$occurredAt,reason:"DEPLOY_MAINTENANCE",version:1}')"
+  payload_hash="$(printf '%s' "${payload}" | sha256sum | awk '{print $1}')"
+  printf '%s' "${payload}" > "${ROLLBACK_STATE_DIR}/gap-${boundary}.json.tmp"
+  chmod 0600 "${ROLLBACK_STATE_DIR}/gap-${boundary}.json.tmp"; sync -f "${ROLLBACK_STATE_DIR}/gap-${boundary}.json.tmp"
+  mv "${ROLLBACK_STATE_DIR}/gap-${boundary}.json.tmp" "${ROLLBACK_STATE_DIR}/gap-${boundary}.json"; sync -f "${ROLLBACK_STATE_DIR}"
+  GAP_EVENT_BOUNDARY="${boundary}"; GAP_EVENT_OCCURRED_AT="${occurred_at}"; GAP_EVENT_PAYLOAD_HASH="${payload_hash}"
+}
+
+append_prepared_gap_event() {
+  "${DB_HELPER}" append-gap "${DEPLOYMENT_ID}" "${GAP_EVENT_BOUNDARY}" "${GAP_EVENT_OCCURRED_AT}" "${GAP_EVENT_PAYLOAD_HASH}"
+}
+
 disable_launches() {
   if ! request_supervisor DISABLE "${TARGET_GENERATION}"; then
     docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor
@@ -242,25 +383,20 @@ disable_launches() {
     container_running="$(docker inspect --format '{{.State.Running}}' fukurou-ktor 2>/dev/null || printf 'false')"
     container_pid="$(docker inspect --format '{{.State.Pid}}' fukurou-ktor 2>/dev/null || printf '0')"
     [[ "${container_running}" == "false" && "${container_pid}" == "0" ]] || fail "PID_ZERO_FALLBACK_FAILED"
-    printf 'version=1\ngeneration=%s\nstate=DISABLED_PENDING_DB\n' "${TARGET_GENERATION}" \
-      > "${FENCE_ROOT}/.fence.tmp.$$"
-    sync -f "${FENCE_ROOT}/.fence.tmp.$$"
-    mv "${FENCE_ROOT}/.fence.tmp.$$" "${FENCE_ROOT}/fence-v1"
-    chmod 0600 "${FENCE_ROOT}/fence-v1"
-    sync -f "${FENCE_ROOT}"
+    write_fence_fallback DISABLED_PENDING_DB "${TARGET_GENERATION}"
   fi
 
   "${DB_HELPER}" install-foundation
-  "${DB_HELPER}" set-maintenance "${DEPLOYMENT_ID}" "${TARGET_GENERATION}"
+  "${DB_HELPER}" install-indexes
+  "${DB_HELPER}" cleanup-terminal-pids >/dev/null
+  prepare_gap_event OPEN
+  "${DB_HELPER}" maintenance-cas "${FENCE_GENERATION}" "${MAINTENANCE_ACTIVE}" "${MAINTENANCE_DEPLOYMENT_ID}" \
+    "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}"
+  append_prepared_gap_event
   if ! request_supervisor COMMIT "${TARGET_GENERATION}"; then
-    printf 'version=1\ngeneration=%s\nstate=DISABLED_COMMITTED\n' "${TARGET_GENERATION}" \
-      > "${FENCE_ROOT}/.fence.tmp.$$"
-    sync -f "${FENCE_ROOT}/.fence.tmp.$$"
-    mv "${FENCE_ROOT}/.fence.tmp.$$" "${FENCE_ROOT}/fence-v1"
-    chmod 0600 "${FENCE_ROOT}/fence-v1"
-    sync -f "${FENCE_ROOT}"
+    write_fence_fallback DISABLED_COMMITTED "${TARGET_GENERATION}"
   fi
-  "${DB_HELPER}" open-gap "${DEPLOYMENT_ID}" "${DEPLOY_OPENED_AT}" "${GAP_PAYLOAD_HASH}"
+  journal_state LAUNCHES_DISABLED
 }
 
 drain_launches() {
@@ -305,7 +441,7 @@ run_candidate_preflight() {
     --arg namespaceId "canary-${DEPLOYMENT_ID}" \
     --arg candidateSha "${DEPLOY_SHA}" \
     --arg candidateDigest "${CANDIDATE_DIGEST}" \
-    --arg contractHash "${CAPABILITY_HASH}" \
+    --arg contractHash "${CANDIDATE_CATALOG_HASH}" \
     --arg nonce "${nonce}" \
     --argjson generation "${TARGET_GENERATION}" \
     --argjson issuedAt "${issued_at}" \
@@ -321,40 +457,45 @@ run_candidate_preflight() {
   chmod 0400 "${signature}"
   local token_hash
   token_hash="$(sha256sum "${token}" | awk '{print $1}')"
+  [[ ! -e "${audit}" ]] || fail "CANARY_TOKEN_ALREADY_ISSUED"
   jq -n --arg tokenHash "${token_hash}" --argjson issuedAt "${issued_at}" \
-    '{tokenHash:$tokenHash,issuedAt:$issuedAt,consumedAt:null,result:null,revokedAt:null}' > "${audit}"
+    '{version:1,state:"ISSUED",tokenHash:$tokenHash,issuedAt:$issuedAt,consumedAt:null,result:null,revokedAt:null}' > "${audit}"
   chmod 0600 "${audit}"
+  sync -f "${audit}"; sync -f "${ROLLBACK_STATE_DIR}"
 
   local consumed_at
   consumed_at="$(date +%s)"
-  jq --argjson consumedAt "${consumed_at}" '.consumedAt=$consumedAt' "${audit}" > "${audit}.tmp"
+  jq --argjson consumedAt "${consumed_at}" 'if .state=="ISSUED" then .state="CONSUMED"|.consumedAt=$consumedAt else error("CANARY_REPLAY") end' "${audit}" > "${audit}.tmp"
   chmod 0600 "${audit}.tmp"
   sync -f "${audit}.tmp"
   mv "${audit}.tmp" "${audit}"
   sync -f "${ROLLBACK_STATE_DIR}"
 
+  local canary_compose="${ROLLBACK_STATE_DIR}/canary-compose.json" canary_project="fukurou-canary-${DEPLOYMENT_ID}"
+  jq -n --arg image "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --arg token "${token}" --arg signature "${signature}" \
+    --arg publicKey "${CANARY_PUBLIC_KEY}" --arg digest "${CANDIDATE_DIGEST}" \
+    --arg catalogHash "${CANDIDATE_CATALOG_HASH}" \
+    '{services:{canary:{image:$image,read_only:true,pids_limit:64,cap_drop:["ALL"],cap_add:["SETGID","SETUID"],
+      environment:{FUKUROU_CANDIDATE_DIGEST:$digest,FUKUROU_CANDIDATE_CATALOG_HASH:$catalogHash},tmpfs:["/tmp:rw,noexec,nosuid,nodev,mode=1777"],
+      volumes:[{type:"bind",source:$token,target:"/canary-token.json",read_only:true},{type:"bind",source:$signature,target:"/canary-token.sig",read_only:true},{type:"bind",source:$publicKey,target:"/canary-public.pem",read_only:true}],
+      command:["--canary-preflight","foundation","/canary-token.json","/canary-token.sig","/canary-public.pem"],networks:["fixture"]}},
+      networks:{fixture:{internal:true}}}' > "${canary_compose}"
+  chmod 0600 "${canary_compose}"; sync -f "${canary_compose}"; sync -f "${ROLLBACK_STATE_DIR}"
   local result="failure"
-  if docker run --rm --read-only --network none --cap-drop ALL --pids-limit 64 \
-    --cap-add SETGID --cap-add SETUID \
-    --env "FUKUROU_CANDIDATE_DIGEST=${CANDIDATE_DIGEST}" \
-    --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
-    --mount "type=bind,source=${token},target=/canary-token.json,readonly" \
-    --mount "type=bind,source=${signature},target=/canary-token.sig,readonly" \
-    --mount "type=bind,source=${CANARY_PUBLIC_KEY},target=/canary-public.pem,readonly" \
-    "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" \
-    --canary-preflight \
-    foundation /canary-token.json /canary-token.sig /canary-public.pem; then
+  if timeout 180 docker compose -p "${canary_project}" -f "${canary_compose}" run --rm canary; then
     result="success"
   fi
+  docker compose -p "${canary_project}" -f "${canary_compose}" down --volumes --remove-orphans >/dev/null 2>&1 || result="failure"
   local completed_at
   completed_at="$(date +%s)"
   jq --arg result "${result}" --argjson completedAt "${completed_at}" \
-    '.result=$result | .revokedAt=$completedAt' "${audit}" > "${audit}.tmp"
+    'if .state=="CONSUMED" then .state="REVOKED"|.result=$result|.revokedAt=$completedAt else error("CANARY_STATE_INVALID") end' "${audit}" > "${audit}.tmp"
   chmod 0600 "${audit}.tmp"
   sync -f "${audit}.tmp"
   mv "${audit}.tmp" "${audit}"
   sync -f "${ROLLBACK_STATE_DIR}"
   rm -f "${token}" "${signature}"
+  sync -f "${ROLLBACK_STATE_DIR}"
   [[ "${result}" == "success" ]] || fail "FOUNDATION_PREFLIGHT_FAILED"
 }
 
@@ -366,18 +507,31 @@ checkout_deploy_sha() {
 }
 
 deploy_compose() {
-  export FUKUROU_IMAGE_TAG="${DEPLOY_SHA}"
-  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull
-  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+  export FUKUROU_IMAGE_REFERENCE="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+  docker pull "${FUKUROU_IMAGE_REFERENCE}" >/dev/null
+  [[ "$(docker image inspect --format '{{join .RepoDigests "|"}}' "${FUKUROU_IMAGE_REFERENCE}")" == *"${FUKUROU_IMAGE_REFERENCE}"* ]] || fail "DIGEST_PULL_MISMATCH"
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --no-build
+  local deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    local status; status="$(docker inspect --format '{{.State.Status}}' fukurou-ktor 2>/dev/null || true)"
+    [[ "${status}" == "running" ]] && break
+    sleep 2
+  done
+  [[ "$(docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${FUKUROU_IMAGE_REFERENCE}" ]] || fail "COMPOSE_CONFIG_IMAGE_MISMATCH"
+  [[ "$(docker image inspect --format '{{join .RepoDigests "|"}}' "$(docker inspect --format '{{.Image}}' fukurou-ktor)")" == *"${FUKUROU_IMAGE_REFERENCE}"* ]] || fail "RUNNING_IMAGE_DIGEST_MISMATCH"
+  [[ "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${DEPLOY_SHA}" ]] || fail "RUNNING_REVISION_MISMATCH"
+  timeout 120 bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done'
+  [[ "$(docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/revision)" == *"${DEPLOY_SHA}"* ]] || fail "HTTP_REVISION_MISMATCH"
+  journal_state CANDIDATE_HEALTHY
 }
 
 resume_launches() {
-  local closed_at close_hash
-  closed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
-  close_hash="${GAP_PAYLOAD_HASH}"
-  "${DB_HELPER}" close-gap "${DEPLOYMENT_ID}" "${closed_at}" "${close_hash}"
-  "${DB_HELPER}" clear-maintenance "${DEPLOYMENT_ID}" "${TARGET_GENERATION}"
+  "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" \
+    "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}"
   request_supervisor ENABLE "${TARGET_GENERATION}" || fail "ENABLE_ACK_FAILED"
+  prepare_gap_event CLOSE
+  append_prepared_gap_event
+  journal_state COMPLETE
 }
 
 prune_old_images() {
@@ -399,7 +553,7 @@ main() {
   fi
 
   require_root
-  for command in base64 cat docker flock git jq openssl sha256sum sync timeout; do require_command "${command}"; done
+  for command in base64 cat docker flock git jq md5sum openssl sha256sum sync timeout; do require_command "${command}"; done
   parse_arguments "$@"
   validate_signed_bundle
   require_initial_state
@@ -409,15 +563,34 @@ main() {
 
   capture_rollback_state
   trap rollback_on_error ERR
+  trap 'on_signal TERM 143' TERM
+  trap 'on_signal INT 130' INT
+  trap 'on_signal HUP 129' HUP
+  trap 'on_signal DEADLINE 124' USR1
+  (sleep 1200; kill -USR1 "$$" 2>/dev/null || true) &
+  DEADLINE_WATCHDOG_PID="$!"
+  FORWARD_DEADLINE_SECONDS=$((SECONDS + 1200))
+  journal_state CAPTURED
+  accept_capability_catalog
+  check_forward_deadline
   provision_fence_root
+  check_forward_deadline
   provision_named_secret
+  check_forward_deadline
   disable_launches
+  check_forward_deadline
   drain_launches
+  check_forward_deadline
   run_candidate_preflight
+  check_forward_deadline
   checkout_deploy_sha
+  check_forward_deadline
   deploy_compose
+  check_forward_deadline
   resume_launches
   prune_old_images
+  kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
+  wait "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
 }
 
 main "$@"

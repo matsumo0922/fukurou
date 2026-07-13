@@ -7515,6 +7515,19 @@ class PostgresPersistenceIntegrationTest {
                     occurredAt = occurredAt,
                 ),
             ).getOrThrow()
+            exposedTransaction(database) {
+                prepare(
+                    """
+                        INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)
+                        VALUES (?,'PAPER','BTC_JPY','FINISHED',?,?)
+                    """.trimIndent(),
+                ).use { statement ->
+                    statement.setString(1, runId)
+                    statement.setLong(2, occurredAt.minusMillis(1).toEpochMilli())
+                    statement.setLong(3, occurredAt.toEpochMilli())
+                    statement.executeUpdate()
+                }
+            }
         }
         val repository = ExposedEvaluationRepository(database)
         val scope = repository.resolveScope(null, "CURRENT").getOrThrow()

@@ -76,6 +76,12 @@ private const val SELECT_SINGLE_ATTEMPT_EXISTS_SQL = """
     LIMIT 1
 """
 
+private const val INSERT_LLM_PID_REGISTRATION_SQL = """
+    INSERT INTO llm_pid_registrations (
+        registration_id, invocation_id, reservation_id, role, container_instance_id, state
+    ) VALUES (md5('fukurou-pid-registration-v1:' || ?)::uuid, ?, ?, 'PROVIDER', ?, 'SPAWN_RESERVED')
+"""
+
 /**
  * RUNNING の LLM 起動予約数を数える SQL。
  */
@@ -218,6 +224,12 @@ private const val HEARTBEAT_LLM_EXECUTION_CLAIM_SQL = """
         AND status = 'RUNNING'
         AND execution_claim_state = 'CLAIMED'
         AND execution_claim_token = ?
+"""
+
+private const val FINISH_LLM_PID_REGISTRATION_SQL = """
+    UPDATE llm_pid_registrations
+    SET state = 'TERMINAL', terminal_reason = ?, terminal_at = clock_timestamp(), updated_at = clock_timestamp()
+    WHERE invocation_id = ? AND state IN ('SPAWN_RESERVED', 'ACTIVE')
 """
 
 /**
@@ -829,8 +841,9 @@ private fun JdbcTransaction.singleAttemptExists(singleAttemptKey: String): Boole
 }
 
 private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationRequest): Boolean {
-    jdbcConnection().prepareStatement(INSERT_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
-        statement.setObject(1, UUID.randomUUID())
+    val reservationId = UUID.randomUUID()
+    val inserted = jdbcConnection().prepareStatement(INSERT_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
+        statement.setObject(1, reservationId)
         statement.setString(2, request.invocationId)
         statement.setString(3, request.triggerKind.name)
         statement.setString(4, request.triggerKey)
@@ -844,8 +857,19 @@ private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationReque
         statement.setString(12, request.populationScope.accountEpochId)
         statement.setString(13, request.populationScope.cohort)
         statement.setString(14, request.populationScope.executionSemanticsVersion)
-        statement.executeQuery().use { resultSet -> return resultSet.next() }
+        statement.executeQuery().use { resultSet -> resultSet.next() }
     }
+    if (!inserted) return false
+
+    jdbcConnection().prepareStatement(INSERT_LLM_PID_REGISTRATION_SQL).use { statement ->
+        statement.setString(1, request.invocationId)
+        statement.setString(2, request.invocationId)
+        statement.setObject(3, reservationId)
+        statement.setString(4, System.getenv("HOSTNAME") ?: "unknown-container")
+        check(statement.executeUpdate() == 1)
+    }
+
+    return true
 }
 
 private fun JdbcTransaction.reservationId(invocationId: String): String {
@@ -877,6 +901,16 @@ fun JdbcTransaction.finishLlmLaunchInTransaction(finish: LlmLaunchReservationFin
     }
 
     check(updatedRows in 0..1) { "Conditional reservation finish updated multiple rows." }
+    if (updatedRows == 0) return
+
+    val pidUpdatedRows = jdbcConnection().prepareStatement(FINISH_LLM_PID_REGISTRATION_SQL).use { statement ->
+        statement.setString(1, finish.reason ?: finish.status.name)
+        statement.setString(2, finish.invocationId)
+        statement.executeUpdate()
+    }
+    require(pidUpdatedRows == 1) {
+        "LLM PID registration was not found. invocationId=${finish.invocationId}"
+    }
 }
 
 /** claim conditional update と stable rejection classification を同じ transaction で行う。 */

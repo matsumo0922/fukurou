@@ -827,6 +827,17 @@ data class EvaluationExclusionSummaryResponse(
     val infrastructureAffectedTradeCount: Int = 0,
     val infrastructureAttributionMissingCount: Int = 0,
     val infrastructureGaps: List<EvaluationInfrastructureGapResponse> = emptyList(),
+    val populationByEntityType: Map<String, EvaluationPopulationCountsResponse> = emptyMap(),
+    val populationTruncated: Boolean = false,
+)
+
+/** 共通 causal projection の entity type 別件数。 */
+@Serializable
+data class EvaluationPopulationCountsResponse(
+    val total: Int,
+    val eligible: Int,
+    val infrastructureGap: Int,
+    val attributionMissing: Int,
 )
 
 /** root deploy protocol が記録した infrastructure gap response。 */
@@ -847,6 +858,15 @@ private fun EvaluationExclusionSummary.toResponse(): EvaluationExclusionSummaryR
         reasons = reasons,
         infrastructureAffectedTradeCount = infrastructureAffectedTradeCount,
         infrastructureAttributionMissingCount = infrastructureAttributionMissingCount,
+        populationByEntityType = populationByEntityType.mapValues { (_, counts) ->
+            EvaluationPopulationCountsResponse(
+                total = counts.total,
+                eligible = counts.eligible,
+                infrastructureGap = counts.infrastructureGap,
+                attributionMissing = counts.attributionMissing,
+            )
+        },
+        populationTruncated = populationTruncated,
         infrastructureGaps = infrastructureGaps.map { gap ->
             EvaluationInfrastructureGapResponse(
                 id = gap.id,

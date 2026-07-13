@@ -15,7 +15,7 @@ main 更新
   ↓
 GitHub-hosted runner が Docker image を build
   ↓
-GHCR に ghcr.io/matsumo0922/fukurou:<commit-sha> を push
+GHCR に commit tag と immutable image digest を push
   ↓
 NAS の self-hosted runner が固定 script を sudo 実行
   ↓
@@ -49,7 +49,7 @@ runner 割り当て待ち（`queued` 状態）の滞留は `timeout-minutes` の
 | deploy script            | `/usr/local/sbin/deploy-fukurou`           |
 | self-hosted runner name  | `dxp4800plus-fukurou-prod`                 |
 | self-hosted runner label | `fukurou-prod`                             |
-| production image         | `ghcr.io/matsumo0922/fukurou:<commit-sha>` |
+| production image         | `ghcr.io/matsumo0922/fukurou@sha256:<digest>` |
 
 ## NAS 側の初期セットアップ
 
@@ -145,7 +145,14 @@ repository の deploy script を root-owned script として反映する。
 sudo install -m 0755 /srv/fukurou/repo/scripts/deploy/deploy-fukurou /usr/local/sbin/deploy-fukurou
 sudo install -m 0755 /srv/fukurou/repo/scripts/deploy/fukurou-deploy-db /usr/local/libexec/fukurou-deploy-db
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1.sql /usr/local/share/fukurou/deploy-foundation-v1.sql
+sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1-indexes.sql /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
+sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/deploy-capability-catalog-v1.json /usr/local/share/fukurou/deploy-capability-catalog-v1.json
 sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/deploy-public-key.pem /usr/local/share/fukurou/deploy-public-key.pem
+sudo cc -std=c17 -O2 -Wall -Wextra -Werror -I/srv/fukurou/repo/scripts/runtime \
+  /srv/fukurou/repo/scripts/runtime/fukurou-runtime-supervisor.c -lcrypto \
+  -o /usr/local/libexec/fukurou-runtime-supervisor
+sudo chown root:root /usr/local/libexec/fukurou-runtime-supervisor
+sudo chmod 0555 /usr/local/libexec/fukurou-runtime-supervisor
 ```
 
 sudoers template を反映する。
@@ -163,17 +170,21 @@ GitHub Actions の `DEPLOY_SIGNING_PRIVATE_KEY` secret は、repository の `dep
 
 ## release / deploy safety foundation
 
-deploy workflow は candidate SHA/image digest、contract version、cumulative capability/hook set、executor/public-key hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。root executor は署名と全 binding を検証してから global flock を取得する。検証不一致では rollback capture、DB、checkout、compose、candidate namespaceを変更しない。
+deploy workflow は candidate SHA/image digest、contract version、versioned capability catalog、executor/public-key hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。catalog は親hashを指し、既存entryをbyte-identicalに保つ単調なsupersetだけを受理する。削除、再定義、version downgrade、parent forkではmutationを開始しない。
 
-検証後の最初の deploy state mutation は `/srv/fukurou/deploy-state/<deployment-id>/` の rollback bundle capture である。bundle は previous repository SHA、未展開の compose source/hash、running image repo digest、runtime config version/hash、pre-filter値、launch maintenance generationを root-only で保持する。render済み compose、`.env`、credential、key bytesは保持しない。file fsync、atomic rename、parent directory fsyncが完了してから typed operationへ進む。
+検証後の最初の deploy state mutation は `/srv/fukurou/deploy-state/<deployment-id>/` の rollback bundle capture である。bundle は `FRESH` / `PRE_FOUNDATION` / `FOUNDATION_V1`、previous repository SHA、全compose source/hash、configured image reference/image ID/repo digest/revision、runtime config、maintenance tuple、raw fence hash、foundation fingerprint、PID registration summary、installed artifact hash、DB capture時刻をroot-onlyで保持する。render済み compose、`.env`、credential、key bytesは保持しない。
 
-production container の PID 1 は `fukurou-runtime-supervisor` であり、scheduler、manual、ops、standalone、provider CLI起点MCPを同じ serialized spawn socketへ集約する。provider/MCP launcherは executableを直接起動せず、固定 kind、allowlisted environment、標準descriptorを PID 1へ渡す。host `/srv/fukurou/runtime/launch-fence` は container `/var/lib/fukurou/launch-fence` に root-only read-write mountされ、generation/checksum付き fence record はtemp write、file fsync、rename、directory fsyncで更新される。
+LLM reservation は同じ transaction で `SPAWN_RESERVED` registration を作る。PID 1 は child を start gate で停止したまま container instance、PID namespace inode、PID、process start ticks を採取し、`ACTIVE` への exact CAS が成功した場合だけ exec を許可する。provider が起動する MCP も同じ invocation/reservation lineage へ別 role で登録し、完了時は全 role を `TERMINAL` にする。terminal row は24時間経過後に最大1,000件ずつ削除する。registration、DB、process identity の不一致や観測不能は launch socket を閉じたままにする。
+
+production container の PID 1 は `fukurou-runtime-supervisor` であり、全LLM/MCP spawnをserialized socketへ集約する。request はversion、profile、length-prefixed argv/env、FD role bitmap、nonceを持ち、peer UID/GID、fixed executable、option順、path、environment、FD種別を同じprofileとして検証する。reject pathは受信した全FDを閉じる。fence は固定key順のcanonical JSON bytesとSHA-256を共通codecでatomic更新する。
 
 deploy maintenance は durable disable ACK、同generationのDB maintenance commit、active process drainの順で進む。PID 1が利用できない場合は application containerのPID 0を確認してからDB maintenanceへ進む。再開はDB maintenance clear後に同generationのenable ACKを取得する。startup時はDB maintenanceとhost fenceを照合するまでspawnを許可せず、欠損、破損、generation不一致、DB failureではlaunchを閉じたままApplication/opsを起動する。
 
-candidate hookはproduction fenceを開かない。host named keyが署名する15分有効・256-bit nonceの`CANARY_ONLY` tokenをcandidate SHA/image digest/contract hashへ固定し、networkなし、DB credentialなし、read-onlyの同一candidate imageで`FOUNDATION_PREFLIGHT_V1`だけを一度実行する。candidateはproductionと同じcode-owned PID 1を起動し、PID 1はUID 10001のpreflight childだけを起動する。DB、Ktor、scheduler、manual/ops endpointは起動しない。private keyはUID 10001、mode 0400で固定し、root executorだけがcandidate token署名に使う。token auditはhashとissued/consumed/result/revoked時刻だけをrollback stateへ残し、token本体と署名は終了時に削除する。
+candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。production DB credential、endpoint、mutation toolは渡さない。tokenはdurableな`ISSUED`→`CONSUMED`→`REVOKED`の一方向状態を取り、再利用しない。
 
-maintenance intervalはroot DB helperが`infrastructure_gaps`へ直接open/closeする。evaluationはpositionのopenからcloseまでのcausal/exposure intervalと半開gap intervalのintersectionを判定し、affected tradeとattribution不能tradeを母集団件数に残したままstrategy KPIから除外する。APIはgap ID、reason、start/end、open状態、affected/missing件数をadditiveに返す。paper fillを履歴から遡及作成しない。
+maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeは共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類する。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。1,000件超、integrity不整合、timeoutは部分値を返さない。
+
+production cutoverのimage referenceはcandidate digestだけである。commit tagは表示用で、pull、create、health後にconfigured reference、image ID/repo digest、`/revision`を照合する。executorはforward 20分、recovery 5分のabsolute budgetを持ち、TERM/INT/HUP/deadlineでもjournalからrecoveryへ入る。`FRESH` / `PRE_FOUNDATION`は旧serviceを自動再開せず、maintenance/fence/gapを閉じない。
 
 ## NAS image 保持
 

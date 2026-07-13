@@ -135,7 +135,7 @@ npm --prefix web run generate:api
 
 Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy scaffold を用意しています。
 
-production deploy は Ed25519 signed typed bundle、mutation 前 rollback capture、host-durable generation fence、PID 1 spawn authority、DB maintenance/drain、network/DB credentialなしの `CANARY_ONLY` preflight を通過した同一 SHA/image digest だけを切り替えます。`PREFILTER_ACTIVATION_RELEASED=false` は active DB config より優先され、Issue #154 の activation まで pre-filter child を起動しません。
+production deploy は Ed25519 signed typed bundle、parent-hash付きcumulative capability catalog、mutation前rollback capture、canonical fence/PID registration、DB maintenance/drain、isolated Compose `CANARY_ONLY` preflightを通過したimmutable image digestだけを切り替えます。deploy gapはappend-only OPEN/CLOSE factとして残り、6 entity共通のcausal projectionがstrategy KPIからaffected/missing recordを除外します。`PREFILTER_ACTIVATION_RELEASED=false` は active DB config より優先されます。
 
 - `Dockerfile`
 - `docker-compose.yml`

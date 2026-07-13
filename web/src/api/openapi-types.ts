@@ -2399,6 +2399,21 @@ export interface components {
             entryRate?: string | null;
             noTradeRate?: string | null;
         };
+        /** EvaluationInfrastructureGapResponse */
+        EvaluationInfrastructureGapResponse: {
+            id: string;
+            reason: string;
+            startedAt: string;
+            endedAt?: string | null;
+            open: boolean;
+        };
+        /** EvaluationPopulationCountsResponse */
+        EvaluationPopulationCountsResponse: {
+            total: number;
+            eligible: number;
+            infrastructureGap: number;
+            attributionMissing: number;
+        };
         /** EvaluationExclusionSummaryResponse */
         EvaluationExclusionSummaryResponse: {
             orderCount?: number;
@@ -2407,6 +2422,13 @@ export interface components {
             reasons?: {
                 [key: string]: number;
             };
+            infrastructureAffectedTradeCount?: number;
+            infrastructureAttributionMissingCount?: number;
+            infrastructureGaps?: components["schemas"]["EvaluationInfrastructureGapResponse"][];
+            populationByEntityType?: {
+                [key: string]: components["schemas"]["EvaluationPopulationCountsResponse"];
+            };
+            populationTruncated?: boolean;
         };
         /** DeduplicationResponse */
         DeduplicationResponse: {

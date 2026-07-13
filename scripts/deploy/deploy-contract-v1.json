@@ -11,7 +11,7 @@
   "requiredHooks": [
     "FOUNDATION_PREFLIGHT_V1"
   ],
-  "capabilityHash": "84812e517a2d5de63abb713b0846c0a3583f21a6dd22f5d93f9f86fdc4291b6c",
+  "capabilityCatalogHash": "987a243fd8c6a337c69665e34ac8749c1c3c71d23f3e69573b2e79d46bfa45c1",
   "createDirectoryIds": [
     "LAUNCH_FENCE_ROOT"
   ],

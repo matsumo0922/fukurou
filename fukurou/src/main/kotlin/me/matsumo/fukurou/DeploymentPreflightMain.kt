@@ -67,7 +67,7 @@ object DeploymentPreflightMain {
         require(allowedHookIds == listOf("FOUNDATION_PREFLIGHT_V1")) {
             "INVALID_CANARY_HOOK_SET"
         }
-        require(token.getValue("contractHash").jsonPrimitive.content == FOUNDATION_CAPABILITY_HASH) {
+        require(token.getValue("contractHash").jsonPrimitive.content == System.getenv("FUKUROU_CANDIDATE_CATALOG_HASH")) {
             "INVALID_CANARY_CONTRACT_BINDING"
         }
         require(token.getValue("candidateSha").jsonPrimitive.content == System.getenv("FUKUROU_REVISION")) {
@@ -95,7 +95,6 @@ object DeploymentPreflightMain {
     }
 }
 
-private const val FOUNDATION_CAPABILITY_HASH = "84812e517a2d5de63abb713b0846c0a3583f21a6dd22f5d93f9f86fdc4291b6c"
 private const val MAX_TOKEN_LIFETIME_SECONDS = 15 * 60L
 private val IMAGE_DIGEST_PATTERN = Regex("sha256:[0-9a-f]{64}")
 private val NONCE_PATTERN = Regex("[0-9a-f]{64}")

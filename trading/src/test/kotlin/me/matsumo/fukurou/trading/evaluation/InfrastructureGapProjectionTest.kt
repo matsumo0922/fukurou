@@ -9,6 +9,40 @@ import kotlin.test.assertEquals
 /** InfrastructureGapProjection の causal interval contract を検証するテスト。 */
 class InfrastructureGapProjectionTest {
     @Test
+    fun `common projection selects earliest gap as representative without multiplying entity`() {
+        val fact = EvaluationPopulationProjection.project(
+            entityType = "ORDER",
+            entityId = "order-1",
+            interval = EvaluationCausalInterval(
+                Instant.parse("2026-07-13T00:00:00Z"),
+                Instant.parse("2026-07-13T00:30:00Z"),
+            ),
+            gaps = listOf(
+                InfrastructureGap("gap-later", "DEPLOY_MAINTENANCE", Instant.parse("2026-07-13T00:20:00Z"), null),
+                InfrastructureGap("gap-first", "DEPLOY_MAINTENANCE", Instant.parse("2026-07-13T00:10:00Z"), null),
+            ),
+            queryNow = Instant.parse("2026-07-13T01:00:00Z"),
+        )
+
+        assertEquals(EvaluationPopulationStatus.INFRASTRUCTURE_GAP, fact.status)
+        assertEquals("gap-first", fact.representativeGapId)
+    }
+
+    @Test
+    fun `common projection retains missing attribution in population`() {
+        val fact = EvaluationPopulationProjection.project(
+            entityType = "EXECUTION",
+            entityId = "execution-1",
+            interval = null,
+            gaps = emptyList(),
+            queryNow = Instant.parse("2026-07-13T01:00:00Z"),
+        )
+
+        assertEquals(EvaluationPopulationStatus.ATTRIBUTION_MISSING, fact.status)
+        assertEquals(null, fact.representativeGapId)
+    }
+
+    @Test
     fun `position opened before gap and closed after gap remains affected`() {
         val affected = InfrastructureGapProjection.affectedGapIds(
             interval = EvaluationCausalInterval(Instant.parse("2026-07-13T00:00:00Z"), Instant.parse("2026-07-13T00:30:00Z")),

@@ -10,7 +10,8 @@
     "minimumContractVersion",
     "requiredCapabilities",
     "requiredHooks",
-    "capabilityHash",
+    "capabilityCatalog",
+    "capabilityCatalogHash",
     "executorSha256",
     "publicKeySha256",
     "operations"
@@ -22,7 +23,8 @@
     "minimumContractVersion": { "const": 1 },
     "requiredCapabilities": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
     "requiredHooks": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-    "capabilityHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "capabilityCatalog": { "type": "object" },
+    "capabilityCatalogHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "executorSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "publicKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "operations": {

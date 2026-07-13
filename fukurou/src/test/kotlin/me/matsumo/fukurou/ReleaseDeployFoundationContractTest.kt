@@ -33,6 +33,11 @@ class ReleaseDeployFoundationContractTest {
             ),
             contract.getValue("requiredCapabilities").jsonArray.map { it.jsonPrimitive.content }.toSet(),
         )
+        val catalog = Json.parseToJsonElement(
+            Files.readString(root.resolve("scripts/deploy/deploy-capability-catalog-v1.json")),
+        ).jsonObject
+        assertEquals(1, catalog.getValue("catalogVersion").jsonPrimitive.content.toInt())
+        assertTrue(catalog.getValue("operations").jsonArray.size >= 9)
         assertEquals(
             listOf("FOUNDATION_PREFLIGHT_V1"),
             contract.getValue("requiredHooks").jsonArray.map { it.jsonPrimitive.content },
@@ -76,11 +81,29 @@ class ReleaseDeployFoundationContractTest {
         val supervisor = Files.readString(root.resolve("scripts/runtime/fukurou-runtime-supervisor.c"))
 
         assertTrue(executor.contains("--canary-preflight"))
-        assertTrue(executor.contains("--network none"))
-        assertTrue(executor.contains("FUKUROU_CANDIDATE_DIGEST="))
+        assertTrue(executor.contains("docker compose -p"))
+        assertTrue(executor.contains("internal:true"))
+        assertFalse(executor.contains("docker run --rm --read-only --network none"))
+        assertTrue(executor.contains("FUKUROU_CANDIDATE_DIGEST"))
         assertFalse(executor.contains("--entrypoint java"))
         assertTrue(supervisor.contains("run_canary_preflight"))
         assertTrue(supervisor.contains("DeploymentPreflightMain"))
+    }
+
+    @Test
+    fun `foundation uses immutable facts digest cutover and durable recovery`() {
+        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+        val migration = Files.readString(root.resolve("scripts/deploy/sql/deploy-foundation-v1.sql"))
+        val compose = Files.readString(root.resolve("docker-compose.prod.yml"))
+
+        assertTrue(migration.contains("infrastructure_gap_events"))
+        assertFalse(migration.contains("UPDATE infrastructure_gap_events"))
+        assertTrue(migration.contains("llm_pid_registrations"))
+        assertTrue(compose.contains("FUKUROU_IMAGE_REFERENCE"))
+        assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
+        assertTrue(executor.contains("MANUAL_RECOVERY_REQUIRED"))
+        assertTrue(executor.contains("maintenance-cas"))
+        assertTrue(executor.contains("CAPABILITY_CATALOG_PARENT_FORK"))
     }
 }
 

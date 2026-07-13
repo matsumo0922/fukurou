@@ -23,13 +23,17 @@ object LaunchFenceDatabaseProbeMain {
     ): String {
         return DriverManager.getConnection(url, user, password).use { connection ->
             connection.prepareStatement(
-                "SELECT generation, enabled FROM llm_launch_maintenance WHERE singleton = TRUE",
+                """
+                    SELECT maintenance.generation, maintenance.enabled,
+                        (SELECT COUNT(*) FROM llm_pid_registrations WHERE state IN ('SPAWN_RESERVED','ACTIVE')) active_pid_count
+                    FROM llm_launch_maintenance maintenance WHERE maintenance.singleton = TRUE
+                """.trimIndent(),
             ).use { statement ->
                 statement.executeQuery().use { result ->
                     if (result.next()) {
-                        "${result.getLong(1)}|${result.getBoolean(2)}"
+                        "${result.getLong(1)}|${result.getBoolean(2)}|${result.getLong(3)}"
                     } else {
-                        "0|false"
+                        "0|false|0"
                     }
                 }
             }

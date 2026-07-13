@@ -8,39 +8,45 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/random.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 static int fukurou_supervisor_proxy(
-    enum fukurou_launch_kind kind,
+    enum fukurou_launch_profile profile,
     char *const arguments[],
     char *const environment[],
     uint16_t descriptor_count
 ) {
     struct fukurou_launch_header header = {
         .magic = FUKUROU_PROTOCOL_MAGIC,
-        .kind = (uint16_t)kind,
-        .descriptor_count = descriptor_count,
+        .version = FUKUROU_PROTOCOL_VERSION,
+        .header_size = sizeof(struct fukurou_launch_header),
+        .profile = (uint16_t)profile,
+        .fd_role_bitmap = descriptor_count == 3 ? 0x7U : descriptor_count == 5 ? 0x1fU : 0U,
     };
+    if ((descriptor_count != 3 && descriptor_count != 5) || getrandom(header.request_nonce, sizeof(header.request_nonce), 0) != sizeof(header.request_nonce)) return 126;
     char payload[FUKUROU_PROTOCOL_MAX_PAYLOAD];
     size_t payload_size = 0;
     for (size_t index = 0; arguments[index] != NULL; index++) {
         if (index >= FUKUROU_PROTOCOL_MAX_ITEMS) return 126;
-        size_t length = strlen(arguments[index]) + 1;
-        if (payload_size + length > sizeof(payload)) return 126;
-        memcpy(payload + payload_size, arguments[index], length);
-        payload_size += length;
+        size_t length = strlen(arguments[index]);
+        if (length > UINT16_MAX || payload_size + sizeof(uint16_t) + length + 1 > sizeof(payload)) return 126;
+        uint16_t encoded_length = (uint16_t)length;
+        memcpy(payload + payload_size, &encoded_length, sizeof(encoded_length)); payload_size += sizeof(encoded_length);
+        memcpy(payload + payload_size, arguments[index], length + 1); payload_size += length + 1;
         header.argc++;
     }
     for (size_t index = 0; environment[index] != NULL; index++) {
         if (index >= FUKUROU_PROTOCOL_MAX_ITEMS) return 126;
-        size_t length = strlen(environment[index]) + 1;
-        if (payload_size + length > sizeof(payload)) return 126;
-        memcpy(payload + payload_size, environment[index], length);
-        payload_size += length;
+        size_t length = strlen(environment[index]);
+        if (length > UINT16_MAX || payload_size + sizeof(uint16_t) + length + 1 > sizeof(payload)) return 126;
+        uint16_t encoded_length = (uint16_t)length;
+        memcpy(payload + payload_size, &encoded_length, sizeof(encoded_length)); payload_size += sizeof(encoded_length);
+        memcpy(payload + payload_size, environment[index], length + 1); payload_size += length + 1;
         header.envc++;
     }
-    header.payload_size = (uint32_t)payload_size;
+    header.total_length = (uint32_t)(sizeof(header) + payload_size);
 
     int socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (socket_fd < 0) return 126;

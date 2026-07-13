@@ -32,13 +32,13 @@ COPY web ./
 RUN npm run build
 
 FROM debian:bookworm-slim AS launcher-build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY scripts/runtime/*.c ./
 COPY scripts/runtime/*.h ./
 RUN gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-llm-agent-launcher fukurou-llm-agent-launcher.c \
     && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-mcp-launcher fukurou-mcp-launcher.c \
-    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-runtime-supervisor fukurou-runtime-supervisor.c
+    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-runtime-supervisor fukurou-runtime-supervisor.c -lcrypto
 
 # ---- runtime stage: 実行は軽量 JRE のみ ----
 FROM eclipse-temurin:21-jre AS runtime
@@ -46,7 +46,7 @@ WORKDIR /app
 
 # 非 root 実行ユーザを用意する。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libcap2-bin nodejs npm \
+    && apt-get install -y --no-install-recommends ca-certificates curl git libcap2-bin nodejs npm \
     && npm install -g @anthropic-ai/claude-code@2.1.199 @openai/codex@0.142.5 \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \

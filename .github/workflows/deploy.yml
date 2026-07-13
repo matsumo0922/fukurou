@@ -118,6 +118,8 @@ jobs:
           install -d -m 0700 deploy-artifact
           executor_hash="$(sha256sum scripts/deploy/deploy-fukurou | awk '{print $1}')"
           public_key_hash="$(sha256sum scripts/deploy/deploy-public-key.pem | awk '{print $1}')"
+          capability_catalog="$(jq -cS . scripts/deploy/deploy-capability-catalog-v1.json)"
+          catalog_hash="$(printf '%s' "${capability_catalog}" | sha256sum | awk '{print $1}')"
           deployment_id="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           jq -cS -n \
@@ -126,11 +128,13 @@ jobs:
             --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
             --arg executorSha256 "${executor_hash}" \
             --arg publicKeySha256 "${public_key_hash}" \
+            --argjson capabilityCatalog "${capability_catalog}" \
+            --arg capabilityCatalogHash "${catalog_hash}" \
             '{deploymentId:$deploymentId,candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,
               minimumContractVersion:1,
               requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
               requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
-              capabilityHash:"84812e517a2d5de63abb713b0846c0a3583f21a6dd22f5d93f9f86fdc4291b6c",
+              capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
               executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,
               operations:[
                 {capability:"CREATE_DIR_V1",operationId:"LAUNCH_FENCE_ROOT"},

@@ -1324,14 +1324,36 @@ class TradingPersistenceBootstrap(
         )
         exec(
             """
-                CREATE TABLE IF NOT EXISTS infrastructure_gaps (
-                    id UUID PRIMARY KEY,
-                    deployment_id VARCHAR(96) NOT NULL UNIQUE,
+                CREATE TABLE IF NOT EXISTS infrastructure_gap_events (
+                    event_id UUID PRIMARY KEY,
+                    gap_id UUID NOT NULL,
+                    deployment_id VARCHAR(96) NOT NULL,
+                    boundary VARCHAR(5) NOT NULL CHECK (boundary IN ('OPEN', 'CLOSE')),
                     reason VARCHAR(64) NOT NULL,
-                    opened_at TIMESTAMPTZ NOT NULL,
-                    closed_at TIMESTAMPTZ,
+                    occurred_at TIMESTAMPTZ NOT NULL,
                     payload_hash CHAR(64) NOT NULL,
-                    CHECK (closed_at IS NULL OR closed_at >= opened_at)
+                    recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                    UNIQUE (deployment_id, boundary),
+                    UNIQUE (gap_id, boundary)
+                )
+            """.trimIndent(),
+        )
+        exec(
+            """
+                CREATE TABLE IF NOT EXISTS llm_pid_registrations (
+                    registration_id UUID PRIMARY KEY,
+                    invocation_id VARCHAR(128) NOT NULL,
+                    reservation_id UUID NOT NULL,
+                    role VARCHAR(24) NOT NULL,
+                    container_instance_id VARCHAR(96) NOT NULL,
+                    pid_namespace_inode BIGINT,
+                    process_id INTEGER,
+                    process_start_ticks BIGINT,
+                    state VARCHAR(24) NOT NULL,
+                    registered_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                    terminal_at TIMESTAMPTZ,
+                    terminal_reason VARCHAR(64)
                 )
             """.trimIndent(),
         )
