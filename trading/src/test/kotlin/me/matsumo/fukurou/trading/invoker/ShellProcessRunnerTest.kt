@@ -77,6 +77,7 @@ class ShellProcessRunnerTest {
         if (!Files.isExecutable(shellPath)) {
             return@runBlocking
         }
+        if (!canInspectProcessTrees()) return@runBlocking
 
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-test")
         val childPidFile = tempDirectory.resolve("child.pid")
@@ -101,6 +102,7 @@ class ShellProcessRunnerTest {
     fun run_timeoutForceKillsProcessTreeThatIgnoresTerm() = runBlocking {
         val shellPath = Path.of("/bin/sh")
         if (!Files.isExecutable(shellPath)) return@runBlocking
+        if (!canInspectProcessTrees()) return@runBlocking
 
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-term-ignore-test")
         val childPidFile = tempDirectory.resolve("child.pid")
@@ -127,7 +129,6 @@ class ShellProcessRunnerTest {
         if (!Files.isExecutable(shellPath)) {
             return@runBlocking
         }
-
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-cleanup-test")
         val cleanupFile = Files.createTempFile(tempDirectory, "secret-config", ".json")
         val cacheFile = Files.createTempFile(tempDirectory, "codex-cache", ".json")
@@ -161,6 +162,7 @@ class ShellProcessRunnerTest {
         if (!Files.isExecutable(shellPath)) {
             return@runBlocking
         }
+        if (!canInspectProcessTrees()) return@runBlocking
 
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-cancel-test")
         val childPidFile = tempDirectory.resolve("child.pid")
@@ -220,8 +222,26 @@ class ShellProcessRunnerTest {
 
     private fun isProcessAlive(processId: Long): Boolean {
         return runCatching {
-            ProcessHandle.of(processId).map { handle -> handle.isAlive }.orElse(false)
+            ProcessBuilder("/bin/kill", "-0", processId.toString())
+                .redirectErrorStream(true)
+                .start()
+                .also { process -> process.inputStream.close() }
+                .waitFor() == 0
         }.getOrDefault(true)
+    }
+
+    private fun canInspectProcessTrees(): Boolean {
+        val probe = ProcessBuilder("/bin/sleep", "1").start()
+
+        return try {
+            probe.toHandle().descendants().use { descendants -> descendants.toList() }
+            true
+        } catch (_: RuntimeException) {
+            false
+        } finally {
+            probe.destroyForcibly()
+            probe.waitFor()
+        }
     }
 }
 
