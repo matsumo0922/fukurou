@@ -431,9 +431,23 @@ bind_image_reference() {
 }
 
 bind_recovery_image_reference() {
-  local reference
+  local reference digest_reference
   reference="$(jq -er '.runningContainer.configuredImageReference' "${ROLLBACK_STATE_DIR}/state.json")" || return 1
-  [[ -n "${reference}" ]] || reference="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+  if [[ ! "${reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]]; then
+    digest_reference="$(jq -er --arg prefix "${IMAGE_REPOSITORY}@sha256:" '
+      [.runningContainer.repoDigests[]? |
+        select(startswith($prefix)) |
+        select(.[($prefix | length):] | test("^[0-9a-f]{64}$"))] |
+      unique | select(length == 1) | .[0]
+    ' "${ROLLBACK_STATE_DIR}/state.json")" || digest_reference=""
+    if [[ -n "${digest_reference}" ]]; then
+      reference="${digest_reference}"
+    elif [[ -z "${reference}" ]]; then
+      reference="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+    else
+      return 1
+    fi
+  fi
   [[ "${reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || return 1
   bind_image_reference "${reference}"
 }
@@ -605,10 +619,16 @@ rollback_on_error() {
     exit "${exit_code}"
   fi
 
-  local previous_reference current_snapshot
+  local previous_reference previous_revision current_snapshot
   previous_reference="$(jq -er '.runningContainer.configuredImageReference' "${ROLLBACK_STATE_DIR}/state.json")"
+  [[ "${previous_reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || \
+    previous_reference="${FUKUROU_IMAGE_REFERENCE}"
   [[ "${previous_reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || {
     echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_PREVIOUS_DIGEST" >&2; exit "${exit_code}";
+  }
+  previous_revision="$(jq -er '.runningContainer.revision | select(type == "string" and length > 0)' \
+    "${ROLLBACK_STATE_DIR}/state.json")" || {
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_PREVIOUS_REVISION" >&2; exit "${exit_code}";
   }
   current_snapshot="$(timeout 30 "${DB_HELPER}" snapshot)" || { echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_DB" >&2; exit "${exit_code}"; }
   [[ "$(jq -er '.runtimeConfigVersion' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_VERSION}" && \
@@ -622,7 +642,7 @@ rollback_on_error() {
   timeout 120 docker pull "${previous_reference}" >/dev/null || exit "${exit_code}"
   timeout 120 docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d --no-build || exit "${exit_code}"
   [[ "$(timeout 10 docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${previous_reference}" ]] || exit "${exit_code}"
-  [[ "$(timeout 10 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${PREVIOUS_REPO_SHA}" ]] || exit "${exit_code}"
+  [[ "$(timeout 10 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${previous_revision}" ]] || exit "${exit_code}"
   timeout 120 bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done' || exit "${exit_code}"
   timeout 30 "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}" || exit "${exit_code}"
   if ! request_supervisor ENABLE "${TARGET_GENERATION}" >/dev/null; then
@@ -755,7 +775,11 @@ observe_runtime_children() {
 }
 
 write_fence_fallback() {
-  "${SUPERVISOR_BINARY}" --fence-write "$1" "$2"
+  timeout 30 docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges=true \
+    --mount "type=bind,src=${FENCE_ROOT},dst=/var/lib/fukurou/launch-fence" \
+    --entrypoint "${SUPERVISOR_BINARY}" \
+    "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --fence-write "$1" "$2"
 }
 
 journal_state() {
