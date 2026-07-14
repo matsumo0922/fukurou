@@ -40,6 +40,7 @@ data class McpLaunchManifest(
     ),
     val toolSchemaHash: String = McpToolContractCatalog.canonicalSchemaHash(LlmInvocationPhase.valueOf(phase)),
     val submissionSocketPath: String = "/tmp/fukurou-submission.sock",
+    val terminalEvidenceCaptureEnabled: Boolean = false,
 )
 
 /** owner-only manifest を fixed directory へ atomic に発行する。 */
@@ -146,6 +147,7 @@ class McpLaunchManifestWriter(
             effectiveInvocationHash = effectiveInvocationHash,
             toolSchemaHash = McpToolContractCatalog.canonicalSchemaHash(phase),
             submissionSocketPath = submissionSocketPath,
+            terminalEvidenceCaptureEnabled = false,
         )
 
         try {

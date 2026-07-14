@@ -21,6 +21,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.PingRequest
 import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
@@ -51,6 +52,12 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
+import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.Broker
@@ -145,6 +152,109 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
  * MCP server の最小 contract を検証するテスト。
  */
 class FukurouMcpServerTest {
+
+    @Test
+    fun terminalEvidenceCollector_isDisabledByDefault() = runBlocking {
+        val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        )
+
+        callTool(server.createServer(), "get_ticker")
+
+        assertEquals(TerminalToolEvidenceBundleStatus.DISABLED, server.terminalEvidenceSnapshot().status)
+        assertTrue(server.terminalEvidenceSnapshot().entries.isEmpty())
+    }
+
+    @Test
+    fun terminalEvidenceCollector_capturesFinalCanonicalResponseWhenUnitEnabled() = runBlocking {
+        val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(clock = fixedClock()),
+            clock = fixedClock(),
+            terminalEvidenceCaptureEnabled = true,
+        )
+
+        callTool(server.createServer(), "get_ticker")
+        val bundle = server.terminalEvidenceSnapshot()
+        val evidence = bundle.entries.single()
+
+        assertEquals(TerminalToolEvidenceBundleStatus.COMPLETE, bundle.status)
+        assertEquals("get_ticker", evidence.toolName)
+        assertEquals(0, evidence.ordinal)
+        assertEquals(ToolEvidenceSourceTimestampStatus.PRESENT, evidence.sourceTimestampStatus)
+        assertEquals(64, evidence.responseHash.length)
+    }
+
+    @Test
+    fun terminalEvidenceCollector_mapsMalformedTimestampShapesWithoutThrowing() {
+        listOf(
+            buildJsonObject { putJsonObject("sourceTimestamp") { put("nested", true) } },
+            buildJsonObject { put("sourceTimestamp", buildJsonArray { add("invalid") }) },
+        ).forEach { freshness ->
+            val collector = TerminalToolEvidenceCollector(enabled = true)
+            val response = buildJsonObject {
+                putJsonObject("freshness") { freshness.forEach { (key, value) -> put(key, value) } }
+            }
+
+            collector.capture("get_ticker", terminalEvidenceResult(response))
+
+            val evidence = collector.snapshot().entries.single()
+            assertEquals(ToolEvidenceSourceTimestampStatus.INVALID, evidence.sourceTimestampStatus)
+            assertEquals(null, evidence.sourceTimestamp)
+        }
+    }
+
+    @Test
+    fun terminalEvidenceCollector_latchesFailureMatrix() {
+        val unsupported = TerminalToolEvidenceCollector(enabled = true)
+        unsupported.capture("get_ticker", CallToolResult(content = emptyList(), structuredContent = null))
+        assertEquals(TerminalToolEvidenceIncompleteReason.UNSUPPORTED_RESPONSE_SHAPE, unsupported.snapshot().incompleteReason)
+
+        val parity = TerminalToolEvidenceCollector(enabled = true)
+        parity.capture(
+            "get_ticker",
+            CallToolResult(
+                content = listOf(TextContent("{\"value\":2}")),
+                structuredContent = buildJsonObject { put("value", 1) },
+            ),
+        )
+        assertEquals(TerminalToolEvidenceIncompleteReason.UNSUPPORTED_RESPONSE_SHAPE, parity.snapshot().incompleteReason)
+
+        val secret = TerminalToolEvidenceCollector(enabled = true)
+        secret.capture(
+            "get_ticker",
+            terminalEvidenceResult(buildJsonObject { put("api_key", "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH") }),
+        )
+        assertEquals(TerminalToolEvidenceIncompleteReason.SECRET_DETECTED, secret.snapshot().incompleteReason)
+
+        val count = TerminalToolEvidenceCollector(enabled = true)
+        repeat(MAX_TERMINAL_TOOL_EVIDENCE_COUNT + 1) { index ->
+            count.capture("get_ticker", terminalEvidenceResult(buildJsonObject { put("value", index) }))
+        }
+        assertEquals(TerminalToolEvidenceIncompleteReason.COUNT_LIMIT, count.snapshot().incompleteReason)
+
+        val byte = TerminalToolEvidenceCollector(enabled = true)
+        val oversizedValue = "x".repeat(
+            MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES - TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES,
+        )
+        byte.capture("get_ticker", terminalEvidenceResult(buildJsonObject { put("value", oversizedValue) }))
+        assertEquals(TerminalToolEvidenceIncompleteReason.BYTE_LIMIT, byte.snapshot().incompleteReason)
+    }
+
+    @Test
+    fun terminalEvidenceCollector_capturesLimitedNonSubmitAndExcludesTerminalResponses() {
+        val collector = TerminalToolEvidenceCollector(enabled = true)
+        val result = terminalEvidenceResult(buildJsonObject { put("value", 1) })
+
+        collector.capture("get_ticker", result)
+        collector.capture("submit_decision", result)
+        collector.capture("submit_falsification", result)
+
+        assertEquals(listOf("get_ticker"), collector.snapshot().entries.map { evidence -> evidence.toolName })
+    }
 
     @Test
     fun constructor_acceptsInjectedMarketDataSource() {
@@ -1879,6 +1989,7 @@ class McpLaunchBootstrapPolicyTest {
                 canonical.copy(runtimeEnvironment = emptyMap()),
                 canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
                 canonical.copy(systemPromptVersion = ""),
+                canonical.copy(terminalEvidenceCaptureEnabled = true),
             ).forEach { rejected ->
                 assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
             }
@@ -1944,6 +2055,11 @@ private fun decodeBootstrap(manifest: McpLaunchManifest, clock: Clock): McpBoots
     val bytes = kotlinx.serialization.json.Json.encodeToString(manifest).encodeToByteArray()
     return McpLaunchBootstrap.decode(bytes, MCP_TEST_PASSWORD.encodeToByteArray(), clock)
 }
+
+private fun terminalEvidenceResult(response: JsonObject): CallToolResult = CallToolResult(
+    content = listOf(TextContent(response.toString())),
+    structuredContent = response,
+)
 
 /** least-privilege PostgreSQL role と production bootstrap/server path の integration。 */
 class McpDatabaseRoleIntegrationTest {
@@ -2381,6 +2497,7 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
                     (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
                 }
             }
+            assertTerminalEvidenceTablePrivileges(statement)
             assertSqlCount(
                 statement,
                 "SELECT count(*) FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(COALESCE(d.defaclacl, acldefault(d.defaclobjtype, d.defaclrole))) a " +
@@ -2422,6 +2539,28 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
                 assertEquals(false, rows.getBoolean(11))
                 assertEquals(false, rows.getBoolean(12))
             }
+        }
+    }
+}
+
+private val TERMINAL_EVIDENCE_TABLES = listOf(
+    "llm_tool_evidence_activation_boundaries",
+    "llm_tool_evidence",
+    "llm_terminal_evidence_links",
+    "llm_decision_phase_evidence_coverage",
+)
+
+private fun assertTerminalEvidenceTablePrivileges(statement: java.sql.Statement) {
+    TERMINAL_EVIDENCE_TABLES.forEach { table ->
+        statement.executeQuery(
+            "SELECT " +
+                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'INSERT'), " +
+                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'UPDATE'), " +
+                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'DELETE'), " +
+                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'TRUNCATE')",
+        ).use { rows ->
+            assertTrue(rows.next())
+            (1..4).forEach { column -> assertFalse(rows.getBoolean(column), "$table privilege $column") }
         }
     }
 }
@@ -2473,6 +2612,10 @@ private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
                 "VALUES (gen_random_uuid(),'BTC','forbidden-thesis',0.01,0,NULL,NULL)",
             "INSERT INTO dedupe_shadow_observations DEFAULT VALUES",
             "INSERT INTO decision_identity_generation_failures DEFAULT VALUES",
+            "INSERT INTO llm_tool_evidence DEFAULT VALUES",
+            "INSERT INTO llm_terminal_evidence_links DEFAULT VALUES",
+            "INSERT INTO llm_decision_phase_evidence_coverage DEFAULT VALUES",
+            "INSERT INTO llm_tool_evidence_activation_boundaries DEFAULT VALUES",
             "UPDATE opportunity_episodes SET closed_at=closed_at,close_reason=close_reason",
             "SELECT acquire_opportunity_episode_gap_population_token('BTC')",
             "UPDATE mcp_current_evaluation_scope SET account_initial_cash_jpy=account_initial_cash_jpy",

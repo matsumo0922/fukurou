@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.runner
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
@@ -21,6 +22,62 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class LlmDecisionSubmissionGatewayTest {
+    @Test
+    fun `Stage 1 gateway rejects enabled terminal evidence activation`() {
+        val path = Path.of("/tmp/fukurou-gateway-activation-${System.nanoTime()}.sock")
+
+        assertFailsWith<IllegalArgumentException> {
+            LlmDecisionSubmissionGateway.start(
+                socketPath = path,
+                repository = InMemoryDecisionRepository(),
+                invocationId = INVOCATION_ID,
+                phase = LlmInvocationPhase.PROPOSER,
+                phaseManifestId = PHASE_MANIFEST_ID,
+                effectiveInvocationHash = EFFECTIVE_HASH,
+                terminalEvidenceCaptureEnabled = true,
+            )
+        }
+        assertFalse(Files.exists(path))
+    }
+
+    @Test
+    fun `disabled terminal request preserves legacy version and field set`() {
+        val request = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+
+        assertEquals("1", request.getValue("version").toString())
+        assertFalse("terminalEvidence" in request)
+        assertEquals(TerminalToolEvidenceBundle.disabled(), decodeTerminalEvidenceBundle(request, false))
+        assertTrue(gatewayFrameFits(request))
+    }
+
+    @Test
+    fun `enabled terminal request requires version two and evidence field`() {
+        val request = LlmSubmissionGatewayCodec.requestWithTerminalEvidence(
+            operation = OPERATION_SUBMIT_DECISION,
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+            payload = LlmSubmissionGatewayCodec.encodeDecision(decision(DecisionAction.NO_TRADE)),
+            terminalEvidence = TerminalToolEvidenceBundle.disabled(),
+        )
+
+        assertEquals("2", request.getValue("version").toString())
+        assertEquals(TerminalToolEvidenceBundle.disabled(), decodeTerminalEvidenceBundle(request, true))
+        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(request, false) }
+    }
+
+    @Test
+    fun `activation and protocol version mismatch is rejected`() {
+        val legacy = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+        val versionTwoWithoutEvidence = legacy.toMutableMap()
+            .also { request -> request["version"] = JsonPrimitive(2) }
+            .let(::JsonObject)
+
+        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(legacy, true) }
+        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(versionTwoWithoutEvidence, true) }
+    }
+
     @Test
     fun `permission failure closes bound channel and aggregates socket cleanup failure`() {
         val path = Path.of("/tmp/fukurou-gateway-permission-${System.nanoTime()}.sock")
@@ -114,6 +171,31 @@ class LlmDecisionSubmissionGatewayTest {
         assertEquals(DecisionAction.NO_TRADE, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action)
         gateway.close()
         assertFalse(Files.exists(path))
+    }
+
+    @Test
+    fun `terminal evidence extension preserves caller tool evidence ids order and duplicates`() = runBlocking {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-caller-evidence-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val callerIds = listOf("tool-2", "tool-1", "tool-2")
+
+        connect(path).use { channel ->
+            LlmSubmissionGatewayCodec.writeFrame(
+                channel,
+                request(
+                    LlmInvocationPhase.PROPOSER,
+                    decision(DecisionAction.NO_TRADE).copy(toolEvidenceIds = callerIds),
+                ),
+            )
+            LlmSubmissionGatewayCodec.readFrame(channel)
+        }
+
+        assertEquals(
+            callerIds,
+            repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.toolEvidenceIds,
+        )
+        gateway.close()
     }
 
     @Test

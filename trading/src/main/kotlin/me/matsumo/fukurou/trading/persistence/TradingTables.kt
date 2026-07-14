@@ -1123,6 +1123,52 @@ object LlmPhaseObservationsTable : Table("llm_phase_observations") {
     override val primaryKey = PrimaryKey(phaseManifestId)
 }
 
+/** tool evidence capture を有効化した code/schema boundary。Stage 1 は空のままにする。 */
+object LlmToolEvidenceActivationBoundariesTable : Table("llm_tool_evidence_activation_boundaries") {
+    val schemaVersion = integer("schema_version")
+    val activatedAt = long("activated_at")
+    override val primaryKey = PrimaryKey(schemaVersion)
+}
+
+/** terminal bundle 経由で app が保存する canonical tool response。 */
+object LlmToolEvidenceTable : Table("llm_tool_evidence") {
+    val id = uuid("id")
+    val phaseManifestId = reference("phase_manifest_id", LlmPhaseInputManifestsTable.phaseManifestId)
+    val ordinal = integer("ordinal")
+    val toolName = varchar("tool_name", 128)
+    val sourceTimestamp = long("source_timestamp").nullable()
+    val sourceTimestampStatus = varchar("source_timestamp_status", 16)
+    val responseJson = text("response_json")
+    val responseHash = varchar("response_hash", 64)
+    val isError = bool("is_error")
+    val capturedAt = long("captured_at")
+    val state = varchar("state", 32)
+    override val primaryKey = PrimaryKey(id)
+    init {
+        uniqueIndex(phaseManifestId, ordinal)
+    }
+}
+
+/** decision/falsification terminal entity と server-owned evidence UUID の link。 */
+object LlmTerminalEvidenceLinksTable : Table("llm_terminal_evidence_links") {
+    val entityKind = varchar("entity_kind", 16)
+    val entityId = uuid("entity_id")
+    val evidenceId = reference("evidence_id", LlmToolEvidenceTable.id)
+    val ordinal = integer("ordinal")
+    override val primaryKey = PrimaryKey(entityKind, entityId, evidenceId)
+}
+
+/** terminal entity の phase 単位 evidence coverage foundation。 */
+object LlmDecisionPhaseEvidenceCoverageTable : Table("llm_decision_phase_evidence_coverage") {
+    val entityKind = varchar("entity_kind", 16)
+    val entityId = uuid("entity_id")
+    val phaseManifestId = reference("phase_manifest_id", LlmPhaseInputManifestsTable.phaseManifestId)
+    val status = varchar("status", 32)
+    val incompleteReason = varchar("incomplete_reason", 64).nullable()
+    val capturedAt = long("captured_at")
+    override val primaryKey = PrimaryKey(entityKind, entityId, phaseManifestId)
+}
+
 /** identity schema が production 集計対象になった明示 boundary。 */
 object DecisionIdentitySchemaBoundariesTable : Table("decision_identity_schema_boundaries") {
     val schemaVersion = integer("schema_version")

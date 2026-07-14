@@ -35,6 +35,16 @@ import me.matsumo.fukurou.mcp.runtime.mcpErrorResult
 import me.matsumo.fukurou.mcp.runtime.redirectProcessStdoutToStderrForMcpStdio
 import me.matsumo.fukurou.mcp.runtime.runStdioMcpServer
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
+import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidence
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
+import me.matsumo.fukurou.trading.audit.terminalEvidenceSourceTimestamp
+import me.matsumo.fukurou.trading.audit.toTerminalEvidenceCanonicalString
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
@@ -336,6 +346,8 @@ private const val MIN_SIMULATED_TIMEOUT_DELAY_MS = 1L
  */
 private const val MAX_SIMULATED_TIMEOUT_DELAY_MS = 120_000L
 
+private val TERMINAL_SUBMISSION_TOOLS = setOf(SUBMIT_DECISION_TOOL, SUBMIT_FALSIFICATION_TOOL)
+
 /**
  * Tool response の JSON 設定。
  */
@@ -434,6 +446,7 @@ fun main() {
         submissionGatewayClient = LlmDecisionSubmissionGatewayClient.fromConnectedDescriptor(
             bootstrap.submissionGatewayBinding,
         ),
+        terminalEvidenceCaptureEnabled = bootstrap.terminalEvidenceCaptureEnabled,
     ).run()
 }
 
@@ -473,6 +486,7 @@ class FukurouMcpServer(
     private val decisionRunContext: DecisionRunContext = DecisionRunContext.fromEnvironment(),
     private val invocationPhase: LlmInvocationPhase? = null,
     private val submissionGatewayClient: LlmDecisionSubmissionGatewayClient? = null,
+    terminalEvidenceCaptureEnabled: Boolean = false,
     allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
     expiresAt: Instant? = null,
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
@@ -486,8 +500,14 @@ class FukurouMcpServer(
     ),
 ) {
 
+    private val terminalEvidenceCollector = TerminalToolEvidenceCollector(terminalEvidenceCaptureEnabled)
+
     init {
         requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
+        if (terminalEvidenceCaptureEnabled) {
+            toolCallLimiter.bindResultObserver(terminalEvidenceCollector::capture)
+            submissionGatewayClient?.bindTerminalEvidenceProvider(terminalEvidenceCollector::snapshot)
+        }
     }
 
     /**
@@ -507,6 +527,8 @@ class FukurouMcpServer(
 
         return server
     }
+
+    internal fun terminalEvidenceSnapshot(): TerminalToolEvidenceBundle = terminalEvidenceCollector.snapshot()
 
     private fun createMcpServer(): Server {
         return Server(
@@ -614,6 +636,98 @@ class FukurouMcpServer(
     }
 }
 
+/** process-local で finalized response だけを bounded terminal bundle へ集める collector。 */
+internal class TerminalToolEvidenceCollector(enabled: Boolean) {
+    private val entries = mutableListOf<TerminalToolEvidence>()
+    private var status = if (enabled) {
+        TerminalToolEvidenceBundleStatus.COMPLETE
+    } else {
+        TerminalToolEvidenceBundleStatus.DISABLED
+    }
+    private var incompleteReason: TerminalToolEvidenceIncompleteReason? = null
+    private var encodedBytes = 0
+
+    @Synchronized
+    fun capture(toolName: String, result: CallToolResult) {
+        if (status != TerminalToolEvidenceBundleStatus.COMPLETE || toolName in TERMINAL_SUBMISSION_TOOLS) return
+        if (entries.size >= MAX_TERMINAL_TOOL_EVIDENCE_COUNT) {
+            markIncomplete(TerminalToolEvidenceIncompleteReason.COUNT_LIMIT)
+
+            return
+        }
+
+        val entry = createEntry(toolName, result) ?: return
+        val nextBytes = encodedBytes +
+            entry.responseJson.encodeToByteArray().size +
+            TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+        if (nextBytes > MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES) {
+            markIncomplete(TerminalToolEvidenceIncompleteReason.BYTE_LIMIT)
+
+            return
+        }
+
+        entries += entry
+        encodedBytes = nextBytes
+    }
+
+    private fun createEntry(toolName: String, result: CallToolResult): TerminalToolEvidence? {
+        val structuredContent = result.structuredContent ?: run {
+            markIncomplete(TerminalToolEvidenceIncompleteReason.UNSUPPORTED_RESPONSE_SHAPE)
+
+            return null
+        }
+        val responseJson = runCatching { structuredContent.toTerminalEvidenceCanonicalString() }
+            .getOrElse {
+                markIncomplete(TerminalToolEvidenceIncompleteReason.CANONICALIZATION_FAILED)
+
+                return null
+            }
+        val text = (result.content.singleOrNull() as? TextContent)?.text
+        val canonicalText = text?.let { value ->
+            runCatching { Json.parseToJsonElement(value).toTerminalEvidenceCanonicalString() }.getOrNull()
+        }
+        val textMatchesStructuredContent = canonicalText == responseJson
+        if (!textMatchesStructuredContent) {
+            markIncomplete(TerminalToolEvidenceIncompleteReason.UNSUPPORTED_RESPONSE_SHAPE)
+
+            return null
+        }
+        val persistedStringsValid = runCatching {
+            ManifestPersistencePolicy.validatePersistedStrings(toolName, responseJson)
+        }.isSuccess
+        if (!persistedStringsValid) {
+            markIncomplete(TerminalToolEvidenceIncompleteReason.SECRET_DETECTED)
+
+            return null
+        }
+
+        val sourceTimestamp = structuredContent.terminalEvidenceSourceTimestamp()
+        return TerminalToolEvidence(
+            ordinal = entries.size,
+            toolName = toolName,
+            responseJson = responseJson,
+            responseHash = ManifestPersistencePolicy.sha256(responseJson),
+            sourceTimestamp = sourceTimestamp.value,
+            sourceTimestampStatus = sourceTimestamp.status,
+            isError = result.isError == true,
+        )
+    }
+
+    @Synchronized
+    fun snapshot(): TerminalToolEvidenceBundle = TerminalToolEvidenceBundle(
+        status = status,
+        incompleteReason = incompleteReason,
+        entries = entries.toList(),
+    )
+
+    private fun markIncomplete(reason: TerminalToolEvidenceIncompleteReason) {
+        status = TerminalToolEvidenceBundleStatus.INCOMPLETE
+        incompleteReason = reason
+        entries.clear()
+        encodedBytes = 0
+    }
+}
+
 /**
  * GMO Coin market tool を fukurou の audit / no-trade guard 付きで実行する adapter。
  *
@@ -626,6 +740,10 @@ private class AuditedGmoCoinMarketToolExecutor(
     private val toolCallLimiter: McpToolCallLimiter,
     private val clientRole: GmoPublicClientRole,
 ) : GmoCoinMarketToolExecutor {
+    override fun observeResult(toolName: String, result: CallToolResult): CallToolResult {
+        return toolCallLimiter.observeResult(toolName, result)
+    }
+
     override suspend fun <T> execute(
         toolName: String,
         request: CallToolRequest,
@@ -757,10 +875,10 @@ private suspend fun handleLimitedTool(
     val limitError = limitErrorOrNull(context.toolCallLimiter, call, definition.kind)
 
     if (limitError != null) {
-        return limitError
+        return context.toolCallLimiter.observeResult(definition.name, limitError)
     }
 
-    return handler(request, call)
+    return context.toolCallLimiter.observeResult(definition.name, handler(request, call))
 }
 
 private fun limitedToolContext(

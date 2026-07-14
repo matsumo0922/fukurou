@@ -33,6 +33,7 @@ class McpLaunchManifestTest {
         assertEquals("2026-07-12T00:01:00Z", manifest.expiresAt)
         assertEquals(listOf("get_balance", "submit_decision"), manifest.allowedTools)
         assertEquals("v1", manifest.systemPromptVersion)
+        assertFalse(manifest.terminalEvidenceCaptureEnabled)
         assertFalse(content.contains("password", ignoreCase = true))
         assertEquals("rw-------", Files.getPosixFilePermissions(first.path).toPermissionString())
         assertTrue(first.path.parent == second.path.parent)

@@ -15,6 +15,15 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
+import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidence
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
+import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
@@ -104,6 +113,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
@@ -870,6 +880,177 @@ private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
  * Exposed/Postgres 実装の DB 契約を実 Postgres で検証するテスト。
  */
 class PostgresPersistenceIntegrationTest {
+
+    @Test
+    fun terminalEvidenceFoundation_bootstrapsDefaultOffWithoutRows() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 0)
+        }
+    }
+
+    @Test
+    fun terminalEvidenceFoundation_unitEnabledWriteIsAtomicAndAppCanonicalized() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        seedTerminalEvidencePhaseManifest(database)
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val responseJson = "{\"price\":\"100\"}"
+        val evidence = TrustedTerminalToolEvidenceBundle(
+            invocationId = TERMINAL_EVIDENCE_INVOCATION_ID,
+            phaseManifestId = TERMINAL_EVIDENCE_PHASE_MANIFEST_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            captureEnabled = true,
+            bundle = TerminalToolEvidenceBundle(
+                status = TerminalToolEvidenceBundleStatus.COMPLETE,
+                incompleteReason = null,
+                entries = listOf(
+                    TerminalToolEvidence(
+                        ordinal = 0,
+                        toolName = "get_ticker",
+                        responseJson = responseJson,
+                        responseHash = ManifestPersistencePolicy.sha256(responseJson),
+                        sourceTimestamp = null,
+                        sourceTimestampStatus = ToolEvidenceSourceTimestampStatus.MISSING,
+                        isError = false,
+                    ),
+                ),
+            ),
+        )
+
+        repository.submitTerminalDecision(
+            noTradeDecisionSubmission().copy(invocationId = TERMINAL_EVIDENCE_INVOCATION_ID),
+            evidence,
+        ).getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 0)
+        }
+
+        val baseEntry = evidence.bundle.entries.single()
+        val secretJson = "{\"api_key\":\"sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH\"}"
+        val timestampJson = "{\"freshness\":{\"sourceTimestamp\":\"2026-07-14T00:00:00Z\"}}"
+        val oversizedJson = "{\"value\":\"${
+            "x".repeat(MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES - TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES)
+        }\"}"
+        val invalidBundles = listOf(
+            evidence.bundle.copy(version = evidence.bundle.version + 1),
+            evidence.bundle.copy(entries = listOf(baseEntry.copy(version = baseEntry.version + 1))),
+            evidence.bundle.copy(entries = listOf(baseEntry.copy(responseHash = "0".repeat(64)))),
+            evidence.bundle.copy(
+                entries = listOf(
+                    baseEntry.copy(
+                        responseJson = "{\"price\":\"100\",\"ask\":\"101\"}",
+                        responseHash = ManifestPersistencePolicy.sha256("{\"price\":\"100\",\"ask\":\"101\"}"),
+                    ),
+                ),
+            ),
+            evidence.bundle.copy(
+                entries = listOf(
+                    baseEntry.copy(responseJson = secretJson, responseHash = ManifestPersistencePolicy.sha256(secretJson)),
+                ),
+            ),
+            evidence.bundle.copy(
+                entries = List(MAX_TERMINAL_TOOL_EVIDENCE_COUNT + 1) { ordinal -> baseEntry.copy(ordinal = ordinal) },
+            ),
+            evidence.bundle.copy(
+                entries = listOf(
+                    baseEntry.copy(
+                        responseJson = oversizedJson,
+                        responseHash = ManifestPersistencePolicy.sha256(oversizedJson),
+                    ),
+                ),
+            ),
+            evidence.bundle.copy(
+                entries = listOf(
+                    baseEntry.copy(
+                        responseJson = timestampJson,
+                        responseHash = ManifestPersistencePolicy.sha256(timestampJson),
+                    ),
+                ),
+            ),
+        )
+        invalidBundles.forEach { invalidBundle ->
+            assertTrue(
+                repository.submitTerminalDecision(
+                    noTradeDecisionSubmission().copy(invocationId = TERMINAL_EVIDENCE_INVOCATION_ID),
+                    evidence.copy(bundle = invalidBundle),
+                ).isFailure,
+            )
+        }
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+        }
+    }
+
+    @Test
+    fun terminalEvidenceFoundation_falsificationGraphCommitsAndRollsBackAtomically() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        seedTerminalEvidencePhaseManifest(database)
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val intentId =
+            requireNotNull(repository.submitDecision(enterDecisionSubmission()).getOrThrow().tradeIntent?.intentId)
+        val responseJson = "{\"verdictInput\":\"complete\"}"
+        val evidence = TrustedTerminalToolEvidenceBundle(
+            invocationId = TERMINAL_EVIDENCE_INVOCATION_ID,
+            phaseManifestId = TERMINAL_EVIDENCE_FALSIFIER_PHASE_MANIFEST_ID,
+            phase = LlmInvocationPhase.FALSIFIER,
+            captureEnabled = true,
+            bundle = TerminalToolEvidenceBundle(
+                status = TerminalToolEvidenceBundleStatus.COMPLETE,
+                incompleteReason = null,
+                entries = listOf(
+                    TerminalToolEvidence(
+                        ordinal = 0,
+                        toolName = "get_trade_intent",
+                        responseJson = responseJson,
+                        responseHash = ManifestPersistencePolicy.sha256(responseJson),
+                        sourceTimestamp = null,
+                        sourceTimestampStatus = ToolEvidenceSourceTimestampStatus.MISSING,
+                        isError = false,
+                    ),
+                ),
+            ),
+        )
+        val submission = FalsificationSubmission(
+            intentId = intentId,
+            verdict = FalsificationVerdict.REJECTED,
+            llmProvider = "fixture",
+            reasonJa = "反証条件が成立しています。",
+        )
+
+        repository.submitTerminalFalsification(submission, evidence).getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM falsifications", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+        }
+
+        val invalid = evidence.copy(
+            bundle = evidence.bundle.copy(
+                entries = evidence.bundle.entries.map { entry -> entry.copy(responseHash = "0".repeat(64)) },
+            ),
+        )
+        assertTrue(repository.submitTerminalFalsification(submission, invalid).isFailure)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM falsifications", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+        }
+    }
 
     @Test
     fun bootstrap_verify_schema_fails_closed_until_backend_bootstrap_creates_schema() = runPostgresTest {
@@ -12267,6 +12448,34 @@ private fun JdbcTransaction.insertDecisionRunScope(
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
 }
+
+private fun seedTerminalEvidencePhaseManifest(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        executeUpdate(
+            """INSERT INTO llm_invocation_audit_roots (root_id, root_kind, captured_at)
+                VALUES ('terminal-evidence-root', 'DECISION_ATTEMPT', 0)
+            """.trimIndent(),
+        )
+        executeUpdate(
+            """INSERT INTO llm_phase_input_manifests
+                (phase_manifest_id, root_id, invocation_id, phase, effective_invocation_hash, captured_at, manifest_json)
+                VALUES ('$TERMINAL_EVIDENCE_PHASE_MANIFEST_ID', 'terminal-evidence-root',
+                        '$TERMINAL_EVIDENCE_INVOCATION_ID', 'PROPOSER', repeat('a', 64), 0, '{}')
+            """.trimIndent(),
+        )
+        executeUpdate(
+            """INSERT INTO llm_phase_input_manifests
+                (phase_manifest_id, root_id, invocation_id, phase, effective_invocation_hash, captured_at, manifest_json)
+                VALUES ('$TERMINAL_EVIDENCE_FALSIFIER_PHASE_MANIFEST_ID', 'terminal-evidence-root',
+                        '$TERMINAL_EVIDENCE_INVOCATION_ID', 'FALSIFIER', repeat('b', 64), 0, '{}')
+            """.trimIndent(),
+        )
+    }
+}
+
+private const val TERMINAL_EVIDENCE_INVOCATION_ID = "terminal-evidence-run"
+private const val TERMINAL_EVIDENCE_PHASE_MANIFEST_ID = "terminal-evidence-run:PROPOSER"
+private const val TERMINAL_EVIDENCE_FALSIFIER_PHASE_MANIFEST_ID = "terminal-evidence-run:FALSIFIER"
 
 private fun selectReservationReason(database: ExposedDatabase, invocationId: String): String? {
     return exposedTransaction(database) {

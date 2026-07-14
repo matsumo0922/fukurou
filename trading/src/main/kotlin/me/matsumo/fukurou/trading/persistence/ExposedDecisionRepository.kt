@@ -3,8 +3,18 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
+import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
+import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_BUNDLE_VERSION
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_VERSION
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.terminalEvidenceSourceTimestamp
+import me.matsumo.fukurou.trading.audit.toTerminalEvidenceCanonicalString
 import me.matsumo.fukurou.trading.decision.DecisionRecord
-import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
@@ -13,6 +23,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.MAX_TRADE_PLAN_REVISIONS
+import me.matsumo.fukurou.trading.decision.TerminalEvidenceDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradeIntentConsumptionRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
@@ -433,11 +444,12 @@ private val DecisionProtocolJson = Json {
  * @param clock 保存時刻に使う clock
  * @param maxTradePlanRevisions TradePlan 正式修正の上限
  */
+@Suppress("TooManyFunctions")
 class ExposedDecisionRepository(
     private val database: ExposedDatabase,
     private val clock: Clock = Clock.systemUTC(),
     private val maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,
-) : DecisionRepository {
+) : TerminalEvidenceDecisionRepository {
 
     override suspend fun submitDecision(submission: DecisionSubmission): Result<DecisionSubmissionResult> {
         return withContext(Dispatchers.IO) {
@@ -457,6 +469,51 @@ class ExposedDecisionRepository(
             runCatching {
                 exposedTransaction(database) {
                     insertFalsificationSubmission(submission, clock.instant())
+                }
+            }
+        }
+    }
+
+    override suspend fun submitTerminalDecision(
+        submission: DecisionSubmission,
+        evidence: TrustedTerminalToolEvidenceBundle,
+    ): Result<DecisionSubmissionResult> {
+        if (!evidence.captureEnabled) return submitWithoutTerminalEvidence(evidence) { submitDecision(submission) }
+
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    validateTrustedTerminalEvidence(evidence)
+                    submission.entryIntent?.let { intent ->
+                        acquireOpportunityEpisodeGapPopulationToken(intent.symbol.apiSymbol)
+                    }
+                    val now = clock.instant()
+                    val result = insertDecisionSubmission(submission, now, maxTradePlanRevisions)
+                    insertTerminalEvidence("DECISION", result.decision.decisionId, evidence, now)
+
+                    result
+                }
+            }
+        }
+    }
+
+    override suspend fun submitTerminalFalsification(
+        submission: FalsificationSubmission,
+        evidence: TrustedTerminalToolEvidenceBundle,
+    ): Result<FalsificationRecord> {
+        if (!evidence.captureEnabled) {
+            return submitWithoutTerminalEvidence(evidence) { submitFalsification(submission) }
+        }
+
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    validateTrustedTerminalEvidence(evidence)
+                    val now = clock.instant()
+                    val result = insertFalsificationSubmission(submission, now)
+                    insertTerminalEvidence("FALSIFICATION", result.falsificationId, evidence, now)
+
+                    result
                 }
             }
         }
@@ -596,6 +653,122 @@ class ExposedDecisionRepository(
         }
     }
 }
+
+private suspend fun <T> submitWithoutTerminalEvidence(
+    evidence: TrustedTerminalToolEvidenceBundle,
+    submission: suspend () -> Result<T>,
+): Result<T> = runCatching {
+    require(evidence.bundle == TerminalToolEvidenceBundle.disabled()) {
+        "Disabled terminal evidence must use the canonical disabled bundle."
+    }
+
+    submission().getOrThrow()
+}
+
+private fun JdbcTransaction.validateTrustedTerminalEvidence(evidence: TrustedTerminalToolEvidenceBundle) {
+    require(evidence.captureEnabled) { "Terminal evidence capture must be enabled explicitly." }
+    require(evidence.bundle.version == TERMINAL_TOOL_EVIDENCE_BUNDLE_VERSION) {
+        "Terminal evidence bundle version mismatch."
+    }
+    require(evidence.bundle.status == TerminalToolEvidenceBundleStatus.COMPLETE) {
+        "Only complete terminal evidence bundles can be persisted by the Stage 1 foundation."
+    }
+    require(evidence.bundle.incompleteReason == null) { "Complete terminal evidence cannot have an incomplete reason." }
+    require(evidence.bundle.entries.size <= MAX_TERMINAL_TOOL_EVIDENCE_COUNT) {
+        "Terminal evidence count exceeds the canonical limit."
+    }
+    require(evidence.bundle.entries.map { entry -> entry.ordinal } == evidence.bundle.entries.indices.toList()) {
+        "Terminal evidence ordinals must be contiguous."
+    }
+    val totalBytes = evidence.bundle.entries.sumOf { entry ->
+        entry.responseJson.encodeToByteArray().size.toLong() + TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+    }
+    require(totalBytes <= MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES) {
+        "Terminal evidence bytes exceed the canonical limit."
+    }
+    evidence.bundle.entries.forEach { entry ->
+        require(entry.version == TERMINAL_TOOL_EVIDENCE_VERSION) { "Terminal evidence entry version mismatch." }
+        require(entry.toolName !in TERMINAL_EVIDENCE_SUBMISSION_TOOLS) { "Terminal submission responses are not evidence." }
+        val response = Json.parseToJsonElement(entry.responseJson)
+        val canonical = response.toTerminalEvidenceCanonicalString()
+        require(canonical == entry.responseJson) { "Terminal evidence response is not canonical." }
+        require(ManifestPersistencePolicy.sha256(canonical) == entry.responseHash) {
+            "Terminal evidence response hash mismatch."
+        }
+        ManifestPersistencePolicy.validatePersistedStrings(entry.toolName, canonical)
+        val sourceTimestamp = response.terminalEvidenceSourceTimestamp()
+        require(
+            entry.sourceTimestamp == sourceTimestamp.value &&
+                entry.sourceTimestampStatus == sourceTimestamp.status,
+        ) {
+            "Terminal evidence source timestamp mismatch."
+        }
+    }
+    jdbcConnection().prepareStatement(
+        "SELECT invocation_id, phase FROM llm_phase_input_manifests WHERE phase_manifest_id = ?",
+    ).use { statement ->
+        statement.setString(1, evidence.phaseManifestId)
+        statement.executeQuery().use { result ->
+            require(result.next()) { "Terminal evidence phase manifest was not found." }
+            require(result.getString(1) == evidence.invocationId && result.getString(2) == evidence.phase.name) {
+                "Terminal evidence phase binding mismatch."
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.insertTerminalEvidence(
+    entityKind: String,
+    entityId: UUID,
+    evidence: TrustedTerminalToolEvidenceBundle,
+    now: Instant,
+) {
+    evidence.bundle.entries.forEach { entry ->
+        val evidenceId = UUID.randomUUID()
+        jdbcConnection().prepareStatement(
+            """INSERT INTO llm_tool_evidence
+                (id, phase_manifest_id, ordinal, tool_name, source_timestamp, source_timestamp_status,
+                 response_json, response_hash, is_error, captured_at, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'TERMINAL_BUNDLE_CAPTURED')
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, evidenceId)
+            statement.setString(2, evidence.phaseManifestId)
+            statement.setInt(3, entry.ordinal)
+            statement.setString(4, entry.toolName)
+            statement.setObject(5, entry.sourceTimestamp?.toEpochMilli())
+            statement.setString(6, entry.sourceTimestampStatus.name)
+            statement.setString(7, entry.responseJson)
+            statement.setString(8, entry.responseHash)
+            statement.setBoolean(9, entry.isError)
+            statement.setLong(10, now.toEpochMilli())
+            statement.executeUpdate()
+        }
+        jdbcConnection().prepareStatement(
+            "INSERT INTO llm_terminal_evidence_links (entity_kind, entity_id, evidence_id, ordinal) VALUES (?, ?, ?, ?)",
+        ).use { statement ->
+            statement.setString(1, entityKind)
+            statement.setObject(2, entityId)
+            statement.setObject(3, evidenceId)
+            statement.setInt(4, entry.ordinal)
+            statement.executeUpdate()
+        }
+    }
+    jdbcConnection().prepareStatement(
+        """INSERT INTO llm_decision_phase_evidence_coverage
+            (entity_kind, entity_id, phase_manifest_id, status, incomplete_reason, captured_at)
+            VALUES (?, ?, ?, 'TERMINAL_BUNDLE_CAPTURED', NULL, ?)
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setString(1, entityKind)
+        statement.setObject(2, entityId)
+        statement.setString(3, evidence.phaseManifestId)
+        statement.setLong(4, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+}
+
+private val TERMINAL_EVIDENCE_SUBMISSION_TOOLS = setOf("submit_decision", "submit_falsification")
 
 @Suppress("CyclomaticComplexMethod", "LongMethod")
 private fun JdbcTransaction.insertDecisionSubmission(

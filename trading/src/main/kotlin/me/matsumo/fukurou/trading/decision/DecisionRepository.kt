@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.trading.decision
 
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import java.time.Duration
@@ -66,6 +68,53 @@ interface DecisionRepository {
         orderId: UUID?,
         consumedAt: Instant,
     ): Result<TradeIntentConsumptionRecord>
+}
+
+/** terminal evidence と entity を同一 transaction で保存できる repository。 */
+interface TerminalEvidenceDecisionRepository : DecisionRepository {
+    /** trusted terminal bundle と decision entity を同じ repository boundary へ渡す。 */
+    suspend fun submitTerminalDecision(
+        submission: DecisionSubmission,
+        evidence: TrustedTerminalToolEvidenceBundle,
+    ): Result<DecisionSubmissionResult>
+
+    /** trusted terminal bundle と falsification entity を同じ repository boundary へ渡す。 */
+    suspend fun submitTerminalFalsification(
+        submission: FalsificationSubmission,
+        evidence: TrustedTerminalToolEvidenceBundle,
+    ): Result<FalsificationRecord>
+}
+
+/** capture 無効時の互換性を保ちつつ terminal decision を保存する。 */
+suspend fun DecisionRepository.submitTerminalDecision(
+    submission: DecisionSubmission,
+    evidence: TrustedTerminalToolEvidenceBundle,
+): Result<DecisionSubmissionResult> {
+    if (this is TerminalEvidenceDecisionRepository) return submitTerminalDecision(submission, evidence)
+
+    return runCatching {
+        validateDisabledTerminalEvidence(evidence)
+        submitDecision(submission).getOrThrow()
+    }
+}
+
+/** capture 無効時の互換性を保ちつつ terminal falsification を保存する。 */
+suspend fun DecisionRepository.submitTerminalFalsification(
+    submission: FalsificationSubmission,
+    evidence: TrustedTerminalToolEvidenceBundle,
+): Result<FalsificationRecord> {
+    if (this is TerminalEvidenceDecisionRepository) return submitTerminalFalsification(submission, evidence)
+
+    return runCatching {
+        validateDisabledTerminalEvidence(evidence)
+        submitFalsification(submission).getOrThrow()
+    }
+}
+
+private fun validateDisabledTerminalEvidence(evidence: TrustedTerminalToolEvidenceBundle) {
+    require(!evidence.captureEnabled && evidence.bundle == TerminalToolEvidenceBundle.disabled()) {
+        "Enabled terminal evidence requires an atomic repository implementation."
+    }
 }
 
 /**
