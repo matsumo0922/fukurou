@@ -11,12 +11,24 @@ source "${ROOT}/scripts/deploy/deploy-fukurou"
 DEPLOYMENT_ID=fixture
 CANDIDATE_DIGEST="sha256:$(printf '0%.0s' {1..64})"
 CANDIDATE_CATALOG_HASH="$(printf '1%.0s' {1..64})"
+export FUKUROU_IMAGE_TAG="${CANDIDATE_DIGEST}"
+export FUKUROU_PUBLIC_ORIGIN=https://fixture.invalid
+export POSTGRES_DB=fukurou_fixture POSTGRES_USER=fukurou_fixture POSTGRES_PASSWORD=unused
 touch "${SELFTEST_ROOT}/token" "${SELFTEST_ROOT}/signature" "${SELFTEST_ROOT}/public"
+touch "${SELFTEST_ROOT}/canary-mcp-password" "${SELFTEST_ROOT}/canary-enabled"
+CANARY_MCP_PASSWORD_SOURCE="${SELFTEST_ROOT}/canary-mcp-password"
+CANARY_FLAG_SOURCE="${SELFTEST_ROOT}/canary-enabled"
 write_canary_compose \
   "${SELFTEST_ROOT}/token" \
   "${SELFTEST_ROOT}/signature" \
   "${SELFTEST_ROOT}/public" \
   "${SELFTEST_ROOT}/canary.yml"
+write_canary_compose \
+  "${SELFTEST_ROOT}/token" \
+  "${SELFTEST_ROOT}/signature" \
+  "${SELFTEST_ROOT}/public" \
+  "${SELFTEST_ROOT}/process-canary.yml" \
+  '["--canary-preflight","process-artifact"]'
 
 export FUKUROU_IMAGE_REFERENCE="ghcr.io/matsumo0922/fukurou@${CANDIDATE_DIGEST}"
 export FUKUROU_PUBLIC_ORIGIN=https://fixture.invalid
@@ -28,6 +40,19 @@ docker compose --env-file "${ROOT}/.env" -p fukurou-canary-fixture \
 if ! validate_canary_compose_json "${SELFTEST_ROOT}/effective.json"; then
   jq '{serviceKeys:(.services|keys),ktor:.services.ktor,postgresProfile:.services.postgres.profiles,cloudflaredProfile:.services.cloudflared.profiles,networks:.networks}' \
     "${SELFTEST_ROOT}/effective.json" >&2
+  exit 1
+fi
+
+docker compose --env-file "${ROOT}/.env" -p fukurou-canary-process-fixture \
+  -f "${ROOT}/docker-compose.prod.yml" -f "${SELFTEST_ROOT}/process-canary.yml" \
+  config --format json > "${SELFTEST_ROOT}/process-effective.json"
+if ! validate_canary_compose_json "${SELFTEST_ROOT}/process-effective.json"; then
+  echo "canary-compose-selftest: process hook overlay failed validation" >&2
+  exit 1
+fi
+if ! jq -e '(.services.ktor.cap_add | sort) == ["CHOWN","DAC_READ_SEARCH","KILL","SETGID","SETPCAP","SETUID"]' \
+  "${SELFTEST_ROOT}/process-effective.json" >/dev/null; then
+  echo "canary-compose-selftest: process hook did not receive exact six capabilities" >&2
   exit 1
 fi
 

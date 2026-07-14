@@ -39,7 +39,7 @@ class ReleaseDeployFoundationContractTest {
         assertEquals(1, catalog.getValue("catalogVersion").jsonPrimitive.content.toInt())
         assertTrue(catalog.getValue("operations").jsonArray.size >= 9)
         assertEquals(
-            listOf("FOUNDATION_PREFLIGHT_V1"),
+            listOf("PROCESS_ARTIFACT_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1"),
             contract.getValue("requiredHooks").jsonArray.map { it.jsonPrimitive.content },
         )
     }
@@ -88,6 +88,23 @@ class ReleaseDeployFoundationContractTest {
         assertFalse(executor.contains("--entrypoint java"))
         assertTrue(supervisor.contains("run_canary_preflight"))
         assertTrue(supervisor.contains("DeploymentPreflightMain"))
+    }
+
+    @Test
+    fun `stage A process hook and authority rejection precede mutation`() {
+        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+        val main = executor.substringAfter("main() {")
+        assertTrue(main.indexOf("journal_state CAPTURED") < main.indexOf("run_candidate_preflight"))
+        assertTrue(main.indexOf("run_candidate_preflight") < main.indexOf("accept_capability_catalog"))
+        assertTrue(executor.contains("PROCESS_ARTIFACT_PREFLIGHT_V1"))
+        assertTrue(executor.contains("PREMUTATION_REJECTED"))
+        assertTrue(executor.contains("executorMutationCount"))
+        assertTrue(Files.readString(root.resolve("scripts/runtime/fukurou-runtime-supervisor.c")).contains("RESOLVE_BENEATH"))
+        assertTrue(executor.contains("productionRollbackCommands"))
+        assertTrue(executor.contains("CAP_KILL") || Files.readString(root.resolve("docker-compose.prod.yml")).contains("KILL"))
+        assertTrue(Files.readString(root.resolve("scripts/runtime/fukurou-mcp-canary-client.mjs")).contains("mcp_fd_bootstrap_probe"))
+        assertTrue(Files.readString(root.resolve("scripts/runtime/fukurou-mcp-launcher.c")).contains("FUKUROU_CANARY_MCP_FIXTURE"))
+        assertTrue(executor.contains("fukurou_mcp_db_password") && executor.contains("fukurou_canary_enabled"))
     }
 
     @Test

@@ -13,13 +13,14 @@ import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.time.Instant
 import java.util.Base64
+import java.util.concurrent.TimeUnit
 
 /** deploy candidate が production mutation 前に実行する unprivileged foundation preflight。 */
 object DeploymentPreflightMain {
     /** allowlist 済み hook と signed one-shot token だけを実行する。 */
     @JvmStatic
     fun main(args: Array<String>) {
-        require(args.size == 4 && args[0] == "foundation") {
+        require(args.size == 4 && args[0] in setOf("foundation", "process-artifact")) {
             "UNSUPPORTED_DEPLOYMENT_PREFLIGHT"
         }
         val tokenBytes = Files.readAllBytes(Path.of(args[1]))
@@ -36,7 +37,53 @@ object DeploymentPreflightMain {
             "CANARY_PRODUCTION_DATABASE_MOUNTED"
         }
 
+        if (args[0] == "process-artifact") {
+            check(System.getenv("FUKUROU_CANARY_MODE") == "CANARY_ONLY") { "CANARY_MODE_REQUIRED" }
+            check(System.getenv("FUKUROU_CANARY_OUTBOUND") == "0") { "CANARY_OUTBOUND_ENABLED" }
+            check(System.getenv("FUKUROU_CANARY_MUTATIONS") == "0") { "CANARY_MUTATION_ENABLED" }
+            check(System.getenv("FUKUROU_CANARY_NORMAL_LOOP") == "1") { "CANARY_NORMAL_LOOP_REQUIRED" }
+            runProcessArtifactLauncherProbe()
+            println("PROCESS_ARTIFACT_PREFLIGHT_V1 OK")
+            return
+        }
+
         println("FOUNDATION_PREFLIGHT_V1 OK")
+    }
+
+    private fun runProcessArtifactLauncherProbe() {
+        val home = Path.of("/run/fukurou/llm-homes/fukurou-llm-config-canary")
+        Files.createDirectories(home.resolve(".cache"))
+        Files.writeString(home.resolve(".credentials.json"), "{\"token\":\"fixture-auth\"}")
+        Files.writeString(home.resolve("claude-mcp-config-canary.json"), "{}")
+
+        val process = ProcessBuilder(
+            "/usr/local/libexec/fukurou-llm-agent-launcher",
+            "canary",
+            PROCESS_ARTIFACT_MANIFEST_ID,
+            "PROPOSER",
+        ).apply {
+            environment().apply {
+                put("HOME", home.toString())
+                put("CLAUDE_CONFIG_DIR", home.toString())
+                put("XDG_CACHE_HOME", "$home/.cache")
+                put("FUKUROU_INVOCATION_ID", "canary-process-artifact")
+                put("FUKUROU_LLM_PROVIDER", "claude")
+                put("FUKUROU_PROMPT_HASH", "canary-prompt-hash")
+                put("FUKUROU_SYSTEM_PROMPT_VERSION", "canary-system-prompt")
+                put("FUKUROU_MARKET_SNAPSHOT_ID", "canary-snapshot")
+                put("FUKUROU_RUNTIME_CONFIG_VERSION_ID", "canary-config")
+                put("FUKUROU_RUNTIME_CONFIG_HASH", "canary-config-hash")
+                put("FUKUROU_CANARY_MCP_FIXTURE", "1")
+            }
+            redirectError(ProcessBuilder.Redirect.INHERIT)
+            redirectOutput(ProcessBuilder.Redirect.INHERIT)
+        }.start()
+        check(process.waitFor(PROCESS_ARTIFACT_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            "PROCESS_ARTIFACT_LAUNCHER_TIMEOUT"
+        }
+        check(process.exitValue() == 0) { "PROCESS_ARTIFACT_LAUNCHER_FAILED" }
+        home.toFile().deleteRecursively()
     }
 
     internal fun verifySignature(
@@ -68,7 +115,10 @@ object DeploymentPreflightMain {
         }
         val allowedHookIds = token.getValue("allowedHookIds").jsonArray
             .map { element -> element.jsonPrimitive.content }
-        require(allowedHookIds == listOf("FOUNDATION_PREFLIGHT_V1")) {
+        require(
+            allowedHookIds == listOf("FOUNDATION_PREFLIGHT_V1") ||
+                allowedHookIds == listOf("PROCESS_ARTIFACT_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1"),
+        ) {
             "INVALID_CANARY_HOOK_SET"
         }
         require(token.getValue("contractHash").jsonPrimitive.content == environment["FUKUROU_CANDIDATE_CATALOG_HASH"]) {
@@ -101,6 +151,8 @@ object DeploymentPreflightMain {
 }
 
 private const val MAX_TOKEN_LIFETIME_SECONDS = 15 * 60L
+private const val PROCESS_ARTIFACT_PROBE_TIMEOUT_SECONDS = 30L
+private const val PROCESS_ARTIFACT_MANIFEST_ID = "0123456789abcdef0123456789abcdef0123456789abcdef"
 private val IMAGE_DIGEST_PATTERN = Regex("sha256:[0-9a-f]{64}")
 private val NONCE_PATTERN = Regex("[0-9a-f]{64}")
 private val NAMESPACE_PATTERN = Regex("canary-[a-zA-Z0-9._-]{1,96}")

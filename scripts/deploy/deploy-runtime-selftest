@@ -235,11 +235,12 @@ DEPLOYMENT_ID=new-candidate
 recover_unfinished_deployments
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do
   [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK || \
+     "$(tail -n 1 "${journal}" | jq -r '.state')" == PREMUTATION_REJECTED || \
      "$(tail -n 1 "${journal}" | jq -r '.state')" == COMPLETE ]]
   validate_journal_history "${journal}"
 done
 [[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-terminal/journal.jsonl" | jq -r '.state')" == COMPLETE ]]
-[[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" | jq -r '.state')" == PREMUTATION_REJECTED ]]
 [[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-disabled/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
 grep -Fq 'ensure-maintenance 7 fixture-clear' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-enable' "${DB_CALLS}"

@@ -62,11 +62,17 @@ RUN apt-get update \
     && install -d -o root -g root -m 0700 /var/lib/fukurou/launch-fence \
     && install -d -o root -g root -m 0700 /run/secrets
 
-COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-llm-agent-launcher /usr/local/libexec/fukurou-llm-agent-launcher
-COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-mcp-launcher /usr/local/libexec/fukurou-mcp-launcher
+COPY --from=launcher-build --chown=root:root --chmod=0755 /src/fukurou-llm-agent-launcher /usr/local/libexec/fukurou-llm-agent-launcher
+COPY --from=launcher-build --chown=root:root --chmod=0755 /src/fukurou-mcp-launcher /usr/local/libexec/fukurou-mcp-launcher
 COPY --from=launcher-build --chown=root:root --chmod=0555 /src/fukurou-runtime-supervisor /usr/local/libexec/fukurou-runtime-supervisor
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-canary-client.mjs /usr/local/libexec/fukurou-mcp-canary-client.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/validate-llm-launcher-probe.mjs /usr/local/libexec/validate-llm-launcher-probe.mjs
+
+# The only process with the exact six-capability authority is PID1. Launchers
+# are ordinary 0755 proxies and never carry a setuid/setgid bit.
+RUN test "$(stat -c '%a' /usr/local/libexec/fukurou-llm-agent-launcher)" = 755 \
+    && test "$(stat -c '%a' /usr/local/libexec/fukurou-mcp-launcher)" = 755 \
+    && test "$(stat -c '%a' /usr/local/libexec/fukurou-runtime-supervisor)" = 555
 
 # Ktor fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
 COPY --from=build /src/fukurou/build/libs/*-all.jar app.jar

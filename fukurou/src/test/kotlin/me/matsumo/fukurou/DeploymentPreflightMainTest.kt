@@ -49,12 +49,18 @@ class DeploymentPreflightMainTest {
         }
     }
 
-    private fun token(expiresAt: Long): ByteArray = """
+    @Test
+    fun processArtifactHookIsAcceptedBeforeFoundation() {
+        val token = token(expiresAt = 1_900, hooks = listOf("PROCESS_ARTIFACT_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1"))
+        DeploymentPreflightMain.verifyToken(token, tokenEnvironment(), 1_100)
+    }
+
+    private fun token(expiresAt: Long, hooks: List<String> = listOf("FOUNDATION_PREFLIGHT_V1")): ByteArray = """
         {
           "profile":"CANARY_ONLY",
           "namespaceId":"canary-fixture",
           "generation":7,
-          "allowedHookIds":["FOUNDATION_PREFLIGHT_V1"],
+          "allowedHookIds":[${hooks.joinToString(",") { "\"$it\"" }}],
           "candidateSha":"candidate-sha",
           "candidateDigest":"${"sha256:" + "a".repeat(64)}",
           "contractHash":"catalog-hash",

@@ -161,7 +161,8 @@ validate_typed_operation_set() {
     unique_items(.requiredCapabilities) and unique_items(.requiredHooks) and
     unique_items([.operations[].operationId]) and
     contains_all(.requiredCapabilities; baseline_capabilities) and
-    contains_all(.requiredHooks; ["FOUNDATION_PREFLIGHT_V1"]) and
+    contains_all(.requiredHooks; ["PROCESS_ARTIFACT_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"]) and
+    (.requiredHooks | index("PROCESS_ARTIFACT_PREFLIGHT_V1")) < (.requiredHooks | index("FOUNDATION_PREFLIGHT_V1")) and
     contains_all(.operations; baseline_operations) and
     all(.requiredCapabilities[]; . as $capability | any($catalog.builtInCapabilities[]; .capabilityId == $capability)) and
     all(.requiredHooks[]; . as $hook | any($catalog.hooks[]; .hookId == $hook)) and
@@ -492,7 +493,11 @@ capture_rollback_state() {
       runtimeConfigHash:$runtimeConfigHash,preFilterActive:$preFilterActive,
       launchMaintenance:{generation:$generation,enabled:$maintenanceActive,deploymentId:$maintenanceDeploymentId},
       launchFence:{bytesBase64:$fenceBytesBase64,sha256:$fenceSha256},foundationCatalogFingerprint:$foundationCatalogFingerprint,
-      pidRegistrations:$pidRegistrations,installed:{executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,capabilityCatalogHash:$capabilityCatalogHash}}' \
+      pidRegistrations:$pidRegistrations,installed:{executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,capabilityCatalogHash:$capabilityCatalogHash},
+      stableAuthority:{installedCatalogHash:$capabilityCatalogHash,productionFenceHash:$fenceHash,
+        secretInventoryDigest:"",dbMaintenance:{generation:$generation,enabled:$maintenanceActive,deploymentId:$maintenanceDeploymentId},
+        gapState:{deploymentId:$deploymentId,state:"CAPTURED"},applicationPair:{image:$configuredImageReference,compose:$composeHash,revision:$revision},
+        runtimeConfig:{version:$runtimeConfigVersion,hash:$runtimeConfigHash}},executorMutationCount:0}' \
     > "${temporary_dir}/state.json"
   chmod 0600 "${temporary_dir}/state.json"
 
@@ -517,6 +522,16 @@ rollback_on_error() {
   [[ "${RECOVERY_ALREADY_STARTED:-false}" == true ]] || journal_state RECOVERY_STARTED "{\"failedExitCode\":${exit_code}}" || true
   local origin_state
   origin_state="$(recovery_origin_state "${ROLLBACK_STATE_DIR}/journal.jsonl")"
+  if [[ "${origin_state}" == "CAPTURED" ]]; then
+    # Before SAFETY_MUTATION_STARTED there is no production rollback. Revoke
+    # the isolated canary, compare the captured authority, and close a
+    # terminal rejection with an independently recorded mutation count.
+    revoke_active_canary || true
+    terminate_active_external_process_group || true
+    assert_pre_mutation_authority || true
+    journal_state PREMUTATION_REJECTED '{"executorMutationCount":0,"productionRollbackCommands":0}' || true
+    exit "${exit_code}"
+  fi
   if [[ "${origin_state}" != PREPARED && "${origin_state}" != CAPTURED ]]; then
     reassert_recovery_safe_boundary "${origin_state}" || {
       echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_SAFE_BOUNDARY" >&2
@@ -566,6 +581,17 @@ rollback_on_error() {
   fi
   journal_state ROLLED_BACK || true
   exit "${exit_code}"
+}
+
+assert_pre_mutation_authority() {
+  [[ -f "${ROLLBACK_STATE_DIR}/state.json" ]] || return 1
+  local mutation_count
+  mutation_count="$(jq -er '.executorMutationCount // 0' "${ROLLBACK_STATE_DIR}/state.json")"
+  [[ "${mutation_count}" == "0" ]] || return 1
+  local current_snapshot
+  current_snapshot="$(timeout 30 "${DB_HELPER}" snapshot 2>/dev/null)" || return 1
+  [[ "$(jq -er '.runtimeConfigVersion' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_VERSION}" ]] || return 1
+  [[ "$(jq -er '.runtimeConfigHash' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_HASH}" ]] || return 1
 }
 
 reassert_recovery_safe_boundary() {
@@ -726,13 +752,13 @@ journal_transition_allowed() {
     LAUNCHES_DISABLED:CANDIDATE_HEALTHY|\
     CANDIDATE_HEALTHY:DB_MAINTENANCE_CLEARED|DB_MAINTENANCE_CLEARED:ENABLE_ACKED|\
     ENABLE_ACKED:GAP_CLOSED|GAP_CLOSED:COMPLETE|\
-    PREPARED:RECOVERY_STARTED|CAPTURED:RECOVERY_STARTED|SAFETY_MUTATION_STARTED:RECOVERY_STARTED|\
+    CAPTURED:PREMUTATION_REJECTED|PREPARED:RECOVERY_STARTED|CAPTURED:RECOVERY_STARTED|SAFETY_MUTATION_STARTED:RECOVERY_STARTED|\
     LAUNCHES_DISABLED:RECOVERY_STARTED|CANDIDATE_HEALTHY:RECOVERY_STARTED|\
     DB_MAINTENANCE_CLEARED:RECOVERY_STARTED|ENABLE_ACKED:RECOVERY_STARTED|GAP_CLOSED:RECOVERY_STARTED|\
     PREPARED:SIGNAL_RECEIVED|CAPTURED:SIGNAL_RECEIVED|SAFETY_MUTATION_STARTED:SIGNAL_RECEIVED|\
     LAUNCHES_DISABLED:SIGNAL_RECEIVED|CANDIDATE_HEALTHY:SIGNAL_RECEIVED|\
     DB_MAINTENANCE_CLEARED:SIGNAL_RECEIVED|ENABLE_ACKED:SIGNAL_RECEIVED|GAP_CLOSED:SIGNAL_RECEIVED|\
-    SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
+    SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:PREMUTATION_REJECTED|RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -746,7 +772,7 @@ legacy_journal_transition_allowed() {
     DB_MAINTENANCE_CLEARED:RECOVERY_STARTED|ENABLE_ACKED:RECOVERY_STARTED|GAP_CLOSED:RECOVERY_STARTED|\
     CAPTURED:SIGNAL_RECEIVED|LAUNCHES_DISABLED:SIGNAL_RECEIVED|CANDIDATE_HEALTHY:SIGNAL_RECEIVED|\
     DB_MAINTENANCE_CLEARED:SIGNAL_RECEIVED|ENABLE_ACKED:SIGNAL_RECEIVED|GAP_CLOSED:SIGNAL_RECEIVED|\
-    SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
+    SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:PREMUTATION_REJECTED|RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -792,7 +818,7 @@ recover_unfinished_deployments() {
   for journal in "${STATE_ROOT}"/*/journal.jsonl; do
     validate_journal_history "${journal}" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
     last_state="$(tail -n 1 "${journal}" | jq -er '.state')" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
-    [[ "${last_state}" == "COMPLETE" || "${last_state}" == "ROLLED_BACK" || \
+    [[ "${last_state}" == "COMPLETE" || "${last_state}" == "ROLLED_BACK" || "${last_state}" == "PREMUTATION_REJECTED" || \
        "${last_state}" == "MANUAL_RECOVERY_REQUIRED" ]] && continue
 
     state_dir="$(dirname "${journal}")"
@@ -810,8 +836,13 @@ recover_unfinished_deployments() {
     origin_state="$(recovery_origin_state "${journal}")"
     if [[ "${origin_state}" == PREPARED || "${origin_state}" == CAPTURED ]]; then
       journal_state RECOVERY_STARTED '{"reason":"startup-captured"}'
-      timeout 30 git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null
-      journal_state ROLLED_BACK
+      if [[ "${origin_state}" == "CAPTURED" ]]; then
+        revoke_active_canary || true
+        assert_pre_mutation_authority || true
+        journal_state PREMUTATION_REJECTED '{"executorMutationCount":0,"productionRollbackCommands":0}'
+      else
+        journal_state ROLLED_BACK
+      fi
       continue
     fi
     case "${origin_state}" in
@@ -855,6 +886,7 @@ revoke_active_canary() {
     canary_transition "$(tail -n 1 "${audit}" | jq -r '.state')" REVOKED "recovery-revoked"
   fi
   unlink "${ROLLBACK_STATE_DIR}/canary-token.json" "${ROLLBACK_STATE_DIR}/canary-token.sig" 2>/dev/null || true
+  unlink "${CANARY_MCP_PASSWORD_SOURCE:-}" "${CANARY_FLAG_SOURCE:-}" 2>/dev/null || true
   sync -f "${ROLLBACK_STATE_DIR}"
 }
 
@@ -884,30 +916,74 @@ canary_transition() {
 write_canary_compose() {
   local token="$1" signature="$2" public_key="$3" output="$4" entrypoint_json="${5:-[\"--canary-preflight\",\"foundation\"]}"
   local canary_project="fukurou-canary-${DEPLOYMENT_ID}"
-  local command_json
+  local command_json capability_json='["SETGID","SETUID"]' process_artifact=false
+  if [[ "${entrypoint_json}" == *'process-artifact'* ]]; then
+    capability_json='["CHOWN","DAC_READ_SEARCH","SETGID","SETUID","SETPCAP","KILL"]'
+    process_artifact=true
+    [[ -n "${CANARY_MCP_PASSWORD_SOURCE:-}" && -n "${CANARY_FLAG_SOURCE:-}" ]] || fail "CANARY_FIXTURE_PATHS_REQUIRED"
+  fi
   command_json="$(jq -c '. + ["/canary-token.json","/canary-token.sig","/canary-public.pem"]' <<<"${entrypoint_json}")"
   jq -nr --arg containerName "${canary_project}-ktor" --arg token "${token}" --arg signature "${signature}" \
     --arg publicKey "${public_key}" --arg digest "${CANDIDATE_DIGEST}" --arg catalogHash "${CANDIDATE_CATALOG_HASH}" \
-    --arg commandJson "${command_json}" \
+    --arg commandJson "${command_json}" --arg capabilityJson "${capability_json}" \
+    --arg mcpPassword "${CANARY_MCP_PASSWORD_SOURCE:-}" --arg canaryFlag "${CANARY_FLAG_SOURCE:-}" \
+    --argjson processArtifact "${process_artifact}" \
     --argjson entrypoint "${entrypoint_json}" '
       "services:\n  ktor:\n    container_name: \($containerName)\n    restart: \"no\"\n    pids_limit: 64\n    cap_add: !override [SETGID, SETUID]\n    depends_on: !reset {}\n    environment:\n      DB_URL: null\n      DB_USER: null\n      DB_PASSWORD: null\n      FUKUROU_CANDIDATE_DIGEST: \"\($digest)\"\n      FUKUROU_CANDIDATE_CATALOG_HASH: \"\($catalogHash)\"\n    volumes: !override\n      - type: bind\n        source: \($token)\n        target: /canary-token.json\n        read_only: true\n      - type: bind\n        source: \($signature)\n        target: /canary-token.sig\n        read_only: true\n      - type: bind\n        source: \($publicKey)\n        target: /canary-public.pem\n        read_only: true\n    networks: !override [fixture]\n    command: \($commandJson)\n  postgres:\n    profiles: [production-only]\n  cloudflared:\n    profiles: [production-only]\nnetworks:\n  fixture:\n    internal: true\n"' > "${output}"
+  if [[ "${entrypoint_json}" == *'process-artifact'* ]]; then
+    local fixture_overlay="${output}.fixture.$$"
+    awk -v password="${CANARY_MCP_PASSWORD_SOURCE}" -v canary_flag="${CANARY_FLAG_SOURCE}" '
+      /target: \/canary-public.pem/ { print; pending_fixture=1; next }
+      pending_fixture {
+        print
+        if ($0 ~ /read_only: true/) {
+          print "      - type: bind"
+          print "        source: " password
+          print "        target: /run/secrets/fukurou_mcp_db_password"
+          print "        read_only: true"
+          print "      - type: bind"
+          print "        source: " canary_flag
+          print "        target: /run/secrets/fukurou_canary_enabled"
+          print "        read_only: true"
+          pending_fixture=0
+        }
+        next
+      }
+      { print }
+    ' "${output}" > "${fixture_overlay}"
+    mv "${fixture_overlay}" "${output}"
+    if sed --version >/dev/null 2>&1; then
+      sed -i 's/cap_add: !override \[SETGID, SETUID\]/cap_add: !override [CHOWN, DAC_READ_SEARCH, SETGID, SETUID, SETPCAP, KILL]/' "${output}"
+      sed -i '/FUKUROU_CANDIDATE_CATALOG_HASH:/a\      FUKUROU_CANARY_MODE: CANARY_ONLY\n      FUKUROU_CANARY_MUTATIONS: "0"\n      FUKUROU_CANARY_OUTBOUND: "0"\n      FUKUROU_CANARY_NORMAL_LOOP: "1"' "${output}"
+    else
+      sed -i '' 's/cap_add: !override \[SETGID, SETUID\]/cap_add: !override [CHOWN, DAC_READ_SEARCH, SETGID, SETUID, SETPCAP, KILL]/' "${output}"
+      sed -i '' '/FUKUROU_CANDIDATE_CATALOG_HASH:/a\
+      FUKUROU_CANARY_MODE: CANARY_ONLY\
+      FUKUROU_CANARY_MUTATIONS: "0"\
+      FUKUROU_CANARY_OUTBOUND: "0"\
+      FUKUROU_CANARY_NORMAL_LOOP: "1"' "${output}"
+    fi
+  fi
 }
 
 validate_canary_compose_json() {
   jq -e --arg digest "${CANDIDATE_DIGEST}" --arg catalogHash "${CANDIDATE_CATALOG_HASH}" '
+    (.services.ktor.environment.FUKUROU_CANARY_MODE == "CANARY_ONLY") as $processArtifact |
     (.services | keys) == ["ktor"] and
     .services.ktor.read_only == true and .services.ktor.pids_limit == 64 and
     (.services.ktor.depends_on // {}) == {} and
     (.services.ktor.cap_drop | index("ALL")) != null and
-    (.services.ktor.cap_add | sort) == ["SETGID","SETUID"] and
+    ((.services.ktor.cap_add | sort) == ["SETGID","SETUID"] or
+      (.services.ktor.cap_add | sort) == ["CHOWN","DAC_READ_SEARCH","KILL","SETGID","SETPCAP","SETUID"]) and
     ([.services.ktor.environment | to_entries[] | select(.key | startswith("DB_")) | select(.value != null)] | length) == 0 and
     .services.ktor.environment.FUKUROU_CANDIDATE_DIGEST == $digest and
     .services.ktor.environment.FUKUROU_CANDIDATE_CATALOG_HASH == $catalogHash and
     (.services.ktor.networks | keys) == ["fixture"] and
     .networks.fixture.internal == true and
-    (.services.ktor.volumes | length) == 3 and
+    (.services.ktor.volumes | length) == (if $processArtifact then 5 else 3 end) and
     all(.services.ktor.volumes[]; .type == "bind" and .read_only == true and
-      (.target | IN("/canary-token.json","/canary-token.sig","/canary-public.pem")))
+      (.target | IN("/canary-token.json","/canary-token.sig","/canary-public.pem",
+        "/run/secrets/fukurou_mcp_db_password","/run/secrets/fukurou_canary_enabled")))
   ' "$1" >/dev/null
 }
 
@@ -1050,6 +1126,14 @@ run_candidate_preflight() {
   local canary_compose="${ROLLBACK_STATE_DIR}/canary-compose.yml" canary_project="fukurou-canary-${DEPLOYMENT_ID}"
   local result="failure"
   local effective_canary="${ROLLBACK_STATE_DIR}/canary-compose.json"
+  CANARY_MCP_PASSWORD_SOURCE="${ROLLBACK_STATE_DIR}/canary-mcp-db-password"
+  CANARY_FLAG_SOURCE="${ROLLBACK_STATE_DIR}/canary-enabled"
+  printf 'canary-fixture-password\n' > "${CANARY_MCP_PASSWORD_SOURCE}"
+  chown root:root "${CANARY_MCP_PASSWORD_SOURCE}"
+  chmod 0400 "${CANARY_MCP_PASSWORD_SOURCE}"
+  : > "${CANARY_FLAG_SOURCE}"
+  chown root:root "${CANARY_FLAG_SOURCE}"
+  chmod 0400 "${CANARY_FLAG_SOURCE}"
   export FUKUROU_IMAGE_REFERENCE="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
   local hook_entry operation_id entrypoint_json hook_count=0
   while IFS= read -r hook_entry; do
@@ -1063,7 +1147,10 @@ run_candidate_preflight() {
       -f "${COMPOSE_FILE}" -f "${canary_compose}" config --format json > "${effective_canary}" || \
       fail "CANARY_COMPOSE_DERIVATION_FAILED"
     validate_canary_compose_json "${effective_canary}" || fail "CANARY_DENY_OVERLAY_FAILED"
-    timeout 180 docker compose --env-file "${ENV_FILE}" -p "${canary_project}" \
+    local hook_inner_timeout=150 hook_outer_timeout=180
+    [[ "${operation_id}" == "PROCESS_ARTIFACT_PREFLIGHT_V1" ]] || hook_inner_timeout=180
+    export FUKUROU_CANARY_INNER_TIMEOUT="${hook_inner_timeout}"
+    timeout "${hook_outer_timeout}" docker compose --env-file "${ENV_FILE}" -p "${canary_project}" \
       -f "${COMPOSE_FILE}" -f "${canary_compose}" run --rm --no-deps ktor || \
       fail "REQUIRED_HOOK_FAILED:${operation_id}"
     if [[ "${operation_id}" == "FOUNDATION_PREFLIGHT_V1" ]]; then
@@ -1077,7 +1164,7 @@ run_candidate_preflight() {
   timeout 60 docker compose --env-file "${ENV_FILE}" -p "${canary_project}" \
     -f "${COMPOSE_FILE}" -f "${canary_compose}" down --volumes --remove-orphans >/dev/null 2>&1 || result="failure"
   canary_transition CONSUMED REVOKED "${result}"
-  rm -f "${token}" "${signature}"
+  rm -f "${token}" "${signature}" "${CANARY_MCP_PASSWORD_SOURCE}" "${CANARY_FLAG_SOURCE}"
   sync -f "${ROLLBACK_STATE_DIR}"
   [[ "${result}" == "success" ]] || fail "FOUNDATION_PREFLIGHT_FAILED"
 }
@@ -1197,6 +1284,9 @@ main() {
   capture_rollback_state
   journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
   journal_state CAPTURED
+  # Stage A process containment is proven while production remains untouched.
+  run_candidate_preflight
+  check_forward_deadline
   accept_capability_catalog
   check_forward_deadline
   provision_fence_root
@@ -1206,8 +1296,6 @@ main() {
   disable_launches
   check_forward_deadline
   drain_launches
-  check_forward_deadline
-  run_candidate_preflight
   check_forward_deadline
   checkout_deploy_sha
   check_forward_deadline

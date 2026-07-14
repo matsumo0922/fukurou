@@ -135,7 +135,7 @@ jobs:
             '{deploymentId:$deploymentId,candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,
               minimumContractVersion:1,
               requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
-              requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+              requiredHooks:["PROCESS_ARTIFACT_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"],
               capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
               executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,foundationHarnessSha256:$foundationHarnessSha256,
               operations:[
@@ -144,6 +144,7 @@ jobs:
                 {capability:"DB_MIGRATION_V1",operationId:"INSTALL_FOUNDATION_V1"},
                 {capability:"DB_MAINTENANCE_V1",operationId:"SET_LAUNCH_MAINTENANCE"},
                 {capability:"DB_MAINTENANCE_V1",operationId:"OPEN_INFRASTRUCTURE_GAP"},
+                {capability:"SMOKE_HOOK_V1",operationId:"PROCESS_ARTIFACT_PREFLIGHT_V1"},
                 {capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_PREFLIGHT_V1"},
                 {capability:"RUN_COMPOSE_PROJECT_V1",operationId:"PRODUCTION"},
                 {capability:"DB_MAINTENANCE_V1",operationId:"CLOSE_INFRASTRUCTURE_GAP"},

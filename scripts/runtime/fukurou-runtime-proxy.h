@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
+#include <signal.h>
 #include <sys/random.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -18,12 +20,17 @@ static int fukurou_supervisor_proxy(
     char *const environment[],
     uint16_t descriptor_count
 ) {
+    /* A proxy must never outlive the JVM that owns the invocation.  PID1 also
+       watches this response socket and tears down the process group on HUP. */
+    pid_t initial_parent = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != initial_parent) return 125;
     struct fukurou_launch_header header = {
         .magic = FUKUROU_PROTOCOL_MAGIC,
         .version = FUKUROU_PROTOCOL_VERSION,
         .header_size = sizeof(struct fukurou_launch_header),
         .profile = (uint16_t)profile,
         .fd_role_bitmap = descriptor_count == 3 ? 0x7U : descriptor_count == 6 ? 0x3fU : 0U,
+        .request_kind = FUKUROU_REQUEST_LAUNCH,
     };
     if ((descriptor_count != 3 && descriptor_count != 6) || getrandom(header.request_nonce, sizeof(header.request_nonce), 0) != sizeof(header.request_nonce)) return 126;
     char payload[FUKUROU_PROTOCOL_MAX_PAYLOAD];
@@ -83,6 +90,43 @@ static int fukurou_supervisor_proxy(
     } while (received < 0 && errno == EINTR);
     close(socket_fd);
     return received == sizeof(status) ? status : 126;
+}
+
+static int fukurou_supervisor_cleanup_proxy(const char *path) {
+    pid_t initial_parent = getppid();
+    if (path == NULL || prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != initial_parent) return 125;
+    size_t length = strlen(path);
+    if (length == 0 || length >= FUKUROU_PROTOCOL_MAX_PAYLOAD) return 126;
+    struct fukurou_launch_header header = {
+        .magic = FUKUROU_PROTOCOL_MAGIC,
+        .version = FUKUROU_PROTOCOL_VERSION,
+        .header_size = sizeof(struct fukurou_launch_header),
+        .profile = FUKUROU_PROFILE_CLEANUP_V1,
+        .argc = 1,
+        .request_kind = FUKUROU_REQUEST_CLEANUP,
+    };
+    uint16_t encoded_length = (uint16_t)length;
+    if (getrandom(header.request_nonce, sizeof(header.request_nonce), 0) != sizeof(header.request_nonce)) return 126;
+    char payload[sizeof(uint16_t) + FUKUROU_PROTOCOL_MAX_PAYLOAD];
+    memcpy(payload, &encoded_length, sizeof(encoded_length));
+    memcpy(payload + sizeof(encoded_length), path, length + 1);
+    header.total_length = (uint32_t)(sizeof(header) + sizeof(encoded_length) + length + 1);
+    int socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) return 126;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    if (strlen(FUKUROU_LAUNCH_SOCKET) >= sizeof(address.sun_path)) { close(socket_fd); return 126; }
+    strcpy(address.sun_path, FUKUROU_LAUNCH_SOCKET);
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) { close(socket_fd); return 125; }
+    struct iovec vector[2] = {
+        {.iov_base = &header, .iov_len = sizeof(header)},
+        {.iov_base = payload, .iov_len = sizeof(encoded_length) + length + 1},
+    };
+    struct msghdr message = {.msg_iov = vector, .msg_iovlen = 2};
+    int status = 126;
+    if (sendmsg(socket_fd, &message, MSG_NOSIGNAL) != (ssize_t)header.total_length ||
+        recv(socket_fd, &status, sizeof(status), 0) != sizeof(status)) status = 126;
+    close(socket_fd);
+    return status;
 }
 
 #endif

@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { createServer } from "node:http";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createServer as createUnixServer } from "node:net";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 
 const [manifestId, phase, rroAction] = process.argv.slice(2);
 const rroActions = ["NO_TRADE", "EXIT", "REDUCE", "ADJUST_PROTECTION", "ENTER", "ADD_LONG"];
@@ -34,6 +35,21 @@ const fixture = createServer((request, response) => {
   response.end(JSON.stringify(bodies[name] ?? { status: 1 }));
 });
 await new Promise(resolve => fixture.listen(18080, "127.0.0.1", resolve));
+const processFixture = process.env.FUKUROU_CANARY_MCP_FIXTURE === "1";
+let gatewayFixture;
+let fixtureManifestPath;
+let fixtureSocketPath;
+if (processFixture) {
+  fixtureManifestPath = `/run/fukurou/mcp-manifests/${manifestId}.json`;
+  fixtureSocketPath = `/run/fukurou/mcp-manifests/${manifestId}.sock`;
+  writeFileSync(fixtureManifestPath, "{}", { mode: 0o600 });
+  try { unlinkSync(fixtureSocketPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  gatewayFixture = createUnixServer(socket => socket.on("data", () => {}));
+  await new Promise((resolve, reject) => {
+    gatewayFixture.once("error", reject);
+    gatewayFixture.listen(fixtureSocketPath, resolve);
+  });
+}
 
 const child = spawn("/usr/local/libexec/fukurou-mcp-launcher", [manifestId], {
   stdio: ["pipe", "pipe", "pipe"],
@@ -103,6 +119,24 @@ async function call(name, args = {}) {
   if (result.isError) throw new Error(`tool failed: ${name}`);
   process.stdout.write(JSON.stringify({ event: "tool_completed", tool: name }) + "\n");
   return result;
+}
+
+if (processFixture) {
+  await request("initialize", {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "fukurou-process-artifact-canary", version: "1" },
+  });
+  await request("tools/list");
+  child.stdin.end();
+  const exitCode = await new Promise(resolve => child.once("exit", code => resolve(code ?? 1)));
+  if (gatewayFixture) await new Promise(resolve => gatewayFixture.close(resolve));
+  if (fixtureManifestPath) unlinkSync(fixtureManifestPath);
+  if (fixtureSocketPath) unlinkSync(fixtureSocketPath);
+  fixture.close();
+  if (exitCode !== 0) throw new Error(`MCP fixture exited with code ${exitCode}`);
+  process.stdout.write(JSON.stringify({ event: "mcp_fd_bootstrap_probe", fdContract: "3:sealed,4:sealed,5:unix" }) + "\n");
+  process.exit(0);
 }
 
 await request("initialize", {

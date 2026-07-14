@@ -9,6 +9,7 @@
     "SMOKE_HOOK_V1"
   ],
   "requiredHooks": [
+    "PROCESS_ARTIFACT_PREFLIGHT_V1",
     "FOUNDATION_PREFLIGHT_V1"
   ],
   "capabilityCatalogHash": "38f677859d490afcb6f7f2ebdafb304fda2fb2728459b137dddef856cabaf5c7",

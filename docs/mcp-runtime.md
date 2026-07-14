@@ -2,6 +2,22 @@
 
 paper ledger の write は current account epoch、`PAPER_WS_V1` execution semantics、active runtime config hash が揃う場合だけ成功する。decision run の audit hash と current epoch の hash が異なる場合は fail closed とし、config 切替中の lineage 混在を防ぐ。
 
+## PID1 containment
+
+production launcher は通常の `0755` proxy であり、privileged authority は
+code-owned PID1 だけが持つ。PID1 は APP / LLM / MCP UID へ直接切り替え、1
+invocation あたり provider 1 個と MCP 0..1 個を同じ process group で起動し、
+child の capability をすべて落として `no_new_privs=1` を設定する。response
+FD の HUP、parent death、timeout、cancel は group へ `TERM` を 2 秒送り、続く
+1 秒で `KILL` と reap を行う。typed cleanup request は
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` で
+`/run/fukurou/llm-homes` 配下に限定する。
+
+MCP bootstrap の FD contract は固定で、FD 3 / 4 は sealed regular memfd、FD 5
+は connected `AF_UNIX` stream socket とする。PID1 は socket 接続中だけ APP
+filesystem identity を復元し、launcher は root-only password の読込と UID
+transition を行わない。
+
 Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 
 ## 現在の構成
@@ -104,9 +120,9 @@ CLI process 終了後は provider output を semantic response、structured usag
 
 runner が CLI に渡す MCP config は fixed `/usr/local/libexec/fukurou-mcp-launcher` と opaque な manifest ID だけを持つ。DB password、DB env、tool policy は JSON/TOML/argv/agent env に書かない。manifest は `/run/fukurou/mcp-manifests` に `appuser` owner・0600 で atomic に発行し、password を含めず、phase、expiry、canonical allowlist、DB URL/user、run identity、system prompt version、call limitだけを持つ。
 
-production image は Ktor `appuser`（UID 10001）、CLI `llm-agent`（UID 10002）、MCP `mcp-runtime`（UID 10003）を分離する。LLM launcher は唯一の setuid MCP helper を起動する必要があるため `no_new_privs=0` を維持し、effective / permitted / ambient capability は空、core dump と dumpability は無効にする。bounding setにはhelperがroot-only inputをsealed FDへ移してUID/GIDを落とすための`CHOWN`、`DAC_READ_SEARCH`、`SETGID`、`SETUID`、`SETPCAP`だけを残す。MCP launcher は canonical ID、manifest owner/mode/link、root-only password file owner/mode/link、phase-scoped submission socket owner/mode/linkを`openat` / `O_NOFOLLOW` / `lstat`で検証する。manifestをFD 3、read/audit用DB passwordをFD 4、app processへ接続済みのsubmission socketだけをFD 5としてbootstrapへ渡し、FD 6以降を閉じてからUID/GIDを10003へ落とす。PID 1 はFD 3/4をwrite/shrink/grow再封印不可のsealed regular input、FD 5をUnix socketとして順序込みで検証し、regular/socketの入れ替えを拒否する。active / ambient / bounding capabilityを空にして`no_new_privs=1`を設定し、agent に root、Docker socket、root bind mount は与えない。
+production image は Ktor `appuser`（UID 10001）、CLI `llm-agent`（UID 10002）、MCP `mcp-runtime`（UID 10003）を分離する。LLM/MCP launcher は通常の proxy で、setuid/setgid bit と file capability を持たず、PID 1 が root-only input を sealed FD へ移してから child の UID/GID、capability、`no_new_privs=1` を設定する。PID 1 の bounding capability は `CHOWN`、`DAC_READ_SEARCH`、`SETGID`、`SETUID`、`SETPCAP`、`KILL` に限定し、child には残さない。PID 1 は canonical ID、manifest owner/mode/link、root-only password file owner/mode/link、phase-scoped submission socket owner/mode/link を検証し、manifestをFD 3、read/audit用DB passwordをFD 4、app processへ接続済みのsubmission socketだけをFD 5としてbootstrapへ渡す。FD 6以降を閉じ、regular/socketの入れ替えを拒否してから child を起動する。agent に root、Docker socket、root bind mount は与えない。
 
-merge 前の exact-image gate は LLM/MCP の process identity、capability、FD、environment、setuid/setgid/file capability、container runtime socket/mount inventory を検査する。fixed setuid helper 2個に依存する境界自体は human review が必要な残余リスクである。
+merge 前の exact-image gate は LLM/MCP の process identity、capability、FD、environment、setuid/setgid/file capability が空であること、container runtime socket/mount inventory を検査する。PID 1 の限定された authority と process-group cleanup は human review が必要な残余リスクとして記録する。
 
 manifest IDはexpiryまでMCP launcherを再実行できるbearer capabilityである。tool call limiterは`command_event_log`のinitial countを復元してrun budgetを共有するが、複数MCP processが同時にloadしてinsertする間の競合では上限を少数call超える可能性がある。各act toolは同じSafetyFloorとcaller guardを通り、manifestのphase allowlist外のtoolは起動時とcall時の両方で拒否する。
 

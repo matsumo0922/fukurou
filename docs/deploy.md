@@ -6,6 +6,16 @@
 
 Fukurou の最小 Ktor backend を NAS 上で常時稼働させ、Cloudflare Tunnel + Access で公開・保護するための運用手順。
 
+Stage A の process-artifact preflight は signed regular-file snapshot の検証後、
+rollback / stable-authority capture 後、最初の production mutation 前に実行する。
+`PROCESS_ARTIFACT_PREFLIGHT_V1`、続く `FOUNDATION_PREFLIGHT_V1` の両 hook が成功し、
+canary の DB / secret / socket / outbound mutation がゼロである場合だけ
+`SAFETY_MUTATION_STARTED` を記録して pair cutover へ進む。CAPTURED 中の失敗・signal・
+watchdog deadline は canary revoke と外部 process-group cleanup の後に
+`PREMUTATION_REJECTED` へ閉じ、production rollback / overwrite は行わない。
+runtime config drift は result を破棄して新しい deployment ID で再取得し、PID / health /
+restart / PID registration の観測変動は判定入力にしない。
+
 この scaffold では `ktor` + `postgres` + `cloudflared` の 3 サービスを扱う。Ktor backend、paper trading runtime、常駐 `ProtectionReconciler`、MCP stdio fat jar の image 同梱、LlmInvoker、daemon scheduler、Obsidian Writer、Reflection Runner、週次 PromptCandidates 生成まで実装済み。Knowledge note の自動適用と live 実発注は実装しない。
 
 ## 全体像
@@ -409,11 +419,11 @@ role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolb
 
 merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
 
-providerがper-run home内へshared groupから通常削除できないmodeのnested artifactを作成した場合、cleanupはfixed LLM launcherのpath限定cleanup modeへ委譲する。対象は`/run/fukurou/llm-homes`直下にappuserが作成したcanonical per-run homeだけで、validated rootから開いたdirectory FDを基準にsymlinkを追跡せずtreeを削除する。helperは同じreal directory inodeのowner traversal/write権限だけを回復し、regular fileのread mode、symlink target、scope外inodeを変更しない。helperを含むcleanup failureでは`/run/fukurou/llm-homes/.cleanup-quarantine`が残り、manual/daemonの次runはcurrent container process内でfail closedになる。markerとper-run artifactは同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
+providerがper-run home内へshared groupから通常削除できないmodeのnested artifactを作成した場合、cleanupはfixed LLM launcherがPID1へ送るtyped cleanup requestへ委譲する。対象は`/run/fukurou/llm-homes`直下にappuserが作成したcanonical per-run homeだけで、validated rootから開いたdirectory FDを基準にsymlinkを追跡せずtreeを削除する。PID1はownerがapp UIDであることを確認し、scope外inodeやsymlink/traversalを拒否する。cleanup failureでは`/run/fukurou/llm-homes/.cleanup-quarantine`が残り、manual/daemonの次runはcurrent container process内でfail closedになる。markerとper-run artifactは同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
 
 rotation 後は旧 image で LLM phase を再有効化しない。障害時は daemon disabled のまま現 image を維持するか、修正版へ roll-forward する。
 
-この境界はfixed setuid helper 2個とdeployごとのprivilege inventory gateに依存する。merge前にfinal imageでsetuid/setgid、file capability、runtime/root control socket、LLM/MCP process属性のexact checkが通ることを確認する。imageまたはCLIを更新してNode内部FD配置が変わった場合は、差分を監査してから`validate-llm-launcher-probe.mjs`の`liveFds` exact inventoryを更新し、同じfinal imageでcanaryを再実行する。
+この境界は code-owned PID 1 の限定 authority と deploy ごとの privilege inventory gate に依存する。merge 前に final image で launcher の setuid/setgid bit と file capability が空であり、runtime/root control socket が存在せず、LLM/MCP process 属性の exact check が通ることを確認する。image または CLI を更新して Node 内部 FD 配置が変わった場合は、差分を監査してから `validate-llm-launcher-probe.mjs` の `liveFds` exact inventory を更新し、同じ final image で canary を再実行する。
 
 ## Rollback
 

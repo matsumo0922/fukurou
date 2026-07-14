@@ -15,6 +15,12 @@ enum fukurou_launch_profile {
     FUKUROU_PROFILE_CODEX_CURRENT_V1 = 2,
     FUKUROU_PROFILE_FOUNDATION_CANARY_V1 = 3,
     FUKUROU_PROFILE_MCP_CURRENT_V1 = 4,
+    FUKUROU_PROFILE_CLEANUP_V1 = 5,
+};
+
+enum fukurou_request_kind {
+    FUKUROU_REQUEST_LAUNCH = 1,
+    FUKUROU_REQUEST_CLEANUP = 2,
 };
 
 enum fukurou_fd_role {
@@ -34,6 +40,8 @@ struct fukurou_launch_header {
     uint16_t argc;
     uint16_t envc;
     uint16_t fd_role_bitmap;
+    uint16_t request_kind;
+    uint16_t reserved;
     unsigned char request_nonce[FUKUROU_PROTOCOL_NONCE_SIZE];
 };
 

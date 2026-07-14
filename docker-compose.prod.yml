@@ -19,6 +19,7 @@ services:
       - SETGID
       - SETUID
       - SETPCAP
+      - KILL
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,mode=1777
       - /run/fukurou/llm-homes:rw,noexec,nosuid,nodev,mode=2750,uid=10001,gid=10004
@@ -41,6 +42,7 @@ services:
       FUKUROU_MCP_SERVER_COMMAND: /usr/local/libexec/fukurou-mcp-launcher
       FUKUROU_REPOSITORY_ROOT: ${FUKUROU_REPOSITORY_ROOT:-/app}
       FUKUROU_LLM_WORKING_DIRECTORY: ${FUKUROU_LLM_WORKING_DIRECTORY:-/tmp/fukurou-llm}
+      FUKUROU_RUNTIME_PROFILE: PID1_AUTHORITY_V1
       FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}
       FUKUROU_CLAUDE_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher claude
       FUKUROU_CODEX_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher codex

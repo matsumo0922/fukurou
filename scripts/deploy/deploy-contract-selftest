@@ -51,9 +51,9 @@ installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $
 baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
   {minimumContractVersion:1,
    requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],
-   requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+   requiredHooks:["PROCESS_ARTIFACT_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"],
    operations:[$catalog.operations[] |
-     select(.profile=="EXECUTOR_STAGE_V1" or .operationId=="FOUNDATION_PREFLIGHT_V1") |
+     select(.profile=="EXECUTOR_STAGE_V1" or .operationId=="PROCESS_ARTIFACT_PREFLIGHT_V1" or .operationId=="FOUNDATION_PREFLIGHT_V1") |
      {capability:.capabilityId,operationId:.operationId}]}
 ')"
 validate_typed_operation_set "${baseline_bundle}" "${installed_catalog}" || fail_selftest "baseline rejected"
@@ -71,7 +71,7 @@ validate_catalog_extension "${installed_catalog}" "${superset_catalog}" "${insta
 validate_typed_operation_set "${superset_bundle}" "${superset_catalog}" || fail_selftest "superset bundle rejected"
 CANDIDATE_CATALOG="${superset_catalog}"
 SIGNED_BUNDLE_JSON="${superset_bundle}"
-[[ "$(required_operation_plan CANDIDATE_HOOK_V1 | jq -s 'length')" == "2" ]] || fail_selftest "accepted required hook missing from dispatch plan"
+[[ "$(required_operation_plan CANDIDATE_HOOK_V1 | jq -s 'length')" == "3" ]] || fail_selftest "accepted required hook missing from dispatch plan"
 
 deleted_bundle="$(jq -cS '.operations |= map(select(.operationId != "CLEAR_LAUNCH_MAINTENANCE"))' <<<"${baseline_bundle}")"
 expect_rejected bundle-deletion validate_typed_operation_set "${deleted_bundle}" "${installed_catalog}"
@@ -102,7 +102,8 @@ docker() {
     return 0
   fi
   if [[ "$1" == run ]]; then
-    [[ " $* " == *" FOUNDATION_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 foundation "* ]]
+    [[ " $* " == *" PROCESS_ARTIFACT_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 process-artifact "* ||
+      " $* " == *" FOUNDATION_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 foundation "* ]]
     return
   fi
   return 0

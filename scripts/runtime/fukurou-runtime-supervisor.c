@@ -20,7 +20,13 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
+#include <linux/capability.h>
+#include <linux/openat2.h>
+#include <sys/syscall.h>
+#include <sys/fsuid.h>
 #include <unistd.h>
+#include <time.h>
 
 #define APP_UID 10001
 #define APP_GID 10004
@@ -33,6 +39,11 @@
 #define FENCE_FILE FENCE_DIRECTORY "/fence-v1"
 #define FENCE_HASH_FILE FENCE_DIRECTORY "/fence-v1.sha256"
 #define MAX_JOBS 64
+#define PROCESS_TERM_GRACE_SECONDS 2
+#define PROCESS_REAP_GRACE_SECONDS 1
+#define CLEANUP_ROOT "/run/fukurou/llm-homes"
+#define MCP_MANIFEST_DIRECTORY "/run/fukurou/mcp-manifests"
+#define MCP_PASSWORD_FILE "/run/secrets/fukurou_mcp_db_password"
 
 struct launch_request {
     struct fukurou_launch_header header;
@@ -43,7 +54,10 @@ struct launch_request {
 
 struct job {
     pid_t pid;
+    pid_t process_group;
     int response_fd;
+    uint16_t profile;
+    unsigned char invocation_nonce[FUKUROU_PROTOCOL_NONCE_SIZE];
 };
 
 static struct job jobs[MAX_JOBS];
@@ -56,6 +70,10 @@ static int launch_listener = -1;
 
 static int read_database_state(unsigned long long *generation, int *maintenance_enabled, unsigned *active_registrations);
 static int reconcile_database(void);
+static void close_request_descriptors(struct launch_request *request);
+static void accept_launch(int listener);
+static void reap_jobs(void);
+static void reap_orphaned_invocations(void);
 
 static const char *environment_value(char **environment, const char *name) {
     size_t name_length = strlen(name);
@@ -273,6 +291,7 @@ static int receive_request(int fd, struct launch_request *request) {
     if (request->header.magic != FUKUROU_PROTOCOL_MAGIC || request->header.version != FUKUROU_PROTOCOL_VERSION ||
         request->header.header_size != sizeof(request->header) || request->header.total_length > sizeof(request->header) + sizeof(request->payload) ||
         received != (ssize_t)request->header.total_length ||
+        (request->header.request_kind != FUKUROU_REQUEST_LAUNCH && request->header.request_kind != FUKUROU_REQUEST_CLEANUP) ||
         request->header.argc == 0 || request->header.argc > FUKUROU_PROTOCOL_MAX_ITEMS ||
         request->header.envc > FUKUROU_PROTOCOL_MAX_ITEMS || request->descriptor_count > 6 ||
         __builtin_popcount(request->header.fd_role_bitmap) != request->descriptor_count) return -1;
@@ -299,10 +318,11 @@ static int split_payload(struct launch_request *request, char **arguments, char 
 }
 
 static const char *executable_for(uint16_t profile, uid_t peer_uid, gid_t peer_gid) {
-    if (profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 && peer_uid == LLM_UID && peer_gid == LLM_GID) return "/usr/local/bin/claude";
-    if (profile == FUKUROU_PROFILE_CODEX_CURRENT_V1 && peer_uid == LLM_UID && peer_gid == LLM_GID) return "/usr/local/bin/codex";
-    if (profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 && peer_uid == LLM_UID && peer_gid == LLM_GID) return "/usr/bin/node";
-    if (profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && peer_uid == MCP_UID && peer_gid == MCP_GID) return "/opt/java/openjdk/bin/java";
+    int app_peer = peer_uid == APP_UID && peer_gid == APP_GID;
+    if (profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 && (app_peer || (peer_uid == LLM_UID && peer_gid == LLM_GID))) return "/usr/local/bin/claude";
+    if (profile == FUKUROU_PROFILE_CODEX_CURRENT_V1 && (app_peer || (peer_uid == LLM_UID && peer_gid == LLM_GID))) return "/usr/local/bin/codex";
+    if (profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 && (app_peer || (peer_uid == LLM_UID && peer_gid == LLM_GID))) return "/usr/bin/node";
+    if (profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && (app_peer || (peer_uid == MCP_UID && peer_gid == MCP_GID))) return "/opt/java/openjdk/bin/java";
     return NULL;
 }
 
@@ -312,11 +332,15 @@ static int environment_name_allowed(uint16_t profile, const char *entry) {
         "XDG_CACHE_HOME=", "FUKUROU_INVOCATION_ID=", "FUKUROU_LLM_PROVIDER=", "FUKUROU_PROMPT_HASH=",
         "FUKUROU_SYSTEM_PROMPT_VERSION=", "FUKUROU_MARKET_SNAPSHOT_ID=", "FUKUROU_RUNTIME_CONFIG_VERSION_ID=",
         "FUKUROU_RUNTIME_CONFIG_HASH=", "FUKUROU_FALSIFIER_INTENT_ID=", "FUKUROU_CANARY_INTENT_ID=",
+        "FUKUROU_CANARY_MCP_FIXTURE=",
         "FUKUROU_CANARY_LLM_DUMPABLE=", "FUKUROU_CANARY_LLM_CORE_LIMIT=", "FUKUROU_CANARY_LLM_LAUNCH_FDS=",
     };
     if (profile == FUKUROU_PROFILE_MCP_CURRENT_V1) {
         return strcmp(entry, "PATH=/opt/java/openjdk/bin:/usr/bin:/bin") == 0 ||
-            strncmp(entry, "FUKUROU_INVOCATION_ID=", 22) == 0;
+            strncmp(entry, "FUKUROU_INVOCATION_ID=", 22) == 0 ||
+            strncmp(entry, "FUKUROU_MCP_MANIFEST_ID=", 24) == 0 ||
+            strcmp(entry, "FUKUROU_CANARY_MCP_FIXTURE=1") == 0 ||
+            strcmp(entry, "FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME=true") == 0;
     }
     if (strncmp(entry, "HOME=/root", 10) == 0 || strncmp(entry, "CODEX_HOME=/root", 16) == 0 ||
         strncmp(entry, "CLAUDE_CONFIG_DIR=/root", 24) == 0 || strncmp(entry, "TMPDIR=/root", 12) == 0 ||
@@ -450,6 +474,8 @@ static int descriptors_allowed(struct launch_request *request) {
         int mcp_submission_socket = request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 &&
             index == 5 && S_ISSOCK(current.st_mode) &&
             getsockname(request->descriptors[index], (struct sockaddr *)&socket_address, &socket_address_length) == 0 &&
+            socket_address.ss_family == AF_UNIX &&
+            getpeername(request->descriptors[index], (struct sockaddr *)&socket_address, &socket_address_length) == 0 &&
             socket_address.ss_family == AF_UNIX;
         int type_allowed = standard_descriptor || mcp_sealed_input || mcp_submission_socket;
         if (!type_allowed) return 0;
@@ -460,6 +486,63 @@ static int descriptors_allowed(struct launch_request *request) {
         }
     }
     return 1;
+}
+
+static int prepare_mcp_bootstrap(struct launch_request *request, char **environment) {
+    if (request->header.profile != FUKUROU_PROFILE_MCP_CURRENT_V1 ||
+        (request->descriptor_count != 0 && request->descriptor_count != 3)) return 0;
+    if (request->descriptor_count == 6) return 0;
+    const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
+    const char *manifest_id = environment_value(environment, "FUKUROU_MCP_MANIFEST_ID");
+    if (invocation_id == NULL || manifest_id == NULL || strlen(invocation_id) > 128 || strlen(manifest_id) != 48) return -1;
+    char manifest_path[256], socket_path[256];
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/%s.json", MCP_MANIFEST_DIRECTORY, manifest_id) >= (int)sizeof(manifest_path) ||
+        snprintf(socket_path, sizeof(socket_path), "%s/%s.sock", MCP_MANIFEST_DIRECTORY, manifest_id) >= (int)sizeof(socket_path)) return -1;
+    int manifest = open(manifest_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int password = open(MCP_PASSWORD_FILE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (manifest < 0 || password < 0) { if (manifest >= 0) close(manifest); if (password >= 0) close(password); return -1; }
+    struct stat manifest_metadata, password_metadata;
+    if (fstat(manifest, &manifest_metadata) != 0 || fstat(password, &password_metadata) != 0 ||
+        !S_ISREG(manifest_metadata.st_mode) || manifest_metadata.st_uid != APP_UID || (manifest_metadata.st_mode & 0777) != 0600 ||
+        !S_ISREG(password_metadata.st_mode) || password_metadata.st_uid != 0 || (password_metadata.st_mode & 0777) != 0400) {
+        close(manifest); close(password); return -1;
+    }
+    int manifest_memfd = memfd_create("fukurou-mcp-manifest", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int password_memfd = memfd_create("fukurou-mcp-password", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (manifest_memfd < 0 || password_memfd < 0) { close(manifest); close(password); if (manifest_memfd >= 0) close(manifest_memfd); if (password_memfd >= 0) close(password_memfd); return -1; }
+    char buffer[4096];
+    for (int source_index = 0; source_index < 2; source_index++) {
+        int source = source_index == 0 ? manifest : password;
+        int target = source_index == 0 ? manifest_memfd : password_memfd;
+        ssize_t count;
+        while ((count = read(source, buffer, sizeof(buffer))) > 0) if (write(target, buffer, (size_t)count) != count) count = -1;
+        if (count < 0 || lseek(target, 0, SEEK_SET) < 0 || fcntl(target, F_ADD_SEALS,
+            F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+            close(manifest); close(password); close(manifest_memfd); close(password_memfd); return -1;
+        }
+    }
+    close(manifest); close(password);
+    int submission = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (submission < 0) { close(manifest_memfd); close(password_memfd); return -1; }
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    if (strlen(socket_path) >= sizeof(address.sun_path)) { close(submission); close(manifest_memfd); close(password_memfd); return -1; }
+    strcpy(address.sun_path, socket_path);
+    uid_t old_fsuid = setfsuid(APP_UID);
+    int connect_status = connect(submission, (struct sockaddr *)&address, sizeof(address));
+    setfsuid(old_fsuid);
+    if (connect_status != 0) { close(submission); close(manifest_memfd); close(password_memfd); return -1; }
+    if (request->descriptor_count == 0) {
+        request->descriptors[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        request->descriptors[1] = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        request->descriptors[2] = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    }
+    request->descriptors[3] = manifest_memfd;
+    request->descriptors[4] = password_memfd;
+    request->descriptors[5] = submission;
+    request->descriptor_count = 6;
+    request->header.fd_role_bitmap = 0x3fU;
+    for (size_t index = 0; index < 3; index++) if (request->descriptors[index] < 0) { close_request_descriptors(request); return -1; }
+    return descriptors_allowed(request) ? 0 : -1;
 }
 
 static int environment_entries_allowed(uint16_t profile, char **environment, uint16_t environment_count) {
@@ -476,9 +559,12 @@ static int environment_entries_allowed(uint16_t profile, char **environment, uin
     const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
     if (!canonical_identifier(invocation_id == NULL ? "" : invocation_id, 128)) return 0;
     if (profile == FUKUROU_PROFILE_MCP_CURRENT_V1) {
-        return environment_count == 2 &&
+        int fixture_environment = environment_count == 5 && strcmp(environment[3], "FUKUROU_CANARY_MCP_FIXTURE=1") == 0 &&
+            strcmp(environment[4], "FUKUROU_MCP_TEST_IN_MEMORY_RUNTIME=true") == 0;
+        return (environment_count == 3 || fixture_environment) &&
             strcmp(environment[0], "PATH=/opt/java/openjdk/bin:/usr/bin:/bin") == 0 &&
-            strncmp(environment[1], "FUKUROU_INVOCATION_ID=", 22) == 0;
+            strncmp(environment[1], "FUKUROU_INVOCATION_ID=", 22) == 0 &&
+            strncmp(environment[2], "FUKUROU_MCP_MANIFEST_ID=", 24) == 0;
     }
     const char *path = environment_value(environment, "PATH");
     const char *lang = environment_value(environment, "LANG");
@@ -556,6 +642,11 @@ static int canary_arguments_allowed(struct launch_request *request, char **argum
 }
 
 static int request_shape_allowed(struct launch_request *request, char **arguments, char **environment) {
+    if (request->header.request_kind == FUKUROU_REQUEST_CLEANUP) {
+        return request->header.profile == FUKUROU_PROFILE_CLEANUP_V1 &&
+            request->header.argc == 1 && request->header.envc == 0 &&
+            request->descriptor_count == 0 && canonical_run_directory(arguments[0], "fukurou-");
+    }
     if ((request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request->header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) &&
         request->header.fd_role_bitmap == 0x7U &&
         strcmp(arguments[0], request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? "claude" : "codex") == 0) {
@@ -564,17 +655,98 @@ static int request_shape_allowed(struct launch_request *request, char **argument
         canary_arguments_allowed(request, arguments) &&
         canary_environment_allowed(arguments, environment)) {
         /* Exact signed fixture profile is accepted. */
-    } else if (request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && request->header.fd_role_bitmap == 0x3fU &&
-        request->header.argc == 5 && strcmp(arguments[0], "java") == 0 &&
-        strcmp(arguments[1], "--add-opens=java.base/java.io=ALL-UNNAMED") == 0 &&
-        strcmp(arguments[2], "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED") == 0 &&
-        strcmp(arguments[3], "-jar") == 0 && strcmp(arguments[4], "/app/fukurou-mcp-all.jar") == 0) {
+    } else if (request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 &&
+        (request->header.fd_role_bitmap == 0U || request->header.fd_role_bitmap == 0x7U || request->header.fd_role_bitmap == 0x3fU) &&
+        request->header.argc >= 5 && request->header.argc <= 6 && strcmp(arguments[0], "java") == 0 &&
+        ((request->header.argc == 5 && environment_value(environment, "FUKUROU_CANARY_MCP_FIXTURE") == NULL) ||
+            (request->header.argc == 6 && strcmp(arguments[1], "-Dfukurou.mcp.testInMemoryRuntime=true") == 0 &&
+                environment_value(environment, "FUKUROU_CANARY_MCP_FIXTURE") != NULL &&
+                strcmp(environment_value(environment, "FUKUROU_CANARY_MCP_FIXTURE"), "1") == 0)) &&
+        strcmp(arguments[request->header.argc == 5 ? 1 : 2], "--add-opens=java.base/java.io=ALL-UNNAMED") == 0 &&
+        strcmp(arguments[request->header.argc == 5 ? 2 : 3], "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED") == 0 &&
+        strcmp(arguments[request->header.argc == 5 ? 3 : 4], "-jar") == 0 &&
+        strcmp(arguments[request->header.argc == 5 ? 4 : 5], "/app/fukurou-mcp-all.jar") == 0) {
         /* MCP has a fixed argv contract. */
     } else {
         return 0;
     }
     if (!environment_entries_allowed(request->header.profile, environment, request->header.envc)) return 0;
     return descriptors_allowed(request);
+}
+
+static int drop_child_privileges(uid_t uid, gid_t gid) {
+    if (setgroups(0, NULL) != 0 || setresgid(gid, gid, gid) != 0 || setresuid(uid, uid, uid) != 0) return -1;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) return -1;
+    for (int capability = 0; capability <= CAP_LAST_CAP; capability++) {
+        if (prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0 && errno != EINVAL && errno != EPERM) return -1;
+    }
+    struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    struct __user_cap_data_struct data[2] = {{0, 0, 0}, {0, 0, 0}};
+    if (syscall(SYS_capset, &header, data) != 0 && errno != EPERM) return -1;
+    return 0;
+}
+
+static int open_contained_directory(const char *path) {
+    size_t root_length = strlen(CLEANUP_ROOT);
+    if (strncmp(path, CLEANUP_ROOT "/", root_length + 1) != 0 || strstr(path + root_length + 1, "..") != NULL) return -1;
+    int root_fd = open(CLEANUP_ROOT, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (root_fd < 0) return -1;
+    struct open_how how = {
+        .flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    int fd = (int)syscall(SYS_openat2, root_fd, path + root_length + 1, &how, sizeof(how));
+    close(root_fd);
+    return fd;
+}
+
+static int remove_contained_tree(int directory_fd) {
+    DIR *directory = fdopendir(dup(directory_fd));
+    if (directory == NULL) return -1;
+    struct dirent *entry;
+    int result = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        struct stat metadata;
+        if (fstatat(directory_fd, entry->d_name, &metadata, AT_SYMLINK_NOFOLLOW) != 0) { result = -1; break; }
+        if (S_ISDIR(metadata.st_mode)) {
+            int child = openat(directory_fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child < 0 || remove_contained_tree(child) != 0 || (child >= 0 && close(child) != 0) ||
+                unlinkat(directory_fd, entry->d_name, AT_REMOVEDIR) != 0) { if (child >= 0) close(child); result = -1; break; }
+        } else if (unlinkat(directory_fd, entry->d_name, 0) != 0) { result = -1; break; }
+    }
+    closedir(directory);
+    return result;
+}
+
+static int cleanup_contained_path(const char *path) {
+    int fd = open_contained_directory(path);
+    if (fd < 0) return 125;
+    struct stat metadata;
+    int result = fstat(fd, &metadata) == 0 && S_ISDIR(metadata.st_mode) &&
+        metadata.st_uid == APP_UID && metadata.st_gid == LLM_GID && remove_contained_tree(fd) == 0;
+    close(fd);
+    if (!result) return 125;
+    size_t root_length = strlen(CLEANUP_ROOT);
+    int root_fd = open(CLEANUP_ROOT, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (root_fd < 0) return 125;
+    int unlink_result = unlinkat(root_fd, path + root_length + 1, AT_REMOVEDIR);
+    close(root_fd);
+    return unlink_result == 0 || errno == ENOENT ? 0 : 125;
+}
+
+static void terminate_job(struct job *job) {
+    if (job->pid == 0) return;
+    pid_t target = job->process_group > 0 ? -job->process_group : job->pid;
+    kill(target, SIGTERM);
+    unsigned long long deadline = (unsigned long long)time(NULL) + PROCESS_TERM_GRACE_SECONDS;
+    while (time(NULL) < (time_t)deadline && waitpid(job->pid, NULL, WNOHANG) == 0) usleep(10000);
+    if (kill(target, 0) == 0) kill(target, SIGKILL);
+    deadline = (unsigned long long)time(NULL) + PROCESS_REAP_GRACE_SECONDS;
+    while (time(NULL) < (time_t)deadline && waitpid(job->pid, NULL, WNOHANG) == 0) usleep(10000);
+    waitpid(job->pid, NULL, 0);
+    if (job->response_fd >= 0) { int status = 124; send(job->response_fd, &status, sizeof(status), MSG_NOSIGNAL); close(job->response_fd); }
+    *job = (struct job){0};
 }
 
 static void close_request_descriptors(struct launch_request *request) {
@@ -629,9 +801,19 @@ static void accept_launch(int listener) {
     }
     const char *executable = executable_for(request.header.profile, credentials.uid, credentials.gid);
     char *arguments[FUKUROU_PROTOCOL_MAX_ITEMS + 1], *environment[FUKUROU_PROTOCOL_MAX_ITEMS + 1];
-    if (executable == NULL || split_payload(&request, arguments, environment) != 0 ||
-        !request_shape_allowed(&request, arguments, environment)) {
+    int request_valid = (request.header.request_kind != FUKUROU_REQUEST_LAUNCH || executable != NULL) &&
+        split_payload(&request, arguments, environment) == 0 && request_shape_allowed(&request, arguments, environment);
+    if (request_valid && request.header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && request.descriptor_count == 0) {
+        request_valid = prepare_mcp_bootstrap(&request, environment) == 0;
+    }
+    if (!request_valid || (request.header.request_kind == FUKUROU_REQUEST_LAUNCH && !descriptors_allowed(&request))) {
         close_request_descriptors(&request);
+        close(connection);
+        return;
+    }
+    if (request.header.request_kind == FUKUROU_REQUEST_CLEANUP) {
+        int status = cleanup_contained_path(arguments[0]);
+        send(connection, &status, sizeof(status), MSG_NOSIGNAL);
         close(connection);
         return;
     }
@@ -662,14 +844,23 @@ static void accept_launch(int listener) {
         for (size_t index = 0; index < request.descriptor_count; index++) {
             if (dup2(request.descriptors[index], (int)index) < 0) _exit(126);
         }
-        if (setgroups(0, NULL) != 0 || setresgid(credentials.gid, credentials.gid, credentials.gid) != 0 ||
-            setresuid(credentials.uid, credentials.uid, credentials.uid) != 0) _exit(126);
+        uid_t target_uid = request.header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 ? MCP_UID :
+            request.header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 ? APP_UID :
+            request.header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request.header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1 ? LLM_UID : APP_UID;
+        gid_t target_gid = request.header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 ? MCP_GID :
+            request.header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request.header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1 ? LLM_GID : APP_GID;
+        if (drop_child_privileges(target_uid, target_gid) != 0) _exit(126);
         umask(0007);
         close_range(request.descriptor_count, ~0U, 0);
         execve(executable, arguments, environment);
         _exit(126);
     }
     close(start_gate[0]);
+    if (setpgid(child, child) != 0) {
+        reject_spawned_child(child, start_gate[1], &request);
+        close(connection);
+        return;
+    }
     const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
     const char *registration_role = request.header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 ? "MCP" : "PROVIDER";
     int receipt_result = request.header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1
@@ -683,7 +874,8 @@ static void accept_launch(int listener) {
     }
     close(start_gate[1]);
     close_request_descriptors(&request);
-    jobs[slot] = (struct job){.pid = child, .response_fd = connection};
+    jobs[slot] = (struct job){.pid = child, .process_group = child, .response_fd = connection,
+        .profile = request.header.profile};
 }
 
 static void reap_jobs(void) {
@@ -696,6 +888,17 @@ static void reap_jobs(void) {
         send(jobs[index].response_fd, &status, sizeof(status), MSG_NOSIGNAL);
         close(jobs[index].response_fd);
         jobs[index] = (struct job){0};
+    }
+}
+
+static void reap_orphaned_invocations(void) {
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].pid == 0 || jobs[index].response_fd < 0) continue;
+        char probe;
+        ssize_t result = recv(jobs[index].response_fd, &probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+        if (result == 0 || (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            terminate_job(&jobs[index]);
+        }
     }
 }
 
@@ -755,9 +958,10 @@ static void accept_control(int listener) {
 static pid_t start_application(void) {
     pid_t child = fork();
     if (child != 0) return child;
-    if (setgroups(0, NULL) != 0 || setresgid(APP_GID, APP_GID, APP_GID) != 0 || setresuid(APP_UID, APP_UID, APP_UID) != 0) {
+    if (drop_child_privileges(APP_UID, APP_GID) != 0) {
         _exit(126);
     }
+    if (close_range(3, ~0U, 0) != 0) _exit(126);
     char *const arguments[] = {"java", "-jar", "/app/app.jar", NULL};
     extern char **environ;
     execve("/opt/java/openjdk/bin/java", arguments, environ);
@@ -765,11 +969,12 @@ static pid_t start_application(void) {
 }
 
 static int run_canary_preflight(char **arguments) {
+    launches_enabled = 1;
+    launch_listener = create_socket(FUKUROU_LAUNCH_SOCKET, 0666);
     pid_t child = fork();
-    if (child < 0) return 125;
+    if (child < 0) { close(launch_listener); launch_listener = -1; unlink(FUKUROU_LAUNCH_SOCKET); return 125; }
     if (child == 0) {
-        if (setgroups(0, NULL) != 0 || setresgid(APP_GID, APP_GID, APP_GID) != 0 ||
-            setresuid(APP_UID, APP_UID, APP_UID) != 0) _exit(126);
+        if (drop_child_privileges(APP_UID, APP_GID) != 0) _exit(126);
         char *const java_arguments[] = {
             "java", "-cp", "/app/app.jar", "me.matsumo.fukurou.DeploymentPreflightMain",
             arguments[0], arguments[1], arguments[2], arguments[3], NULL,
@@ -779,7 +984,16 @@ static int run_canary_preflight(char **arguments) {
         _exit(126);
     }
     int status = 0;
-    if (waitpid(child, &status, 0) != child) return 125;
+    for (;;) {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) break;
+        if (result < 0 && errno != EINTR) { status = 125; break; }
+        struct pollfd descriptor = {.fd = launch_listener, .events = POLLIN};
+        if (poll(&descriptor, 1, 200) > 0 && (descriptor.revents & POLLIN)) accept_launch(launch_listener);
+        reap_orphaned_invocations();
+        reap_jobs();
+    }
+    close(launch_listener); launch_listener = -1; unlink(FUKUROU_LAUNCH_SOCKET);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
@@ -874,6 +1088,7 @@ static int protocol_reject_case(unsigned case_id) {
         .total_length = sizeof(struct fukurou_launch_header),
         .profile = FUKUROU_PROFILE_MCP_CURRENT_V1,
         .argc = 1,
+        .request_kind = FUKUROU_REQUEST_LAUNCH,
     };
     uint16_t descriptor_count = 0;
     switch (case_id) {
@@ -997,11 +1212,12 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
     };
     const char *mcp_environment[] = {
         "PATH=/opt/java/openjdk/bin:/usr/bin:/bin", "FUKUROU_INVOCATION_ID=receipt-failure-fixture",
+        "FUKUROU_MCP_MANIFEST_ID=0123456789abcdef0123456789abcdef0123456789abcdef",
     };
     const char **arguments = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_arguments : canary_arguments;
     const char **environment = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_environment : canary_environment;
     uint16_t argument_count = test_case == ACCEPT_RECEIPT_FAILURE ? 5 : 4;
-    uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 2 : 13;
+    uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 3 : 13;
     const char *mutated_arguments[5];
     memcpy(mutated_arguments, canary_arguments, sizeof(canary_arguments));
     const char *mutated_environment[13];
@@ -1045,6 +1261,7 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
         .argc = argument_count,
         .envc = environment_count,
         .fd_role_bitmap = test_case == ACCEPT_RECEIPT_FAILURE ? 0x3fU : 0x7U,
+        .request_kind = FUKUROU_REQUEST_LAUNCH,
     };
     header.request_nonce[0] = (unsigned char)(nonce_seed + 1U);
     char payload[FUKUROU_PROTOCOL_MAX_PAYLOAD];
@@ -1163,7 +1380,7 @@ static int protocol_selftest(void) {
         environment_entries_allowed(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, root_environment, 1) ||
         environment_entries_allowed(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, bad_value_environment, 1) ||
         environment_entries_allowed(FUKUROU_PROFILE_MCP_CURRENT_V1, missing_invocation_environment, 1) ||
-        executable_for(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, APP_UID, APP_GID) != NULL ||
+        executable_for(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, APP_UID, APP_GID) == NULL ||
         executable_for(0xffffU, LLM_UID, LLM_GID) != NULL) return 125;
     struct launch_request mcp_descriptors = {
         .header = {.profile = FUKUROU_PROFILE_MCP_CURRENT_V1},
@@ -1298,6 +1515,7 @@ int main(int argc, char **argv) {
         if (poll(descriptors, 2, 200) < 0 && errno != EINTR) fatal("poll failed");
         if (descriptors[0].revents & POLLIN) accept_control(control);
         if (launch_listener >= 0 && descriptors[1].revents & POLLIN) accept_launch(launch_listener);
+        reap_orphaned_invocations();
         reap_jobs();
         int status = 0;
         pid_t result = waitpid(application, &status, WNOHANG);
