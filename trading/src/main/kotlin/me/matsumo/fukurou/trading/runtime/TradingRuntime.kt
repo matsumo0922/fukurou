@@ -94,7 +94,9 @@ private const val MAXIMUM_POOL_SIZE = 4
 /**
  * runtime DB pool の初期化失敗 timeout。
  */
-private const val INITIALIZATION_FAIL_TIMEOUT = -1L
+private const val INITIALIZATION_FAIL_TIMEOUT_MILLIS = 30_000L
+
+/** runtime DB poolからconnectionを取得するときの最大待機時間。 */
 private const val CONNECTION_TIMEOUT_MILLIS = 500L
 
 /**
@@ -634,7 +636,7 @@ private data class PostgresRuntimeServices(
 )
 
 /**
- * HikariCP の DataSource を作る。
+ * 初回connectionをboundedに確立し、初期化後はfail-fastに取得するDataSourceを作る。
  */
 private fun createDataSource(config: TradingDatabaseConfig): HikariDataSource {
     val hikariConfig = HikariConfig().apply {
@@ -642,7 +644,7 @@ private fun createDataSource(config: TradingDatabaseConfig): HikariDataSource {
         username = config.user
         password = config.password
         maximumPoolSize = MAXIMUM_POOL_SIZE
-        initializationFailTimeout = INITIALIZATION_FAIL_TIMEOUT
+        initializationFailTimeout = INITIALIZATION_FAIL_TIMEOUT_MILLIS
         connectionTimeout = CONNECTION_TIMEOUT_MILLIS
     }
 
