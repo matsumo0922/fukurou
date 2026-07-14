@@ -473,39 +473,46 @@ private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_COLUMNS_SQL = """
     SELECT 1
     WHERE NOT EXISTS (
         SELECT * FROM (VALUES
-            (1, 'session_id', 'uuid', 'NO', ''),
-            (2, 'provider', 'character varying', 'NO', ''),
-            (3, 'symbol', 'character varying', 'NO', ''),
-            (4, 'channel', 'character varying', 'NO', ''),
-            (5, 'state', 'character varying', 'NO', ''),
-            (6, 'last_received_sequence', 'bigint', 'NO', '0'),
-            (7, 'starting_at', 'bigint', 'NO', ''),
-            (8, 'connected_at', 'bigint', 'YES', ''),
-            (9, 'stopping_at', 'bigint', 'YES', ''),
-            (10, 'disconnected_at', 'bigint', 'YES', ''),
-            (11, 'disconnect_source', 'character varying', 'YES', '')
-        ) expected(ordinal_position, column_name, data_type, is_nullable, column_default)
+            (1, 'session_id', 'uuid', -1, 'NO', ''),
+            (2, 'provider', 'character varying', 32, 'NO', ''),
+            (3, 'symbol', 'character varying', 32, 'NO', ''),
+            (4, 'channel', 'character varying', 32, 'NO', ''),
+            (5, 'state', 'character varying', 32, 'NO', ''),
+            (6, 'last_received_sequence', 'bigint', -1, 'NO', '0'),
+            (7, 'starting_at', 'bigint', -1, 'NO', ''),
+            (8, 'connected_at', 'bigint', -1, 'YES', ''),
+            (9, 'stopping_at', 'bigint', -1, 'YES', ''),
+            (10, 'disconnected_at', 'bigint', -1, 'YES', ''),
+            (11, 'disconnect_source', 'character varying', 32, 'YES', '')
+        ) expected(ordinal_position, column_name, data_type, maximum_length, is_nullable, column_default)
         EXCEPT
-        SELECT ordinal_position, column_name::text, data_type::text, is_nullable::text,
+        SELECT ordinal_position, column_name::text, data_type::text, COALESCE(character_maximum_length, -1),
+            is_nullable::text,
             CASE WHEN column_name = 'last_received_sequence' AND column_default IN ('0', '0::bigint')
                 THEN '0' ELSE COALESCE(column_default, '') END
         FROM information_schema.columns
         WHERE table_schema = current_schema() AND table_name = 'market_data_ingress_sessions'
     ) AND NOT EXISTS (
-        SELECT ordinal_position, column_name::text, data_type::text, is_nullable::text,
+        SELECT ordinal_position, column_name::text, data_type::text, COALESCE(character_maximum_length, -1),
+            is_nullable::text,
             CASE WHEN column_name = 'last_received_sequence' AND column_default IN ('0', '0::bigint')
                 THEN '0' ELSE COALESCE(column_default, '') END
         FROM information_schema.columns
         WHERE table_schema = current_schema() AND table_name = 'market_data_ingress_sessions'
         EXCEPT
         SELECT * FROM (VALUES
-            (1, 'session_id', 'uuid', 'NO', ''), (2, 'provider', 'character varying', 'NO', ''),
-            (3, 'symbol', 'character varying', 'NO', ''), (4, 'channel', 'character varying', 'NO', ''),
-            (5, 'state', 'character varying', 'NO', ''), (6, 'last_received_sequence', 'bigint', 'NO', '0'),
-            (7, 'starting_at', 'bigint', 'NO', ''), (8, 'connected_at', 'bigint', 'YES', ''),
-            (9, 'stopping_at', 'bigint', 'YES', ''), (10, 'disconnected_at', 'bigint', 'YES', ''),
-            (11, 'disconnect_source', 'character varying', 'YES', '')
-        ) expected(ordinal_position, column_name, data_type, is_nullable, column_default)
+            (1, 'session_id', 'uuid', -1, 'NO', ''),
+            (2, 'provider', 'character varying', 32, 'NO', ''),
+            (3, 'symbol', 'character varying', 32, 'NO', ''),
+            (4, 'channel', 'character varying', 32, 'NO', ''),
+            (5, 'state', 'character varying', 32, 'NO', ''),
+            (6, 'last_received_sequence', 'bigint', -1, 'NO', '0'),
+            (7, 'starting_at', 'bigint', -1, 'NO', ''),
+            (8, 'connected_at', 'bigint', -1, 'YES', ''),
+            (9, 'stopping_at', 'bigint', -1, 'YES', ''),
+            (10, 'disconnected_at', 'bigint', -1, 'YES', ''),
+            (11, 'disconnect_source', 'character varying', 32, 'YES', '')
+        ) expected(ordinal_position, column_name, data_type, maximum_length, is_nullable, column_default)
     )
 """
 

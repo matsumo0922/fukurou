@@ -56,6 +56,107 @@ class GmoDurablePublicWebSocketMarketEventStreamTest {
     }
 
     @Test
+    fun f1TerminalAtBeginSeamStartsNoDatabaseLifecycle() = runBlocking {
+        val fixture = ListenerFixture(racePoint = DurableListenerRacePoint.F1_BEGIN)
+
+        fixture.start()
+        fixture.listener.awaitTermination()
+
+        assertEquals(emptyList(), fixture.ingress.calls)
+        assertEquals(0, fixture.socket.sentTexts.size)
+        assertEquals(0, fixture.socket.requestCount)
+    }
+
+    @Test
+    fun f1StartedBeginDelaysTerminationUntilDatabaseDisconnectCompletes() = runBlocking {
+        val disconnect = CompletableDeferred<Result<Unit>>()
+        val fixture = ListenerFixture(
+            race = StartupRace.BEGIN,
+            disconnectDeferred = disconnect,
+        )
+        val session = GmoDurableMarketEventSession(fixture.socket, fixture.events, fixture.scope, fixture.listener)
+        fixture.start()
+        await { "begin" in fixture.ingress.calls }
+
+        session.close()
+        assertTrue(fixture.scope.isActive)
+        assertEquals(0, fixture.ingress.disconnectCount)
+
+        fixture.completeRaceBoundary()
+        await { fixture.ingress.disconnectCount == 1 }
+        assertTrue(fixture.scope.isActive)
+
+        disconnect.complete(Result.success(Unit))
+        await { !fixture.scope.isActive }
+    }
+
+    @Test
+    fun f2TerminalAtSubscribeSeamSendsNoSubscription() = runBlocking {
+        val fixture = ListenerFixture(racePoint = DurableListenerRacePoint.F2_SUBSCRIBE)
+
+        fixture.start()
+        fixture.listener.awaitTermination()
+
+        assertEquals(listOf("begin", "disconnect:TRANSPORT_ERROR"), fixture.ingress.calls)
+        assertEquals(0, fixture.socket.sentTexts.size)
+        assertEquals(0, fixture.socket.requestCount)
+    }
+
+    @Test
+    fun f3TerminalAtActivateSeamPublishesNoInitialDemand() = runBlocking {
+        val fixture = ListenerFixture(racePoint = DurableListenerRacePoint.F3_ACTIVATE)
+
+        fixture.start()
+        fixture.listener.awaitTermination()
+
+        assertEquals(listOf("begin", "activate", "disconnect:TRANSPORT_ERROR"), fixture.ingress.calls)
+        assertEquals(0, fixture.socket.requestCount)
+    }
+
+    @Test
+    fun f4TerminalAtDecodeSeamDecodesAndRegistersNothing() = runBlocking {
+        val fixture = ListenerFixture(racePoint = DurableListenerRacePoint.F4_DECODE)
+        fixture.startConnected()
+
+        fixture.listener.onText(fixture.socket, tradePayload(1), true)
+        fixture.listener.awaitTermination()
+
+        assertEquals(0, fixture.ingress.calls.count { it.startsWith("register:") })
+        assertTrue(fixture.events.tryReceive().isFailure)
+        assertEquals(1, fixture.socket.requestCount)
+    }
+
+    @Test
+    fun f5TerminalAtRegisterSeamPublishesNoEventOrDemand() = runBlocking {
+        val fixture = ListenerFixture(racePoint = DurableListenerRacePoint.F5_REGISTER)
+        fixture.startConnected()
+
+        fixture.listener.onText(fixture.socket, tradePayload(1), true)
+        fixture.listener.awaitTermination()
+
+        assertEquals(1, fixture.ingress.calls.count { it.startsWith("register:") })
+        assertTrue(fixture.events.tryReceive().isFailure)
+        assertEquals(1, fixture.socket.requestCount)
+    }
+
+    @Test
+    fun f6TerminalAtPongAndDemandSeamsPublishesNoLateDemand() = runBlocking {
+        listOf(1, 2).forEach { occurrence ->
+            val fixture = ListenerFixture(
+                racePoint = DurableListenerRacePoint.F6_PING,
+                raceOccurrence = occurrence,
+            )
+            fixture.startConnected()
+
+            fixture.listener.onPing(fixture.socket, ByteBuffer.allocate(0))
+            fixture.listener.awaitTermination()
+
+            assertEquals(if (occurrence == 1) 0 else 1, fixture.socket.pongCount, "occurrence=$occurrence")
+            assertEquals(1, fixture.socket.requestCount, "occurrence=$occurrence")
+        }
+    }
+
+    @Test
     fun errorBeforeStartingClaimsTerminalWithoutDatabaseBegin() {
         val fixture = ListenerFixture()
 
@@ -131,6 +232,27 @@ class GmoDurablePublicWebSocketMarketEventStreamTest {
     }
 
     @Test
+    fun f8TerminationCompletionOccursAfterDatabaseDisconnect() = runBlocking {
+        val disconnect = CompletableDeferred<Result<Unit>>()
+        val fixture = ListenerFixture(
+            disconnectDeferred = disconnect,
+            racePoint = DurableListenerRacePoint.F8_TERMINATION,
+        )
+        fixture.startConnected()
+        val session = GmoDurableMarketEventSession(fixture.socket, fixture.events, fixture.scope, fixture.listener)
+
+        session.close()
+        await { fixture.ingress.disconnectCount == 1 }
+        assertTrue(fixture.scope.isActive)
+
+        disconnect.complete(Result.success(Unit))
+        await { !fixture.scope.isActive }
+
+        assertEquals(1, fixture.ingress.disconnectCount)
+        assertEquals(1, fixture.raceSeam.invocationCount)
+    }
+
+    @Test
     fun registrationAllowsOnlyOneInFlightAndIgnoresLateCompletionAfterTerminal() = runBlocking {
         val registration = CompletableDeferred<Result<Boolean>>()
         val fixture = ListenerFixture(registerDeferred = registration)
@@ -183,6 +305,8 @@ private class ListenerFixture(
     registerDeferred: CompletableDeferred<Result<Boolean>>? = null,
     disconnectDeferred: CompletableDeferred<Result<Unit>>? = null,
     deferPong: Boolean = false,
+    racePoint: DurableListenerRacePoint? = null,
+    raceOccurrence: Int = 1,
 ) {
     private val beginDeferred = if (race == StartupRace.BEGIN) CompletableDeferred<Result<Unit>>() else null
     private val activateDeferred = if (race == StartupRace.ACTIVATE) CompletableDeferred<Result<Boolean>>() else null
@@ -196,6 +320,7 @@ private class ListenerFixture(
     val socket = RecordingWebSocket(race == StartupRace.SUBSCRIBE, deferPong)
     val events = Channel<PaperMarketTradeEvent>(1_024)
     val scope = CoroutineScope(Dispatchers.Unconfined)
+    val raceSeam = InjectingRaceSeam(racePoint, raceOccurrence)
     val listener = GmoDurableWebSocketListener(
         sessionId = UUID.randomUUID(),
         identity = MarketStreamIdentity("GMO_COIN", "BTC_JPY", "TRADES"),
@@ -204,7 +329,12 @@ private class ListenerFixture(
         events = events,
         scope = scope,
         clock = Clock.systemUTC(),
+        raceSeam = raceSeam,
     )
+
+    init {
+        raceSeam.action = { listener.onError(socket, IllegalStateException("injected terminal race")) }
+    }
 
     fun start() = listener.start(socket, "subscription")
 
@@ -219,6 +349,21 @@ private class ListenerFixture(
         beginDeferred?.complete(Result.success(Unit))
         socket.sendTextDeferred?.complete(socket)
         activateDeferred?.complete(Result.success(true))
+    }
+}
+
+private class InjectingRaceSeam(
+    private val target: DurableListenerRacePoint?,
+    private val targetOccurrence: Int,
+) : DurableListenerRaceSeam {
+    lateinit var action: () -> Unit
+    var invocationCount = 0
+        private set
+
+    override fun before(point: DurableListenerRacePoint) {
+        if (point != target) return
+        invocationCount += 1
+        if (invocationCount == targetOccurrence) action()
     }
 }
 
@@ -291,6 +436,7 @@ private class RecordingWebSocket(deferSendText: Boolean = false, deferPong: Bool
     val sendPongDeferred = if (deferPong) CompletableFuture<WebSocket>() else null
     @Volatile var requestCount = 0L
     @Volatile var aborted = false
+    @Volatile var pongCount = 0
 
     override fun sendText(data: CharSequence, last: Boolean): CompletableFuture<WebSocket> {
         sentTexts += data.toString()
@@ -301,7 +447,10 @@ private class RecordingWebSocket(deferSendText: Boolean = false, deferPong: Bool
 
     override fun sendPing(message: ByteBuffer): CompletableFuture<WebSocket> = completed()
 
-    override fun sendPong(message: ByteBuffer): CompletableFuture<WebSocket> = sendPongDeferred ?: completed()
+    override fun sendPong(message: ByteBuffer): CompletableFuture<WebSocket> {
+        pongCount += 1
+        return sendPongDeferred ?: completed()
+    }
 
     override fun sendClose(statusCode: Int, reason: String): CompletableFuture<WebSocket> = completed()
 

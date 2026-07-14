@@ -1,7 +1,7 @@
 package me.matsumo.fukurou.trading.exchange.gmo
 
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -21,8 +21,6 @@ import java.time.Clock
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionStage
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 
 private const val DURABLE_EVENT_BUFFER_CAPACITY = 1_024
 
@@ -100,57 +98,94 @@ internal class GmoDurableWebSocketListener(
     private val events: Channel<PaperMarketTradeEvent>,
     private val scope: CoroutineScope,
     private val clock: Clock,
+    private val raceSeam: DurableListenerRaceSeam = DurableListenerRaceSeam.NONE,
 ) : WebSocket.Listener {
-    private val state = AtomicReference(DurableListenerState.CREATED)
-    private val beginSettled = AtomicBoolean(false)
-    private val disconnectStarted = AtomicBoolean(false)
-    private val terminalSource = AtomicReference<DurableIngressGapSource?>()
+    private val lifecycleLock = Any()
+    private var state = DurableListenerState.CREATED
+    private var beginSettled = false
+    private var disconnectStarted = false
+    private var terminalSource: DurableIngressGapSource? = null
     private val termination = CompletableDeferred<Unit>()
     private val fragments = StringBuilder()
-
-    @Volatile
     private var startupDeadline: IngressOperationDeadline? = null
 
     override fun onOpen(webSocket: WebSocket) = Unit
 
     fun start(webSocket: WebSocket, subscription: String) {
-        if (!state.compareAndSet(DurableListenerState.CREATED, DurableListenerState.BEGINNING)) return
         val deadline = IngressOperationDeadline.start()
-        startupDeadline = deadline
-        scope.launch {
-            ingress.begin(sessionId, identity, deadline).fold(
-                onSuccess = {
-                    beginSettled.set(true)
-                    if (!state.compareAndSet(DurableListenerState.BEGINNING, DurableListenerState.SUBSCRIBING)) {
-                        ensureDisconnect(webSocket)
-                        return@fold
-                    }
-                    webSocket.sendText(subscription, true).whenComplete { _, failure ->
-                        if (failure == null) {
-                            activate(webSocket)
-                        } else {
-                            fail(webSocket, DurableIngressGapSource.TRANSPORT_ERROR)
-                        }
-                    }
-                },
-                onFailure = {
-                    beginSettled.set(true)
-                    fail(webSocket, DurableIngressGapSource.DATABASE_FAILURE)
-                },
-            )
+        synchronized(lifecycleLock) {
+            if (state != DurableListenerState.CREATED) return
+            state = DurableListenerState.BEGINNING
+            raceSeam.before(DurableListenerRacePoint.F1_BEGIN)
+            if (state != DurableListenerState.BEGINNING) return
+            startupDeadline = deadline
+            scope.launch { begin(webSocket, subscription, deadline) }
         }
     }
 
+    private suspend fun begin(
+        webSocket: WebSocket,
+        subscription: String,
+        deadline: IngressOperationDeadline,
+    ) {
+        ingress.begin(sessionId, identity, deadline).fold(
+            onSuccess = { beginSucceeded(webSocket, subscription) },
+            onFailure = {
+                val terminalClaimed = synchronized(lifecycleLock) {
+                    beginSettled = true
+                    state == DurableListenerState.TERMINATING
+                }
+                if (terminalClaimed) {
+                    ensureDisconnect(webSocket)
+                } else {
+                    fail(webSocket, DurableIngressGapSource.DATABASE_FAILURE)
+                }
+            },
+        )
+    }
+
+    private fun beginSucceeded(webSocket: WebSocket, subscription: String) {
+        var disconnectRequired = false
+        synchronized(lifecycleLock) {
+            beginSettled = true
+            if (state == DurableListenerState.BEGINNING) {
+                raceSeam.before(DurableListenerRacePoint.F2_SUBSCRIBE)
+                if (state == DurableListenerState.BEGINNING) {
+                    state = DurableListenerState.SUBSCRIBING
+                    webSocket.sendText(subscription, true).whenComplete { _, failure ->
+                        if (failure == null) activate(webSocket) else fail(
+                            webSocket,
+                            DurableIngressGapSource.TRANSPORT_ERROR,
+                        )
+                    }
+                }
+            } else {
+                disconnectRequired = true
+            }
+        }
+        if (disconnectRequired) ensureDisconnect(webSocket)
+    }
+
     private fun activate(webSocket: WebSocket) {
-        if (!state.compareAndSet(DurableListenerState.SUBSCRIBING, DurableListenerState.ACTIVATING)) return
-        val deadline = startupDeadline ?: return webSocket.abort()
+        val deadline = synchronized(lifecycleLock) {
+            if (state != DurableListenerState.SUBSCRIBING) return
+            state = DurableListenerState.ACTIVATING
+            startupDeadline
+        } ?: return fail(webSocket, DurableIngressGapSource.TRANSPORT_ERROR)
         scope.launch {
             ingress.activate(sessionId, deadline).fold(
                 onSuccess = { activated ->
-                    if (activated && state.compareAndSet(DurableListenerState.ACTIVATING, DurableListenerState.CONNECTED)) {
-                        webSocket.request(1)
-                    } else if (!activated) {
+                    if (!activated) {
                         fail(webSocket, DurableIngressGapSource.SEQUENCE_GAP)
+                    } else {
+                        synchronized(lifecycleLock) {
+                            if (state != DurableListenerState.ACTIVATING) return@fold
+                            raceSeam.before(DurableListenerRacePoint.F3_ACTIVATE)
+                            if (state == DurableListenerState.ACTIVATING) {
+                                state = DurableListenerState.CONNECTED
+                                webSocket.request(1)
+                            }
+                        }
                     }
                 },
                 onFailure = { fail(webSocket, DurableIngressGapSource.DATABASE_FAILURE) },
@@ -163,46 +198,56 @@ internal class GmoDurableWebSocketListener(
         data: CharSequence,
         last: Boolean,
     ): CompletionStage<*>? {
-        if (state.get() != DurableListenerState.CONNECTED) return null
-        synchronized(fragments) {
-            if (state.get() != DurableListenerState.CONNECTED) return null
+        var event: PaperMarketTradeEvent? = null
+        synchronized(lifecycleLock) {
+            if (state != DurableListenerState.CONNECTED) return null
             fragments.append(data)
             if (!last) {
-                webSocket.request(1)
+                raceSeam.before(DurableListenerRacePoint.F4_DECODE)
+                if (state == DurableListenerState.CONNECTED) webSocket.request(1)
                 return null
             }
 
             val payload = fragments.toString()
             fragments.setLength(0)
+            raceSeam.before(DurableListenerRacePoint.F4_DECODE)
+            if (state != DurableListenerState.CONNECTED) return null
             val decoded = runCatching { decoder.decode(payload, clock.instant()) }
             decoded.fold(
-                onSuccess = { event ->
-                    if (event == null) {
-                        if (state.get() == DurableListenerState.CONNECTED) webSocket.request(1)
+                onSuccess = { decodedEvent ->
+                    if (decodedEvent == null) {
+                        if (state == DurableListenerState.CONNECTED) webSocket.request(1)
                     } else {
-                        register(webSocket, event)
+                        state = DurableListenerState.REGISTERING
+                        event = decodedEvent
                     }
                 },
                 onFailure = { fail(webSocket, DurableIngressGapSource.TRANSPORT_ERROR) },
             )
         }
+        event?.let { decodedEvent -> register(webSocket, decodedEvent) }
 
         return null
     }
 
     private fun register(webSocket: WebSocket, event: PaperMarketTradeEvent) {
-        if (!state.compareAndSet(DurableListenerState.CONNECTED, DurableListenerState.REGISTERING)) {
-            fail(webSocket, DurableIngressGapSource.SEQUENCE_GAP)
-            return
-        }
         scope.launch {
             ingress.registerReceived(sessionId, event.sequence, IngressOperationDeadline.start()).fold(
                 onSuccess = { registered ->
-                    when {
-                        !registered -> fail(webSocket, DurableIngressGapSource.SEQUENCE_GAP)
-                        !state.compareAndSet(DurableListenerState.REGISTERING, DurableListenerState.CONNECTED) -> Unit
-                        !events.trySend(event).isSuccess -> fail(webSocket, DurableIngressGapSource.BACKPRESSURE)
-                        else -> webSocket.request(1)
+                    if (!registered) {
+                        fail(webSocket, DurableIngressGapSource.SEQUENCE_GAP)
+                    } else {
+                        synchronized(lifecycleLock) {
+                            if (state != DurableListenerState.REGISTERING) return@fold
+                            raceSeam.before(DurableListenerRacePoint.F5_REGISTER)
+                            if (state != DurableListenerState.REGISTERING) return@fold
+                            if (!events.trySend(event).isSuccess) {
+                                fail(webSocket, DurableIngressGapSource.BACKPRESSURE)
+                            } else {
+                                state = DurableListenerState.CONNECTED
+                                webSocket.request(1)
+                            }
+                        }
                     }
                 },
                 onFailure = { fail(webSocket, DurableIngressGapSource.DATABASE_FAILURE) },
@@ -211,10 +256,21 @@ internal class GmoDurableWebSocketListener(
     }
 
     override fun onPing(webSocket: WebSocket, message: ByteBuffer): CompletionStage<*> {
-        if (state.get() != DurableListenerState.CONNECTED) return CompletableFuture.completedFuture(webSocket)
-        return webSocket.sendPong(message).whenComplete { _, failure ->
-            if (failure == null && state.get() == DurableListenerState.CONNECTED) webSocket.request(1)
-            if (failure != null) fail(webSocket, DurableIngressGapSource.TRANSPORT_ERROR)
+        return synchronized(lifecycleLock) {
+            if (state != DurableListenerState.CONNECTED) return CompletableFuture.completedFuture(webSocket)
+            raceSeam.before(DurableListenerRacePoint.F6_PING)
+            if (state != DurableListenerState.CONNECTED) return CompletableFuture.completedFuture(webSocket)
+            webSocket.sendPong(message).whenComplete { _, failure ->
+                if (failure != null) {
+                    fail(webSocket, DurableIngressGapSource.TRANSPORT_ERROR)
+                } else {
+                    synchronized(lifecycleLock) {
+                        if (state != DurableListenerState.CONNECTED) return@whenComplete
+                        raceSeam.before(DurableListenerRacePoint.F6_PING)
+                        if (state == DurableListenerState.CONNECTED) webSocket.request(1)
+                    }
+                }
+            }
         }
     }
 
@@ -236,45 +292,71 @@ internal class GmoDurableWebSocketListener(
     suspend fun awaitTermination() = termination.await()
 
     private fun fail(webSocket: WebSocket, source: DurableIngressGapSource) {
-        if (!claimTerminal(source)) return
-        webSocket.abort()
-        if (state.get() == DurableListenerState.TERMINATING && beginSettled.get()) {
-            ensureDisconnect(webSocket)
-        } else if (startupDeadline == null) {
-            finishTerminal()
-        }
-    }
-
-    @Synchronized
-    private fun claimTerminal(source: DurableIngressGapSource): Boolean {
-        while (true) {
-            val current = state.get()
-            if (current == DurableListenerState.TERMINATING || current == DurableListenerState.TERMINATED) return false
-            terminalSource.set(source)
-            if (state.compareAndSet(current, DurableListenerState.TERMINATING)) {
-                return true
+        var disconnectRequired = false
+        synchronized(lifecycleLock) {
+            if (!claimTerminal(source)) return
+            webSocket.abort()
+            if (beginSettled) {
+                disconnectRequired = true
+            } else if (startupDeadline == null) {
+                finishTerminal()
             }
         }
+        if (disconnectRequired) ensureDisconnect(webSocket)
+    }
+
+    private fun claimTerminal(source: DurableIngressGapSource): Boolean {
+        if (state == DurableListenerState.TERMINATING || state == DurableListenerState.TERMINATED) return false
+        terminalSource = source
+        state = DurableListenerState.TERMINATING
+        return true
     }
 
     private fun ensureDisconnect(webSocket: WebSocket) {
-        if (!disconnectStarted.compareAndSet(false, true)) return
-        val source = terminalSource.get() ?: DurableIngressGapSource.TRANSPORT_ERROR
+        val source = synchronized(lifecycleLock) {
+            if (disconnectStarted) return
+            disconnectStarted = true
+            terminalSource ?: DurableIngressGapSource.TRANSPORT_ERROR
+        }
         scope.launch {
             try {
                 ingress.disconnect(sessionId, source, IngressOperationDeadline.start())
             } finally {
-                webSocket.abort()
-                finishTerminal()
+                synchronized(lifecycleLock) {
+                    webSocket.abort()
+                    finishTerminal()
+                }
             }
         }
     }
 
     private fun finishTerminal() {
-        state.set(DurableListenerState.TERMINATED)
+        raceSeam.before(DurableListenerRacePoint.F8_TERMINATION)
+        if (state != DurableListenerState.TERMINATING) return
+        state = DurableListenerState.TERMINATED
         events.close()
         termination.complete(Unit)
     }
+}
+
+/** async lifecycle raceをside-effect直前へ決定的に注入するtest seam。 */
+internal fun interface DurableListenerRaceSeam {
+    fun before(point: DurableListenerRacePoint)
+
+    companion object {
+        val NONE = DurableListenerRaceSeam { }
+    }
+}
+
+/** finite inventory F1-F6/F8に対応するrace注入点。 */
+internal enum class DurableListenerRacePoint {
+    F1_BEGIN,
+    F2_SUBSCRIBE,
+    F3_ACTIVATE,
+    F4_DECODE,
+    F5_REGISTER,
+    F6_PING,
+    F8_TERMINATION,
 }
 
 /** durable listenerのasync callbackを直列化する有限状態。 */

@@ -930,6 +930,17 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun durableIngressSchemaVerifier_rejectsWrongVarcharLength() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE market_data_ingress_sessions ALTER COLUMN provider TYPE VARCHAR(64)")
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
     fun durableIngressSchemaVerifier_rejectsMissingForeignKey() = runPostgresTest {
         val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
         bootstrap.ensureSchema().getOrThrow()

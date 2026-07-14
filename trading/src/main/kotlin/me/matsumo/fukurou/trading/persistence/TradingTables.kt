@@ -829,7 +829,7 @@ object MarketDataIngressSessionsTable : Table("market_data_ingress_sessions") {
     val connectedAt = long("connected_at").nullable()
     val stoppingAt = long("stopping_at").nullable()
     val disconnectedAt = long("disconnected_at").nullable()
-    val disconnectSource = varchar("disconnect_source", length = 64).nullable()
+    val disconnectSource = varchar("disconnect_source", length = 32).nullable()
 
     override val primaryKey = PrimaryKey(sessionId)
 }
