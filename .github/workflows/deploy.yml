@@ -89,6 +89,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
+        id: build_push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -99,17 +100,99 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Create signed typed deploy bundle
+        shell: bash
+        env:
+          DEPLOY_SIGNING_PRIVATE_KEY: ${{ secrets.DEPLOY_SIGNING_PRIVATE_KEY }}
+          CANDIDATE_DIGEST: ${{ steps.build_push.outputs.digest }}
+          DEPLOY_SHA: ${{ steps.resolve.outputs.deploy_sha }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${DEPLOY_SIGNING_PRIVATE_KEY}" ]] || {
+            echo "::error::DEPLOY_SIGNING_PRIVATE_KEY is required"
+            exit 1
+          }
+          [[ "${CANDIDATE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          install -d -m 0700 deploy-artifact
+          executor_hash="$(sha256sum scripts/deploy/deploy-fukurou | awk '{print $1}')"
+          foundation_harness_hash="$(sha256sum scripts/mcp-credential-isolation-check scripts/deploy/sql/mcp-role.sql | awk '{print $1}' | sha256sum | awk '{print $1}')"
+          public_key_hash="$(sha256sum scripts/deploy/deploy-public-key.pem | awk '{print $1}')"
+          capability_catalog="$(jq -cS . scripts/deploy/deploy-capability-catalog-v1.json)"
+          catalog_hash="$(printf '%s' "${capability_catalog}" | sha256sum | awk '{print $1}')"
+          deployment_id="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          jq -cS -n \
+            --arg deploymentId "${deployment_id}" \
+            --arg candidateSha "${DEPLOY_SHA}" \
+            --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
+            --arg executorSha256 "${executor_hash}" \
+            --arg foundationHarnessSha256 "${foundation_harness_hash}" \
+            --arg publicKeySha256 "${public_key_hash}" \
+            --argjson capabilityCatalog "${capability_catalog}" \
+            --arg capabilityCatalogHash "${catalog_hash}" \
+            '{deploymentId:$deploymentId,candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,
+              minimumContractVersion:1,
+              requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
+              requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+              capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
+              executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,foundationHarnessSha256:$foundationHarnessSha256,
+              operations:[
+                {capability:"CREATE_DIR_V1",operationId:"LAUNCH_FENCE_ROOT"},
+                {capability:"INSTALL_SECRET_REF_V1",operationId:"LLM_LAUNCH_SIGNING_KEY_V1"},
+                {capability:"DB_MIGRATION_V1",operationId:"INSTALL_FOUNDATION_V1"},
+                {capability:"DB_MAINTENANCE_V1",operationId:"SET_LAUNCH_MAINTENANCE"},
+                {capability:"DB_MAINTENANCE_V1",operationId:"OPEN_INFRASTRUCTURE_GAP"},
+                {capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_PREFLIGHT_V1"},
+                {capability:"RUN_COMPOSE_PROJECT_V1",operationId:"PRODUCTION"},
+                {capability:"DB_MAINTENANCE_V1",operationId:"CLOSE_INFRASTRUCTURE_GAP"},
+                {capability:"DB_MAINTENANCE_V1",operationId:"CLEAR_LAUNCH_MAINTENANCE"}
+              ]}' > deploy-artifact/deploy-bundle.json
+
+          key_file="$(mktemp)"
+          trap 'shred -u "${key_file}"' EXIT
+          chmod 0600 "${key_file}"
+          printf '%s\n' "${DEPLOY_SIGNING_PRIVATE_KEY}" > "${key_file}"
+          openssl pkeyutl -sign -rawin -inkey "${key_file}" \
+            -in deploy-artifact/deploy-bundle.json \
+            -out deploy-artifact/deploy-bundle.sig
+
+      - name: Upload signed deploy bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-bundle-${{ steps.resolve.outputs.deploy_sha }}
+          path: deploy-artifact/
+          if-no-files-found: error
+          retention-days: 1
+
   deploy:
     name: Deploy on NAS
     needs: build
     concurrency:
       group: fukurou-production-deploy
       cancel-in-progress: false
-    timeout-minutes: 15
+    timeout-minutes: 35
     runs-on:
       - self-hosted
       - fukurou-prod
     permissions: {}
     steps:
+      - name: Download signed deploy bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-bundle-${{ needs.build.outputs.deploy_sha }}
+          path: deploy-artifact
+
+      - name: Verify installed deploy contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(sudo /usr/local/sbin/deploy-fukurou --print-contract-version)" == "1" ]]
+
       - name: Deploy pinned image
-        run: sudo /usr/local/sbin/deploy-fukurou ${{ needs.build.outputs.deploy_sha }}
+        run: >-
+          sudo /usr/local/sbin/deploy-fukurou
+          --bundle "${GITHUB_WORKSPACE}/deploy-artifact/deploy-bundle.json"
+          --signature "${GITHUB_WORKSPACE}/deploy-artifact/deploy-bundle.sig"
+          ${{ needs.build.outputs.deploy_sha }}

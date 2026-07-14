@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <linux/capability.h>
+#include "fukurou-runtime-proxy.h"
 
 #define LLM_UID 10002
 #define APP_UID 10001
@@ -50,6 +51,14 @@ static void require_canary_flag(void) {
     if (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) || metadata.st_uid != 0 ||
         (metadata.st_mode & 0777) != 0400 || metadata.st_nlink != 1) fail("canary flag metadata rejected");
     close(fd);
+}
+
+static int lowercase_hex(const char *value, size_t expected_length) {
+    if (strlen(value) != expected_length) return 0;
+    for (const char *cursor = value; *cursor != '\0'; cursor++) {
+        if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) return 0;
+    }
+    return 1;
 }
 
 static int required_mcp_launcher_capability(int capability) {
@@ -277,11 +286,15 @@ int main(int argc, char **argv, char **envp) {
     if (strcmp(argv[1], "codex") == 0) executable = "/usr/local/bin/codex";
     int canary = strcmp(argv[1], "canary") == 0;
     if (canary) {
+        int standard_phase = argc == 4 &&
+            (strcmp(argv[3], "PROPOSER") == 0 || strcmp(argv[3], "FALSIFIER") == 0);
         int rro_action = argc == 5 && strcmp(argv[3], "RISK_REDUCTION_ONLY") == 0 &&
             (strcmp(argv[4], "NO_TRADE") == 0 || strcmp(argv[4], "EXIT") == 0 ||
              strcmp(argv[4], "REDUCE") == 0 || strcmp(argv[4], "ADJUST_PROTECTION") == 0 ||
              strcmp(argv[4], "ENTER") == 0 || strcmp(argv[4], "ADD_LONG") == 0);
-        if (argc != 4 && !rro_action) fail("canary mode requires manifest id, phase, and optional RRO action");
+        if (!lowercase_hex(argv[2], 48) || (!standard_phase && !rro_action)) {
+            fail("canary manifest or phase rejected");
+        }
         require_canary_flag();
         executable = "/usr/bin/node";
     }
@@ -317,9 +330,11 @@ int main(int argc, char **argv, char **envp) {
         clean_env[output++] = "FUKUROU_CANARY_LLM_LAUNCH_FDS=0,1,2";
         clean_env[output] = NULL;
         char *const canary_args[] = {"node", CANARY_CLIENT, argv[2], argv[3], argc == 5 ? argv[4] : NULL, NULL};
-        execve(executable, canary_args, clean_env);
+        _exit(fukurou_supervisor_proxy(FUKUROU_PROFILE_FOUNDATION_CANARY_V1, canary_args, clean_env, 3));
     } else {
-        execve(executable, &argv[1], clean_env);
+        enum fukurou_launch_profile profile = strcmp(argv[1], "claude") == 0
+            ? FUKUROU_PROFILE_CLAUDE_CURRENT_V1 : FUKUROU_PROFILE_CODEX_CURRENT_V1;
+        _exit(fukurou_supervisor_proxy(profile, &argv[1], clean_env, 3));
     }
     fail(strerror(errno));
 }

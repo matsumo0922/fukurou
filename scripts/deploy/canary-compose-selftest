@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+readonly SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
+export FUKUROU_DEPLOY_ROOT="${SELFTEST_ROOT}/deploy"
+
+# shellcheck source=deploy-fukurou
+source "${ROOT}/scripts/deploy/deploy-fukurou"
+DEPLOYMENT_ID=fixture
+CANDIDATE_DIGEST="sha256:$(printf '0%.0s' {1..64})"
+CANDIDATE_CATALOG_HASH="$(printf '1%.0s' {1..64})"
+touch "${SELFTEST_ROOT}/token" "${SELFTEST_ROOT}/signature" "${SELFTEST_ROOT}/public"
+write_canary_compose \
+  "${SELFTEST_ROOT}/token" \
+  "${SELFTEST_ROOT}/signature" \
+  "${SELFTEST_ROOT}/public" \
+  "${SELFTEST_ROOT}/canary.yml"
+
+export FUKUROU_IMAGE_REFERENCE="ghcr.io/matsumo0922/fukurou@${CANDIDATE_DIGEST}"
+export FUKUROU_PUBLIC_ORIGIN=https://fixture.invalid
+export FUKUROU_MCP_DB_PASSWORD_FILE="${SELFTEST_ROOT}/db-password-unused"
+touch "${FUKUROU_MCP_DB_PASSWORD_FILE}"
+docker compose --env-file "${ROOT}/.env" -p fukurou-canary-fixture \
+  -f "${ROOT}/docker-compose.prod.yml" -f "${SELFTEST_ROOT}/canary.yml" \
+  config --format json > "${SELFTEST_ROOT}/effective.json"
+if ! validate_canary_compose_json "${SELFTEST_ROOT}/effective.json"; then
+  jq '{serviceKeys:(.services|keys),ktor:.services.ktor,postgresProfile:.services.postgres.profiles,cloudflaredProfile:.services.cloudflared.profiles,networks:.networks}' \
+    "${SELFTEST_ROOT}/effective.json" >&2
+  exit 1
+fi
+
+jq '.services.ktor.environment.DB_PASSWORD="forbidden"' \
+  "${SELFTEST_ROOT}/effective.json" > "${SELFTEST_ROOT}/forbidden.json"
+if validate_canary_compose_json "${SELFTEST_ROOT}/forbidden.json"; then
+  echo "canary-compose-selftest: DB credential inheritance was accepted" >&2
+  exit 1
+fi
+
+echo "CANARY_COMPOSE_SELFTEST_OK source=production deny=db,dependencies,volumes,networks failure=db-inheritance-rejected"

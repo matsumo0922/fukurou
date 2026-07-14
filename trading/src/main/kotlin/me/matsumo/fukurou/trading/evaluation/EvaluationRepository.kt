@@ -67,7 +67,9 @@ interface EvaluationRepository {
         val tradeResult = fetchClosedTrades(period, scope = scope).getOrThrow()
         fetchReportSnapshot(period).getOrThrow().copy(
             trades = tradeResult,
-            dailyPnl = tradeResult.trades.map { trade -> DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy) },
+            dailyPnl = tradeResult.strategyEligibleTrades.map { trade ->
+                DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
+            },
             priorPnlJpy = sumTradePnlBefore(period.from, scope).getOrThrow(),
             initialCashJpy = scope.initialCashJpy,
         )
@@ -168,10 +170,25 @@ interface EvaluationRepository {
         Result.success(EvaluationLlmUsageQueryResult(emptyList(), truncated = false))
     }
 
+    /** 指定 entity ID を共通 causal population へ投影する。 */
+    suspend fun classifyPopulationEntities(
+        period: EvaluationPeriod,
+        entityType: EvaluationPopulationEntityType,
+        entityIds: Set<String>,
+    ): Result<Map<String, EvaluationPopulationStatus>> = Result.success(
+        entityIds.associateWith { EvaluationPopulationStatus.ELIGIBLE },
+    )
+
     /**
      * kill 基準に必要な closed trade 数と PF を取得する。
      */
     suspend fun fetchKillCriterionStats(): Result<KillCriterionStats>
+}
+
+/** 共通 causal population が扱う entity type。 */
+enum class EvaluationPopulationEntityType {
+    RUN,
+    DECISION,
 }
 
 /** audit/non-trade population を immutable epoch lifecycle と交差させる。 */

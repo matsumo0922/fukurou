@@ -177,7 +177,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
         val runCount = evaluationRepository.countDecisionRuns(period, scope).getOrThrow()
         val actionCounts = evaluationRepository.countDecisionsByAction(period, scope).getOrThrow()
         val exclusionSummary = evaluationRepository.fetchExclusionSummary(period, scope).getOrThrow()
-        val performance = EvaluationMath.summarizeTrades(tradeResult.trades)
+        val performance = EvaluationMath.summarizeTrades(tradeResult.strategyEligibleTrades)
         val deduplication = evaluationRepository.fetchDeduplicationMetrics(period, scope).getOrThrow()
         val killStats = evaluationRepository.fetchKillCriterionStats().getOrThrow()
         val riskState = evaluationRiskStateRepository.current().getOrThrow()
@@ -205,7 +205,7 @@ private fun Route.registerEvaluationSummaryRoute(dependencies: EvaluationRouteDe
                 exclusions = exclusionSummary.toResponse(),
                 deduplication = DeduplicationResponse.from(deduplication),
                 marketRegimes = EvaluationMath.summarizeByMarketRegime(
-                    trades = tradeResult.trades,
+                    trades = tradeResult.strategyEligibleTrades,
                     regimes = regimes,
                     zoneId = EvaluationZone,
                 ).map { performance -> EvaluationMarketRegimeResponse.fromPerformance(performance) },
@@ -263,10 +263,10 @@ private fun Route.registerEvaluationSetupsRoute(dependencies: EvaluationRouteDep
                 scope = scope.toResponse(),
                 attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
-                setups = EvaluationMath.summarizeBySetup(tradeResult.trades)
+                setups = EvaluationMath.summarizeBySetup(tradeResult.strategyEligibleTrades)
                     .map { performance -> EvaluationSetupResponse.fromPerformance(performance) },
                 marketRegimes = EvaluationMath.summarizeByMarketRegime(
-                    trades = tradeResult.trades,
+                    trades = tradeResult.strategyEligibleTrades,
                     regimes = regimes,
                     zoneId = EvaluationZone,
                 ).map { performance -> EvaluationMarketRegimeResponse.fromPerformance(performance) },
@@ -317,9 +317,9 @@ private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRou
                 scope = scope.toResponse(),
                 attributionCoverage = tradeResult.attributionCoverage.toResponse(),
                 truncated = tradeResult.truncated,
-                bySetup = EvaluationMath.calibrationBySetup(tradeResult.trades)
+                bySetup = EvaluationMath.calibrationBySetup(tradeResult.strategyEligibleTrades)
                     .map { group -> EvaluationCalibrationGroupResponse.fromStats(group) },
-                byProvider = EvaluationMath.calibrationByProvider(tradeResult.trades)
+                byProvider = EvaluationMath.calibrationByProvider(tradeResult.strategyEligibleTrades)
                     .map { group -> EvaluationCalibrationGroupResponse.fromStats(group) },
             ),
         )
@@ -404,7 +404,7 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
             )
             return@get
         }
-        val dailyPnl = tradeResult.trades.map { trade ->
+        val dailyPnl = tradeResult.strategyEligibleTrades.map { trade ->
             DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
         }
         val dailyCandleLimit = call.requireDailyCandleLimit(effectiveDateRange) ?: return@get
@@ -478,7 +478,7 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
         val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
         val usageResult = evaluationRepository.fetchLlmPhaseUsages(dateRange.toPeriod(), scope = scope).getOrThrow()
-        val costs = EvaluationMath.summarizeLlmCosts(usageResult.facts)
+        val costs = EvaluationMath.summarizeLlmCosts(usageResult.strategyEligibleFacts)
 
         call.respond(
             EvaluationCostsResponse(
@@ -824,6 +824,30 @@ data class EvaluationExclusionSummaryResponse(
     val decisionRunCount: Int = 0,
     val tradeCount: Int = 0,
     val reasons: Map<String, Int> = emptyMap(),
+    val infrastructureAffectedTradeCount: Int = 0,
+    val infrastructureAttributionMissingCount: Int = 0,
+    val infrastructureGaps: List<EvaluationInfrastructureGapResponse> = emptyList(),
+    val populationByEntityType: Map<String, EvaluationPopulationCountsResponse> = emptyMap(),
+    val populationTruncated: Boolean = false,
+)
+
+/** 共通 causal projection の entity type 別件数。 */
+@Serializable
+data class EvaluationPopulationCountsResponse(
+    val total: Int,
+    val eligible: Int,
+    val infrastructureGap: Int,
+    val attributionMissing: Int,
+)
+
+/** root deploy protocol が記録した infrastructure gap response。 */
+@Serializable
+data class EvaluationInfrastructureGapResponse(
+    val id: String,
+    val reason: String,
+    val startedAt: String,
+    val endedAt: String?,
+    val open: Boolean,
 )
 
 private fun EvaluationExclusionSummary.toResponse(): EvaluationExclusionSummaryResponse {
@@ -832,6 +856,26 @@ private fun EvaluationExclusionSummary.toResponse(): EvaluationExclusionSummaryR
         decisionRunCount = decisionRunCount,
         tradeCount = positionCount,
         reasons = reasons,
+        infrastructureAffectedTradeCount = infrastructureAffectedTradeCount,
+        infrastructureAttributionMissingCount = infrastructureAttributionMissingCount,
+        populationByEntityType = populationByEntityType.mapValues { (_, counts) ->
+            EvaluationPopulationCountsResponse(
+                total = counts.total,
+                eligible = counts.eligible,
+                infrastructureGap = counts.infrastructureGap,
+                attributionMissing = counts.attributionMissing,
+            )
+        },
+        populationTruncated = populationTruncated,
+        infrastructureGaps = infrastructureGaps.map { gap ->
+            EvaluationInfrastructureGapResponse(
+                id = gap.id,
+                reason = gap.reason,
+                startedAt = gap.startedAt.toString(),
+                endedAt = gap.endedAt?.toString(),
+                open = gap.endedAt == null,
+            )
+        },
     )
 }
 

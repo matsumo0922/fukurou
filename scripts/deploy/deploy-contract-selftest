@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELFTEST_HARNESS="$(mktemp)"
+SELFTEST_HARNESS_SQL="$(mktemp)"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "${SELFTEST_HARNESS}"
+printf '%s\n' 'SELECT 1;' > "${SELFTEST_HARNESS_SQL}"
+chmod 0755 "${SELFTEST_HARNESS}"
+export FUKUROU_FOUNDATION_HARNESS="${SELFTEST_HARNESS}"
+export FUKUROU_FOUNDATION_HARNESS_SQL="${SELFTEST_HARNESS_SQL}"
+source "${SCRIPT_DIRECTORY}/deploy-fukurou"
+
+timeout() {
+  shift
+  "$@"
+}
+
+fail_selftest() {
+  echo "deploy-contract-selftest: $*" >&2
+  exit 1
+}
+
+expect_rejected() {
+  local name="$1"
+  shift
+  if "$@"; then fail_selftest "${name} was accepted"; fi
+}
+
+installed_catalog="$(jq -cS . "${SCRIPT_DIRECTORY}/deploy-capability-catalog-v1.json")"
+installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $1}')"
+baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
+  {minimumContractVersion:1,
+   requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],
+   requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+   operations:[$catalog.operations[] |
+     select(.profile=="EXECUTOR_STAGE_V1" or .operationId=="FOUNDATION_PREFLIGHT_V1") |
+     {capability:.capabilityId,operationId:.operationId}]}
+')"
+validate_typed_operation_set "${baseline_bundle}" "${installed_catalog}" || fail_selftest "baseline rejected"
+
+superset_catalog="$(jq -cS --arg parent "${installed_hash}" '
+  .catalogVersion=2 | .parentCatalogHash=$parent |
+  .hooks += [{hookId:"FOUNDATION_RECOVERY_PROBE_V2",profile:"CANDIDATE_HOOK_V1",entrypoint:["--canary-preflight","recovery-v2"]}] |
+  .operations += [{capabilityId:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2",parameterSchemaId:"SMOKE_HOOK_FOUNDATION_V1",profile:"CANDIDATE_HOOK_V1",entrypoint:["--canary-preflight","recovery-v2"]}]
+' <<<"${installed_catalog}")"
+superset_bundle="$(jq -cS '
+  .requiredHooks += ["FOUNDATION_RECOVERY_PROBE_V2"] |
+  .operations += [{capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2"}]
+' <<<"${baseline_bundle}")"
+validate_catalog_extension "${installed_catalog}" "${superset_catalog}" "${installed_hash}" || fail_selftest "superset catalog rejected"
+validate_typed_operation_set "${superset_bundle}" "${superset_catalog}" || fail_selftest "superset bundle rejected"
+CANDIDATE_CATALOG="${superset_catalog}"
+SIGNED_BUNDLE_JSON="${superset_bundle}"
+[[ "$(required_operation_plan CANDIDATE_HOOK_V1 | jq -s 'length')" == "2" ]] || fail_selftest "accepted required hook missing from dispatch plan"
+
+deleted_bundle="$(jq -cS '.operations |= map(select(.operationId != "CLEAR_LAUNCH_MAINTENANCE"))' <<<"${baseline_bundle}")"
+expect_rejected bundle-deletion validate_typed_operation_set "${deleted_bundle}" "${installed_catalog}"
+deleted_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=2|.parentCatalogHash=$parent|.operations|=map(select(.operationId!="CLEAR_LAUNCH_MAINTENANCE"))' <<<"${installed_catalog}")"
+expect_rejected catalog-deletion validate_catalog_extension "${installed_catalog}" "${deleted_catalog}" "${installed_hash}"
+redefined_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=2|.parentCatalogHash=$parent|(.operations[]|select(.operationId=="PRODUCTION").capabilityId)="SMOKE_HOOK_V1"' <<<"${installed_catalog}")"
+expect_rejected catalog-redefinition validate_catalog_extension "${installed_catalog}" "${redefined_catalog}" "${installed_hash}"
+forked_catalog="$(jq -cS '.catalogVersion=2|.parentCatalogHash=("0" * 64)' <<<"${installed_catalog}")"
+expect_rejected catalog-fork validate_catalog_extension "${installed_catalog}" "${forked_catalog}" "${installed_hash}"
+downgraded_catalog="$(jq -cS --arg parent "${installed_hash}" '.catalogVersion=1|.parentCatalogHash=$parent' <<<"${installed_catalog}")"
+expect_rejected catalog-downgrade validate_catalog_extension "${installed_catalog}" "${downgraded_catalog}" "${installed_hash}"
+duplicate_catalog="$(jq -cS '.operations += [.operations[0]]' <<<"${installed_catalog}")"
+expect_rejected duplicate-operation validate_catalog_dispatchability "${duplicate_catalog}"
+unsupported_schema_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").parameterSchemaId)="UNKNOWN_V2"' <<<"${installed_catalog}")"
+expect_rejected unsupported-schema validate_catalog_dispatchability "${unsupported_schema_catalog}"
+unsupported_profile_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").profile)="UNSUPPORTED_V2"' <<<"${installed_catalog}")"
+expect_rejected unsupported-profile validate_catalog_dispatchability "${unsupported_profile_catalog}"
+bad_entrypoint_catalog="$(jq -cS '(.operations[]|select(.operationId=="FOUNDATION_PREFLIGHT_V1").entrypoint)=["/bin/sh","-c"]' <<<"${installed_catalog}")"
+expect_rejected unsupported-entrypoint validate_catalog_dispatchability "${bad_entrypoint_catalog}"
+
+CANDIDATE_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+CANDIDATE_CATALOG_HASH="${installed_hash}"
+CANDIDATE_CATALOG="${installed_catalog}"
+SIGNED_BUNDLE_JSON="${baseline_bundle}"
+docker() {
+  if [[ "$1" == image && "$2" == inspect ]]; then
+    printf '%s@%s\n' "${IMAGE_REPOSITORY}" "${CANDIDATE_DIGEST}"
+    return 0
+  fi
+  if [[ "$1" == run ]]; then
+    [[ " $* " == *" FOUNDATION_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 foundation "* ]]
+    return
+  fi
+  return 0
+}
+probe_candidate_operations || fail_selftest "exact candidate foundation probe rejected"
+CANDIDATE_CATALOG="${superset_catalog}"
+SIGNED_BUNDLE_JSON="${superset_bundle}"
+expect_rejected future-image-operation probe_candidate_operations
+
+ROLLBACK_STATE_DIR="$(mktemp -d)"
+DISPATCHED_OPERATION_IDS=""
+record_operation_dispatch FOUNDATION_PREFLIGHT_V1
+record_operation_dispatch PRODUCTION
+[[ "$(wc -l < "${ROLLBACK_STATE_DIR}/operation-dispatch.jsonl" | tr -d ' ')" == 2 ]] || fail_selftest "durable dispatch ledger missing entries"
+expect_rejected duplicate-durable-dispatch record_operation_dispatch PRODUCTION
+MUTATION_COUNT=0
+harness_hash="$(sha256sum "${SELFTEST_HARNESS}" "${SELFTEST_HARNESS_SQL}" | awk '{print $1}' | sha256sum | awk '{print $1}')"
+validate_foundation_harness_hash "${harness_hash}" || fail_selftest "signed harness hash rejected"
+expect_rejected tampered-harness-mutation0 validate_foundation_harness_hash "$(printf '0%.0s' {1..64})"
+[[ "${MUTATION_COUNT}" == 0 ]] || fail_selftest "harness mismatch mutated state"
+
+echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted-dispatched exact-image-probe=future-rejected-mutation0 durable-dispatch=recorded deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"

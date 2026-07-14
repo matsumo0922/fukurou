@@ -14,6 +14,8 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.evaluation.ClosedTradeFact
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationEntityType
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
@@ -137,7 +139,7 @@ class KnowledgeService(
                 ),
             ).getOrThrow()
             val setupPerformance = setupPerformanceSummaries(
-                trades = tradeResult.trades,
+                trades = tradeResult.strategyEligibleTrades,
                 queryTags = emptyList(),
             )
             val lessons = decisionRecords
@@ -200,7 +202,7 @@ class KnowledgeService(
                 scope = scope,
             ).getOrThrow()
             val setupPerformance = setupPerformanceSummaries(
-                trades = tradeResult.trades,
+                trades = tradeResult.strategyEligibleTrades,
                 queryTags = normalizedTags,
             )
 
@@ -250,22 +252,40 @@ class KnowledgeService(
         val fetchLimit = (responseLimit * KNOWLEDGE_DECISION_FETCH_MULTIPLIER)
             .coerceAtMost(MAX_KNOWLEDGE_DECISION_FETCH_LIMIT)
 
-        return decisionRepository.findDecisionsCreatedBetween(
+        val records = decisionRepository.findDecisionsCreatedBetween(
             from = period.from,
             toExclusive = period.toExclusive,
             limit = fetchLimit,
         ).getOrThrow().asReversed()
+        val statuses = evaluationRepository.classifyPopulationEntities(
+            period = period,
+            entityType = EvaluationPopulationEntityType.DECISION,
+            entityIds = records.mapTo(mutableSetOf()) { record -> record.decision.decisionId.toString() },
+        ).getOrThrow()
+
+        return records.filter { record ->
+            statuses[record.decision.decisionId.toString()] == EvaluationPopulationStatus.ELIGIBLE
+        }
     }
 
     private suspend fun fetchRecentRuns(period: EvaluationPeriod, responseLimit: Int): List<LlmRunRecord> {
         val fetchLimit = (responseLimit * KNOWLEDGE_DECISION_FETCH_MULTIPLIER)
             .coerceAtMost(MAX_KNOWLEDGE_RUN_FETCH_LIMIT)
 
-        return llmRunRepository.findRunsStartedBetween(
+        val records = llmRunRepository.findRunsStartedBetween(
             from = period.from,
             toExclusive = period.toExclusive,
             limit = fetchLimit,
         ).getOrThrow().asReversed()
+        val statuses = evaluationRepository.classifyPopulationEntities(
+            period = period,
+            entityType = EvaluationPopulationEntityType.RUN,
+            entityIds = records.mapTo(mutableSetOf()) { record -> record.invocationId },
+        ).getOrThrow()
+
+        return records.filter { record ->
+            statuses[record.invocationId] == EvaluationPopulationStatus.ELIGIBLE
+        }
     }
 
     private fun failurePatterns(

@@ -382,6 +382,7 @@ private val LIFECYCLE_MUTATION_SOURCE_ALLOWLIST = listOf(
     LifecycleMutationSourceEntry(
         file = "scripts/mcp-credential-isolation-check",
         mutations = setOf(
+            LifecycleMutationTuple("INSERT", "llm_launch_reservations"),
             LifecycleMutationTuple("INSERT", "llm_runs"),
             LifecycleMutationTuple("INSERT", "opportunity_episodes"),
             LifecycleMutationTuple("UPDATE", "opportunity_episodes"),

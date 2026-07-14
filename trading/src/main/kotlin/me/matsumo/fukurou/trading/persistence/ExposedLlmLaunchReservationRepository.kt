@@ -35,6 +35,7 @@ import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -74,6 +75,12 @@ private const val SELECT_SINGLE_ATTEMPT_EXISTS_SQL = """
     FROM llm_launch_reservations
     WHERE single_attempt_key = ?
     LIMIT 1
+"""
+
+private const val INSERT_LLM_PID_REGISTRATION_SQL = """
+    INSERT INTO llm_pid_registrations (
+        registration_id, invocation_id, reservation_id, role, container_instance_id, state
+    ) VALUES (?, ?, ?, 'PROVIDER', ?, 'SPAWN_RESERVED')
 """
 
 /**
@@ -120,15 +127,20 @@ private const val FINISH_LLM_LAUNCH_RESERVATION_SQL = """
         finished_at = ?,
         reason = ?
     WHERE invocation_id = ?
-        AND status = 'RUNNING'
         AND (
-            (execution_claim_state = 'CLAIMED' AND ? IS NOT NULL AND execution_claim_token = ?)
-            OR (
-                execution_claim_state IS DISTINCT FROM 'CLAIMED'
-                AND (? IS NULL OR execution_claim_token = ?)
+            (
+                status = 'RUNNING'
+                AND (
+                    (execution_claim_state = 'CLAIMED' AND ? IS NOT NULL AND execution_claim_token = ?)
+                    OR (
+                        execution_claim_state IS DISTINCT FROM 'CLAIMED'
+                        AND (? IS NULL OR execution_claim_token = ?)
+                    )
+                )
+                AND (? IS NULL OR execution_claim_heartbeat_at = ?)
             )
+            OR (status = ? AND finished_at = ? AND reason IS NOT DISTINCT FROM ?)
         )
-        AND (? IS NULL OR execution_claim_heartbeat_at = ?)
 """
 
 /** AVAILABLE reservation を一度だけ CLAIMED へ遷移させる SQL。 */
@@ -218,6 +230,19 @@ private const val HEARTBEAT_LLM_EXECUTION_CLAIM_SQL = """
         AND status = 'RUNNING'
         AND execution_claim_state = 'CLAIMED'
         AND execution_claim_token = ?
+"""
+
+private const val FINISH_LLM_PID_REGISTRATION_SQL = """
+    UPDATE llm_pid_registrations
+    SET state = 'TERMINAL', terminal_reason = ?, terminal_at = clock_timestamp(), updated_at = clock_timestamp()
+    WHERE invocation_id = ? AND state IN ('SPAWN_RESERVED', 'ACTIVE')
+"""
+
+private const val COUNT_LLM_PID_REGISTRATIONS_SQL = """
+    SELECT COUNT(*) AS total_count,
+        COUNT(*) FILTER (WHERE state IN ('SPAWN_RESERVED', 'ACTIVE')) AS active_count
+    FROM llm_pid_registrations
+    WHERE invocation_id = ?
 """
 
 /**
@@ -524,6 +549,11 @@ private fun JdbcTransaction.recoverStaleExecutionClaimInTransaction(
         statement.setNullableLong(7, request.observedHeartbeatAt?.toEpochMilli())
         val recovered = statement.executeUpdate() == 1
         if (recovered) {
+            terminalizeLlmPidRegistrations(
+                invocationId = request.invocationId,
+                reason = request.reason,
+                requireRegistration = false,
+            )
             val runRecovered = recoverCurrentProcessLlmRun(request, deadline, nanoTime)
             insertRecoveryEvent(request, runRecovered, deadline, nanoTime)
         }
@@ -829,8 +859,10 @@ private fun JdbcTransaction.singleAttemptExists(singleAttemptKey: String): Boole
 }
 
 private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationRequest): Boolean {
-    jdbcConnection().prepareStatement(INSERT_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
-        statement.setObject(1, UUID.randomUUID())
+    val reservationId = deterministicUuid("fukurou-launch-reservation-v1:${request.invocationId}")
+    val registrationId = deterministicUuid("fukurou-pid-registration-v1:${request.invocationId}:PROVIDER")
+    val inserted = jdbcConnection().prepareStatement(INSERT_LLM_LAUNCH_RESERVATION_SQL).use { statement ->
+        statement.setObject(1, reservationId)
         statement.setString(2, request.invocationId)
         statement.setString(3, request.triggerKind.name)
         statement.setString(4, request.triggerKey)
@@ -844,8 +876,19 @@ private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationReque
         statement.setString(12, request.populationScope.accountEpochId)
         statement.setString(13, request.populationScope.cohort)
         statement.setString(14, request.populationScope.executionSemanticsVersion)
-        statement.executeQuery().use { resultSet -> return resultSet.next() }
+        statement.executeQuery().use { resultSet -> resultSet.next() }
     }
+    if (!inserted) return false
+
+    jdbcConnection().prepareStatement(INSERT_LLM_PID_REGISTRATION_SQL).use { statement ->
+        statement.setObject(1, registrationId)
+        statement.setString(2, request.invocationId)
+        statement.setObject(3, reservationId)
+        statement.setString(4, System.getenv("HOSTNAME") ?: "unknown-container")
+        check(statement.executeUpdate() == 1)
+    }
+
+    return true
 }
 
 private fun JdbcTransaction.reservationId(invocationId: String): String {
@@ -873,10 +916,54 @@ fun JdbcTransaction.finishLlmLaunchInTransaction(finish: LlmLaunchReservationFin
         statement.setNullableString(8, finish.claimantToken)
         statement.setNullableLong(9, finish.observedHeartbeatAt?.toEpochMilli())
         statement.setNullableLong(10, finish.observedHeartbeatAt?.toEpochMilli())
+        statement.setString(11, finish.status.name)
+        statement.setLong(12, finish.finishedAt.toEpochMilli())
+        statement.setNullableString(13, finish.reason)
         statement.executeUpdate()
     }
 
-    check(updatedRows in 0..1) { "Conditional reservation finish updated multiple rows." }
+    require(updatedRows == 1) {
+        "LLM launch reservation was not found. invocationId=${finish.invocationId}"
+    }
+    terminalizeLlmPidRegistrations(
+        invocationId = finish.invocationId,
+        reason = finish.reason ?: finish.status.name,
+        requireRegistration = true,
+    )
+}
+
+/** reservation terminal化と同じtransactionで対応PID registrationを収束させる。 */
+internal fun JdbcTransaction.terminalizeLlmPidRegistrations(
+    invocationId: String,
+    reason: String,
+    requireRegistration: Boolean,
+) {
+    jdbcConnection().prepareStatement(FINISH_LLM_PID_REGISTRATION_SQL).use { statement ->
+        statement.setString(1, reason)
+        statement.setString(2, invocationId)
+        statement.executeUpdate()
+    }
+    val registrationCounts = jdbcConnection().prepareStatement(COUNT_LLM_PID_REGISTRATIONS_SQL).use { statement ->
+        statement.setString(1, invocationId)
+        statement.executeQuery().use { resultSet ->
+            require(resultSet.next())
+            resultSet.getInt("total_count") to resultSet.getInt("active_count")
+        }
+    }
+    val totalCountAllowed = if (requireRegistration) registrationCounts.first in 1..2 else registrationCounts.first in 0..2
+    require(totalCountAllowed && registrationCounts.second == 0) {
+        "LLM PID registrations did not reach a terminal state. invocationId=$invocationId"
+    }
+}
+
+private fun deterministicUuid(value: String): UUID {
+    val digest = MessageDigest.getInstance("MD5").digest(value.toByteArray())
+    val hexadecimal = digest.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+    return UUID.fromString(
+        "${hexadecimal.substring(0, 8)}-${hexadecimal.substring(8, 12)}-${hexadecimal.substring(12, 16)}-" +
+            "${hexadecimal.substring(16, 20)}-${hexadecimal.substring(20, 32)}",
+    )
 }
 
 /** claim conditional update と stable rejection classification を同じ transaction で行う。 */

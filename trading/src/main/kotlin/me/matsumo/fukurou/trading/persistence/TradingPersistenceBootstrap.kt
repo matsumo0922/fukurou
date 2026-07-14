@@ -1251,6 +1251,7 @@ class TradingPersistenceBootstrap(
                 setLocalPostgresSetting("lock_timeout", previousLockTimeout)
                 setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
                 ensureGapPopulationLifecycleSchema()
+                ensureLaunchFoundationSchema()
                 val now = Instant.now(clock)
 
                 jdbcConnection().prepareStatement(
@@ -1304,6 +1305,62 @@ class TradingPersistenceBootstrap(
                 onStaleLlmRunsRecovered(recoveredCount)
             }
         }
+    }
+
+    private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.ensureLaunchFoundationSchema() {
+        exec(
+            """
+                CREATE TABLE IF NOT EXISTS llm_launch_maintenance (
+                    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                    generation BIGINT NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    deployment_id VARCHAR(96),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                )
+            """.trimIndent(),
+        )
+        exec(
+            """
+                INSERT INTO llm_launch_maintenance(singleton, generation, enabled)
+                VALUES (TRUE, 0, FALSE)
+                ON CONFLICT (singleton) DO NOTHING
+            """.trimIndent(),
+        )
+        exec(
+            """
+                CREATE TABLE IF NOT EXISTS infrastructure_gap_events (
+                    event_id UUID PRIMARY KEY,
+                    gap_id UUID NOT NULL,
+                    deployment_id VARCHAR(96) NOT NULL,
+                    boundary VARCHAR(5) NOT NULL CHECK (boundary IN ('OPEN', 'CLOSE')),
+                    reason VARCHAR(64) NOT NULL,
+                    occurred_at TIMESTAMPTZ NOT NULL,
+                    payload_hash CHAR(64) NOT NULL,
+                    recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                    UNIQUE (deployment_id, boundary),
+                    UNIQUE (gap_id, boundary)
+                )
+            """.trimIndent(),
+        )
+        exec(
+            """
+                CREATE TABLE IF NOT EXISTS llm_pid_registrations (
+                    registration_id UUID PRIMARY KEY,
+                    invocation_id VARCHAR(128) NOT NULL,
+                    reservation_id UUID NOT NULL,
+                    role VARCHAR(24) NOT NULL,
+                    container_instance_id VARCHAR(96) NOT NULL,
+                    pid_namespace_inode BIGINT,
+                    process_id INTEGER,
+                    process_start_ticks BIGINT,
+                    state VARCHAR(24) NOT NULL,
+                    registered_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                    terminal_at TIMESTAMPTZ,
+                    terminal_reason VARCHAR(64)
+                )
+            """.trimIndent(),
+        )
     }
 
     /**
@@ -2055,7 +2112,7 @@ private fun JdbcTransaction.recoverStaleLlmReservation(invocationId: String, now
         WHERE invocation_id = ? AND status = ?
     """.trimIndent()
 
-    return jdbcConnection().prepareStatement(sql).use { statement ->
+    val recovered = jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, "FAILED")
         statement.setLong(2, now.toEpochMilli())
         statement.setString(3, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
@@ -2063,6 +2120,15 @@ private fun JdbcTransaction.recoverStaleLlmReservation(invocationId: String, now
         statement.setString(5, "RUNNING")
         statement.executeUpdate() == 1
     }
+    if (recovered) {
+        terminalizeLlmPidRegistrations(
+            invocationId = invocationId,
+            reason = LlmRunTerminalCause.RESTART_INTERRUPTED.name,
+            requireRegistration = false,
+        )
+    }
+
+    return recovered
 }
 
 private fun JdbcTransaction.insertLlmInvocationRecoveryEvent(

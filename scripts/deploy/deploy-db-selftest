@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
+touch "${SELFTEST_ROOT}/foundation.sql" "${SELFTEST_ROOT}/indexes.sql"
+export FUKUROU_FOUNDATION_SQL="${SELFTEST_ROOT}/foundation.sql"
+export FUKUROU_FOUNDATION_INDEX_SQL="${SELFTEST_ROOT}/indexes.sql"
+export FUKUROU_MCP_DB_USER=fukurou_mcp_fixture
+
+# shellcheck source=fukurou-deploy-db
+source "$(dirname "$0")/fukurou-deploy-db"
+
+MODE=PRE_FOUNDATION
+LAST_PSQL_ARGS="${SELFTEST_ROOT}/psql-args"
+docker() {
+  if [[ "$1" == "inspect" && "${*: -1}" == "${APPLICATION_CONTAINER}" ]]; then return 1; fi
+  return 1
+}
+timeout() { shift; "$@"; }
+psql_exec() {
+  printf '%s\n' "$*" > "${LAST_PSQL_ARGS}"
+  local query="$*"
+  if [[ "${query}" == *"infrastructure_gap_events"* && "${query}" == *"to_regclass"* ]]; then
+    [[ "${MODE}" == FOUNDATION_V1 ]] && printf 't\n' || printf 'f\n'
+  elif [[ "${query}" == *"llm_launch_maintenance"* && "${query}" == *"to_regclass"* ]]; then
+    [[ "${MODE}" == FOUNDATION_V1 ]] && printf 't\n' || printf 'f\n'
+  elif [[ "${query}" == *"llm_pid_registrations"* && "${query}" == *"to_regclass"* ]]; then
+    [[ "${MODE}" == FOUNDATION_V1 ]] && printf 't\n' || printf 'f\n'
+  elif [[ "${query}" == *"runtime_config_versions"* && "${query}" == *"to_regclass"* ]]; then
+    printf 'f\n'
+  elif [[ "${query}" == *"jsonb_build_object('generation'"* ]]; then
+    printf '{"generation":4,"enabled":true,"deploymentId":"fixture"}\n'
+  elif [[ "${query}" == *"jsonb_build_object('active'"* ]]; then
+    printf '{"active":0,"total":2}\n'
+  else
+    printf '{"captureDbTimestamp":"2026-07-13T00:00:00.000000Z","runtimeConfigVersion":"","runtimeConfigHash":"","preFilterActive":"","foundationCatalogFingerprint":"fixture"}\n'
+  fi
+}
+
+[[ -z "$(application_value FUKUROU_MCP_DB_USER)" ]]
+install_foundation >/dev/null
+grep -Fq -- '--set=mcp_role=fukurou_mcp_fixture' "${LAST_PSQL_ARGS}"
+
+pre_snapshot="$(snapshot)"
+[[ "$(jq -r '.installKind' <<<"${pre_snapshot}")" == PRE_FOUNDATION ]]
+[[ "$(jq -r '.maintenance.enabled' <<<"${pre_snapshot}")" == false ]]
+
+MODE=FOUNDATION_V1
+foundation_snapshot="$(snapshot)"
+[[ "$(jq -r '.installKind' <<<"${foundation_snapshot}")" == FOUNDATION_V1 ]]
+[[ "$(jq -r '.maintenance.generation' <<<"${foundation_snapshot}")" == 4 ]]
+[[ "$(jq -r '.pidRegistrations.total' <<<"${foundation_snapshot}")" == 2 ]]
+
+echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact snapshots=pre-foundation,foundation-v1"

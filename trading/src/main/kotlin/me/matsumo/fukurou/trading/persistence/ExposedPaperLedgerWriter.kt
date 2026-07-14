@@ -46,6 +46,7 @@ import me.matsumo.fukurou.trading.broker.unrealizedPnlAt
 import me.matsumo.fukurou.trading.broker.unrealizedRAt
 import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Order
@@ -254,6 +255,7 @@ internal class ExposedPaperLedgerWriter(
                     val writeIntent = resolvePaperWriteContext(command.auditContext)
                         .intent(PaperWritePolicy.RISK_REDUCING)
                     val position = requireOpenPosition(positionId)
+                    val auditContext = command.auditContext.withPositionFallback(selectPositionAuditContext(positionId))
                     val closeOrderId = orderId.toString()
                     val realizedFill = fill.withRealizedPnl(position)
 
@@ -267,7 +269,7 @@ internal class ExposedPaperLedgerWriter(
                             position = position,
                             sizeBtc = realizedFill.sizeBtc,
                             reasonJa = command.reasonJa,
-                            auditContext = command.auditContext,
+                            auditContext = auditContext,
                             writeIntent = writeIntent,
                         ),
                         clock = clock,
@@ -279,7 +281,7 @@ internal class ExposedPaperLedgerWriter(
                             mode = position.mode,
                             side = OrderSide.SELL,
                             fill = realizedFill,
-                            auditContext = command.auditContext,
+                            auditContext = auditContext,
                             writeIntent = writeIntent,
                         ),
                     )
@@ -754,7 +756,8 @@ private fun JdbcTransaction.triggerEventStop(
     val realizedFill = fill.withRealizedPnl(position)
 
     updateOrderStatus(stopOrder.orderId, OrderStatus.FILLED, "market event stop trigger", context.clock)
-    insertExecution(eventExecutionRequest(stopOrder.orderId, position, realizedFill, event, context.writeIntent))
+    val auditContext = selectPositionAuditContext(UUID.fromString(position.positionId))
+    insertExecution(eventExecutionRequest(stopOrder.orderId, position, realizedFill, event, context.writeIntent, auditContext))
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, context.clock)
     context.progress.filledOrderIds += stopOrder.orderId
@@ -776,6 +779,7 @@ private fun JdbcTransaction.triggerEventTakeProfit(position: Position, context: 
         .copy(executedAt = event.receivedAt)
     val realizedFill = fill.withRealizedPnl(position)
     val closeOrderId = UUID.randomUUID()
+    val auditContext = selectPositionAuditContext(UUID.fromString(position.positionId))
 
     insertCloseOrder(
         CloseOrderInsertRequest(
@@ -783,12 +787,12 @@ private fun JdbcTransaction.triggerEventTakeProfit(position: Position, context: 
             position,
             realizedFill.sizeBtc,
             "market event virtual take profit trigger",
-            PaperTradeAuditContext.EMPTY,
+            auditContext,
             context.writeIntent,
         ),
         context.clock,
     )
-    insertExecution(eventExecutionRequest(closeOrderId.toString(), position, realizedFill, event, context.writeIntent))
+    insertExecution(eventExecutionRequest(closeOrderId.toString(), position, realizedFill, event, context.writeIntent, auditContext))
     closePositionRow(position, realizedFill)
     updateAccountAfterSell(realizedFill, context.clock)
     context.progress.canceledOrderIds += stopOrder.orderId
@@ -806,12 +810,14 @@ private data class EventProtectionContext(
     val clock: Clock,
 )
 
+@Suppress("LongParameterList")
 private fun eventExecutionRequest(
     orderId: String,
     position: Position,
     fill: SimulatedFill,
     event: PaperMarketTradeEvent,
     writeIntent: PaperWriteIntent,
+    auditContext: PaperTradeAuditContext,
 ): ExecutionInsertRequest {
     return ExecutionInsertRequest(
         orderId,
@@ -819,7 +825,7 @@ private fun eventExecutionRequest(
         position.mode,
         OrderSide.SELL,
         fill,
-        PaperTradeAuditContext.EMPTY,
+        auditContext,
         writeIntent,
         event,
     )
@@ -1168,6 +1174,7 @@ private fun JdbcTransaction.triggerStopProtection(
         context.simulationContext,
     )
     val realizedFill = fill.withRealizedPnl(position)
+    val auditContext = selectPositionAuditContext(UUID.fromString(position.positionId))
 
     updateOrderStatus(stopOrder.orderId, OrderStatus.FILLED, "reconciler stop trigger", clock)
     insertExecution(
@@ -1177,7 +1184,7 @@ private fun JdbcTransaction.triggerStopProtection(
             mode = position.mode,
             side = OrderSide.SELL,
             fill = realizedFill,
-            auditContext = PaperTradeAuditContext.EMPTY,
+            auditContext = auditContext,
             writeIntent = writeContext.intent(PaperWritePolicy.RISK_REDUCING),
         ),
     )
@@ -1214,6 +1221,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
     )
     val realizedFill = fill.withRealizedPnl(position)
     val closeOrderId = UUID.randomUUID()
+    val auditContext = selectPositionAuditContext(UUID.fromString(position.positionId))
 
     insertCloseOrder(
         request = CloseOrderInsertRequest(
@@ -1221,7 +1229,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
             position = position,
             sizeBtc = realizedFill.sizeBtc,
             reasonJa = VIRTUAL_TAKE_PROFIT_TRIGGER_REASON,
-            auditContext = PaperTradeAuditContext.EMPTY,
+            auditContext = auditContext,
             writeIntent = writeContext.intent(PaperWritePolicy.RISK_REDUCING),
         ),
         clock = clock,
@@ -1233,7 +1241,7 @@ private fun JdbcTransaction.triggerTakeProfitProtection(
             mode = position.mode,
             side = OrderSide.SELL,
             fill = realizedFill,
-            auditContext = PaperTradeAuditContext.EMPTY,
+            auditContext = auditContext,
             writeIntent = writeContext.intent(PaperWritePolicy.RISK_REDUCING),
         ),
     )
@@ -2104,6 +2112,37 @@ private fun JdbcTransaction.requireOpenPosition(positionId: UUID): Position {
     return selectOpenPositions()
         .firstOrNull { position -> position.positionId == positionId.toString() }
         ?: throw IllegalArgumentException("position was not found.")
+}
+
+private fun JdbcTransaction.selectPositionAuditContext(positionId: UUID): PaperTradeAuditContext {
+    return prepare(
+        """
+            SELECT decision_run_id, llm_provider,
+                prompt_hash, system_prompt_version, market_snapshot_id
+            FROM positions
+            WHERE id = ?
+        """,
+    ).use { statement ->
+        statement.setObject(1, positionId)
+        statement.executeQuery().use { result ->
+            require(result.next()) { "position audit context was not found." }
+            PaperTradeAuditContext(
+                decisionRunContext = DecisionRunContext(
+                    decisionRunId = result.getString("decision_run_id"),
+                    llmProvider = result.getString("llm_provider"),
+                    promptHash = result.getString("prompt_hash"),
+                    systemPromptVersion = result.getString("system_prompt_version"),
+                    marketSnapshotId = result.getString("market_snapshot_id"),
+                ),
+                toolCallId = null,
+                clientRequestId = null,
+            )
+        }
+    }
+}
+
+private fun PaperTradeAuditContext.withPositionFallback(fallback: PaperTradeAuditContext): PaperTradeAuditContext {
+    return if (decisionRunContext.decisionRunId == null) copy(decisionRunContext = fallback.decisionRunContext) else this
 }
 
 private fun JdbcTransaction.requireOpenOrder(orderId: UUID): Order {

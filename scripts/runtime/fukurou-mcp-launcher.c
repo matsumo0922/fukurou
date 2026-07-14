@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/securebits.h>
@@ -17,6 +18,7 @@
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include "fukurou-runtime-proxy.h"
 
 #define APP_UID 10001
 #define MCP_UID 10003
@@ -189,6 +191,16 @@ int main(int argc, char **argv) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) fail("cannot set no_new_privs");
     verify_final_security_state(canary);
 
+    const char *invocation_id = getenv("FUKUROU_INVOCATION_ID");
+    if (invocation_id == NULL || strlen(invocation_id) == 0 || strlen(invocation_id) > 128) fail("invocation id is required");
+    for (const char *cursor = invocation_id; *cursor != '\0'; cursor++) {
+        if (!(isalnum((unsigned char)*cursor) || *cursor == '.' || *cursor == '_' || *cursor == ':' || *cursor == '-')) {
+            fail("invocation id is malformed");
+        }
+    }
+    char invocation_environment[160];
+    if (snprintf(invocation_environment, sizeof(invocation_environment), "FUKUROU_INVOCATION_ID=%s", invocation_id) >=
+        (int)sizeof(invocation_environment)) fail("invocation id is too long");
     char *const args[] = {
         "java",
         "--add-opens=java.base/java.io=ALL-UNNAMED",
@@ -197,7 +209,6 @@ int main(int argc, char **argv) {
         MCP_JAR,
         NULL
     };
-    char *const environment[] = {"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", NULL};
-    execve("/opt/java/openjdk/bin/java", args, environment);
-    fail(strerror(errno));
+    char *const environment[] = {"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", invocation_environment, NULL};
+    _exit(fukurou_supervisor_proxy(FUKUROU_PROFILE_MCP_CURRENT_V1, args, environment, 6));
 }

@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.reflection
 
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EQUITY_SNAPSHOT_TRADING_DATE_ZONE
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationEntityType
+import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
@@ -92,6 +94,16 @@ class ReflectionDataCollector(
                 limit = limit,
             ).getOrThrow()
         }
+        val decisionStatuses = evaluationRepository.classifyPopulationEntities(
+            period = evaluationPeriod,
+            entityType = EvaluationPopulationEntityType.DECISION,
+            entityIds = decisions.values.mapTo(mutableSetOf()) { record -> record.decision.decisionId.toString() },
+        ).getOrThrow()
+        val runStatuses = evaluationRepository.classifyPopulationEntities(
+            period = evaluationPeriod,
+            entityType = EvaluationPopulationEntityType.RUN,
+            entityIds = llmRuns.values.mapTo(mutableSetOf()) { record -> record.invocationId },
+        ).getOrThrow()
         val closedTradeResult = evaluationRepository.fetchClosedTrades(
             period = evaluationPeriod,
             limit = queryLimit,
@@ -105,12 +117,16 @@ class ReflectionDataCollector(
 
         return ReflectionWindowData(
             period = period,
-            decisions = decisions.values,
-            llmRuns = llmRuns.values,
-            closedTrades = closedTradeResult.trades,
+            decisions = decisions.values.filter { record ->
+                decisionStatuses[record.decision.decisionId.toString()] == EvaluationPopulationStatus.ELIGIBLE
+            },
+            llmRuns = llmRuns.values.filter { record ->
+                runStatuses[record.invocationId] == EvaluationPopulationStatus.ELIGIBLE
+            },
+            closedTrades = closedTradeResult.strategyEligibleTrades,
             decisionRunCount = evaluationRepository.countDecisionRuns(evaluationPeriod, scope).getOrThrow(),
             actionCounts = evaluationRepository.countDecisionsByAction(evaluationPeriod, scope).getOrThrow(),
-            llmPhaseUsages = usageResult.facts,
+            llmPhaseUsages = usageResult.strategyEligibleFacts,
             truncation = ReflectionTruncationFlags(
                 decisions = decisions.truncated,
                 llmRuns = llmRuns.truncated,
