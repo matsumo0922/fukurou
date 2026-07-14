@@ -17,6 +17,7 @@ PRODUCTION_TIMEOUT_DEFINITION="$(declare -f timeout | sed '1s/^timeout/productio
 boottime_seconds() { printf '1\n'; }
 
 DB_CALLS="${SELFTEST_ROOT}/db-calls"
+DOCKER_CALLS="${SELFTEST_ROOT}/docker-calls"
 DB_STATE_ROOT="${SELFTEST_ROOT}/db-state"
 mkdir -p "${DB_STATE_ROOT}/gaps"
 OBSERVATION_MODE=stopped
@@ -59,6 +60,7 @@ timeout() {
 git() { return 0; }
 docker() {
   local operation="${1:-}" argument="${2:-}" control="" generation=""
+  printf '%s\n' "$*" >> "${DOCKER_CALLS}"
   case "${operation}" in
     exec)
       while [[ "$#" -gt 0 ]]; do
@@ -135,8 +137,10 @@ capture_body="$(declare -f capture_rollback_state)"
 write_recovery_state() {
   local state_dir="$1" deployment_id="$2"
   local configured_reference="${3-ghcr.io/matsumo0922/fukurou@sha256:0000000000000000000000000000000000000000000000000000000000000000}"
+  local repo_digest="${4:-}" repo_digests='[]'
+  [[ -z "${repo_digest}" ]] || repo_digests="[\"${repo_digest}\"]"
   cat > "${state_dir}/state.json" <<JSON
-{"deploymentId":"${deployment_id}","installKind":"FOUNDATION_V1","previousRepoSha":"0000000000000000000000000000000000000000","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6},"runningContainer":{"configuredImageReference":"${configured_reference}"}}
+{"deploymentId":"${deployment_id}","installKind":"FOUNDATION_V1","previousRepoSha":"1111111111111111111111111111111111111111","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6},"runningContainer":{"configuredImageReference":"${configured_reference}","repoDigests":${repo_digests},"revision":"0000000000000000000000000000000000000000"}}
 JSON
   printf 'services:\n  ktor:\n    image: ${FUKUROU_IMAGE_REFERENCE:?}\n    environment:\n      FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_TAG:?}\n' > "${state_dir}/docker-compose.prod.yml"
 }
@@ -151,6 +155,25 @@ bind_recovery_image_reference
 [[ "${FUKUROU_IMAGE_REFERENCE}" == "ghcr.io/matsumo0922/fukurou@${CANDIDATE_DIGEST}" ]]
 [[ "${FUKUROU_IMAGE_TAG}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
 rm -rf "${fresh_state_dir}"
+
+tag_state_dir="${STATE_ROOT}/tag-image-binding"
+mkdir -p "${tag_state_dir}"
+tag_digest="ghcr.io/matsumo0922/fukurou@sha256:$(printf '4%.0s' {1..64})"
+write_recovery_state "${tag_state_dir}" tag-image-binding \
+  "ghcr.io/matsumo0922/fukurou:legacy-tag" "${tag_digest}"
+ROLLBACK_STATE_DIR="${tag_state_dir}"
+unset FUKUROU_IMAGE_REFERENCE FUKUROU_IMAGE_TAG
+bind_recovery_image_reference
+[[ "${FUKUROU_IMAGE_REFERENCE}" == "${tag_digest}" ]]
+[[ "${FUKUROU_IMAGE_TAG}" == "${tag_digest}" ]]
+rm -rf "${tag_state_dir}"
+
+CANDIDATE_DIGEST="sha256:$(printf '5%.0s' {1..64})"
+mkdir -p "${FENCE_ROOT}"
+write_fence_fallback DISABLED_PENDING_DB 7
+grep -Fq \
+  "run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges=true --mount type=bind,src=${FENCE_ROOT},dst=/var/lib/fukurou/launch-fence --entrypoint ${SUPERVISOR_BINARY} ${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST} --fence-write DISABLED_PENDING_DB 7" \
+  "${DOCKER_CALLS}"
 
 create_recovery_fixture() {
   local deployment_id="$1" terminal_state="$2"

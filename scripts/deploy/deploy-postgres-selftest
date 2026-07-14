@@ -18,11 +18,20 @@ docker run -d --name "${CONTAINER}" \
   -e POSTGRES_PASSWORD="${PASSWORD}" \
   postgres:16-alpine >/dev/null
 
+postgres_ready=false
 for _ in {1..60}; do
-  docker exec "${CONTAINER}" pg_isready -U "${USER}" -d "${DATABASE}" >/dev/null 2>&1 && break
+  if docker exec "${CONTAINER}" sh -ec \
+    'test "$(cat /proc/1/comm)" = postgres && pg_isready -U "$1" -d "$2"' \
+    _ "${USER}" "${DATABASE}" >/dev/null 2>&1; then
+    postgres_ready=true
+    break
+  fi
   sleep 1
 done
-docker exec "${CONTAINER}" pg_isready -U "${USER}" -d "${DATABASE}" >/dev/null
+[[ "${postgres_ready}" == true ]] || {
+  docker logs "${CONTAINER}" >&2
+  exit 1
+}
 
 export FUKUROU_POSTGRES_CONTAINER="${CONTAINER}"
 export FUKUROU_APPLICATION_CONTAINER="${CONTAINER}-absent"
