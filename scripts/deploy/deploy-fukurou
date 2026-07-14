@@ -118,7 +118,7 @@ timeout() {
     (( remaining > 0 )) || return 124
     (( requested <= remaining )) || requested="${remaining}"
   fi
-  command setsid timeout --signal=TERM --kill-after=5 "${requested}" "$@" &
+  command timeout --signal=TERM --kill-after=5 "${requested}" "$@" &
   ACTIVE_EXTERNAL_PGID="$!"
   local status=0
   wait "${ACTIVE_EXTERNAL_PGID}" || status="$?"
@@ -1243,7 +1243,7 @@ main() {
   DEPLOY_STAGE=PRECHECK
   PENDING_STATE_DIR=""
   require_root
-  for command in base64 cat docker find flock git jq md5sum openssl setsid sha256sum sync timeout; do require_command "${command}"; done
+  for command in base64 cat docker find flock git jq md5sum openssl sha256sum sync timeout; do require_command "${command}"; done
   parse_arguments "$@"
   DEPLOY_STAGE=VALIDATE_SIGNED_BUNDLE
   validate_signed_bundle
