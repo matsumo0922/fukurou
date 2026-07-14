@@ -101,6 +101,7 @@ class ReleaseDeployFoundationContractTest {
         assertFalse(migration.contains("UPDATE infrastructure_gap_events"))
         assertTrue(migration.contains("llm_pid_registrations"))
         assertTrue(compose.contains("FUKUROU_IMAGE_REFERENCE"))
+        assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
         assertFalse(compose.contains("image: ghcr.io/matsumo0922/fukurou:\${FUKUROU_IMAGE_TAG"))
         assertTrue(executor.contains("MANUAL_RECOVERY_REQUIRED"))
         assertTrue(executor.contains("maintenance-cas"))
@@ -112,6 +113,7 @@ class ReleaseDeployFoundationContractTest {
                 .substringBefore("probe_candidate_operations")
                 .contains("start_forward_deadline_watchdog"),
         )
+        assertTrue(main.indexOf("validate_production_compose") < main.indexOf("capture_rollback_state"))
         assertTrue(executor.contains("legacy_journal_transition_allowed"))
         assertTrue(executor.contains("load_prepared_gap_event OPEN"))
     }

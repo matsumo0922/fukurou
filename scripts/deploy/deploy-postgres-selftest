@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+readonly CONTAINER="fukurou-deploy-postgres-selftest-$$"
+readonly DATABASE="fukurou"
+readonly USER="fukurou"
+readonly PASSWORD="fixture-password"
+
+cleanup() {
+  docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+docker run -d --name "${CONTAINER}" \
+  -e POSTGRES_DB="${DATABASE}" \
+  -e POSTGRES_USER="${USER}" \
+  -e POSTGRES_PASSWORD="${PASSWORD}" \
+  postgres:16-alpine >/dev/null
+
+for _ in {1..60}; do
+  docker exec "${CONTAINER}" pg_isready -U "${USER}" -d "${DATABASE}" >/dev/null 2>&1 && break
+  sleep 1
+done
+docker exec "${CONTAINER}" pg_isready -U "${USER}" -d "${DATABASE}" >/dev/null
+
+export FUKUROU_POSTGRES_CONTAINER="${CONTAINER}"
+export FUKUROU_APPLICATION_CONTAINER="${CONTAINER}-absent"
+export FUKUROU_FOUNDATION_SQL="${ROOT}/scripts/deploy/sql/deploy-foundation-v1.sql"
+export FUKUROU_FOUNDATION_INDEX_SQL="${ROOT}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql"
+export FUKUROU_MCP_DB_USER=fukurou_mcp
+
+# shellcheck source=fukurou-deploy-db
+source "${ROOT}/scripts/deploy/fukurou-deploy-db"
+
+timeout() {
+  shift
+  "$@"
+}
+
+pre_foundation_snapshot="$(snapshot)"
+[[ "$(jq -r '.installKind' <<<"${pre_foundation_snapshot}")" == PRE_FOUNDATION ]]
+[[ "$(jq -r '.maintenance.enabled' <<<"${pre_foundation_snapshot}")" == false ]]
+[[ "$(jq -r '.maintenance.generation' <<<"${pre_foundation_snapshot}")" == 0 ]]
+[[ "$(jq -r '.pidRegistrations.total' <<<"${pre_foundation_snapshot}")" == 0 ]]
+
+psql_exec <<'SQL'
+CREATE ROLE fukurou_mcp;
+CREATE TABLE positions (mode text, status text, account_epoch_id uuid, closed_at timestamptz, opened_at timestamptz, id uuid);
+CREATE TABLE orders (created_at timestamptz, updated_at timestamptz, decision_run_id uuid, intent_id uuid, id uuid);
+CREATE TABLE executions (executed_at timestamptz, position_id uuid, order_id uuid, decision_run_id uuid, id uuid);
+CREATE TABLE decisions (created_at timestamptz, invocation_id text, id uuid);
+CREATE TABLE llm_runs (
+    invocation_id text PRIMARY KEY,
+    status text,
+    started_at bigint,
+    finished_at bigint,
+    error_message text,
+    terminal_cause text
+);
+CREATE TABLE llm_launch_reservations (
+    invocation_id text PRIMARY KEY,
+    status text,
+    finished_at bigint,
+    reason text
+);
+SQL
+
+install_foundation >/dev/null
+install_foundation >/dev/null
+install_indexes >/dev/null
+
+foundation_snapshot="$(snapshot)"
+[[ "$(jq -r '.installKind' <<<"${foundation_snapshot}")" == FOUNDATION_V1 ]]
+[[ "$(jq -r '.maintenance.enabled' <<<"${foundation_snapshot}")" == false ]]
+
+psql_exec <<'SQL'
+INSERT INTO llm_launch_reservations(invocation_id, status) VALUES ('active-fixture', 'RUNNING');
+INSERT INTO llm_runs(invocation_id, status, started_at) VALUES ('active-fixture', 'RUNNING', 1);
+INSERT INTO llm_pid_registrations(
+    registration_id, invocation_id, reservation_id, role, container_instance_id,
+    pid_namespace_inode, process_id, process_start_ticks, state
+) VALUES (
+    '00000000-0000-0000-0000-000000000010', 'active-fixture',
+    '00000000-0000-0000-0000-000000000011', 'PROVIDER', 'fixture-container',
+    1, 2, 3, 'ACTIVE'
+);
+INSERT INTO llm_pid_registrations(
+    registration_id, invocation_id, reservation_id, role, container_instance_id,
+    state, terminal_at, terminal_reason
+) VALUES (
+    '00000000-0000-0000-0000-000000000020', 'old-terminal-fixture',
+    '00000000-0000-0000-0000-000000000021', 'MCP', 'fixture-container',
+    'TERMINAL', clock_timestamp() - interval '25 hours', 'FIXTURE'
+);
+SQL
+
+[[ "$(active_launch_count)" == 2 ]]
+interrupt_active_launches fixture >/dev/null
+[[ "$(active_launch_count)" == 0 ]]
+[[ "$(psql_exec -Atc "SELECT status || ':' || reason FROM llm_launch_reservations WHERE invocation_id='active-fixture'")" == 'FAILED:DEPLOY_MAINTENANCE_INTERRUPTED:fixture' ]]
+[[ "$(psql_exec -Atc "SELECT status || ':' || terminal_cause FROM llm_runs WHERE invocation_id='active-fixture'")" == 'FAILED:RESTART_INTERRUPTED' ]]
+[[ "$(cleanup_terminal_pid_registrations)" == 1 ]]
+[[ "$(psql_exec -Atc "SELECT COUNT(*) FROM llm_pid_registrations WHERE registration_id='00000000-0000-0000-0000-000000000020'")" == 0 ]]
+
+maintenance_cas 0 false "" 1 true fixture >/dev/null
+if (maintenance_cas 0 false "" 2 true wrong-fixture >/dev/null 2>&1); then
+  echo "deploy-postgres-selftest: mismatched maintenance CAS was accepted" >&2
+  exit 1
+fi
+maintenance_snapshot="$(snapshot)"
+[[ "$(jq -r '.maintenance.generation' <<<"${maintenance_snapshot}")" == 1 ]]
+[[ "$(jq -r '.maintenance.enabled' <<<"${maintenance_snapshot}")" == true ]]
+[[ "$(jq -r '.maintenance.deploymentId' <<<"${maintenance_snapshot}")" == fixture ]]
+ensure_maintenance 1 fixture >/dev/null
+if (ensure_maintenance 2 fixture >/dev/null 2>&1); then
+  echo "deploy-postgres-selftest: mismatched maintenance recovery was accepted" >&2
+  exit 1
+fi
+
+timestamp="$(database_timestamp)"
+payload_hash="$(printf fixture | sha256sum | awk '{print $1}')"
+append_gap fixture OPEN "${timestamp}" "${payload_hash}" >/dev/null
+append_gap fixture OPEN "${timestamp}" "${payload_hash}" >/dev/null
+[[ "$(gap_state fixture)" == OPEN ]]
+conflicting_hash="$(printf conflict | sha256sum | awk '{print $1}')"
+if (append_gap fixture OPEN "${timestamp}" "${conflicting_hash}" >/dev/null 2>&1); then
+  echo "deploy-postgres-selftest: conflicting immutable gap event was accepted" >&2
+  exit 1
+fi
+append_gap fixture CLOSE "${timestamp}" "${payload_hash}" >/dev/null
+[[ "$(gap_state fixture)" == CLOSED ]]
+
+psql_exec <<'SQL'
+CREATE TABLE runtime_config_versions (id uuid PRIMARY KEY, status text NOT NULL);
+CREATE TABLE runtime_config_values (version_id uuid NOT NULL, config_key text NOT NULL, config_value text NOT NULL);
+INSERT INTO runtime_config_versions(id, status) VALUES ('00000000-0000-0000-0000-000000000001', 'ACTIVE');
+INSERT INTO runtime_config_values(version_id, config_key, config_value)
+VALUES ('00000000-0000-0000-0000-000000000001', 'daemon.preFilterEnabled', 'false');
+SQL
+
+runtime_snapshot="$(snapshot)"
+[[ "$(jq -r '.runtimeConfigVersion' <<<"${runtime_snapshot}")" == 00000000-0000-0000-0000-000000000001 ]]
+[[ "$(jq -r '.preFilterActive' <<<"${runtime_snapshot}")" == false ]]
+[[ "$(jq -r '.maintenance.enabled' <<<"${runtime_snapshot}")" == true ]]
+
+echo "DEPLOY_POSTGRES_SELFTEST_OK postgres=16 snapshots=pre-foundation,foundation,runtime-config maintenance=false-to-true gap=open-to-close launches=count-interrupt terminal-cleanup=bounded indexes=idempotent"

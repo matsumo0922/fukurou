@@ -13,6 +13,7 @@
     "capabilityCatalog",
     "capabilityCatalogHash",
     "executorSha256",
+    "foundationHarnessSha256",
     "publicKeySha256",
     "operations"
   ],
@@ -26,6 +27,7 @@
     "capabilityCatalog": { "type": "object" },
     "capabilityCatalogHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "executorSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "foundationHarnessSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "publicKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "operations": {
       "type": "array",

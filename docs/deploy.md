@@ -185,7 +185,7 @@ deploy maintenance は durable disable ACK、同generationのDB maintenance comm
 
 candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。署名bundleへhash固定したinstalled foundation harnessが、同じdigestの一時PID 1に対してproviderとMCPのtyped launch、fixture auth、required tool/output schema、failure cleanupを実行し、repository checkout内のscriptは実行しない。終了時は一時container、internal network、volumeが0件であることを確認する。production DB credential、endpoint、mutation toolは渡さない。
 
-deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。新しいdeploy journalはrollback capture後かつ最初のsafety mutation前に`PREPARED`、launch disable開始前に`SAFETY_MUTATION_STARTED`を永続化する。`CAPTURED`から始まる旧形式の正当なhash chainはversion-aware validatorで読み取り、terminal historyは再実行せず、unfinished historyは記録済みstateに対応するstartup recoveryへ入る。hash改ざんと形式ごとの不正なtransitionは拒否する。
+deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。新しいdeploy journalはrollback state directoryを公開する前かつ最初のsafety mutation前に`PREPARED`、launch disable開始前に`SAFETY_MUTATION_STARTED`を永続化する。`CAPTURED`から始まる旧形式の正当なhash chainはversion-aware validatorで読み取り、terminal historyは再実行せず、unfinished historyは記録済みstateに対応するstartup recoveryへ入る。hash改ざんと形式ごとの不正なtransitionは拒否する。
 
 live errorとstartup recoveryはいずれもmaintenance再確立、active reservation 0、disable fence、OPEN gapを再確認してから保存済みrollbackを実行する。観測したgap stateが`MISSING`なら永続化済みOPEN eventを再送し、存在しない場合はrecovery-owned gapを開く。`OPEN`は同じdeployment gapを継続し、`CLOSED`はrecovery-owned gapを開いてrollback区間を記録する。`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。
 
@@ -193,18 +193,19 @@ deadlineはdeploy lock取得時の`/proc/uptime`を共通の起点にする。st
 
 maintenance intervalはroot DB helperがappend-only `infrastructure_gap_events`へimmutableなOPEN/CLOSE factを直接記録する。decision/run/order/position/execution/tradeはrun開始からexposure終了までの共通causal projectionで`ELIGIBLE` / `INFRASTRUCTURE_GAP` / `ATTRIBUTION_MISSING`に分類し、非terminal run、order/intent/decision/runの不一致、position内execution orderの不一致もmissingにする。summary、setup、calibration、benchmark、prior PnL、kill criterion、run rate、report、reflection、knowledge、usageは同じeligible境界を使い、APIはentity type別件数とgap catalogを返す。依頼期間と交差するgapだけを上限判定し、gap 1,000件超、entity 20,000件超、integrity不整合、timeoutは部分値を返さない。
 
-deploy foundation のlocal semantic fixtureは次を実行する。`canary-compose-selftest`はproduction composeへdeny overlayを合成した実効JSONを検証するため、Docker Composeが必要である。
+deploy foundation のlocal semantic fixtureは次を実行する。`deploy-postgres-selftest`は使い捨てのPostgreSQL 16 containerでroot DB helperの全operationを検証し、`canary-compose-selftest`はproduction composeへdeny overlayを合成した実効JSONを検証するため、どちらもDockerが必要である。
 
 ```sh
 scripts/deploy/deploy-contract-selftest
 scripts/deploy/deploy-runtime-selftest
 scripts/deploy/deploy-db-selftest
+scripts/deploy/deploy-postgres-selftest
 scripts/deploy/canary-compose-selftest
 docker build --target launcher-build -t fukurou-launcher-build:selftest .
 docker run --rm fukurou-launcher-build:selftest ./fukurou-runtime-supervisor --protocol-selftest
 ```
 
-production cutoverのimage referenceはcandidate digestだけである。commit tagは表示用で、pull、create、health後にconfigured reference、image ID/repo digest、`/revision`を照合する。executorはlock取得の共通起点からforward 20分、recoveryは同じ起点から25分（forward終了後は最大5分）のabsolute budgetを持ち、TERM/INT/HUP/deadlineでもjournalからrecoveryへ入る。`FRESH` / `PRE_FOUNDATION`は旧serviceを自動再開せず、maintenance/fence/gapを閉じない。
+production cutoverとLLM phase manifestのimage referenceは、どちらもcandidate digestを含む同じimmutable referenceである。executorはcheckout前とrollback時に保存済みcomposeとの互換変数にも同じimmutable referenceを束縛し、tagへ退行させない。commit tagは表示用で、pull、create、health後にconfigured reference、image ID/repo digest、`/revision`を照合する。executorはrollback capture前にproduction composeをrender検証し、失敗時はstageとstable reasonを出して未確定の一時stateを削除する。executorはlock取得の共通起点からforward 20分、recoveryは同じ起点から25分（forward終了後は最大5分）のabsolute budgetを持ち、TERM/INT/HUP/deadlineでもjournalからrecoveryへ入る。`FRESH` / `PRE_FOUNDATION`は旧serviceを自動再開せず、maintenance/fence/gapを閉じない。
 
 ## NAS image 保持
 

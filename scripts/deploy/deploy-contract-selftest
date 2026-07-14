@@ -48,6 +48,13 @@ rm -rf "${signature_test_root}"
 
 installed_catalog="$(jq -cS . "${SCRIPT_DIRECTORY}/deploy-capability-catalog-v1.json")"
 installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $1}')"
+[[ "$(jq -er '.capabilityCatalogHash' "${SCRIPT_DIRECTORY}/deploy-contract-v1.json")" == "${installed_hash}" ]] || \
+  fail_selftest "static contract catalog hash is stale"
+jq -e '
+  (.required | index("foundationHarnessSha256")) != null and
+  .properties.foundationHarnessSha256.pattern == "^[0-9a-f]{64}$"
+' "${SCRIPT_DIRECTORY}/deploy-bundle.schema.json" >/dev/null || \
+  fail_selftest "bundle schema does not require the signed foundation harness hash"
 baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
   {minimumContractVersion:1,
    requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],

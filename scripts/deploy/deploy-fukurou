@@ -25,8 +25,24 @@ readonly APPLICATION_UID=10001
 readonly APPLICATION_GID=10001
 
 fail() {
-  echo "deploy-fukurou: $*" >&2
+  echo "deploy-fukurou: stage=${DEPLOY_STAGE:-PRECHECK} reason=$*" >&2
   return 1
+}
+
+cleanup_pending_state() {
+  [[ -n "${PENDING_STATE_DIR:-}" ]] || return 0
+  case "${PENDING_STATE_DIR}" in
+    "${STATE_ROOT}"/.*.tmp.*) rm -rf -- "${PENDING_STATE_DIR}" ;;
+    *) fail "REFUSING_UNSAFE_PENDING_STATE_CLEANUP:${PENDING_STATE_DIR}"; return 1 ;;
+  esac
+  PENDING_STATE_DIR=""
+}
+
+cleanup_stale_pending_states() {
+  local stale_state
+  while IFS= read -r -d '' stale_state; do
+    rm -rf -- "${stale_state}"
+  done < <(find "${STATE_ROOT}" -xdev -mindepth 1 -maxdepth 1 -type d -name '.*.tmp.*' -print0)
 }
 
 boottime_seconds() {
@@ -40,6 +56,8 @@ on_signal() {
   SIGNAL_NAME="${signal_name}"
   terminate_active_external_process_group
   if [[ -z "${ROLLBACK_STATE_DIR:-}" || ! -f "${ROLLBACK_STATE_DIR}/journal.jsonl" ]]; then
+    cleanup_pending_state || true
+    echo "deploy-fukurou: stage=${DEPLOY_STAGE:-UNKNOWN} reason=SIGNAL_BEFORE_ROLLBACK_CAPTURE:${signal_name}" >&2
     exit "${code}"
   fi
   journal_state SIGNAL_RECEIVED "{\"signal\":\"${signal_name}\"}" 2>/dev/null || true
@@ -399,6 +417,49 @@ probe_candidate_operations() {
   done < <(required_operation_plan CANDIDATE_HOOK_V1)
 }
 
+validate_production_compose() {
+  bind_image_reference "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+  timeout 30 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config --quiet || \
+    fail "PRODUCTION_COMPOSE_DERIVATION_FAILED"
+}
+
+bind_image_reference() {
+  local reference="$1"
+  export FUKUROU_IMAGE_REFERENCE="${reference}"
+  # A saved pre-cutover compose can still read this legacy variable during rollback.
+  export FUKUROU_IMAGE_TAG="${reference}"
+}
+
+bind_recovery_image_reference() {
+  local reference
+  reference="$(jq -er '.runningContainer.configuredImageReference' "${ROLLBACK_STATE_DIR}/state.json")" || return 1
+  [[ -n "${reference}" ]] || reference="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+  [[ "${reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || return 1
+  bind_image_reference "${reference}"
+}
+
+validate_runtime_snapshot() {
+  jq -e '
+    (.installKind | type == "string") and
+    (.captureDbTimestamp | type == "string") and
+    (.runtimeConfigVersion | type == "string") and
+    (.runtimeConfigHash | type == "string") and
+    (.preFilterActive | type == "string") and
+    (.foundationCatalogFingerprint | type == "string") and
+    (.maintenance | type == "object") and
+    (.maintenance.generation | type == "number" and floor == . and . >= 0) and
+    (.maintenance.enabled | type == "boolean") and
+    (.maintenance.deploymentId | type == "string") and
+    (.pidRegistrations | type == "object") and
+    (.pidRegistrations.active | type == "number" and floor == . and . >= 0) and
+    (.pidRegistrations.total | type == "number" and floor == . and . >= 0)
+  ' <<<"$1" >/dev/null
+}
+
+read_maintenance_enabled() {
+  jq -er '.maintenance.enabled | if type == "boolean" then tostring else error("maintenance.enabled must be boolean") end' <<<"$1"
+}
+
 require_initial_state() {
   [[ -d "${REPO_DIR}/.git" ]] || fail "repository checkout is missing"
   [[ -f "${ENV_FILE}" ]] || fail "production environment file is missing"
@@ -429,6 +490,7 @@ capture_rollback_state() {
   [[ ! -e "${state_dir}" && ! -e "${temporary_dir}" ]] || fail "deployment state already exists"
 
   install -d -o root -g root -m 0700 "${temporary_dir}"
+  PENDING_STATE_DIR="${temporary_dir}"
 
   local previous_sha compose_hash runtime_snapshot install_kind configured_image image_id image_digest revision
   local fence_hash="" fence_bytes="" executor_hash public_key_hash installed_catalog_hash
@@ -440,13 +502,14 @@ capture_rollback_state() {
   revision="$(inspect_optional_application '{{range .Config.Env}}{{println .}}{{end}}' | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')"
   compose_hash="$(sha256sum "${COMPOSE_FILE}" | awk '{print $1}')"
   runtime_snapshot="$(timeout 30 "${DB_HELPER}" snapshot)"
+  validate_runtime_snapshot "${runtime_snapshot}" || fail "INVALID_RUNTIME_SNAPSHOT"
   install_kind="$(jq -er '.installKind' <<<"${runtime_snapshot}")"
   [[ "${install_kind}" == "PRE_FOUNDATION" && -z "${configured_image}" ]] && install_kind="FRESH"
   RUNTIME_CONFIG_VERSION="$(jq -er '.runtimeConfigVersion' <<<"${runtime_snapshot}")"
   RUNTIME_CONFIG_HASH="$(jq -er '.runtimeConfigHash' <<<"${runtime_snapshot}")"
   PREFILTER_ACTIVE="$(jq -er '.preFilterActive' <<<"${runtime_snapshot}")"
   FENCE_GENERATION="$(jq -er '.maintenance.generation' <<<"${runtime_snapshot}")"
-  MAINTENANCE_ACTIVE="$(jq -er '.maintenance.enabled' <<<"${runtime_snapshot}")"
+  MAINTENANCE_ACTIVE="$(read_maintenance_enabled "${runtime_snapshot}")"
   MAINTENANCE_DEPLOYMENT_ID="$(jq -er '.maintenance.deploymentId' <<<"${runtime_snapshot}")"
   TARGET_GENERATION="$((FENCE_GENERATION + 1))"
   [[ "${TARGET_GENERATION}" -le 9223372036854775807 ]] || fail "FENCE_GENERATION_OVERFLOW"
@@ -498,17 +561,21 @@ capture_rollback_state() {
 
   sync -f "${temporary_dir}/docker-compose.prod.yml"
   sync -f "${temporary_dir}/state.json"
-  mv "${temporary_dir}" "${state_dir}"
-  sync -f "${STATE_ROOT}"
+  ROLLBACK_STATE_DIR="${temporary_dir}"
+  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
   ROLLBACK_STATE_DIR="${state_dir}"
+  mv "${temporary_dir}" "${state_dir}"
+  PENDING_STATE_DIR=""
+  sync -f "${STATE_ROOT}"
 }
 
 rollback_on_error() {
   local exit_code="$?"
   trap - ERR
   stop_forward_deadline_watchdog
+  cleanup_pending_state || true
   if [[ -z "${ROLLBACK_STATE_DIR:-}" || ! -f "${ROLLBACK_STATE_DIR}/journal.jsonl" ]]; then
-    echo "deploy-fukurou: deployment failed before rollback state was captured" >&2
+    echo "deploy-fukurou: stage=${DEPLOY_STAGE:-UNKNOWN} reason=DEPLOYMENT_FAILED_BEFORE_ROLLBACK_CAPTURE" >&2
     exit "${exit_code}"
   fi
   RECOVERY_DEADLINE_BOOTTIME="${RECOVERY_LIMIT_BOOTTIME:-$(( $(boottime_seconds) + 300 ))}"
@@ -517,6 +584,10 @@ rollback_on_error() {
   [[ "${RECOVERY_ALREADY_STARTED:-false}" == true ]] || journal_state RECOVERY_STARTED "{\"failedExitCode\":${exit_code}}" || true
   local origin_state
   origin_state="$(recovery_origin_state "${ROLLBACK_STATE_DIR}/journal.jsonl")"
+  bind_recovery_image_reference || {
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_IMAGE_REFERENCE" >&2
+    exit "${exit_code}"
+  }
   if [[ "${origin_state}" != PREPARED && "${origin_state}" != CAPTURED ]]; then
     reassert_recovery_safe_boundary "${origin_state}" || {
       echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_SAFE_BOUNDARY" >&2
@@ -547,7 +618,7 @@ rollback_on_error() {
   (( $(boottime_seconds) < RECOVERY_DEADLINE_BOOTTIME )) || exit "${exit_code}"
   timeout 45 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor || exit "${exit_code}"
   assert_application_pid_zero || exit "${exit_code}"
-  export FUKUROU_IMAGE_REFERENCE="${previous_reference}"
+  bind_image_reference "${previous_reference}"
   timeout 120 docker pull "${previous_reference}" >/dev/null || exit "${exit_code}"
   timeout 120 docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d --no-build || exit "${exit_code}"
   [[ "$(timeout 10 docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${previous_reference}" ]] || exit "${exit_code}"
@@ -805,6 +876,7 @@ recover_unfinished_deployments() {
     RUNTIME_CONFIG_HASH="$(jq -er '.runtimeConfigHash' "${state_dir}/state.json")"
     FENCE_GENERATION="$(jq -er '.launchMaintenance.generation' "${state_dir}/state.json")"
     TARGET_GENERATION="$((FENCE_GENERATION + 1))"
+    bind_recovery_image_reference || fail "RECOVERY_IMAGE_REFERENCE_INVALID:${DEPLOYMENT_ID}"
 
     echo "deploy-fukurou: recovering unfinished deployment ${DEPLOYMENT_ID} from ${last_state}" >&2
     origin_state="$(recovery_origin_state "${journal}")"
@@ -903,6 +975,7 @@ validate_canary_compose_json() {
     ([.services.ktor.environment | to_entries[] | select(.key | startswith("DB_")) | select(.value != null)] | length) == 0 and
     .services.ktor.environment.FUKUROU_CANDIDATE_DIGEST == $digest and
     .services.ktor.environment.FUKUROU_CANDIDATE_CATALOG_HASH == $catalogHash and
+    .services.ktor.environment.FUKUROU_LLM_IMAGE_DIGEST == ("ghcr.io/matsumo0922/fukurou@" + $digest) and
     (.services.ktor.networks | keys) == ["fixture"] and
     .networks.fixture.internal == true and
     (.services.ktor.volumes | length) == 3 and
@@ -1050,7 +1123,7 @@ run_candidate_preflight() {
   local canary_compose="${ROLLBACK_STATE_DIR}/canary-compose.yml" canary_project="fukurou-canary-${DEPLOYMENT_ID}"
   local result="failure"
   local effective_canary="${ROLLBACK_STATE_DIR}/canary-compose.json"
-  export FUKUROU_IMAGE_REFERENCE="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+  bind_image_reference "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
   local hook_entry operation_id entrypoint_json hook_count=0
   while IFS= read -r hook_entry; do
     [[ -n "${hook_entry}" ]] || continue
@@ -1090,7 +1163,7 @@ checkout_deploy_sha() {
 }
 
 deploy_compose() {
-  export FUKUROU_IMAGE_REFERENCE="${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
+  bind_image_reference "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
   timeout 180 docker pull "${FUKUROU_IMAGE_REFERENCE}" >/dev/null
   [[ "$(timeout 10 docker image inspect --format '{{join .RepoDigests "|"}}' "${FUKUROU_IMAGE_REFERENCE}")" == *"${FUKUROU_IMAGE_REFERENCE}"* ]] || fail "DIGEST_PULL_MISMATCH"
   timeout 120 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --no-build
@@ -1167,14 +1240,20 @@ main() {
     exit 0
   fi
 
+  DEPLOY_STAGE=PRECHECK
+  PENDING_STATE_DIR=""
   require_root
-  for command in base64 cat docker flock git jq md5sum openssl setsid sha256sum sync timeout; do require_command "${command}"; done
+  for command in base64 cat docker find flock git jq md5sum openssl setsid sha256sum sync timeout; do require_command "${command}"; done
   parse_arguments "$@"
+  DEPLOY_STAGE=VALIDATE_SIGNED_BUNDLE
   validate_signed_bundle
+  DEPLOY_STAGE=REQUIRE_INITIAL_STATE
   require_initial_state
 
   exec 9>"${LOCK_FILE}"
   flock -n 9 || fail "another deployment is already running"
+  DEPLOY_STAGE=CLEANUP_STALE_PENDING_STATES
+  cleanup_stale_pending_states
 
   DEPLOY_START_BOOTTIME="$(boottime_seconds)"
   FORWARD_DEADLINE_BOOTTIME=$((DEPLOY_START_BOOTTIME + 1200))
@@ -1187,35 +1266,53 @@ main() {
   trap stop_forward_deadline_watchdog EXIT
   start_forward_deadline_watchdog
 
+  DEPLOY_STAGE=RECOVER_UNFINISHED_DEPLOYMENTS
   check_forward_deadline
   recover_unfinished_deployments
   ROLLBACK_STATE_DIR=""
   start_forward_deadline_watchdog
   check_forward_deadline
+  DEPLOY_STAGE=PROBE_CANDIDATE_OPERATIONS
   probe_candidate_operations
   check_forward_deadline
+  DEPLOY_STAGE=VALIDATE_PRODUCTION_COMPOSE
+  validate_production_compose
+  check_forward_deadline
+  DEPLOY_STAGE=CAPTURE_ROLLBACK_STATE
   capture_rollback_state
-  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
+  DEPLOY_STAGE=PREPARE_DURABLE_JOURNAL
   journal_state CAPTURED
+  DEPLOY_STAGE=ACCEPT_CAPABILITY_CATALOG
   accept_capability_catalog
   check_forward_deadline
+  DEPLOY_STAGE=PROVISION_FENCE_ROOT
   provision_fence_root
   check_forward_deadline
+  DEPLOY_STAGE=PROVISION_NAMED_SECRET
   provision_named_secret
   check_forward_deadline
+  DEPLOY_STAGE=DISABLE_LAUNCHES
   disable_launches
   check_forward_deadline
+  DEPLOY_STAGE=DRAIN_LAUNCHES
   drain_launches
   check_forward_deadline
+  DEPLOY_STAGE=RUN_CANDIDATE_PREFLIGHT
   run_candidate_preflight
   check_forward_deadline
+  DEPLOY_STAGE=CHECKOUT_DEPLOY_SHA
   checkout_deploy_sha
   check_forward_deadline
+  DEPLOY_STAGE=DEPLOY_COMPOSE
   deploy_compose
   check_forward_deadline
+  DEPLOY_STAGE=RESUME_LAUNCHES
   resume_launches
+  DEPLOY_STAGE=VERIFY_REQUIRED_OPERATIONS
   verify_required_operations_dispatched
+  DEPLOY_STAGE=PRUNE_OLD_IMAGES
   prune_old_images
+  DEPLOY_STAGE=COMPLETE
   stop_forward_deadline_watchdog
 }
 
