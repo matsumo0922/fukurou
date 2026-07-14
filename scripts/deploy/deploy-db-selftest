@@ -13,6 +13,8 @@ source "$(dirname "$0")/fukurou-deploy-db"
 
 MODE=PRE_FOUNDATION
 LAST_PSQL_ARGS="${SELFTEST_ROOT}/psql-args"
+LAST_SNAPSHOT_QUERY="${SELFTEST_ROOT}/snapshot-query"
+HAS_RUNTIME_CONFIG=false
 docker() {
   if [[ "$1" == "inspect" && "${*: -1}" == "${APPLICATION_CONTAINER}" ]]; then return 1; fi
   return 1
@@ -21,6 +23,12 @@ timeout() { shift; "$@"; }
 psql_exec() {
   printf '%s\n' "$*" > "${LAST_PSQL_ARGS}"
   local query="$*"
+  if [[ "${query}" != *"-c"* ]]; then
+    query+=$'\n'"$(cat)"
+  fi
+  if [[ "${query}" == *"foundationCatalogFingerprint"* ]]; then
+    printf '%s\n' "${query}" > "${LAST_SNAPSHOT_QUERY}"
+  fi
   if [[ "${query}" == *"infrastructure_gap_events"* && "${query}" == *"to_regclass"* ]]; then
     [[ "${MODE}" == FOUNDATION_V1 ]] && printf 't\n' || printf 'f\n'
   elif [[ "${query}" == *"llm_launch_maintenance"* && "${query}" == *"to_regclass"* ]]; then
@@ -28,7 +36,7 @@ psql_exec() {
   elif [[ "${query}" == *"llm_pid_registrations"* && "${query}" == *"to_regclass"* ]]; then
     [[ "${MODE}" == FOUNDATION_V1 ]] && printf 't\n' || printf 'f\n'
   elif [[ "${query}" == *"runtime_config_versions"* && "${query}" == *"to_regclass"* ]]; then
-    printf 'f\n'
+    [[ "${HAS_RUNTIME_CONFIG}" == true ]] && printf 't\n' || printf 'f\n'
   elif [[ "${query}" == *"jsonb_build_object('generation'"* ]]; then
     printf '{"generation":4,"enabled":true,"deploymentId":"fixture"}\n'
   elif [[ "${query}" == *"jsonb_build_object('active'"* ]]; then
@@ -45,6 +53,7 @@ grep -Fq -- '--set=mcp_role=fukurou_mcp_fixture' "${LAST_PSQL_ARGS}"
 pre_snapshot="$(snapshot)"
 [[ "$(jq -r '.installKind' <<<"${pre_snapshot}")" == PRE_FOUNDATION ]]
 [[ "$(jq -r '.maintenance.enabled' <<<"${pre_snapshot}")" == false ]]
+grep -Fq "relkind::text" "${LAST_SNAPSHOT_QUERY}"
 
 MODE=FOUNDATION_V1
 foundation_snapshot="$(snapshot)"
@@ -52,4 +61,10 @@ foundation_snapshot="$(snapshot)"
 [[ "$(jq -r '.maintenance.generation' <<<"${foundation_snapshot}")" == 4 ]]
 [[ "$(jq -r '.pidRegistrations.total' <<<"${foundation_snapshot}")" == 2 ]]
 
-echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact snapshots=pre-foundation,foundation-v1"
+HAS_RUNTIME_CONFIG=true
+runtime_snapshot="$(snapshot)"
+[[ "$(jq -r '.installKind' <<<"${runtime_snapshot}")" == FOUNDATION_V1 ]]
+grep -Fq "c.relkind::text" "${LAST_SNAPSHOT_QUERY}"
+grep -Fxq -- '-Atq' "${LAST_PSQL_ARGS}"
+
+echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact snapshots=pre-foundation,foundation-v1,runtime-config"
