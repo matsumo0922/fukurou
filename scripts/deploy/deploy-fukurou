@@ -258,6 +258,12 @@ validate_foundation_harness_hash() {
     fail "INSTALLED_FOUNDATION_HARNESS_HASH_MISMATCH"
 }
 
+verify_bundle_signature() {
+  local bundle_path="$1" signature_path="$2" public_key="${3:-${PUBLIC_KEY}}"
+  openssl pkeyutl -verify -pubin -inkey "${public_key}" -rawin \
+    -in "${bundle_path}" -sigfile "${signature_path}" >/dev/null 2>&1
+}
+
 validate_signed_bundle() {
   [[ -f "${BUNDLE_PATH}" && -f "${SIGNATURE_PATH}" ]] || fail "bundle or signature is missing"
   [[ -f "${PUBLIC_KEY}" ]] || fail "installed deploy public key is missing"
@@ -265,15 +271,59 @@ validate_signed_bundle() {
   [[ "$(stat -c '%s' "${BUNDLE_PATH}")" -le 65536 && "$(stat -c '%s' "${SIGNATURE_PATH}")" -le 1024 ]] || \
     fail "bundle inputs exceed size limit"
 
-  local bundle_json signature_base64
-  bundle_json="$(cat "${BUNDLE_PATH}"; printf x)"
-  bundle_json="${bundle_json%x}"
-  SIGNED_BUNDLE_JSON="${bundle_json}"
-  signature_base64="$(base64 -w 0 "${SIGNATURE_PATH}")"
+  local bundle_json snapshot_dir snapshot_bundle snapshot_signature snapshot_bundle_size snapshot_signature_size
+  snapshot_dir="$(mktemp -d)" || {
+    fail "BUNDLE_SNAPSHOT_CREATE_FAILED"
+    return 1
+  }
+  if ! chmod 0700 "${snapshot_dir}"; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "BUNDLE_SNAPSHOT_CREATE_FAILED"
+    return 1
+  fi
+  snapshot_bundle="${snapshot_dir}/deploy-bundle.json"
+  snapshot_signature="${snapshot_dir}/deploy-bundle.sig"
+  if ! command cp --no-dereference -- "${BUNDLE_PATH}" "${snapshot_bundle}" ||
+    ! command cp --no-dereference -- "${SIGNATURE_PATH}" "${snapshot_signature}"; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "BUNDLE_SNAPSHOT_CREATE_FAILED"
+    return 1
+  fi
+  if [[ ! -f "${snapshot_bundle}" || -L "${snapshot_bundle}" ||
+    ! -f "${snapshot_signature}" || -L "${snapshot_signature}" ]]; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "BUNDLE_SNAPSHOT_INVALID"
+    return 1
+  fi
+  if ! chmod 0600 "${snapshot_bundle}" "${snapshot_signature}" ||
+    ! snapshot_bundle_size="$(stat -c '%s' "${snapshot_bundle}")" ||
+    ! snapshot_signature_size="$(stat -c '%s' "${snapshot_signature}")"; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "BUNDLE_SNAPSHOT_INVALID"
+    return 1
+  fi
+  if [[ "${snapshot_bundle_size}" -gt 65536 || "${snapshot_signature_size}" -gt 1024 ]]; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "bundle inputs exceed size limit"
+    return 1
+  fi
 
-  openssl pkeyutl -verify -pubin -inkey "${PUBLIC_KEY}" -rawin \
-    -in <(printf '%s' "${bundle_json}") \
-    -sigfile <(printf '%s' "${signature_base64}" | base64 -d) >/dev/null 2>&1 || fail "INVALID_BUNDLE_SIGNATURE"
+  if ! bundle_json="$(cat "${snapshot_bundle}"; cat_status=$?; printf x; exit "${cat_status}")"; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "BUNDLE_SNAPSHOT_INVALID"
+    return 1
+  fi
+  bundle_json="${bundle_json%x}"
+  if ! verify_bundle_signature "${snapshot_bundle}" "${snapshot_signature}"; then
+    rm -rf -- "${snapshot_dir}" || true
+    fail "INVALID_BUNDLE_SIGNATURE"
+    return 1
+  fi
+  if ! rm -rf -- "${snapshot_dir}"; then
+    fail "BUNDLE_SNAPSHOT_CLEANUP_FAILED"
+    return 1
+  fi
+  SIGNED_BUNDLE_JSON="${bundle_json}"
 
   local candidate_sha minimum_version executor_hash public_key_hash harness_hash self_hash installed_key_hash
   candidate_sha="$(jq -er '.candidateSha' <<<"${bundle_json}")"
