@@ -11,8 +11,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientConfig
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.MCP_MANIFEST_VERSION
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
-import me.matsumo.fukurou.trading.runner.CANONICAL_FALSIFIER_MCP_TOOL_NAMES
-import me.matsumo.fukurou.trading.runner.CANONICAL_PROPOSER_MCP_TOOL_NAMES
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import java.nio.file.Files
 import java.nio.file.Path
@@ -25,9 +24,14 @@ object McpLaunchBootstrap {
         val manifestBytes = readBoundedDescriptor(MANIFEST_FD, MAX_MANIFEST_BYTES)
         val passwordBytes = readBoundedDescriptor(PASSWORD_FD, MAX_PASSWORD_BYTES)
 
+        require(Files.exists(Path.of("/proc/self/fd/$SUBMISSION_GATEWAY_FD"))) {
+            "MCP submission gateway descriptor is unavailable."
+        }
+
         return decode(manifestBytes, passwordBytes, clock)
     }
 
+    @Suppress("LongMethod")
     internal fun decode(
         manifestBytes: ByteArray,
         passwordBytes: ByteArray,
@@ -46,12 +50,22 @@ object McpLaunchBootstrap {
         require(manifest.version == MCP_MANIFEST_VERSION) { "Unsupported MCP manifest version." }
         val phase = runCatching { LlmInvocationPhase.valueOf(manifest.phase) }
             .getOrElse { throw IllegalArgumentException("Unsupported MCP manifest phase.") }
-        val canonicalTools = when (phase) {
-            LlmInvocationPhase.PROPOSER -> CANONICAL_PROPOSER_MCP_TOOL_NAMES
-            LlmInvocationPhase.FALSIFIER -> CANONICAL_FALSIFIER_MCP_TOOL_NAMES
-            else -> throw IllegalArgumentException("Unsupported MCP manifest phase.")
-        }
+        val canonicalTools = McpToolContractCatalog.toolsFor(phase)
+        require(canonicalTools.isNotEmpty()) { "Unsupported MCP manifest phase." }
         require(manifest.allowedTools.toSet() == canonicalTools) { "MCP manifest allowlist is not canonical." }
+        require(manifest.toolSchemaHash == McpToolContractCatalog.canonicalSchemaHash(phase)) {
+            "MCP manifest tool schema hash mismatch."
+        }
+        require(manifest.phaseManifestId.isNotBlank() && manifest.effectiveInvocationHash.length == 64) {
+            "MCP manifest effective phase identity is required."
+        }
+        require(
+            manifest.submissionSocketPath.isNotBlank() &&
+                Path.of(manifest.submissionSocketPath).isAbsolute &&
+                manifest.submissionSocketPath.endsWith(".sock"),
+        ) {
+            "MCP manifest submission gateway path is invalid."
+        }
         require(manifest.systemPromptVersion.isNotBlank()) { "MCP manifest system prompt version is required." }
         require(expiresAt.isAfter(Instant.now(clock))) { "MCP manifest is expired." }
         require(password.isNotEmpty()) { "MCP password descriptor must not be empty." }
@@ -85,6 +99,12 @@ object McpLaunchBootstrap {
             actToolCallLimit = manifest.actToolCallLimit,
             gmoPublicClientConfig = GmoPublicClientConfig(baseUrl = manifest.gmoPublicBaseUrl),
             tradingConfig = runtimeConfig,
+            submissionGatewayBinding = McpSubmissionGatewayBinding(
+                invocationId = manifest.invocationId,
+                phase = phase,
+                phaseManifestId = manifest.phaseManifestId,
+                effectiveInvocationHash = manifest.effectiveInvocationHash,
+            ),
         )
     }
 
@@ -107,6 +127,7 @@ data class McpBootstrapConfig(
     val actToolCallLimit: Int,
     val gmoPublicClientConfig: GmoPublicClientConfig,
     val tradingConfig: TradingBotConfig,
+    val submissionGatewayBinding: McpSubmissionGatewayBinding,
 ) {
     override fun toString(): String = "McpBootstrapConfig(" +
         "databaseConfig=$databaseConfig, " +
@@ -118,11 +139,13 @@ data class McpBootstrapConfig(
         "actToolCallLimit=$actToolCallLimit, " +
         "gmoPublicClientConfig=$gmoPublicClientConfig, " +
         "tradingConfig=$tradingConfig" +
+        ", submissionGatewayBinding=$submissionGatewayBinding" +
         ")"
 }
 
 private const val MANIFEST_FD = 3
 private const val PASSWORD_FD = 4
+private const val SUBMISSION_GATEWAY_FD = 5
 private const val MAX_MANIFEST_BYTES = 64 * 1024
 private const val MAX_PASSWORD_BYTES = 4096
 private val MANIFEST_JSON = Json {

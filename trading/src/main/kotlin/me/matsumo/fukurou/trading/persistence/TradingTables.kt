@@ -1072,6 +1072,57 @@ object DecisionMaterialStateManifestsTable : Table("decision_material_state_mani
     override val primaryKey = PrimaryKey(invocationId)
 }
 
+/** LLM invocation family の append-only audit root。 */
+object LlmInvocationAuditRootsTable : Table("llm_invocation_audit_roots") {
+    val rootId = varchar("root_id", 128)
+    val rootKind = varchar("root_kind", 32)
+    val capturedAt = long("captured_at")
+    override val primaryKey = PrimaryKey(rootId)
+}
+
+/** full decision run の append-only input manifest。 */
+object LlmRunInputManifestsTable : Table("llm_run_input_manifests") {
+    val invocationId = varchar("invocation_id", 128)
+    val rootId = reference("root_id", LlmInvocationAuditRootsTable.rootId)
+    val materialInvocationId = reference("material_invocation_id", DecisionMaterialStateManifestsTable.invocationId)
+    val materialContentHash = varchar("material_content_hash", 64)
+    val schemaVersion = integer("schema_version")
+    val contentHash = varchar("content_hash", 64)
+    val capturedAt = long("captured_at")
+    val manifestJson = text("manifest_json")
+    override val primaryKey = PrimaryKey(invocationId)
+}
+
+/** 各 CLI 起動直前の append-only effective invocation manifest。 */
+object LlmPhaseInputManifestsTable : Table("llm_phase_input_manifests") {
+    val phaseManifestId = varchar("phase_manifest_id", 128)
+    val rootId = reference("root_id", LlmInvocationAuditRootsTable.rootId)
+    val invocationId = varchar("invocation_id", 128)
+    val runManifestInvocationId = reference("run_manifest_invocation_id", LlmRunInputManifestsTable.invocationId).nullable()
+    val runManifestContentHash = varchar("run_manifest_content_hash", 64).nullable()
+    val materialInvocationId = reference(
+        "material_invocation_id",
+        DecisionMaterialStateManifestsTable.invocationId,
+    ).nullable()
+    val materialContentHash = varchar("material_content_hash", 64).nullable()
+    val phase = varchar("phase", 32)
+    val effectiveInvocationHash = varchar("effective_invocation_hash", 64)
+    val capturedAt = long("captured_at")
+    val manifestJson = text("manifest_json")
+    override val primaryKey = PrimaryKey(phaseManifestId)
+}
+
+/** phase 終了時に初めて確定する append-only observation。 */
+object LlmPhaseObservationsTable : Table("llm_phase_observations") {
+    val phaseManifestId = reference("phase_manifest_id", LlmPhaseInputManifestsTable.phaseManifestId)
+    val modelCoverageStatus = varchar("model_coverage_status", 64)
+    val effortCoverageStatus = varchar("effort_coverage_status", 64)
+    val terminatedAt = long("terminated_at")
+    val contentHash = varchar("content_hash", 64)
+    val observationJson = text("observation_json")
+    override val primaryKey = PrimaryKey(phaseManifestId)
+}
+
 /** identity schema が production 集計対象になった明示 boundary。 */
 object DecisionIdentitySchemaBoundariesTable : Table("decision_identity_schema_boundaries") {
     val schemaVersion = integer("schema_version")

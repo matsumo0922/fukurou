@@ -16,6 +16,7 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
+import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
 import me.matsumo.fukurou.trading.activity.DecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerRepository
 import me.matsumo.fukurou.trading.config.RuntimeConfigAdminService
@@ -28,6 +29,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigValidationRejectedExceptio
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionDetail
 import me.matsumo.fukurou.trading.config.RuntimeConfigVersionSummary
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
@@ -43,6 +45,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionReposi
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
@@ -58,6 +61,7 @@ import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
+import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.SecretRedactor
@@ -454,11 +458,23 @@ private fun createEvaluationRouteDependencies(
             )
         },
         llmInvocationAuditor = overrides.llmInvocationAuditor ?: database?.let { connectedDatabase ->
+            val commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(databaseResources.environment)
             LlmInvocationAuditor(
                 commandEventLog = ExposedCommandEventLog(connectedDatabase),
                 redactor = SecretRedactor.fromEnvironment(databaseResources.environment),
                 clock = runtime.clock,
                 toolName = "evaluation_report",
+                phaseManifestRecorder = LlmPhaseManifestRecorder(
+                    repository = ExposedLlmInputManifestRepository(connectedDatabase),
+                    cliVersionProbe = ProcessScopedLlmCliVersionProbe,
+                    runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
+                    runtimeEnvironmentSnapshot = RuntimeConfigCatalog.runtimeEnvironment(runtime.tradingConfig)
+                        .toSortedMap()
+                        .entries
+                        .joinToString("\n") { entry -> "${entry.key}=${entry.value}" },
+                    clock = runtime.clock,
+                    commandRendererConfig = commandRendererConfig,
+                ),
             )
         },
         environment = databaseResources.environment,

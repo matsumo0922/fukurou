@@ -67,6 +67,21 @@ data class LlmCommandRendererConfig(
         }
     }
 
+    /** renderer と同じ command templateからversion probe commandを生成する。 */
+    fun versionProbeRequest(provider: LlmProvider, immutableFingerprint: String?): LlmCliVersionProbeRequest {
+        val template = when (provider) {
+            LlmProvider.CLAUDE -> claudeCommandTemplate
+            LlmProvider.CODEX -> codexCommandTemplate
+        }
+
+        return LlmCliVersionProbeRequest(
+            provider = provider,
+            command = template + "--version",
+            templateRevision = LLM_CLI_COMMAND_TEMPLATE_REVISION,
+            immutableFingerprint = immutableFingerprint,
+        )
+    }
+
     companion object {
         /**
          * 環境変数から renderer 設定を構築する。
@@ -552,6 +567,9 @@ val DEFAULT_CLAUDE_COMMAND_TEMPLATE = listOf("claude")
  * 既定 Codex CLI command template。
  */
 val DEFAULT_CODEX_COMMAND_TEMPLATE = listOf("codex")
+
+/** CLI command template / version probe contract のrevision。 */
+const val LLM_CLI_COMMAND_TEMPLATE_REVISION = "llm-cli-command-v1"
 
 /**
  * Claude headless 実行の既定共通引数。

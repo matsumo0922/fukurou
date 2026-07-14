@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 
 const [path, phase] = process.argv.slice(2);
-if (!path || !["PROPOSER", "FALSIFIER"].includes(phase)) throw new Error("probe path and phase are required");
+if (!path || !["PROPOSER", "FALSIFIER", "RISK_REDUCTION_ONLY"].includes(phase)) {
+  throw new Error("probe path and phase are required");
+}
 const probes = readFileSync(path, "utf8")
   .split("\n")
   .filter(Boolean)
@@ -19,9 +21,8 @@ const expectedEnvironment = [
   "FUKUROU_INVOCATION_ID", "FUKUROU_LLM_PROVIDER", "FUKUROU_MARKET_SNAPSHOT_ID", "FUKUROU_PROMPT_HASH",
   "FUKUROU_RUNTIME_CONFIG_HASH", "FUKUROU_RUNTIME_CONFIG_VERSION_ID", "FUKUROU_SYSTEM_PROMPT_VERSION",
   "HOME", "LANG", "LC_ALL", "PATH", "XDG_CACHE_HOME",
-  ...(phase === "PROPOSER"
-    ? ["CLAUDE_CONFIG_DIR"]
-    : ["CODEX_HOME", "FUKUROU_CANARY_INTENT_ID", "FUKUROU_FALSIFIER_INTENT_ID"]),
+  ...(phase === "PROPOSER" ? ["CLAUDE_CONFIG_DIR"] : ["CODEX_HOME"]),
+  ...(phase === "FALSIFIER" ? ["FUKUROU_CANARY_INTENT_ID", "FUKUROU_FALSIFIER_INTENT_ID"] : []),
 ].sort();
 const expected = {
   uid: "10002\t10002\t10002\t10002",

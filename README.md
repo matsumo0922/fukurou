@@ -34,7 +34,7 @@ Kotlin/JVM ・ Ktor ・ Exposed ・ PostgreSQL ・ Docker Compose ・ MCP 公式
 
 現時点では、`:trading` の paper account / broker / safety / WebSocket paper execution / decision protocol / evaluation / knowledge writer / reflection runner / 週次 PromptCandidates / GMO Public market data、`:mcp-gmo-coin` の GMO Public market tools、`:mcp` の fukurou stdio server と fat jar、`:fukurou` の Ktor backend + 常駐 worker、`web/` の Vite + React + TypeScript foundation が実装済みです。
 
-entry decision は full run 前に固定した bounded material-state manifest と、server が生成する episode / thesis / geometry / material-state identity を decision と intent に保存します。`/evaluation/summary` の `deduplication` と Overview は identity / shadow coverage、resting maintenance、false-suppression proxy の観測値を表示します。ゼロ分母の rate は `null` です。
+entry decision は full run 前に固定した typed / bounded material-state manifest と、server が生成する episode / thesis / geometry / material-state identity を decision と intent に保存します。各CLI phaseはeffective prompt、role、tool catalog、production command template / image fingerprint / versionを含むCLI identity、runtime configをimmutable input manifestへ固定し、run/materialの参照hashとnullable FKを保存します。終了時のobserved identityはconfigured identityから推測せず別rowへ保存し、decision attemptのobservation欠損時はfresh approvalがあってもentryを拒否します。standard snapshotを固定できない場合は新規entryをfail closedにし、minimal account snapshotを保存できる場合だけrisk-reduction-only判断へ移ります。`/evaluation/summary` の `deduplication` と Overview は identity / shadow coverage、resting maintenance、false-suppression proxy の観測値を表示します。ゼロ分母の rate は `null` です。
 
 paper の未約定 LIMIT、BUY STOP、protective STOP、virtual TP は GMO Public WebSocket `trades/BTC` の接続中に受信した realtime event だけで前進します。transport activity、trade、periodic maintenance は別々に監査し、trade 無音だけでは接続障害にしません。close/error、decode failure、buffer overflow、transport liveness timeout は market-data gap として永続化し、影響する注文・position・decision run を成績評価から除外します。REST history、candle、再接続後の履歴から遡及約定は作りません。
 
@@ -58,7 +58,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /swagger`
 - `GET /openapi.json`
 
-`/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、LLM execution claim の outcome-unknown registry・heartbeat・bounded periodic recovery scan、WebSocket が `CONNECTED`、未回復の market-data gapがないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。DB scan failureまたはtermination fenceを確認できないstale claimがある間はready 503かつ新しいLLM admission 0を維持します。FOMC calendar の空、不正、期限切れは runtime config warning と新規 entry の fail-closed として扱い、readiness と ProtectionReconciler は継続します。trade は正常に無音になり得るため、readiness の必須条件にしません。
+`/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、LLM execution claim の outcome-unknown registry・heartbeat・bounded periodic recovery scan、WebSocket が `CONNECTED`、未回復の market-data gapがないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。DB scan failureまたはtermination fenceを確認できないstale claimがある間はready 503かつ新しいLLM admission 0を維持します。recovery scanは5秒のpage deadline内でentityを独立transactionとして順次処理し、先行commit済みclaimは後続失敗の影響を受けず解放します。cursorとscan healthはpage全体の成功後だけ前進し、retryは未完了claimだけを収束させます。FOMC calendar の空、不正、期限切れは runtime config warning と新規 entry の fail-closed として扱い、readiness と ProtectionReconciler は継続します。trade は正常に無音になり得るため、readiness の必須条件にしません。
 
 ## Local development
 

@@ -10,15 +10,19 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
+import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
@@ -177,6 +181,7 @@ internal fun startReflectionRunnerWorker(
     ).start()
 }
 
+@Suppress("LongMethod")
 private fun createReflectionRunner(
     database: ExposedDatabase,
     environment: Map<String, String>,
@@ -226,6 +231,20 @@ private fun createReflectionRunner(
                         redactor = redactor,
                         clock = clock,
                         humanLogger = { message -> REFLECTION_WORKER_LOGGER.info(message) },
+                        phaseManifestRecorder = LlmPhaseManifestRecorder(
+                            repository = ExposedLlmInputManifestRepository(database),
+                            cliVersionProbe = ProcessScopedLlmCliVersionProbe,
+                            runtimeConfigSnapshot = null,
+                            runtimeEnvironmentSnapshot = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig)
+                                .toSortedMap()
+                                .entries
+                                .joinToString("\n") { entry -> "${entry.key}=${entry.value}" },
+                            clock = clock,
+                            commandRendererConfig = LlmCommandRendererConfig.fromEnvironment(
+                                environment,
+                                tradingConfig.llmModels,
+                            ),
+                        ),
                     ),
                     workingDirectory = workingDirectory,
                     parentEnvironment = environment,

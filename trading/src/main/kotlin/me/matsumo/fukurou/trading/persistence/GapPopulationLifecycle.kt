@@ -2,6 +2,7 @@
 
 package me.matsumo.fukurou.trading.persistence
 
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.security.MessageDigest
 import java.time.Instant
@@ -260,6 +261,103 @@ fun JdbcTransaction.acquireGapPopulationGenerationTokenForEntity(
         }
     }
     return acquireGapPopulationGenerationToken(scope)
+}
+
+/** persisted entity scope tokenをrecovery pageのabsolute deadline内で取得する。 */
+fun JdbcTransaction.acquireGapPopulationGenerationTokenForEntity(
+    entityType: String,
+    entityId: String,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): GapPopulationGenerationToken {
+    val scope = prepareRecoveryStatement(
+        sql = "SELECT scope_kind,mode,symbol,account_epoch_id,cohort,execution_semantics_version " +
+            "FROM gap_population_entity_scopes WHERE entity_type=? AND entity_id=?",
+        deadline = deadline,
+        nanoTime = nanoTime,
+    ).use { statement ->
+        statement.setString(1, entityType)
+        statement.setString(2, entityId)
+        statement.executeQuery().use { rows ->
+            require(rows.next()) { "gap population entity scope is missing." }
+            GapPopulationScope(
+                kind = rows.getString(1),
+                mode = rows.getString(2),
+                symbol = rows.getString(3),
+                accountEpochId = rows.getObject(4, UUID::class.java),
+                cohort = rows.getString(5),
+                executionSemanticsVersion = rows.getString(6),
+            )
+        }
+    }
+
+    return acquireGapPopulationGenerationToken(scope, deadline, nanoTime)
+}
+
+private fun JdbcTransaction.acquireGapPopulationGenerationToken(
+    scope: GapPopulationScope,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): GapPopulationGenerationToken {
+    val existing = prepareRecoveryStatement(
+        sql = "SELECT current_setting('fukurou.gap_population_token', true)",
+        deadline = deadline,
+        nanoTime = nanoTime,
+    ).use { statement ->
+        statement.executeQuery().use { rows -> if (rows.next()) rows.getString(1) else null }
+    }
+    if (!existing.isNullOrBlank()) {
+        require(configuredGapPopulationTokenMatches("ALL", scope, deadline, nanoTime)) {
+            "gap population token cannot be reacquired with another scope."
+        }
+        return PersistedGapPopulationGenerationToken(existing.substringAfter(':').toLong())
+    }
+
+    prepareRecoveryStatement(
+        sql = "SELECT acquire_gap_population_generation_token(?,?,?,?,?,?)",
+        deadline = deadline,
+        nanoTime = nanoTime,
+    ).use { statement ->
+        statement.setString(1, scope.kind)
+        statement.setString(2, scope.mode)
+        statement.setString(3, scope.symbol)
+        statement.setObject(4, scope.accountEpochId)
+        statement.setString(5, scope.cohort)
+        statement.setString(6, scope.executionSemanticsVersion)
+        statement.executeQuery().use { rows -> require(rows.next()) }
+    }
+
+    return prepareRecoveryStatement(
+        sql = "SELECT current_setting('fukurou.gap_population_token', true)",
+        deadline = deadline,
+        nanoTime = nanoTime,
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            require(rows.next())
+            PersistedGapPopulationGenerationToken(rows.getString(1).substringAfter(':').toLong())
+        }
+    }
+}
+
+private fun JdbcTransaction.configuredGapPopulationTokenMatches(
+    allowedPopulation: String,
+    scope: GapPopulationScope,
+    deadline: LlmExecutionRecoveryDeadline,
+    nanoTime: () -> Long,
+): Boolean {
+    return prepareRecoveryStatement(
+        sql = "SELECT allowed_population,scope_kind,scope_mode,scope_symbol,scope_account_epoch_id,scope_cohort," +
+            "scope_execution_semantics_version FROM gap_population_control WHERE id=1 AND token_txid=txid_current()",
+        deadline = deadline,
+        nanoTime = nanoTime,
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            rows.next() && rows.getString(1) == allowedPopulation &&
+                rows.getString(2) == scope.kind && rows.getString(3) == scope.mode &&
+                rows.getString(4) == scope.symbol && rows.getObject(5, UUID::class.java) == scope.accountEpochId &&
+                rows.getString(6) == scope.cohort && rows.getString(7) == scope.executionSemanticsVersion
+        }
+    }
 }
 
 private fun JdbcTransaction.readConfiguredGapPopulationToken(): GapPopulationGenerationToken {
@@ -578,8 +676,10 @@ internal fun JdbcTransaction.enqueueGapPopulationWork(
 
 /** active/queued work を page/pass 境界で前進させる。 */
 internal fun JdbcTransaction.recoverGapPopulationPass(now: Instant): GapPopulationRecoverySummary {
-    executeUpdate("SET LOCAL lock_timeout='2s'")
-    executeUpdate("SET LOCAL statement_timeout='5s'")
+    applyTransactionTimeouts(
+        lockTimeoutSeconds = 2,
+        statementTimeoutSeconds = 5,
+    )
     acquireGapPopulationGenerationToken()
     activateNextQueuedWork(now)
 

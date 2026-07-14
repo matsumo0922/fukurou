@@ -41,14 +41,27 @@ class SecretRedactor(
         }
     }
 
+    /** raw structured field が既知 secret を含む場合は値をechoせず拒否する。 */
+    fun requireNoKnownSecret(vararg values: String?) {
+        val containsKnownSecret = values.filterNotNull().any { value ->
+            secretValues.any { secret -> secret.isNotEmpty() && value.contains(secret) }
+        }
+        require(!containsKnownSecret) { "Persisted structured identity contains a known secret." }
+    }
+
     companion object {
         /**
          * 環境変数名から secret らしい値を集めて redactor を構築する。
          */
         fun fromEnvironment(environment: Map<String, String>): SecretRedactor {
-            val secretValues = environment.secretValuesFromEnvironment() + environment.secretValuesFromAuthFiles()
+            val secretValues = knownSecretValuesFromEnvironment(environment)
 
             return SecretRedactor(secretValues)
+        }
+
+        /** manifest persistence と共用する既知 secret 実値を収集する。 */
+        fun knownSecretValuesFromEnvironment(environment: Map<String, String>): Set<String> {
+            return environment.secretValuesFromEnvironment() + environment.secretValuesFromAuthFiles()
         }
     }
 }

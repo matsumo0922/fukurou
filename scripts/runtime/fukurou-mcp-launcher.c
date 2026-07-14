@@ -15,7 +15,10 @@
 #include <linux/capability.h>
 #include <sys/fsuid.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
+#define APP_UID 10001
 #define MCP_UID 10003
 #define MCP_GID 10003
 #define MANIFEST_DIRECTORY "/run/fukurou/mcp-manifests"
@@ -65,6 +68,30 @@ static int safe_open_password(void) {
     struct stat metadata;
     if (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode)) fail("password is not a regular file");
     if (metadata.st_uid != 0 || (metadata.st_mode & 0777) != 0400 || metadata.st_nlink != 1) fail("password metadata rejected");
+    return fd;
+}
+
+static int connect_submission_gateway(const char *id) {
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    int count = snprintf(path, sizeof(path), "%s/%s.sock", MANIFEST_DIRECTORY, id);
+    if (count < 0 || (size_t)count >= sizeof(path)) fail("submission gateway path rejected");
+    struct stat metadata;
+    if (lstat(path, &metadata) != 0 || !S_ISSOCK(metadata.st_mode)) fail("submission gateway is not a socket");
+    if (metadata.st_uid != 10001 || (metadata.st_mode & 0777) != 0600 || metadata.st_nlink != 1) {
+        fail("submission gateway metadata rejected");
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) fail("cannot create submission gateway socket");
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, (size_t)count + 1);
+    setfsuid(APP_UID);
+    if (setfsuid((uid_t)-1) != APP_UID) fail("cannot assume submission gateway owner identity");
+    int connect_status = connect(fd, (struct sockaddr *)&address, sizeof(address));
+    int connect_error = errno;
+    setfsuid(0);
+    if (setfsuid((uid_t)-1) != 0) fail("cannot restore launcher filesystem identity");
+    if (connect_status != 0) fail(strerror(connect_error));
     return fd;
 }
 
@@ -121,13 +148,13 @@ static void verify_final_security_state(int canary) {
         if (prctl(PR_CAPBSET_READ, capability, 0, 0, 0) == 1) fail("capability bounding invariant rejected");
         if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, capability, 0, 0) == 1) fail("ambient capability invariant rejected");
     }
-    for (int descriptor = 0; descriptor <= 4; descriptor++) {
+    for (int descriptor = 0; descriptor <= 5; descriptor++) {
         if (fcntl(descriptor, F_GETFD) < 0) fail("required descriptor invariant rejected");
     }
-    for (int descriptor = 5; descriptor <= 64; descriptor++) {
+    for (int descriptor = 6; descriptor <= 64; descriptor++) {
         if (fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) fail("unexpected descriptor invariant rejected");
     }
-    if (canary) fprintf(stderr, "MCP_LAUNCHER_PROBE uid=10003 gid=10003 fsuid=10003 fsgid=10003 groups=empty nnp=1 caps=zero capbnd=zero fds=0,1,2,3,4\n");
+    if (canary) fprintf(stderr, "MCP_LAUNCHER_PROBE uid=10003 gid=10003 fsuid=10003 fsgid=10003 groups=empty nnp=1 caps=zero capbnd=zero fds=0,1,2,3,4,5\n");
 }
 
 int main(int argc, char **argv) {
@@ -136,14 +163,20 @@ int main(int argc, char **argv) {
     int canary = canary_enabled();
     int manifest = safe_open_manifest(argv[1]);
     int password = safe_open_password();
+    int submission_gateway = connect_submission_gateway(argv[1]);
     int manifest_source = copy_to_mcp_memfd(manifest, "fukurou-mcp-manifest", 64 * 1024);
     int password_source = copy_to_mcp_memfd(password, "fukurou-mcp-password", 4096);
     close(manifest); close(password);
     if (manifest_source < 0 || password_source < 0) fail("cannot duplicate bootstrap descriptors");
-    if (dup2(manifest_source, 3) < 0 || dup2(password_source, 4) < 0) fail("cannot install bootstrap descriptors");
+    if (dup2(manifest_source, 3) < 0 || dup2(password_source, 4) < 0 || dup2(submission_gateway, 5) < 0) {
+        fail("cannot install bootstrap descriptors");
+    }
     close(manifest_source); close(password_source);
-    if (fcntl(3, F_SETFD, 0) != 0 || fcntl(4, F_SETFD, 0) != 0) fail("cannot preserve bootstrap descriptors");
-    if (close_range(5, ~0U, 0) != 0) fail("cannot close inherited descriptors");
+    if (submission_gateway != 5) close(submission_gateway);
+    if (fcntl(3, F_SETFD, 0) != 0 || fcntl(4, F_SETFD, 0) != 0 || fcntl(5, F_SETFD, 0) != 0) {
+        fail("cannot preserve bootstrap descriptors");
+    }
+    if (close_range(6, ~0U, 0) != 0) fail("cannot close inherited descriptors");
 
     struct rlimit core = {0, 0};
     if (setrlimit(RLIMIT_CORE, &core) != 0) fail("cannot disable core dumps");
@@ -156,7 +189,14 @@ int main(int argc, char **argv) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) fail("cannot set no_new_privs");
     verify_final_security_state(canary);
 
-    char *const args[] = {"java", "-jar", MCP_JAR, NULL};
+    char *const args[] = {
+        "java",
+        "--add-opens=java.base/java.io=ALL-UNNAMED",
+        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+        "-jar",
+        MCP_JAR,
+        NULL
+    };
     char *const environment[] = {"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", NULL};
     execve("/opt/java/openjdk/bin/java", args, environment);
     fail(strerror(errno));

@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.invoker
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
@@ -33,13 +34,69 @@ data class McpLaunchManifest(
     val runtimeEnvironment: Map<String, String>,
     val totalToolCallLimit: Int,
     val actToolCallLimit: Int,
+    val phaseManifestId: String = "$invocationId-${phase.lowercase()}",
+    val effectiveInvocationHash: String = me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy.sha256(
+        promptHash,
+    ),
+    val toolSchemaHash: String = McpToolContractCatalog.canonicalSchemaHash(LlmInvocationPhase.valueOf(phase)),
+    val submissionSocketPath: String = "/tmp/fukurou-submission.sock",
 )
 
 /** owner-only manifest を fixed directory へ atomic に発行する。 */
+@Suppress("ClassOrdering")
 class McpLaunchManifestWriter(
     private val directory: Path = Path.of(DEFAULT_MCP_MANIFEST_DIRECTORY),
     private val clock: Clock = Clock.systemUTC(),
 ) {
+    companion object {
+        /** CLI launch前に永続 phase identityをowner-only manifestへ固定する。 */
+        fun bindPhaseIdentity(
+            path: Path,
+            phaseManifestId: String,
+            effectiveInvocationHash: String,
+        ) {
+            val manifest = MANIFEST_JSON.decodeFromString<McpLaunchManifest>(Files.readString(path)).copy(
+                phaseManifestId = phaseManifestId,
+                effectiveInvocationHash = effectiveInvocationHash,
+            )
+            val temporary = Files.createTempFile(path.parent, ".${path.fileName}-", ".tmp")
+            try {
+                Files.writeString(
+                    temporary,
+                    MANIFEST_JSON.encodeToString(manifest),
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE,
+                )
+                Files.setPosixFilePermissions(temporary, PRIVATE_FILE_PERMISSIONS)
+                Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (throwable: Throwable) {
+                Files.deleteIfExists(temporary)
+                throw throwable
+            }
+        }
+
+        /** launcher 接続前に app-owned gateway socket を同じ manifest へ固定する。 */
+        fun bindSubmissionSocket(path: Path, submissionSocketPath: Path) {
+            val manifest = MANIFEST_JSON.decodeFromString<McpLaunchManifest>(Files.readString(path)).copy(
+                submissionSocketPath = submissionSocketPath.toString(),
+            )
+            val temporary = Files.createTempFile(path.parent, ".${path.fileName}-", ".tmp")
+            try {
+                Files.writeString(
+                    temporary,
+                    MANIFEST_JSON.encodeToString(manifest),
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE,
+                )
+                Files.setPosixFilePermissions(temporary, PRIVATE_FILE_PERMISSIONS)
+                Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (throwable: Throwable) {
+                Files.deleteIfExists(temporary)
+                throw throwable
+            }
+        }
+    }
+
     @Suppress("LongParameterList")
     fun write(
         invocationId: String,
@@ -53,6 +110,11 @@ class McpLaunchManifestWriter(
         timeout: Duration,
         totalToolCallLimit: Int,
         actToolCallLimit: Int,
+        phaseManifestId: String = "$invocationId-${phase.name.lowercase()}",
+        effectiveInvocationHash: String = me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy.sha256(
+            context.promptHash.orEmpty(),
+        ),
+        submissionSocketPath: String = "",
     ): McpLaunchCapability {
         require(allowedTools.isNotEmpty()) { "MCP manifest allowedTools must not be empty." }
         require(databaseUrl.isNotBlank() && databaseUser.isNotBlank()) { "MCP database identity is required." }
@@ -80,6 +142,10 @@ class McpLaunchManifestWriter(
             runtimeEnvironment = runtimeEnvironment.toSortedMap(),
             totalToolCallLimit = totalToolCallLimit,
             actToolCallLimit = actToolCallLimit,
+            phaseManifestId = phaseManifestId,
+            effectiveInvocationHash = effectiveInvocationHash,
+            toolSchemaHash = McpToolContractCatalog.canonicalSchemaHash(phase),
+            submissionSocketPath = submissionSocketPath,
         )
 
         try {
@@ -111,7 +177,7 @@ class McpLaunchManifestWriter(
 data class McpLaunchCapability(val id: String, val path: Path)
 
 const val DEFAULT_MCP_MANIFEST_DIRECTORY = "/run/fukurou/mcp-manifests"
-const val MCP_MANIFEST_VERSION = 1
+const val MCP_MANIFEST_VERSION = 2
 private const val MANIFEST_ID_BYTES = 24
 private val SECURE_RANDOM = SecureRandom()
 private val MANIFEST_JSON = Json { encodeDefaults = true }

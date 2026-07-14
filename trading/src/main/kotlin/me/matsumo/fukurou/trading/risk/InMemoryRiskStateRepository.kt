@@ -1,9 +1,16 @@
 package me.matsumo.fukurou.trading.risk
 
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.time.Clock
 import java.time.Instant
+
+/** in-memory risk と paper ledger writer が共有する同期境界。 */
+class InMemoryAccountStateBoundary {
+    private val lock = Any()
+
+    fun <T> read(block: () -> T): T = synchronized(lock, block)
+
+    fun <T> write(block: () -> T): T = synchronized(lock, block)
+}
 
 /**
  * unit test と DB 未構成時のための in-memory risk_state repository。
@@ -14,17 +21,18 @@ import java.time.Instant
 class InMemoryRiskStateRepository(
     clock: Clock = Clock.systemUTC(),
     initialState: RiskState = RiskState(updatedAt = Instant.now(clock)),
+    internal val accountStateBoundary: InMemoryAccountStateBoundary = InMemoryAccountStateBoundary(),
 ) : RiskStateRepository {
-
-    private val mutex = Mutex()
     private var storedState = initialState
 
     override suspend fun current(): Result<RiskState> {
-        return mutex.withLock { Result.success(storedState) }
+        return accountStateBoundary.read { Result.success(storedState) }
     }
 
+    internal fun currentSnapshot(): RiskState = accountStateBoundary.read { storedState }
+
     override suspend fun setHardHalt(reason: String, at: Instant): Result<RiskState> {
-        return mutex.withLock {
+        return accountStateBoundary.write {
             runCatching {
                 require(reason.isNotBlank()) { "HARD_HALT reason is required." }
 
@@ -41,7 +49,7 @@ class InMemoryRiskStateRepository(
     }
 
     override suspend fun setSoftHalt(reason: String, at: Instant): Result<RiskState> {
-        return mutex.withLock {
+        return accountStateBoundary.write {
             runCatching {
                 require(reason.isNotBlank()) { "SOFT_HALT reason is required." }
 
@@ -62,7 +70,7 @@ class InMemoryRiskStateRepository(
     }
 
     override suspend fun resume(reason: String, at: Instant): Result<RiskState> {
-        return mutex.withLock {
+        return accountStateBoundary.write {
             runCatching {
                 require(reason.isNotBlank()) { "manual resume reason is required." }
 
@@ -82,7 +90,7 @@ class InMemoryRiskStateRepository(
      * command audit 失敗時の rollback 用に risk_state snapshot を復元する。
      */
     suspend fun restore(state: RiskState): Result<Unit> {
-        return mutex.withLock {
+        return accountStateBoundary.write {
             runCatching {
                 storedState = state
             }

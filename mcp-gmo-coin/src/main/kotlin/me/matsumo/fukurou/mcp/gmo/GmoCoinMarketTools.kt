@@ -9,11 +9,11 @@ import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.domain.RecentTrade
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.market.FreshnessDefaults
 import me.matsumo.fukurou.trading.market.FreshnessMetadata
 import me.matsumo.fukurou.trading.market.FreshnessSource
@@ -78,20 +79,14 @@ private const val GET_SYMBOL_RULES_TOOL = "get_symbol_rules"
  */
 private const val CALC_INDICATOR_TOOL = "calc_indicator"
 
-/**
- * JSON schema の string 型。
- */
-private const val JSON_TYPE_STRING = "string"
+private fun String.catalogToolSchema(): ToolSchema {
+    val schema = McpToolContractCatalog.schema(this)
 
-/**
- * JSON schema の integer 型。
- */
-private const val JSON_TYPE_INTEGER = "integer"
-
-/**
- * JSON schema の object 型。
- */
-private const val JSON_TYPE_OBJECT = "object"
+    return ToolSchema(
+        properties = schema["properties"]?.jsonObject,
+        required = schema["required"]?.jsonArray?.map { value -> value.jsonPrimitive.content },
+    )
+}
 
 /**
  * candles 取得の既定本数。
@@ -363,15 +358,7 @@ private fun Server.registerTickerTool(
     addTool(
         name = GET_TICKER_TOOL,
         description = "Get the latest GMO Coin public ticker for BTC spot. Response includes freshness metadata.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("symbol") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Spot symbol. BTC only.")
-                    put("default", TradingSymbol.BTC.apiSymbol)
-                }
-            },
-        ),
+        inputSchema = GET_TICKER_TOOL.catalogToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleGetTicker(
@@ -393,20 +380,7 @@ private fun Server.registerCandlesTool(
     addTool(
         name = GET_CANDLES_TOOL,
         description = candlesDescription(dailyKlineRequestLimit),
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-                putIntervalSchema()
-                putJsonObject("limit") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Number of recent candles.")
-                    put("default", DEFAULT_CANDLE_LIMIT)
-                    put("minimum", 1)
-                    put("maximum", MAX_CANDLE_LIMIT)
-                }
-            },
-            required = listOf("interval"),
-        ),
+        inputSchema = GET_CANDLES_TOOL.catalogToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleGetCandles(
@@ -427,18 +401,7 @@ private fun Server.registerOrderbookTool(
     addTool(
         name = GET_ORDERBOOK_TOOL,
         description = "Get GMO Coin public orderbook for BTC spot. Response includes freshness metadata.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-                putJsonObject("depth") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Number of bid and ask levels.")
-                    put("default", DEFAULT_ORDERBOOK_DEPTH)
-                    put("minimum", 1)
-                    put("maximum", MAX_ORDERBOOK_DEPTH)
-                }
-            },
-        ),
+        inputSchema = GET_ORDERBOOK_TOOL.catalogToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleGetOrderbook(
@@ -458,18 +421,7 @@ private fun Server.registerTradesTool(
     addTool(
         name = GET_TRADES_TOOL,
         description = "Get recent GMO Coin public trades for BTC spot. Response includes freshness metadata.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-                putJsonObject("limit") {
-                    put("type", JSON_TYPE_INTEGER)
-                    put("description", "Number of recent trades.")
-                    put("default", DEFAULT_TRADES_LIMIT)
-                    put("minimum", 1)
-                    put("maximum", MAX_TRADES_LIMIT)
-                }
-            },
-        ),
+        inputSchema = GET_TRADES_TOOL.catalogToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleGetTrades(
@@ -488,11 +440,7 @@ private fun Server.registerSymbolRulesTool(
     addTool(
         name = GET_SYMBOL_RULES_TOOL,
         description = "Get cached GMO Coin public symbol rules for BTC spot.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-            },
-        ),
+        inputSchema = GET_SYMBOL_RULES_TOOL.catalogToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleGetSymbolRules(request, marketDataSource, toolExecutor)
@@ -505,22 +453,7 @@ private fun Server.registerCalcIndicatorTool(dependencies: GmoCoinCalcIndicatorT
     addTool(
         name = CALC_INDICATOR_TOOL,
         description = indicatorDescription(dailyKlineRequestLimit),
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putSymbolSchema()
-                putIntervalSchema()
-                putJsonObject("indicator") {
-                    put("type", JSON_TYPE_STRING)
-                    put("description", "Indicator name.")
-                    put("enum", ToolJson.encodeToJsonElement(IndicatorType.entries.map { indicator -> indicator.name }))
-                }
-                putJsonObject("params") {
-                    put("type", JSON_TYPE_OBJECT)
-                    put("description", indicatorParamsDescription(dailyKlineRequestLimit))
-                }
-            },
-            required = listOf("interval", "indicator"),
-        ),
+        inputSchema = CALC_INDICATOR_TOOL.catalogToolSchema(),
         toolAnnotations = ToolAnnotations(readOnlyHint = true, openWorldHint = true),
     ) { request ->
         handleCalcIndicator(
@@ -701,22 +634,6 @@ private suspend fun handleGetTicker(
         },
         onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
     )
-}
-
-private fun JsonObjectBuilder.putSymbolSchema() {
-    putJsonObject("symbol") {
-        put("type", JSON_TYPE_STRING)
-        put("description", "Spot symbol. BTC only.")
-        put("default", TradingSymbol.BTC.apiSymbol)
-    }
-}
-
-private fun JsonObjectBuilder.putIntervalSchema() {
-    putJsonObject("interval") {
-        put("type", JSON_TYPE_STRING)
-        put("description", "Candle interval.")
-        put("enum", ToolJson.encodeToJsonElement(CandleInterval.entries.map { interval -> interval.apiValue }))
-    }
 }
 
 private fun parseTradingSymbol(rawSymbol: String?): Result<TradingSymbol> {
@@ -1030,14 +947,6 @@ private fun indicatorDescription(dailyKlineRequestLimit: Int?): String {
         "Calculate one technical indicator from GMO Coin public candles. The handler expands the candle limit to each indicator's minimum required count before calculating. DAY-based intervals use GMO business dates that switch at 06:00 JST. Response includes candle requirement and freshness metadata."
     } else {
         "Calculate one technical indicator from GMO Coin public candles. The handler expands the candle limit to each indicator's minimum required count before calculating. DAY-based intervals use GMO business dates that switch at 06:00 JST and stitch up to $dailyKlineRequestLimit dates, so long 1hour windows may still return fewer candles than required. Response includes candle requirement and freshness metadata."
-    }
-}
-
-private fun indicatorParamsDescription(dailyKlineRequestLimit: Int?): String {
-    return if (dailyKlineRequestLimit == null) {
-        "Indicator params. Use period, lookback, fast_period, slow_period, signal_period, and limit as needed."
-    } else {
-        "Indicator params. Use period, lookback, fast_period, slow_period, signal_period, and limit as needed. DAY-based candle limits are capped by $dailyKlineRequestLimit stitched GMO business dates."
     }
 }
 

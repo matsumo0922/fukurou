@@ -14,6 +14,14 @@ class InMemoryCommandEventLog : CommandEventLog, CommandEventFeedReader {
     private val storedEvents = mutableListOf<CommandEvent>()
 
     override suspend fun append(event: CommandEvent): Result<Unit> {
+        runCatching {
+            ManifestPersistencePolicy.validateCommandEvent(
+                context = event.decisionRunContext,
+                toolName = event.toolName,
+                clientRequestId = event.clientRequestId,
+                payload = event.payload,
+            )
+        }.exceptionOrNull()?.let { failure -> return Result.failure(failure) }
         mutex.withLock {
             storedEvents += event
         }

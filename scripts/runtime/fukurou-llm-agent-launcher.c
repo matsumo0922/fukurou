@@ -277,7 +277,11 @@ int main(int argc, char **argv, char **envp) {
     if (strcmp(argv[1], "codex") == 0) executable = "/usr/local/bin/codex";
     int canary = strcmp(argv[1], "canary") == 0;
     if (canary) {
-        if (argc != 4) fail("canary mode requires manifest id and phase");
+        int rro_action = argc == 5 && strcmp(argv[3], "RISK_REDUCTION_ONLY") == 0 &&
+            (strcmp(argv[4], "NO_TRADE") == 0 || strcmp(argv[4], "EXIT") == 0 ||
+             strcmp(argv[4], "REDUCE") == 0 || strcmp(argv[4], "ADJUST_PROTECTION") == 0 ||
+             strcmp(argv[4], "ENTER") == 0 || strcmp(argv[4], "ADD_LONG") == 0);
+        if (argc != 4 && !rro_action) fail("canary mode requires manifest id, phase, and optional RRO action");
         require_canary_flag();
         executable = "/usr/bin/node";
     }
@@ -312,7 +316,7 @@ int main(int argc, char **argv, char **envp) {
         clean_env[output++] = "FUKUROU_CANARY_LLM_CORE_LIMIT=0:0";
         clean_env[output++] = "FUKUROU_CANARY_LLM_LAUNCH_FDS=0,1,2";
         clean_env[output] = NULL;
-        char *const canary_args[] = {"node", CANARY_CLIENT, argv[2], argv[3], NULL};
+        char *const canary_args[] = {"node", CANARY_CLIENT, argv[2], argv[3], argc == 5 ? argv[4] : NULL, NULL};
         execve(executable, canary_args, clean_env);
     } else {
         execve(executable, &argv[1], clean_env);

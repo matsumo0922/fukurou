@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.audit.FUKUROU_PROMPT_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_RUNTIME_CONFIG_HASH_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_RUNTIME_CONFIG_VERSION_ID_ENV
 import me.matsumo.fukurou.trading.audit.FUKUROU_SYSTEM_PROMPT_VERSION_ENV
+import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
@@ -261,6 +262,7 @@ class LlmDaemonPreFilterGate(
         triggerKey: String,
         invocationId: String,
         observedAt: Instant,
+        triggerSnapshot: LlmRunTriggerSnapshot? = null,
     ): LlmDaemonPreFilterDecision {
         if (!daemonConfig.preFilterEnabled || !triggerKind.shouldRunPreFilter()) {
             return LlmDaemonPreFilterDecision.RUN_FULL
@@ -272,7 +274,7 @@ class LlmDaemonPreFilterGate(
                 triggerKind = triggerKind,
                 triggerKey = triggerKey,
                 observedAt = observedAt,
-                runnerRequest = requestBase,
+                runnerRequest = requestBase.copy(triggerSnapshot = triggerSnapshot ?: requestBase.triggerSnapshot),
             ),
         ).getOrElse { throwable ->
             if (throwable is CancellationException) {

@@ -52,6 +52,9 @@ enum class LlmInvocationPhase {
      */
     FALSIFIER,
 
+    /** standard context 不成立時に exposure 減少だけを許可する phase。 */
+    RISK_REDUCTION_ONLY,
+
     /**
      * 週次 reflection から prompt candidate を生成する phase。
      */

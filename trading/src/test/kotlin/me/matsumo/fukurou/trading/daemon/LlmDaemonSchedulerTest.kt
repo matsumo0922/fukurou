@@ -6,6 +6,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.CommandEvent
@@ -211,6 +212,50 @@ class LlmDaemonSchedulerTest {
         assertTrue(reservations.finishRequests.isEmpty())
         assertTrue(fixture.launches.isEmpty())
         assertEquals(0, fixture.eventLog.events().count { event -> event.eventType == CommandEventType.NO_TRADE_EXIT })
+    }
+
+    @Test
+    fun blockingReservationLookupDelayKeepsTriggerSnapshotAtSelectionTimeAndReservesAtFreshTime() = runBlocking {
+        val selectedAt = Instant.parse("2026-07-10T12:00:00Z")
+        val clock = MutableClock(selectedAt)
+        val riskStateRepository = InMemoryRiskStateRepository(clock)
+        val reservations = RecordingReservationRepository(
+            delegate = InMemoryLlmLaunchReservationRepository(riskStateRepository),
+            onFindBlocking = { clock.advance(Duration.ofSeconds(2)) },
+        )
+        val preFilter = FakePreFilter()
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                    preFilterEnabled = true,
+                ),
+            ),
+            clock = clock,
+            riskStateRepository = riskStateRepository,
+            reservations = reservations,
+            preFilter = preFilter,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        val launchSnapshot = requireNotNull(fixture.launches.single().triggerSnapshot)
+        val preFilterSnapshot = requireNotNull(preFilter.requests.single().runnerRequest.triggerSnapshot)
+        val reservation = reservations.tryReserveRequests.single()
+        val launchedPayload = Json.parseToJsonElement(
+            fixture.eventLog.events().single { event ->
+                event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED
+            }.payload,
+        ).jsonObject
+        assertEquals(selectedAt, launchSnapshot.observedAt)
+        assertEquals(selectedAt.plusSeconds(2), reservation.reservedAt)
+        assertTrue(launchSnapshot === preFilterSnapshot)
+        assertEquals(
+            selectedAt.toString(),
+            launchedPayload.getValue("typedTriggerObservedAt").jsonPrimitive.content,
+        )
     }
 
     @Test
@@ -472,17 +517,36 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun launchThreadsSingleOpenRiskSnapshotThroughReservationRunAndAudit() = runBlocking {
+    fun launchThreadsImmutableTriggerAndOpenRiskSnapshotsThroughPreFilterRunAndPostSpawnAudit() = runBlocking {
         var brokerReads = 0
+        val eventLog = InMemoryCommandEventLog()
+        val preFilter = FakePreFilter()
         val snapshot = LlmDaemonOpenRiskSnapshot(
             openPositionCount = 0,
             restingEntryOrders = emptyList(),
             otherOpenOrderCount = 0,
         )
         val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                    preFilterEnabled = true,
+                ),
+            ),
+            eventLog = eventLog,
+            preFilter = preFilter,
             openRiskReader = {
                 brokerReads += 1
                 Result.success(snapshot)
+            },
+            launchHandler = { request ->
+                assertTrue(
+                    eventLog.events().none { event ->
+                        event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED
+                    },
+                )
+                successfulRunnerResult(request)
             },
         )
 
@@ -491,9 +555,19 @@ class LlmDaemonSchedulerTest {
         assertIs<LlmDaemonTickResult.Launched>(result)
         assertEquals(1, brokerReads)
         assertEquals(1, fixture.launches.size)
+        assertEquals(1, preFilter.requests.size)
+        val launchSnapshot = requireNotNull(fixture.launches.single().triggerSnapshot)
+        val preFilterSnapshot = requireNotNull(preFilter.requests.single().runnerRequest.triggerSnapshot)
+        assertTrue(launchSnapshot === preFilterSnapshot)
         val launched = fixture.eventLog.events().single { event ->
             event.eventType == CommandEventType.DAEMON_TRIGGER_LAUNCHED
         }
+        val launchedPayload = Json.parseToJsonElement(launched.payload).jsonObject
+        assertEquals(launchSnapshot.kind, launchedPayload.getValue("typedTriggerKind").jsonPrimitive.content)
+        assertEquals(
+            launchSnapshot.observedAt.toString(),
+            launchedPayload.getValue("typedTriggerObservedAt").jsonPrimitive.content,
+        )
         assertTrue(launched.payload.contains("\"restingOnly\":false"))
         assertTrue(launched.payload.contains("\"openPositionCount\":0"))
         assertTrue(launched.payload.contains("\"restingEntryOrderCount\":0"))
@@ -1205,7 +1279,12 @@ class LlmDaemonSchedulerTest {
 
     @Test
     fun priceMoveTriggerLaunchesForUpAndDownMovesWithAuditDetails() = runBlocking {
-        val upFixture = schedulerFixture()
+        val daemonConfig = LlmDaemonConfig(
+            enabled = true,
+            launchEnabled = true,
+            priceMoveThresholdRatio = BigDecimal("0.009"),
+        )
+        val upFixture = schedulerFixture(tradingConfig = tradingConfig(daemon = daemonConfig))
         upFixture.scheduler.tick()
         upFixture.clock.advance(Duration.ofSeconds(300))
         upFixture.tickerReader.currentPriceJpy = BigDecimal("10100000")
@@ -1213,6 +1292,7 @@ class LlmDaemonSchedulerTest {
         val upResult = upFixture.scheduler.tick()
         val upPayload = upFixture.launchedPayload(LlmDaemonTriggerKind.PRICE_MOVE)
         val upDetails = upPayload.getValue("details").jsonObject
+        val upMeasurement = upPayload.getValue("typedTriggerMeasurements").jsonArray.single().jsonObject
 
         assertIs<LlmDaemonTickResult.Launched>(upResult)
         assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, upResult.triggerKind)
@@ -1221,8 +1301,14 @@ class LlmDaemonSchedulerTest {
         assertEquals("300", upDetails.stringValue("windowSeconds"))
         assertEquals("10000000", upDetails.stringValue("basePriceJpy"))
         assertEquals("10100000", upDetails.stringValue("currentPriceJpy"))
+        assertEquals("absolute_price_change_ratio", upMeasurement.stringValue("metric"))
+        assertEquals("0.01000000", upMeasurement.stringValue("measuredValue"))
+        assertEquals("GREATER_THAN_OR_EQUAL", upMeasurement.stringValue("comparator"))
+        assertEquals("0.009", upMeasurement.stringValue("threshold"))
+        assertEquals("0.00100000", upMeasurement.stringValue("signedMargin"))
+        assertEquals("RATIO", upMeasurement.stringValue("unit"))
 
-        val downFixture = schedulerFixture()
+        val downFixture = schedulerFixture(tradingConfig = tradingConfig(daemon = daemonConfig))
         downFixture.scheduler.tick()
         downFixture.clock.advance(Duration.ofSeconds(300))
         downFixture.tickerReader.currentPriceJpy = BigDecimal("9900000")
@@ -1230,6 +1316,7 @@ class LlmDaemonSchedulerTest {
         val downResult = downFixture.scheduler.tick()
         val downPayload = downFixture.launchedPayload(LlmDaemonTriggerKind.PRICE_MOVE)
         val downDetails = downPayload.getValue("details").jsonObject
+        val downMeasurement = downPayload.getValue("typedTriggerMeasurements").jsonArray.single().jsonObject
 
         assertIs<LlmDaemonTickResult.Launched>(downResult)
         assertEquals(LlmDaemonTriggerKind.PRICE_MOVE, downResult.triggerKind)
@@ -1237,6 +1324,10 @@ class LlmDaemonSchedulerTest {
         assertEquals("-0.01000000", downDetails.stringValue("changeRatio"))
         assertEquals("10000000", downDetails.stringValue("basePriceJpy"))
         assertEquals("9900000", downDetails.stringValue("currentPriceJpy"))
+        assertEquals("0.01000000", downMeasurement.stringValue("measuredValue"))
+        assertEquals("GREATER_THAN_OR_EQUAL", downMeasurement.stringValue("comparator"))
+        assertEquals("0.009", downMeasurement.stringValue("threshold"))
+        assertEquals("0.00100000", downMeasurement.stringValue("signedMargin"))
     }
 
     @Test
@@ -1357,6 +1448,11 @@ class LlmDaemonSchedulerTest {
                         blackoutAfter = Duration.ofHours(1),
                     ),
                 ),
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                    stopProximityRemainingRThreshold = BigDecimal("0.4"),
+                ),
             ),
             hasOpenRisk = true,
             positionsReader = positionsReader,
@@ -1366,6 +1462,7 @@ class LlmDaemonSchedulerTest {
         val result = fixture.scheduler.tick()
         val payload = fixture.launchedPayload(LlmDaemonTriggerKind.STOP_PROXIMITY)
         val details = payload.getValue("details").jsonObject
+        val measurement = payload.getValue("typedTriggerMeasurements").jsonArray.single().jsonObject
 
         assertIs<LlmDaemonTickResult.Launched>(result)
         assertEquals(LlmDaemonTriggerKind.STOP_PROXIMITY, result.triggerKind)
@@ -1374,6 +1471,12 @@ class LlmDaemonSchedulerTest {
         assertEquals("0.30000000", details.stringValue("remainingR"))
         assertEquals("90", details.stringValue("stopLossJpy"))
         assertEquals("93", details.stringValue("currentPriceJpy"))
+        assertEquals("remaining_distance_to_stop", measurement.stringValue("metric"))
+        assertEquals("0.30000000", measurement.stringValue("measuredValue"))
+        assertEquals("LESS_THAN_OR_EQUAL", measurement.stringValue("comparator"))
+        assertEquals("0.4", measurement.stringValue("threshold"))
+        assertEquals("0.10000000", measurement.stringValue("signedMargin"))
+        assertEquals("R", measurement.stringValue("unit"))
     }
 
     @Test
@@ -2075,10 +2178,12 @@ private class RecordingReservationRepository(
     var blockingLookupCallCount: Int = 0
     var tryReserveCallCount: Int = 0
     val finishRequests: MutableList<LlmLaunchReservationFinish> = mutableListOf()
+    val tryReserveRequests: MutableList<LlmLaunchReservationRequest> = mutableListOf()
 
     override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
         admissionCallCount += 1
         tryReserveCallCount += 1
+        tryReserveRequests += request
         onTryReserve()
 
         return delegate.tryReserve(request)
