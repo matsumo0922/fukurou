@@ -5,9 +5,16 @@ readonly ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 readonly SELFTEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
 export FUKUROU_DEPLOY_ROOT="${SELFTEST_ROOT}/deploy"
+mkdir -p "${FUKUROU_DEPLOY_ROOT}/repo"
+cp "${ROOT}/docker-compose.prod.yml" "${FUKUROU_DEPLOY_ROOT}/repo/docker-compose.prod.yml"
+cp "${ROOT}/.env.example" "${FUKUROU_DEPLOY_ROOT}/.env"
 
 # shellcheck source=deploy-fukurou
 source "${ROOT}/scripts/deploy/deploy-fukurou"
+timeout() {
+  shift
+  "$@"
+}
 DEPLOYMENT_ID=fixture
 CANDIDATE_DIGEST="sha256:$(printf '0%.0s' {1..64})"
 CANDIDATE_CATALOG_HASH="$(printf '1%.0s' {1..64})"
@@ -22,7 +29,18 @@ export FUKUROU_IMAGE_REFERENCE="ghcr.io/matsumo0922/fukurou@${CANDIDATE_DIGEST}"
 export FUKUROU_PUBLIC_ORIGIN=https://fixture.invalid
 export FUKUROU_MCP_DB_PASSWORD_FILE="${SELFTEST_ROOT}/db-password-unused"
 touch "${FUKUROU_MCP_DB_PASSWORD_FILE}"
-docker compose --env-file "${ROOT}/.env" -p fukurou-canary-fixture \
+validate_production_compose
+sed 's#FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}#FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_TAG:?FUKUROU_IMAGE_TAG is required}#' \
+  "${ROOT}/docker-compose.prod.yml" > "${COMPOSE_FILE}"
+validate_production_compose
+[[ "${FUKUROU_IMAGE_TAG}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
+previous_reference="ghcr.io/matsumo0922/fukurou@sha256:$(printf '2%.0s' {1..64})"
+bind_image_reference "${previous_reference}"
+docker compose --env-file "${ROOT}/.env.example" -f "${COMPOSE_FILE}" config --quiet
+[[ "${FUKUROU_IMAGE_REFERENCE}" == "${previous_reference}" && "${FUKUROU_IMAGE_TAG}" == "${previous_reference}" ]]
+bind_image_reference "ghcr.io/matsumo0922/fukurou@${CANDIDATE_DIGEST}"
+cp "${ROOT}/docker-compose.prod.yml" "${COMPOSE_FILE}"
+docker compose --env-file "${ROOT}/.env.example" -p fukurou-canary-fixture \
   -f "${ROOT}/docker-compose.prod.yml" -f "${SELFTEST_ROOT}/canary.yml" \
   config --format json > "${SELFTEST_ROOT}/effective.json"
 if ! validate_canary_compose_json "${SELFTEST_ROOT}/effective.json"; then
@@ -38,4 +56,4 @@ if validate_canary_compose_json "${SELFTEST_ROOT}/forbidden.json"; then
   exit 1
 fi
 
-echo "CANARY_COMPOSE_SELFTEST_OK source=production deny=db,dependencies,volumes,networks failure=db-inheritance-rejected"
+echo "CANARY_COMPOSE_SELFTEST_OK source=production preflight=current-and-legacy-rendered rollback=legacy-image-binding deny=db,dependencies,volumes,networks failure=db-inheritance-rejected"

@@ -42,7 +42,8 @@ maintenance_cas() {
   local next_generation="$4" next_enabled="$5" next_deployment="$6"
   validate_generation "${expected_generation}"; validate_generation "${next_generation}"
   validate_deployment_id "${next_deployment}"
-  psql_exec -At --set=expected_generation="${expected_generation}" --set=expected_enabled="${expected_enabled}" \
+  local changed_count
+  changed_count="$(psql_exec -Atq --set=expected_generation="${expected_generation}" --set=expected_enabled="${expected_enabled}" \
     --set=expected_deployment="${expected_deployment}" --set=next_generation="${next_generation}" \
     --set=next_enabled="${next_enabled}" --set=next_deployment="${next_deployment}" <<'SQL'
 BEGIN;
@@ -60,15 +61,18 @@ WITH changed AS (
       AND COALESCE(deployment_id, '') = :'expected_deployment'
     RETURNING generation, enabled, COALESCE(deployment_id, '') AS deployment_id
 )
-SELECT CASE WHEN COUNT(*) = 1 THEN 1 ELSE 1/0 END FROM changed;
+SELECT COUNT(*) FROM changed;
 COMMIT;
 SQL
+  )"
+  [[ "${changed_count}" == 1 ]] || fail "maintenance CAS did not match the expected tuple"
 }
 
 ensure_maintenance() {
   local generation="$1" deployment_id="$2"
   validate_generation "${generation}"; validate_deployment_id "${deployment_id}"
-  psql_exec -At --set=generation="${generation}" --set=deployment_id="${deployment_id}" <<'SQL'
+  local changed_count
+  changed_count="$(psql_exec -Atq --set=generation="${generation}" --set=deployment_id="${deployment_id}" <<'SQL'
 BEGIN;
 SET LOCAL lock_timeout = '500ms';
 SET LOCAL statement_timeout = '2s';
@@ -82,16 +86,19 @@ WITH locked AS (
       AND (COALESCE(deployment_id, '') IN ('', :'deployment_id'))
     RETURNING 1
 )
-SELECT CASE WHEN COUNT(*)=1 THEN 1 ELSE 1/0 END FROM changed;
+SELECT COUNT(*) FROM changed;
 COMMIT;
 SQL
+  )"
+  [[ "${changed_count}" == 1 ]] || fail "maintenance state could not be re-established"
 }
 
 append_gap() {
   local deployment_id="$1" boundary="$2" occurred_at="$3" payload_hash="$4"
   validate_deployment_id "${deployment_id}"; validate_hash "${payload_hash}"
   [[ "${boundary}" == "OPEN" || "${boundary}" == "CLOSE" ]] || fail "invalid boundary"
-  psql_exec -At --set=deployment_id="${deployment_id}" --set=boundary="${boundary}" \
+  local verified_count
+  verified_count="$(psql_exec -Atq --set=deployment_id="${deployment_id}" --set=boundary="${boundary}" \
     --set=occurred_at="${occurred_at}" --set=payload_hash="${payload_hash}" <<'SQL'
 BEGIN;
 SET LOCAL lock_timeout = '500ms';
@@ -114,9 +121,11 @@ WITH identity AS (
     WHERE deployment_id = :'deployment_id' AND boundary = :'boundary'
       AND payload_hash = :'payload_hash'
 )
-SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 1/0 END FROM verified;
+SELECT COUNT(*) FROM verified;
 COMMIT;
 SQL
+  )"
+  [[ "${verified_count}" -ge 1 ]] || fail "gap event did not match the immutable deployment boundary"
 }
 
 gap_state() {
@@ -210,7 +219,7 @@ SQL
 }
 
 cleanup_terminal_pid_registrations() {
-  psql_exec -At <<'SQL'
+  psql_exec -Atq <<'SQL'
 BEGIN;
 SET LOCAL lock_timeout = '250ms';
 SET LOCAL statement_timeout = '1s';

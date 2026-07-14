@@ -92,18 +92,65 @@ docker() {
       [[ "${OBSERVATION_MODE}" != absent ]] || return 0
       printf 'fukurou-ktor\n'
       ;;
-    compose|pull|image|images|rmi) return 0 ;;
+    compose)
+      [[ "${FUKUROU_IMAGE_REFERENCE:-}" =~ ^ghcr.io/matsumo0922/fukurou@sha256:[0-9a-f]{64}$ ]]
+      [[ "${FUKUROU_IMAGE_TAG:-}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
+      ;;
+    pull|image|images|rmi) return 0 ;;
     *) return 0 ;;
   esac
 }
 
+runtime_snapshot='{"captureDbTimestamp":"2026-07-14T00:00:00.000000Z","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","preFilterActive":"false","foundationCatalogFingerprint":"fixture","installKind":"PRE_FOUNDATION","maintenance":{"generation":0,"enabled":false,"deploymentId":""},"pidRegistrations":{"active":0,"total":0}}'
+validate_runtime_snapshot "${runtime_snapshot}"
+[[ "$(read_maintenance_enabled "${runtime_snapshot}")" == false ]]
+if validate_runtime_snapshot "$(jq 'del(.maintenance.enabled)' <<<"${runtime_snapshot}")"; then
+  echo "deploy-runtime-selftest: missing maintenance flag was accepted" >&2
+  exit 1
+fi
+if read_maintenance_enabled "$(jq '.maintenance.enabled="false"' <<<"${runtime_snapshot}")" >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: string maintenance flag was accepted" >&2
+  exit 1
+fi
+
+PENDING_STATE_DIR="${STATE_ROOT}/.fixture.tmp.$$"
+mkdir -p "${PENDING_STATE_DIR}"
+cleanup_pending_state
+[[ ! -e "${STATE_ROOT}/.fixture.tmp.$$" ]]
+unsafe_pending_state="${SELFTEST_ROOT}/must-remain"
+mkdir -p "${unsafe_pending_state}"
+PENDING_STATE_DIR="${unsafe_pending_state}"
+if cleanup_pending_state >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: unsafe pending-state path was accepted" >&2
+  exit 1
+fi
+[[ -d "${unsafe_pending_state}" ]]
+PENDING_STATE_DIR=""
+mkdir -p "${STATE_ROOT}/.stale-one.tmp.1" "${STATE_ROOT}/.stale-two.tmp.2"
+cleanup_stale_pending_states
+[[ ! -e "${STATE_ROOT}/.stale-one.tmp.1" && ! -e "${STATE_ROOT}/.stale-two.tmp.2" ]]
+capture_body="$(declare -f capture_rollback_state)"
+[[ "${capture_body}" == *"journal_state PREPARED"*'mv "${temporary_dir}" "${state_dir}"'* ]]
+
 write_recovery_state() {
   local state_dir="$1" deployment_id="$2"
+  local configured_reference="${3-ghcr.io/matsumo0922/fukurou@sha256:0000000000000000000000000000000000000000000000000000000000000000}"
   cat > "${state_dir}/state.json" <<JSON
-{"deploymentId":"${deployment_id}","installKind":"FOUNDATION_V1","previousRepoSha":"0000000000000000000000000000000000000000","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6},"runningContainer":{"configuredImageReference":"ghcr.io/matsumo0922/fukurou@sha256:0000000000000000000000000000000000000000000000000000000000000000"}}
+{"deploymentId":"${deployment_id}","installKind":"FOUNDATION_V1","previousRepoSha":"0000000000000000000000000000000000000000","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6},"runningContainer":{"configuredImageReference":"${configured_reference}"}}
 JSON
-  printf 'services: {}\n' > "${state_dir}/docker-compose.prod.yml"
+  printf 'services:\n  ktor:\n    image: ${FUKUROU_IMAGE_REFERENCE:?}\n    environment:\n      FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_TAG:?}\n' > "${state_dir}/docker-compose.prod.yml"
 }
+
+fresh_state_dir="${STATE_ROOT}/fresh-image-binding"
+mkdir -p "${fresh_state_dir}"
+write_recovery_state "${fresh_state_dir}" fresh-image-binding ""
+ROLLBACK_STATE_DIR="${fresh_state_dir}"
+CANDIDATE_DIGEST="sha256:$(printf '3%.0s' {1..64})"
+unset FUKUROU_IMAGE_REFERENCE FUKUROU_IMAGE_TAG
+bind_recovery_image_reference
+[[ "${FUKUROU_IMAGE_REFERENCE}" == "ghcr.io/matsumo0922/fukurou@${CANDIDATE_DIGEST}" ]]
+[[ "${FUKUROU_IMAGE_TAG}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
+rm -rf "${fresh_state_dir}"
 
 create_recovery_fixture() {
   local deployment_id="$1" terminal_state="$2"
@@ -232,7 +279,9 @@ set -e
 [[ "${early_signal_status}" == 143 ]]
 
 DEPLOYMENT_ID=new-candidate
+unset FUKUROU_IMAGE_REFERENCE FUKUROU_IMAGE_TAG
 recover_unfinished_deployments
+[[ "${FUKUROU_IMAGE_TAG}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do
   [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK || \
      "$(tail -n 1 "${journal}" | jq -r '.state')" == COMPLETE ]]
@@ -297,7 +346,7 @@ DEPLOYMENT_ID=fixture
 DISPATCHED_OPERATION_IDS=$'\nPRODUCTION\n'
 SUPERVISOR_MODE=enable-failure
 GAP_MODE=success
-request_supervisor() { [[ !("${SUPERVISOR_MODE}" == enable-failure && "$1" == ENABLE) ]]; }
+request_supervisor() { [[ ! ("${SUPERVISOR_MODE}" == enable-failure && "$1" == ENABLE) ]]; }
 prepare_gap_event() {
   GAP_EVENT_DEPLOYMENT_ID="${DEPLOYMENT_ID}"; GAP_EVENT_BOUNDARY="$1"
   GAP_EVENT_OCCURRED_AT=fixture; GAP_EVENT_PAYLOAD_HASH="$(printf 'a%.0s' {1..64})"
@@ -312,7 +361,7 @@ if (resume_launches >/dev/null 2>&1); then
 fi
 grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
 
-if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1; then
+if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1 && command -v ps >/dev/null 2>&1; then
   eval "${PRODUCTION_TIMEOUT_DEFINITION}"
   process_fixture="${SELFTEST_ROOT}/process-group"
   if production_timeout 1 bash -c 'trap "" TERM; echo "$$" > "$1"; sleep 30 & echo "$!" >> "$1"; wait' _ "${process_fixture}"; then
@@ -320,7 +369,8 @@ if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1; then
     exit 1
   fi
   while IFS= read -r process_id; do
-    if kill -0 "${process_id}" 2>/dev/null; then
+    process_state="$(ps -o stat= -p "${process_id}" 2>/dev/null | awk 'NF {print $1; exit}')" || process_state=""
+    if [[ -n "${process_state}" && "${process_state}" != Z* ]]; then
       echo "deploy-runtime-selftest: timeout left process ${process_id} alive" >&2
       exit 1
     fi
@@ -376,4 +426,4 @@ if command -v flock >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && comm
   }
 fi
 
-echo "DEPLOY_RUNTIME_SELFTEST_OK journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated watchdog=lock-closed-processes-reaped-deadline-signaled"
+echo "DEPLOY_RUNTIME_SELFTEST_OK snapshot=false-preserved-invalid-rejected pending-state=safe-and-stale-cleanup journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated watchdog=lock-closed-processes-reaped-deadline-signaled"

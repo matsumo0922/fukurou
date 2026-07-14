@@ -1,0 +1,54 @@
+name: Deploy validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/deploy*.yml"
+      - ".env.example"
+      - "docker-compose.prod.yml"
+      - "scripts/deploy/**"
+      - "fukurou/src/test/kotlin/me/matsumo/fukurou/ReleaseDeployFoundationContractTest.kt"
+      - "docs/deploy.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-contract:
+    name: Deploy contract and PostgreSQL 16
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate shell syntax
+        run: >-
+          bash -n
+          scripts/deploy/deploy-fukurou
+          scripts/deploy/fukurou-deploy-db
+          scripts/deploy/deploy-contract-selftest
+          scripts/deploy/deploy-runtime-selftest
+          scripts/deploy/deploy-db-selftest
+          scripts/deploy/deploy-postgres-selftest
+          scripts/deploy/canary-compose-selftest
+
+      - name: Run deploy semantic selftests
+        run: |
+          scripts/deploy/deploy-contract-selftest
+          scripts/deploy/deploy-runtime-selftest
+          scripts/deploy/deploy-db-selftest
+          scripts/deploy/deploy-postgres-selftest
+          scripts/deploy/canary-compose-selftest
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run file-level deploy contract test
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-deploy-validation
+        run: ./gradlew :fukurou:test --tests me.matsumo.fukurou.ReleaseDeployFoundationContractTest
