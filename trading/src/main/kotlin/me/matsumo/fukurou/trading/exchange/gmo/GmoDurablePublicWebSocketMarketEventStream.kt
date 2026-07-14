@@ -153,10 +153,11 @@ internal class GmoDurableWebSocketListener(
                 if (state == DurableListenerState.BEGINNING) {
                     state = DurableListenerState.SUBSCRIBING
                     webSocket.sendText(subscription, true).whenComplete { _, failure ->
-                        if (failure == null) activate(webSocket) else fail(
-                            webSocket,
-                            DurableIngressGapSource.TRANSPORT_ERROR,
-                        )
+                        if (failure == null) {
+                            activate(webSocket)
+                        } else {
+                            fail(webSocket, DurableIngressGapSource.TRANSPORT_ERROR)
+                        }
                     }
                 }
             } else {

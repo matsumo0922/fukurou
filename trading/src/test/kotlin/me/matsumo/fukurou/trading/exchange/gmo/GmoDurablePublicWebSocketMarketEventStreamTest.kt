@@ -434,8 +434,11 @@ private class RecordingWebSocket(deferSendText: Boolean = false, deferPong: Bool
     val sentTexts = CopyOnWriteArrayList<String>()
     val sendTextDeferred = if (deferSendText) CompletableFuture<WebSocket>() else null
     val sendPongDeferred = if (deferPong) CompletableFuture<WebSocket>() else null
+
     @Volatile var requestCount = 0L
+
     @Volatile var aborted = false
+
     @Volatile var pongCount = 0
 
     override fun sendText(data: CharSequence, last: Boolean): CompletableFuture<WebSocket> {

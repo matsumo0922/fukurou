@@ -163,42 +163,48 @@ class ExposedDurableMarketEventIngress(
                 val operation = executor.submit<T> { mutateOnConnection(deadline, connection, mutation) }
                 executor.shutdown()
 
-                try {
+                val outcome = runCatching {
                     val waitMillis = deadline.requireRemaining().minus(INGRESS_ABORT_RESERVE).toMillis()
                     if (waitMillis <= 0) throw SQLTimeoutException("No durable ingress operation budget remains.")
                     operation.get(waitMillis, TimeUnit.MILLISECONDS)
-                } catch (failure: TimeoutException) {
-                    val abortFailure = runCatching {
-                        connection.get()?.let { acquiredConnection ->
-                            val abortWorker = Executors.newSingleThreadExecutor { runnable ->
-                                Thread(runnable, "durable-ingress-abort").apply { isDaemon = true }
+                }.recoverCatching { failure ->
+                    when (failure) {
+                        is TimeoutException -> {
+                            val abortFailure = runCatching {
+                                connection.get()?.let { acquiredConnection ->
+                                    val abortWorker = Executors.newSingleThreadExecutor { runnable ->
+                                        Thread(runnable, "durable-ingress-abort").apply { isDaemon = true }
+                                    }
+                                    abortExecutor.set(abortWorker)
+                                    acquiredConnection.abort(abortWorker)
+                                    abortWorker.shutdown()
+                                }
+                            }.exceptionOrNull()
+                            operation.cancel(true)
+                            throw SQLTimeoutException("Durable ingress JDBC operation exceeded its deadline.").apply {
+                                initCause(failure)
+                                abortFailure?.let(::addSuppressed)
                             }
-                            abortExecutor.set(abortWorker)
-                            acquiredConnection.abort(abortWorker)
-                            abortWorker.shutdown()
                         }
-                    }.exceptionOrNull()
-                    operation.cancel(true)
-                    throw SQLTimeoutException("Durable ingress JDBC operation exceeded its deadline.").apply {
-                        initCause(failure)
-                        abortFailure?.let(::addSuppressed)
-                    }
-                } catch (failure: ExecutionException) {
-                    throw failure.cause ?: failure
-                } finally {
-                    operation.cancel(true)
-                    executor.shutdownNow()
-                    val terminated = executor.awaitTermination(
-                        deadline.remaining().toMillis().coerceAtLeast(1),
-                        TimeUnit.MILLISECONDS,
-                    )
-                    if (!terminated) throw SQLTimeoutException("Durable ingress JDBC worker outlived its deadline.")
-                    abortExecutor.get()?.let { abortWorker ->
-                        if (!abortWorker.awaitTermination(1, TimeUnit.MILLISECONDS)) {
-                            abortWorker.shutdownNow()
-                        }
+                        is ExecutionException -> throw failure.cause ?: failure
+                        else -> throw failure
                     }
                 }
+
+                operation.cancel(true)
+                executor.shutdownNow()
+                val terminated = executor.awaitTermination(
+                    deadline.remaining().toMillis().coerceAtLeast(1),
+                    TimeUnit.MILLISECONDS,
+                )
+                if (!terminated) throw SQLTimeoutException("Durable ingress JDBC worker outlived its deadline.")
+                abortExecutor.get()?.let { abortWorker ->
+                    if (!abortWorker.awaitTermination(1, TimeUnit.MILLISECONDS)) {
+                        abortWorker.shutdownNow()
+                    }
+                }
+
+                outcome.getOrThrow()
             }
         }
 
