@@ -361,7 +361,7 @@ if (resume_launches >/dev/null 2>&1); then
 fi
 grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
 
-if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1; then
+if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1 && command -v ps >/dev/null 2>&1; then
   eval "${PRODUCTION_TIMEOUT_DEFINITION}"
   process_fixture="${SELFTEST_ROOT}/process-group"
   if production_timeout 1 bash -c 'trap "" TERM; echo "$$" > "$1"; sleep 30 & echo "$!" >> "$1"; wait' _ "${process_fixture}"; then
@@ -369,7 +369,8 @@ if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1; then
     exit 1
   fi
   while IFS= read -r process_id; do
-    if kill -0 "${process_id}" 2>/dev/null; then
+    process_state="$(ps -o stat= -p "${process_id}" 2>/dev/null | awk 'NF {print $1; exit}')" || process_state=""
+    if [[ -n "${process_state}" && "${process_state}" != Z* ]]; then
       echo "deploy-runtime-selftest: timeout left process ${process_id} alive" >&2
       exit 1
     fi
