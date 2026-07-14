@@ -361,8 +361,16 @@ if (resume_launches >/dev/null 2>&1); then
 fi
 grep -Fq 'maintenance-cas 7 false fixture 7 true fixture' "${DB_CALLS}"
 
-if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1 && command -v ps >/dev/null 2>&1; then
+if [[ -x /usr/bin/timeout ]] && command -v ps >/dev/null 2>&1; then
   eval "${PRODUCTION_TIMEOUT_DEFINITION}"
+  fake_bin="${SELFTEST_ROOT}/fake-bin"
+  mkdir -p "${fake_bin}"
+  printf '#!/usr/bin/env bash\nexit 97\n' > "${fake_bin}/setsid"
+  chmod +x "${fake_bin}/setsid"
+  PATH="${fake_bin}:${PATH}" production_timeout 5 true || {
+    echo "deploy-runtime-selftest: timeout wrapper still depends on setsid" >&2
+    exit 1
+  }
   process_fixture="${SELFTEST_ROOT}/process-group"
   if production_timeout 1 bash -c 'trap "" TERM; echo "$$" > "$1"; sleep 30 & echo "$!" >> "$1"; wait' _ "${process_fixture}"; then
     echo "deploy-runtime-selftest: timeout process group fixture unexpectedly succeeded" >&2
