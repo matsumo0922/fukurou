@@ -2108,7 +2108,7 @@ private fun JdbcTransaction.recoverStaleLlmReservation(invocationId: String, now
         WHERE invocation_id = ? AND status = ?
     """.trimIndent()
 
-    return jdbcConnection().prepareStatement(sql).use { statement ->
+    val recovered = jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, "FAILED")
         statement.setLong(2, now.toEpochMilli())
         statement.setString(3, LlmRunTerminalCause.RESTART_INTERRUPTED.name)
@@ -2116,6 +2116,15 @@ private fun JdbcTransaction.recoverStaleLlmReservation(invocationId: String, now
         statement.setString(5, "RUNNING")
         statement.executeUpdate() == 1
     }
+    if (recovered) {
+        terminalizeLlmPidRegistrations(
+            invocationId = invocationId,
+            reason = LlmRunTerminalCause.RESTART_INTERRUPTED.name,
+            requireRegistration = false,
+        )
+    }
+
+    return recovered
 }
 
 private fun JdbcTransaction.insertLlmInvocationRecoveryEvent(

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -436,9 +437,17 @@ static int descriptors_allowed(struct launch_request *request) {
     for (size_t index = 0; index < request->descriptor_count; index++) {
         struct stat current;
         if (fstat(request->descriptors[index], &current) != 0) return 0;
-        int type_allowed = index < 3
-            ? (S_ISREG(current.st_mode) || S_ISCHR(current.st_mode) || S_ISFIFO(current.st_mode) || S_ISSOCK(current.st_mode))
-            : S_ISREG(current.st_mode);
+        int seals = request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && (index == 3 || index == 4)
+            ? fcntl(request->descriptors[index], F_GET_SEALS) : -1;
+        int standard_descriptor = index < 3 &&
+            (S_ISREG(current.st_mode) || S_ISCHR(current.st_mode) || S_ISFIFO(current.st_mode) || S_ISSOCK(current.st_mode));
+        int mcp_sealed_input = request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 &&
+            (index == 3 || index == 4) && S_ISREG(current.st_mode) && seals >= 0 &&
+            (seals & (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE)) ==
+                (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+        int mcp_submission_socket = request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 &&
+            index == 5 && S_ISSOCK(current.st_mode);
+        int type_allowed = standard_descriptor || mcp_sealed_input || mcp_submission_socket;
         if (!type_allowed) return 0;
         for (size_t previous = 0; previous < index; previous++) {
             struct stat other;
@@ -934,6 +943,16 @@ static int append_launch_item(char *payload, size_t *offset, const char *value) 
     return 0;
 }
 
+static int create_sealed_selftest_descriptor(void) {
+    int descriptor = memfd_create("fukurou-protocol-selftest", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (descriptor < 0 || write(descriptor, "x", 1) != 1 || lseek(descriptor, 0, SEEK_SET) < 0 ||
+        fcntl(descriptor, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+        if (descriptor >= 0) close(descriptor);
+        return -1;
+    }
+    return descriptor;
+}
+
 static int send_accept_selftest_request(const char *path, enum accept_selftest_case test_case, unsigned nonce_seed) {
     uid_t uid = test_case == ACCEPT_RECEIPT_FAILURE ? MCP_UID : LLM_UID;
     gid_t gid = test_case == ACCEPT_RECEIPT_FAILURE ? MCP_GID : LLM_GID;
@@ -1037,11 +1056,19 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
 
     uint16_t descriptor_count = test_case == ACCEPT_RECEIPT_FAILURE ? 6 : 3;
     int descriptors[6];
-    for (size_t index = 0; index < descriptor_count; index++) {
+    int submission_pair[2] = {-1, -1};
+    for (size_t index = 0; index < (descriptor_count < 3 ? descriptor_count : 3); index++) {
         char template[] = "/tmp/fukurou-accept-selftest-XXXXXX";
         descriptors[index] = mkstemp(template);
         if (descriptors[index] < 0) return 125;
         unlink(template);
+    }
+    if (test_case == ACCEPT_RECEIPT_FAILURE) {
+        descriptors[3] = create_sealed_selftest_descriptor();
+        descriptors[4] = create_sealed_selftest_descriptor();
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, submission_pair) != 0) return 125;
+        descriptors[5] = submission_pair[0];
+        if (descriptors[3] < 0 || descriptors[4] < 0) return 125;
     }
     char control[CMSG_SPACE(sizeof(descriptors))] = {0};
     struct iovec vectors[2] = {
@@ -1059,6 +1086,7 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
     memcpy(CMSG_DATA(control_header), descriptors, sizeof(int) * descriptor_count);
     ssize_t sent = sendmsg(connection, &message, MSG_NOSIGNAL);
     for (size_t index = 0; index < descriptor_count; index++) close(descriptors[index]);
+    if (submission_pair[1] >= 0) close(submission_pair[1]);
     if (sent != (ssize_t)header.total_length) return 125;
     int status = -1;
     ssize_t received = recv(connection, &status, sizeof(status), 0);
@@ -1133,6 +1161,38 @@ static int protocol_selftest(void) {
         environment_entries_allowed(FUKUROU_PROFILE_MCP_CURRENT_V1, missing_invocation_environment, 1) ||
         executable_for(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, APP_UID, APP_GID) != NULL ||
         executable_for(0xffffU, LLM_UID, LLM_GID) != NULL) return 125;
+    struct launch_request mcp_descriptors = {
+        .header = {.profile = FUKUROU_PROFILE_MCP_CURRENT_V1},
+        .descriptor_count = 6,
+    };
+    for (size_t index = 0; index < 5; index++) {
+        mcp_descriptors.descriptors[index] = create_sealed_selftest_descriptor();
+        if (mcp_descriptors.descriptors[index] < 0) return 125;
+    }
+    int mcp_submission_pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, mcp_submission_pair) != 0) return 125;
+    mcp_descriptors.descriptors[5] = mcp_submission_pair[0];
+    if (!descriptors_allowed(&mcp_descriptors)) return 125;
+    int submission_socket = mcp_descriptors.descriptors[5];
+    mcp_descriptors.descriptors[5] = create_sealed_selftest_descriptor();
+    if (descriptors_allowed(&mcp_descriptors)) return 125;
+    close(mcp_descriptors.descriptors[5]);
+    mcp_descriptors.descriptors[5] = submission_socket;
+    int sealed_manifest = mcp_descriptors.descriptors[3];
+    mcp_descriptors.descriptors[3] = submission_socket;
+    mcp_descriptors.descriptors[5] = sealed_manifest;
+    if (descriptors_allowed(&mcp_descriptors)) return 125;
+    mcp_descriptors.descriptors[3] = sealed_manifest;
+    mcp_descriptors.descriptors[5] = submission_socket;
+    int second_socket_pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, second_socket_pair) != 0) return 125;
+    int sealed_password = mcp_descriptors.descriptors[4];
+    mcp_descriptors.descriptors[4] = second_socket_pair[0];
+    if (descriptors_allowed(&mcp_descriptors)) return 125;
+    close(second_socket_pair[0]); close(second_socket_pair[1]);
+    mcp_descriptors.descriptors[4] = sealed_password;
+    close_request_descriptors(&mcp_descriptors);
+    close(mcp_submission_pair[1]);
     struct launch_request duplicate_descriptors = {.descriptor_count = 2};
     duplicate_descriptors.descriptors[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
     duplicate_descriptors.descriptors[1] = open("/dev/null", O_RDONLY | O_CLOEXEC);

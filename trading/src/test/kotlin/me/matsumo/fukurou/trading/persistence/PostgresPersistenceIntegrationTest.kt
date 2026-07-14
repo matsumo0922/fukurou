@@ -4201,6 +4201,7 @@ class PostgresPersistenceIntegrationTest {
 
         reservationRepository.tryReserve(llmLaunchReservationRequest("orphan-stale-reservation", runnerConfig, staleAt)).getOrThrow()
         bootstrap.ensureSchema().getOrThrow()
+        assertPidRegistrationCounts(database, "orphan-stale-reservation", total = 1, active = 0)
 
         runRepository.insertRunning(llmRunStart("terminal-run-stale-reservation", staleAt)).getOrThrow()
         runRepository.finish(
@@ -4594,6 +4595,7 @@ class PostgresPersistenceIntegrationTest {
                 ),
             ),
         )
+        activatePidRegistrations(database, "bootstrap-claim", includeMcp = true)
         val recoveryClock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC)
         val bootstrap = TradingPersistenceBootstrap(
             database = database,
@@ -4626,6 +4628,7 @@ class PostgresPersistenceIntegrationTest {
             selectReservationReason(database, "bootstrap-claim"),
         )
         assertTrue(selectRecoveryAuditPayload(database, "bootstrap-claim").contains("previous_process_generation_ended"))
+        assertPidRegistrationCounts(database, "bootstrap-claim", total = 2, active = 0)
     }
 
     @Test
@@ -4668,6 +4671,7 @@ class PostgresPersistenceIntegrationTest {
             selectRecoveryAuditPayload(database, "previous-epoch-bootstrap-recovery")
                 .contains("previous_process_generation_ended"),
         )
+        assertPidRegistrationCounts(database, "previous-epoch-bootstrap-recovery", total = 0, active = 0)
     }
 
     @Test
@@ -4689,6 +4693,7 @@ class PostgresPersistenceIntegrationTest {
                 ),
             ),
         )
+        activatePidRegistrations(database, "current-process-recovery", includeMcp = true)
         runRepository.insertRunning(llmRunStart("current-process-recovery", now)).getOrThrow()
         val snapshot = requireNotNull(
             reservationRepository.findExecutionClaim("current-process-recovery").getOrThrow(),
@@ -4730,6 +4735,7 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(auditPayload.contains("12345678"))
         assertTrue(auditPayload.contains(Regex("\"runRecovered\"\\s*:\\s*true")))
         assertTrue(auditPayload.contains(Regex("\"reservationRecovered\"\\s*:\\s*true")))
+        assertPidRegistrationCounts(database, "current-process-recovery", total = 2, active = 0)
     }
 
     @Test
@@ -4767,6 +4773,7 @@ class PostgresPersistenceIntegrationTest {
             assertEquals(1, faultController.lostCommitResponses)
             assertEquals(1, countRecoveryAuditEvents(faultDatabase, snapshot.invocationId))
             assertTrue(selectRecoveryAuditPayload(faultDatabase, snapshot.invocationId).contains(request.recoveryAttemptId.toString()))
+            assertPidRegistrationCounts(faultDatabase, snapshot.invocationId, total = 1, active = 0)
         }
     }
 
@@ -4803,6 +4810,7 @@ class PostgresPersistenceIntegrationTest {
             )
             assertEquals(2, faultController.recoveryMutationEntries)
             assertEquals(1, countRecoveryAuditEvents(faultDatabase, snapshot.invocationId))
+            assertPidRegistrationCounts(faultDatabase, snapshot.invocationId, total = 1, active = 0)
         }
     }
 
@@ -4943,6 +4951,7 @@ class PostgresPersistenceIntegrationTest {
                 assertEquals(1, faultController.recoveryMutationEntries)
                 assertEquals(1, countRecoveryAuditEvents(faultDatabase, "commit-readback-loss"))
                 assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+                assertPidRegistrationCounts(faultDatabase, "commit-readback-loss", total = 1, active = 0)
             }
         } finally {
             LlmExecutionAdmissionHealth.resetForTest()
@@ -7919,6 +7928,15 @@ class PostgresPersistenceIntegrationTest {
         insertFinishedLlmRun(database, "run-entry-${addEntry.commandId}")
 
         broker.placeOrder(addEntry).getOrThrow()
+        val addOrderId = exposedTransaction(database) {
+            prepare("SELECT id FROM orders WHERE intent_id=? AND side='BUY'").use { statement ->
+                statement.setObject(1, requireNotNull(addEntry.intentId))
+                statement.executeQuery().use { resultSet ->
+                    check(resultSet.next())
+                    resultSet.getObject(1, UUID::class.java)
+                }
+            }
+        }
         val positionAfterAdd = broker.getPositions().getOrThrow().single()
 
         broker.closePosition(
@@ -7994,6 +8012,35 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
         assertEquals("247000", evaluatedTrade.initialRiskPriceWidthJpy?.stripTrailingZeros()?.toPlainString())
         assertLedgerLineage(database, "manual close")
+
+        exposedTransaction(database) {
+            prepare("UPDATE orders SET created_at=?,updated_at=? WHERE position_id=?").use { statement ->
+                statement.setLong(1, fixedInstant().toEpochMilli())
+                statement.setLong(2, fixedInstant().toEpochMilli())
+                statement.setObject(3, UUID.fromString(positionAfterAdd.positionId))
+                assertTrue(statement.executeUpdate() >= 4)
+            }
+            prepare("UPDATE orders SET intent_id=NULL WHERE id=?").use { statement ->
+                statement.setObject(1, addOrderId)
+                assertEquals(1, statement.executeUpdate())
+            }
+        }
+        val missingResult = evaluationRepository.fetchClosedTrades(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val missingPopulation = evaluationRepository.fetchExclusionSummary(
+            EvaluationPeriod(
+                from = fixedInstant().minusSeconds(1),
+                toExclusive = fixedInstant().plusSeconds(1),
+            ),
+        ).getOrThrow().populationByEntityType
+        assertEquals(1, missingResult.attributionCoverage.missing)
+        listOf("ORDER", "EXECUTION", "POSITION", "TRADE").forEach { entityType ->
+            assertEquals(1, missingPopulation.getValue(entityType).attributionMissing, entityType)
+        }
     }
 
     @Test
@@ -12770,6 +12817,69 @@ private fun countRecoveryAuditEvents(database: ExposedDatabase, invocationId: St
             statement.executeQuery().use { resultSet ->
                 check(resultSet.next())
                 resultSet.getInt(1)
+            }
+        }
+    }
+}
+
+private fun activatePidRegistrations(
+    database: ExposedDatabase,
+    invocationId: String,
+    includeMcp: Boolean,
+) {
+    exposedTransaction(database) {
+        prepare(
+            """
+                UPDATE llm_pid_registrations
+                SET state='ACTIVE', pid_namespace_inode=42, process_id=4242,
+                    process_start_ticks=99, updated_at=clock_timestamp()
+                WHERE invocation_id=? AND role='PROVIDER'
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            require(statement.executeUpdate() == 1)
+        }
+        if (includeMcp) {
+            prepare(
+                """
+                    INSERT INTO llm_pid_registrations(
+                        registration_id, invocation_id, reservation_id, role, container_instance_id,
+                        pid_namespace_inode, process_id, process_start_ticks, state
+                    )
+                    SELECT md5('fukurou-pid-registration-v1:' || invocation_id || ':MCP')::uuid,
+                        invocation_id, reservation_id, 'MCP', container_instance_id,
+                        42, 4343, 100, 'ACTIVE'
+                    FROM llm_pid_registrations
+                    WHERE invocation_id=? AND role='PROVIDER'
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, invocationId)
+                require(statement.executeUpdate() == 1)
+            }
+        }
+    }
+}
+
+private fun assertPidRegistrationCounts(
+    database: ExposedDatabase,
+    invocationId: String,
+    total: Int,
+    active: Int,
+) {
+    exposedTransaction(database) {
+        prepare(
+            """
+                SELECT COUNT(*) AS total_count,
+                    COUNT(*) FILTER (WHERE state IN ('SPAWN_RESERVED','ACTIVE')) AS active_count
+                FROM llm_pid_registrations
+                WHERE invocation_id=?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { rows ->
+                require(rows.next())
+                assertEquals(total, rows.getInt("total_count"))
+                assertEquals(active, rows.getInt("active_count"))
             }
         }
     }

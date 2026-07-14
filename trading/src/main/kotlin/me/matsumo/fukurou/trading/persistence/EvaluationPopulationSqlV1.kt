@@ -89,23 +89,33 @@ internal fun evaluationOrderLineageMissingSql(
         ${evaluationRunMissingSql(runAlias)})
 """.trimIndent()
 
-/** intentを持つentryとdirect runだけを持つsystem/close orderを同じstatusへ投影する。 */
+/** semantic BUYはexact intent lineage、system/close orderはdirect runでstatusへ投影する。 */
 internal fun evaluationOrderCausalMissingSql(
     orderAlias: String,
     intentAlias: String,
     decisionAlias: String,
     runAlias: String,
 ): String = """
-    ($orderAlias.id IS NULL OR $orderAlias.decision_run_id IS NULL OR
-        ${evaluationRunMissingSql(runAlias)} OR
-        ($orderAlias.intent_id IS NOT NULL AND (
+    ($orderAlias.id IS NULL OR
+        ($orderAlias.side = 'BUY' AND (
+            $orderAlias.intent_id IS NULL OR $intentAlias.id IS NULL OR
+            $decisionAlias.id IS NULL OR $decisionAlias.invocation_id IS NULL OR
+            $orderAlias.decision_run_id IS NULL OR
+            $orderAlias.decision_run_id IS DISTINCT FROM $decisionAlias.invocation_id OR
+            ${evaluationRunMissingSql(runAlias)}
+        )) OR
+        ($orderAlias.side <> 'BUY' AND (
+            $orderAlias.decision_run_id IS NULL OR
+            ${evaluationRunMissingSql(runAlias)} OR
+            ($orderAlias.intent_id IS NOT NULL AND (
             $intentAlias.id IS NULL OR $decisionAlias.id IS NULL OR
             $decisionAlias.invocation_id IS NULL OR
             $orderAlias.decision_run_id IS DISTINCT FROM $decisionAlias.invocation_id
+            ))
         )))
 """.trimIndent()
 
-/** execution direct run、order direct run、任意entry intentのchainをexactに照合する。 */
+/** execution direct runと、BUYなら必須となるorder intent chainをexactに照合する。 */
 internal fun evaluationExecutionCausalMissingSql(
     executionAlias: String,
     orderAlias: String,

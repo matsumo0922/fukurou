@@ -549,6 +549,11 @@ private fun JdbcTransaction.recoverStaleExecutionClaimInTransaction(
         statement.setNullableLong(7, request.observedHeartbeatAt?.toEpochMilli())
         val recovered = statement.executeUpdate() == 1
         if (recovered) {
+            terminalizeLlmPidRegistrations(
+                invocationId = request.invocationId,
+                reason = request.reason,
+                requireRegistration = false,
+            )
             val runRecovered = recoverCurrentProcessLlmRun(request, deadline, nanoTime)
             insertRecoveryEvent(request, runRecovered, deadline, nanoTime)
         }
@@ -920,20 +925,34 @@ fun JdbcTransaction.finishLlmLaunchInTransaction(finish: LlmLaunchReservationFin
     require(updatedRows == 1) {
         "LLM launch reservation was not found. invocationId=${finish.invocationId}"
     }
+    terminalizeLlmPidRegistrations(
+        invocationId = finish.invocationId,
+        reason = finish.reason ?: finish.status.name,
+        requireRegistration = true,
+    )
+}
+
+/** reservation terminal化と同じtransactionで対応PID registrationを収束させる。 */
+internal fun JdbcTransaction.terminalizeLlmPidRegistrations(
+    invocationId: String,
+    reason: String,
+    requireRegistration: Boolean,
+) {
     jdbcConnection().prepareStatement(FINISH_LLM_PID_REGISTRATION_SQL).use { statement ->
-        statement.setString(1, finish.reason ?: finish.status.name)
-        statement.setString(2, finish.invocationId)
+        statement.setString(1, reason)
+        statement.setString(2, invocationId)
         statement.executeUpdate()
     }
     val registrationCounts = jdbcConnection().prepareStatement(COUNT_LLM_PID_REGISTRATIONS_SQL).use { statement ->
-        statement.setString(1, finish.invocationId)
+        statement.setString(1, invocationId)
         statement.executeQuery().use { resultSet ->
             require(resultSet.next())
             resultSet.getInt("total_count") to resultSet.getInt("active_count")
         }
     }
-    require(registrationCounts.first in 1..2 && registrationCounts.second == 0) {
-        "LLM PID registrations did not reach a terminal state. invocationId=${finish.invocationId}"
+    val totalCountAllowed = if (requireRegistration) registrationCounts.first in 1..2 else registrationCounts.first in 0..2
+    require(totalCountAllowed && registrationCounts.second == 0) {
+        "LLM PID registrations did not reach a terminal state. invocationId=$invocationId"
     }
 }
 
