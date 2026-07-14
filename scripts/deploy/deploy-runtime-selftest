@@ -327,4 +327,53 @@ if [[ -x /usr/bin/timeout ]] && command -v setsid >/dev/null 2>&1; then
   done < "${process_fixture}"
 fi
 
-echo "DEPLOY_RUNTIME_SELFTEST_OK journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated"
+if command -v flock >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v ps >/dev/null 2>&1; then
+  watchdog_lock="${SELFTEST_ROOT}/watchdog.lock"
+  exec 9>"${watchdog_lock}"
+  flock -n 9
+  FORWARD_DEADLINE_BOOTTIME=601
+  watchdog_err_result="${SELFTEST_ROOT}/watchdog-err-trap"
+  trap 'touch "${watchdog_err_result}"' ERR
+  start_forward_deadline_watchdog
+  watchdog_pid="${DEADLINE_WATCHDOG_PID}"
+  watchdog_child_pid=""
+  for _ in {1..50}; do
+    watchdog_child_pid="$(ps -o pid= --ppid "${watchdog_pid}" | awk 'NF {print $1; exit}')"
+    [[ -z "${watchdog_child_pid}" ]] || break
+    sleep 0.02
+  done
+  [[ -n "${watchdog_child_pid}" ]] || {
+    echo "deploy-runtime-selftest: watchdog child was not observed" >&2
+    exit 1
+  }
+  exec 9>&-
+  flock -n "${watchdog_lock}" -c true || {
+    echo "deploy-runtime-selftest: watchdog inherited the deploy lock" >&2
+    exit 1
+  }
+  stop_forward_deadline_watchdog
+  trap - ERR
+  [[ ! -e "${watchdog_err_result}" ]] || {
+    echo "deploy-runtime-selftest: watchdog cleanup inherited the deployment ERR trap" >&2
+    exit 1
+  }
+  for process_id in "${watchdog_pid}" "${watchdog_child_pid}"; do
+    if kill -0 "${process_id}" 2>/dev/null; then
+      echo "deploy-runtime-selftest: watchdog cleanup left process ${process_id} alive" >&2
+      exit 1
+    fi
+  done
+
+  watchdog_signal_result="${SELFTEST_ROOT}/watchdog-signal"
+  trap 'printf "USR1_RECEIVED\n" > "${watchdog_signal_result}"; stop_forward_deadline_watchdog' USR1
+  FORWARD_DEADLINE_BOOTTIME=2
+  start_forward_deadline_watchdog
+  wait "${DEADLINE_WATCHDOG_PID}" || true
+  trap - USR1
+  [[ "$(cat "${watchdog_signal_result}")" == USR1_RECEIVED ]] || {
+    echo "deploy-runtime-selftest: watchdog deadline signal was not received" >&2
+    exit 1
+  }
+fi
+
+echo "DEPLOY_RUNTIME_SELFTEST_OK journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated watchdog=lock-closed-processes-reaped-deadline-signaled"

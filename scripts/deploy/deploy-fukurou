@@ -59,14 +59,35 @@ check_forward_deadline() {
   [[ "$(boottime_seconds)" -lt "${FORWARD_DEADLINE_BOOTTIME}" ]] || fail "FORWARD_DEADLINE_EXCEEDED"
 }
 
+stop_forward_deadline_watchdog() {
+  [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]] || return 0
+  kill -TERM "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
+  wait "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
+  DEADLINE_WATCHDOG_PID=""
+}
+
 start_forward_deadline_watchdog() {
-  if [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]]; then
-    kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
-    wait "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
-  fi
+  stop_forward_deadline_watchdog
   local remaining=$((FORWARD_DEADLINE_BOOTTIME - $(boottime_seconds)))
   (( remaining > 0 )) || fail "FORWARD_DEADLINE_EXCEEDED"
-  (sleep "${remaining}"; kill -USR1 "$$" 2>/dev/null || true) &
+  (
+    exec 9>&-
+    trap - ERR
+    local watchdog_sleep_pid=""
+    cleanup_watchdog_sleep() {
+      [[ -n "${watchdog_sleep_pid}" ]] || return 0
+      kill -TERM "${watchdog_sleep_pid}" 2>/dev/null || true
+      wait "${watchdog_sleep_pid}" 2>/dev/null || true
+      watchdog_sleep_pid=""
+    }
+    trap cleanup_watchdog_sleep TERM INT HUP EXIT
+    sleep "${remaining}" &
+    watchdog_sleep_pid="$!"
+    wait "${watchdog_sleep_pid}" || exit 0
+    watchdog_sleep_pid=""
+    trap - TERM INT HUP EXIT
+    kill -USR1 "$$" 2>/dev/null || true
+  ) &
   DEADLINE_WATCHDOG_PID="$!"
 }
 
@@ -485,7 +506,7 @@ capture_rollback_state() {
 rollback_on_error() {
   local exit_code="$?"
   trap - ERR
-  if [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]]; then kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true; fi
+  stop_forward_deadline_watchdog
   if [[ -z "${ROLLBACK_STATE_DIR:-}" || ! -f "${ROLLBACK_STATE_DIR}/journal.jsonl" ]]; then
     echo "deploy-fukurou: deployment failed before rollback state was captured" >&2
     exit "${exit_code}"
@@ -1163,6 +1184,7 @@ main() {
   trap 'on_signal INT 130' INT
   trap 'on_signal HUP 129' HUP
   trap 'on_signal DEADLINE 124' USR1
+  trap stop_forward_deadline_watchdog EXIT
   start_forward_deadline_watchdog
 
   check_forward_deadline
@@ -1194,8 +1216,7 @@ main() {
   resume_launches
   verify_required_operations_dispatched
   prune_old_images
-  kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
-  wait "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
+  stop_forward_deadline_watchdog
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
