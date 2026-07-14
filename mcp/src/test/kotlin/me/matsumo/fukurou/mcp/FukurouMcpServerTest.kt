@@ -51,6 +51,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.Broker
@@ -144,6 +146,41 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
  * MCP server の最小 contract を検証するテスト。
  */
 class FukurouMcpServerTest {
+
+    @Test
+    fun terminalEvidenceCollector_isDisabledByDefault() = runBlocking {
+        val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(),
+        )
+
+        callTool(server.createServer(), "get_ticker")
+
+        assertEquals(TerminalToolEvidenceBundleStatus.DISABLED, server.terminalEvidenceSnapshot().status)
+        assertTrue(server.terminalEvidenceSnapshot().entries.isEmpty())
+    }
+
+    @Test
+    fun terminalEvidenceCollector_capturesFinalCanonicalResponseWhenUnitEnabled() = runBlocking {
+        val server = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = FakeMarketDataSource,
+            tradingRuntime = TradingRuntimeFactory.inMemory(clock = fixedClock()),
+            clock = fixedClock(),
+            terminalEvidenceCaptureEnabled = true,
+        )
+
+        callTool(server.createServer(), "get_ticker")
+        val bundle = server.terminalEvidenceSnapshot()
+        val evidence = bundle.entries.single()
+
+        assertEquals(TerminalToolEvidenceBundleStatus.COMPLETE, bundle.status)
+        assertEquals("get_ticker", evidence.toolName)
+        assertEquals(0, evidence.ordinal)
+        assertEquals(ToolEvidenceSourceTimestampStatus.PRESENT, evidence.sourceTimestampStatus)
+        assertEquals(64, evidence.responseHash.length)
+    }
 
     @Test
     fun constructor_acceptsInjectedMarketDataSource() {
@@ -1878,6 +1915,7 @@ class McpLaunchBootstrapPolicyTest {
                 canonical.copy(runtimeEnvironment = emptyMap()),
                 canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
                 canonical.copy(systemPromptVersion = ""),
+                canonical.copy(terminalEvidenceCaptureEnabled = true),
             ).forEach { rejected ->
                 assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
             }
@@ -2448,6 +2486,10 @@ private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
                 "VALUES (gen_random_uuid(),'BTC','forbidden-thesis',0.01,0,NULL,NULL)",
             "INSERT INTO dedupe_shadow_observations DEFAULT VALUES",
             "INSERT INTO decision_identity_generation_failures DEFAULT VALUES",
+            "INSERT INTO llm_tool_evidence DEFAULT VALUES",
+            "INSERT INTO llm_terminal_evidence_links DEFAULT VALUES",
+            "INSERT INTO llm_decision_phase_evidence_coverage DEFAULT VALUES",
+            "INSERT INTO llm_tool_evidence_activation_boundaries DEFAULT VALUES",
             "UPDATE opportunity_episodes SET closed_at=closed_at,close_reason=close_reason",
             "SELECT acquire_opportunity_episode_gap_population_token('BTC')",
             "UPDATE mcp_current_evaluation_scope SET account_initial_cash_jpy=account_initial_cash_jpy",

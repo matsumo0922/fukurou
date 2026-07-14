@@ -155,6 +155,9 @@ interface GmoCoinMarketToolExecutor {
     fun errorResponse(throwable: Throwable): GmoCoinMarketToolErrorResponse? {
         return null
     }
+
+    /** finalized MCP response を任意 collector へ渡す。 */
+    fun observeResult(toolName: String, result: CallToolResult): CallToolResult = result
 }
 
 /**
@@ -487,15 +490,18 @@ private suspend fun handleGetCandles(
         marketDataSource.getCandles(symbol, interval, limit).getOrThrow()
     }
 
-    return candles.fold(
-        onSuccess = { value ->
-            candlesResult(
-                candles = value,
-                interval = requestedInterval,
-                clock = clock,
-            )
-        },
-        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+    return toolExecutor.observeResult(
+        GET_CANDLES_TOOL,
+        candles.fold(
+            onSuccess = { value ->
+                candlesResult(
+                    candles = value,
+                    interval = requestedInterval,
+                    clock = clock,
+                )
+            },
+            onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+        ),
     )
 }
 
@@ -512,14 +518,17 @@ private suspend fun handleGetOrderbook(
         marketDataSource.getOrderbook(symbol, depth).getOrThrow()
     }
 
-    return orderbook.fold(
-        onSuccess = { value ->
-            orderbookResult(
-                orderbook = value,
-                clock = clock,
-            )
-        },
-        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+    return toolExecutor.observeResult(
+        GET_ORDERBOOK_TOOL,
+        orderbook.fold(
+            onSuccess = { value ->
+                orderbookResult(
+                    orderbook = value,
+                    clock = clock,
+                )
+            },
+            onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+        ),
     )
 }
 
@@ -536,14 +545,17 @@ private suspend fun handleGetTrades(
         marketDataSource.getTrades(symbol, limit).getOrThrow()
     }
 
-    return trades.fold(
-        onSuccess = { value ->
-            tradesResult(
-                trades = value,
-                clock = clock,
-            )
-        },
-        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+    return toolExecutor.observeResult(
+        GET_TRADES_TOOL,
+        trades.fold(
+            onSuccess = { value ->
+                tradesResult(
+                    trades = value,
+                    clock = clock,
+                )
+            },
+            onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+        ),
     )
 }
 
@@ -558,9 +570,12 @@ private suspend fun handleGetSymbolRules(
         marketDataSource.getSymbolRules(symbol).getOrThrow()
     }
 
-    return symbolRules.fold(
-        onSuccess = { value -> symbolRulesResult(value) },
-        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+    return toolExecutor.observeResult(
+        GET_SYMBOL_RULES_TOOL,
+        symbolRules.fold(
+            onSuccess = { value -> symbolRulesResult(value) },
+            onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+        ),
     )
 }
 
@@ -607,9 +622,12 @@ private suspend fun handleCalcIndicator(
         )
     }
 
-    return indicator.fold(
-        onSuccess = { value -> indicatorResult(value) },
-        onFailure = { throwable -> throwableResult(throwable, dependencies.toolExecutor) },
+    return dependencies.toolExecutor.observeResult(
+        CALC_INDICATOR_TOOL,
+        indicator.fold(
+            onSuccess = { value -> indicatorResult(value) },
+            onFailure = { throwable -> throwableResult(throwable, dependencies.toolExecutor) },
+        ),
     )
 }
 
@@ -625,14 +643,17 @@ private suspend fun handleGetTicker(
         marketDataSource.getTicker(symbol).getOrThrow()
     }
 
-    return ticker.fold(
-        onSuccess = { value ->
-            tickerResult(
-                ticker = value,
-                clock = clock,
-            )
-        },
-        onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+    return toolExecutor.observeResult(
+        GET_TICKER_TOOL,
+        ticker.fold(
+            onSuccess = { value ->
+                tickerResult(
+                    ticker = value,
+                    clock = clock,
+                )
+            },
+            onFailure = { throwable -> throwableResult(throwable, toolExecutor) },
+        ),
     )
 }
 

@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.mcp
 
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
@@ -53,6 +54,19 @@ class McpToolCallLimiter(
 
     @Volatile
     private var initialCounts: McpToolCallCounts? = null
+
+    @Volatile
+    private var resultObserver: (String, CallToolResult) -> Unit = { _, _ -> }
+
+    internal fun bindResultObserver(observer: (String, CallToolResult) -> Unit) {
+        resultObserver = observer
+    }
+
+    internal fun observeResult(toolName: String, result: CallToolResult): CallToolResult {
+        resultObserver(toolName, result)
+
+        return result
+    }
 
     /**
      * tool call 予算を 1 回消費し、超過時は no-trade audit 付きの失敗を返す。

@@ -66,6 +66,27 @@ import kotlin.test.assertTrue
 class GmoCoinMcpServerTest {
 
     @Test
+    fun marketToolExecutor_observesFinalizedResponse() = runBlocking {
+        val server = testServer()
+        val executor = CapturingMarketToolExecutor()
+        server.registerGmoCoinMarketTools(
+            marketDataSource = FakeMarketDataSource,
+            toolExecutor = executor,
+        )
+        val request = CallToolRequest(
+            params = CallToolRequestParams(
+                name = "get_ticker",
+                arguments = buildJsonObject {},
+            ),
+        )
+
+        val result = server.tools.getValue("get_ticker").handler.invoke(TestClientConnection, request)
+
+        assertEquals("get_ticker", executor.observedToolName)
+        assertEquals(result.structuredContent, executor.observedResult?.structuredContent)
+    }
+
+    @Test
     fun registerGmoCoinMarketTools_exposesMarketToolsOnly() {
         val server = testServer()
 
@@ -569,6 +590,25 @@ class GmoCoinMcpServerTest {
             stale = false,
             source = "GMO_PUBLIC_REST",
         )
+    }
+}
+
+/** finalized market responseをtestから観測するexecutor。 */
+private class CapturingMarketToolExecutor : GmoCoinMarketToolExecutor {
+    var observedToolName: String? = null
+    var observedResult: CallToolResult? = null
+
+    override suspend fun <T> execute(
+        toolName: String,
+        request: CallToolRequest,
+        block: suspend () -> T,
+    ): Result<T> = runCatching { block() }
+
+    override fun observeResult(toolName: String, result: CallToolResult): CallToolResult {
+        observedToolName = toolName
+        observedResult = result
+
+        return result
     }
 }
 

@@ -67,6 +67,9 @@ object McpLaunchBootstrap {
             "MCP manifest submission gateway path is invalid."
         }
         require(manifest.systemPromptVersion.isNotBlank()) { "MCP manifest system prompt version is required." }
+        require(!manifest.terminalEvidenceCaptureEnabled) {
+            "Terminal evidence capture is unavailable in this binary."
+        }
         require(expiresAt.isAfter(Instant.now(clock))) { "MCP manifest is expired." }
         require(password.isNotEmpty()) { "MCP password descriptor must not be empty." }
         require(manifest.totalToolCallLimit in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN) {
@@ -105,6 +108,7 @@ object McpLaunchBootstrap {
                 phaseManifestId = manifest.phaseManifestId,
                 effectiveInvocationHash = manifest.effectiveInvocationHash,
             ),
+            terminalEvidenceCaptureEnabled = false,
         )
     }
 
@@ -128,6 +132,7 @@ data class McpBootstrapConfig(
     val gmoPublicClientConfig: GmoPublicClientConfig,
     val tradingConfig: TradingBotConfig,
     val submissionGatewayBinding: McpSubmissionGatewayBinding,
+    val terminalEvidenceCaptureEnabled: Boolean = false,
 ) {
     override fun toString(): String = "McpBootstrapConfig(" +
         "databaseConfig=$databaseConfig, " +
@@ -140,6 +145,7 @@ data class McpBootstrapConfig(
         "gmoPublicClientConfig=$gmoPublicClientConfig, " +
         "tradingConfig=$tradingConfig" +
         ", submissionGatewayBinding=$submissionGatewayBinding" +
+        ", terminalEvidenceCaptureEnabled=$terminalEvidenceCaptureEnabled" +
         ")"
 }
 

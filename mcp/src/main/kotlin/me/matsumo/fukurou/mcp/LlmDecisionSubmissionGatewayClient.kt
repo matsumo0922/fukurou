@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.mcp
 
 import kotlinx.serialization.json.JsonObject
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -18,6 +19,12 @@ class LlmDecisionSubmissionGatewayClient private constructor(
     private val channel: SocketChannel,
     private val binding: McpSubmissionGatewayBinding,
 ) : AutoCloseable {
+    private var terminalEvidenceProvider: () -> TerminalToolEvidenceBundle = TerminalToolEvidenceBundle::disabled
+
+    internal fun bindTerminalEvidenceProvider(provider: () -> TerminalToolEvidenceBundle) {
+        terminalEvidenceProvider = provider
+    }
+
     fun submitDecision(submission: DecisionSubmission): JsonObject = submit(
         operation = OPERATION_SUBMIT_DECISION,
         payload = LlmSubmissionGatewayCodec.encodeDecision(submission),
@@ -31,16 +38,31 @@ class LlmDecisionSubmissionGatewayClient private constructor(
     override fun close() = channel.close()
 
     private fun submit(operation: String, payload: JsonObject): JsonObject {
-        LlmSubmissionGatewayCodec.writeFrame(
-            channel = channel,
-            payload = LlmSubmissionGatewayCodec.request(
+        val request = LlmSubmissionGatewayCodec.request(
+            operation = operation,
+            invocationId = binding.invocationId,
+            phase = binding.phase,
+            phaseManifestId = binding.phaseManifestId,
+            effectiveInvocationHash = binding.effectiveInvocationHash,
+            payload = payload,
+            terminalEvidence = terminalEvidenceProvider(),
+        )
+        val boundedRequest = if (LlmSubmissionGatewayCodec.fitsFrame(request)) {
+            request
+        } else {
+            LlmSubmissionGatewayCodec.request(
                 operation = operation,
                 invocationId = binding.invocationId,
                 phase = binding.phase,
                 phaseManifestId = binding.phaseManifestId,
                 effectiveInvocationHash = binding.effectiveInvocationHash,
                 payload = payload,
-            ),
+                terminalEvidence = TerminalToolEvidenceBundle.frameLimit(),
+            )
+        }
+        LlmSubmissionGatewayCodec.writeFrame(
+            channel = channel,
+            payload = boundedRequest,
         )
 
         return LlmSubmissionGatewayCodec.readFrame(channel).also { response ->

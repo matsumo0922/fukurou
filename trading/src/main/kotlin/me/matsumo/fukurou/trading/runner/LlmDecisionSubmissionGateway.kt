@@ -9,6 +9,12 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidence
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
+import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
+import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -20,6 +26,8 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.submitTerminalDecision
+import me.matsumo.fukurou.trading.decision.submitTerminalFalsification
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -87,6 +95,7 @@ class LlmDecisionSubmissionGateway private constructor(
             phase: LlmInvocationPhase,
             phaseManifestId: String,
             effectiveInvocationHash: String,
+            terminalEvidenceCaptureEnabled: Boolean = false,
         ): LlmDecisionSubmissionGateway = startWithHooks(
             socketPath = socketPath,
             repository = repository,
@@ -94,6 +103,7 @@ class LlmDecisionSubmissionGateway private constructor(
             phase = phase,
             phaseManifestId = phaseManifestId,
             effectiveInvocationHash = effectiveInvocationHash,
+            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
             hooks = LlmDecisionSubmissionGatewayStartHooks(),
         )
 
@@ -106,7 +116,11 @@ class LlmDecisionSubmissionGateway private constructor(
             phaseManifestId: String,
             effectiveInvocationHash: String,
             hooks: LlmDecisionSubmissionGatewayStartHooks,
+            terminalEvidenceCaptureEnabled: Boolean = false,
         ): LlmDecisionSubmissionGateway {
+            require(!terminalEvidenceCaptureEnabled) {
+                "Terminal evidence capture is unavailable in this binary."
+            }
             require(socketPath.toString().toByteArray().size <= MAX_UNIX_SOCKET_PATH_BYTES) {
                 "Submission socket path is too long."
             }
@@ -136,6 +150,7 @@ class LlmDecisionSubmissionGateway private constructor(
                                             phase = phase,
                                             phaseManifestId = phaseManifestId,
                                             effectiveInvocationHash = effectiveInvocationHash,
+                                            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
                                         )
                                     }
                                 }.getOrElse {
@@ -193,6 +208,7 @@ class LlmDecisionSubmissionGateway private constructor(
             phase: LlmInvocationPhase,
             phaseManifestId: String,
             effectiveInvocationHash: String,
+            terminalEvidenceCaptureEnabled: Boolean,
         ): JsonObject {
             require(request.requiredString("version") == GATEWAY_PROTOCOL_VERSION.toString()) {
                 "Submission gateway protocol version rejected."
@@ -204,6 +220,19 @@ class LlmDecisionSubmissionGateway private constructor(
                 "Gateway effective invocation binding mismatch."
             }
             val payload = request.getValue("payload").jsonObject
+            val terminalEvidence = LlmTerminalEvidenceCodec.decodeBundle(
+                request.getValue("terminalEvidence").jsonObject,
+            )
+            val trustedTerminalEvidence = TrustedTerminalToolEvidenceBundle(
+                invocationId = invocationId,
+                phaseManifestId = phaseManifestId,
+                phase = phase,
+                captureEnabled = terminalEvidenceCaptureEnabled,
+                bundle = terminalEvidence,
+            )
+            require(terminalEvidence == TerminalToolEvidenceBundle.disabled()) {
+                "Terminal evidence capture is unavailable in this binary."
+            }
 
             return when (request.requiredString("operation")) {
                 OPERATION_SUBMIT_DECISION -> {
@@ -217,15 +246,18 @@ class LlmDecisionSubmissionGateway private constructor(
                             "RISK_REDUCTION_ONLY rejects risk-increasing decisions."
                         }
                     }
-                    LlmSubmissionGatewayCodec.decisionResult(repository.submitDecision(submission).getOrThrow())
+                    LlmSubmissionGatewayCodec.decisionResult(
+                        repository.submitTerminalDecision(submission, trustedTerminalEvidence).getOrThrow(),
+                    )
                 }
                 OPERATION_SUBMIT_FALSIFICATION -> {
                     require(phase == LlmInvocationPhase.FALSIFIER) {
                         "submit_falsification is not authorized for this phase."
                     }
                     LlmSubmissionGatewayCodec.falsificationResult(
-                        repository.submitFalsification(
+                        repository.submitTerminalFalsification(
                             LlmSubmissionGatewayCodec.decodeFalsification(payload),
+                            trustedTerminalEvidence,
                         ).getOrThrow(),
                     )
                 }
@@ -252,6 +284,7 @@ object LlmSubmissionGatewayCodec {
         phaseManifestId: String,
         effectiveInvocationHash: String,
         payload: JsonObject,
+        terminalEvidence: TerminalToolEvidenceBundle = TerminalToolEvidenceBundle.disabled(),
     ): JsonObject = buildJsonObject {
         put("version", GATEWAY_PROTOCOL_VERSION)
         put("operation", operation)
@@ -260,7 +293,11 @@ object LlmSubmissionGatewayCodec {
         put("phaseManifestId", phaseManifestId)
         put("effectiveInvocationHash", effectiveInvocationHash)
         put("payload", payload)
+        put("terminalEvidence", LlmTerminalEvidenceCodec.encodeBundle(terminalEvidence))
     }
+
+    fun fitsFrame(payload: JsonObject): Boolean = payload.toString().encodeToByteArray().size in
+        1..MAX_GATEWAY_FRAME_BYTES
 
     fun encodeDecision(submission: DecisionSubmission): JsonObject = buildJsonObject {
         putNullableString("invocationId", submission.invocationId)
@@ -425,6 +462,52 @@ object LlmSubmissionGatewayCodec {
     )
 }
 
+/** terminal evidence bundle の versioned wire codec。 */
+object LlmTerminalEvidenceCodec {
+    fun encodeBundle(bundle: TerminalToolEvidenceBundle): JsonObject = buildJsonObject {
+        put("version", bundle.version)
+        put("status", bundle.status.name)
+        bundle.incompleteReason?.let { reason -> put("incompleteReason", reason.name) }
+        putJsonArray("entries") {
+            bundle.entries.forEach { entry ->
+                add(
+                    buildJsonObject {
+                        put("version", entry.version)
+                        put("ordinal", entry.ordinal)
+                        put("toolName", entry.toolName)
+                        put("responseJson", entry.responseJson)
+                        put("responseHash", entry.responseHash)
+                        entry.sourceTimestamp?.let { timestamp -> put("sourceTimestamp", timestamp.toString()) }
+                        put("sourceTimestampStatus", entry.sourceTimestampStatus.name)
+                        put("isError", entry.isError)
+                    },
+                )
+            }
+        }
+    }
+
+    fun decodeBundle(value: JsonObject): TerminalToolEvidenceBundle = TerminalToolEvidenceBundle(
+        version = value.requiredString("version").toInt(),
+        status = TerminalToolEvidenceBundleStatus.valueOf(value.requiredString("status")),
+        incompleteReason = value.optionalString("incompleteReason")?.let(TerminalToolEvidenceIncompleteReason::valueOf),
+        entries = value.getValue("entries").jsonArray.map { element ->
+            val entry = element.jsonObject
+            TerminalToolEvidence(
+                version = entry.requiredString("version").toInt(),
+                ordinal = entry.requiredString("ordinal").toInt(),
+                toolName = entry.requiredString("toolName"),
+                responseJson = entry.requiredString("responseJson"),
+                responseHash = entry.requiredString("responseHash"),
+                sourceTimestamp = entry.optionalString("sourceTimestamp")?.let(Instant::parse),
+                sourceTimestampStatus = ToolEvidenceSourceTimestampStatus.valueOf(
+                    entry.requiredString("sourceTimestampStatus"),
+                ),
+                isError = entry.requiredString("isError").toBooleanStrict(),
+            )
+        },
+    )
+}
+
 private fun JsonObject.requiredString(name: String): String = getValue(name).jsonPrimitive.content
 private fun JsonObject.optionalString(name: String): String? = get(name)?.jsonPrimitive?.content
 private fun JsonObject.stringList(name: String): List<String> = getValue(name).jsonArray.map {
@@ -439,8 +522,8 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.putStringList(name: Str
 
 const val OPERATION_SUBMIT_DECISION = "SUBMIT_DECISION"
 const val OPERATION_SUBMIT_FALSIFICATION = "SUBMIT_FALSIFICATION"
-private const val GATEWAY_PROTOCOL_VERSION = 1
-private const val MAX_GATEWAY_FRAME_BYTES = 128 * 1024
+private const val GATEWAY_PROTOCOL_VERSION = 2
+const val MAX_GATEWAY_FRAME_BYTES = 128 * 1024
 private const val MAX_UNIX_SOCKET_PATH_BYTES = 103
 private const val GATEWAY_CLOSE_WAIT_MILLIS = 500L
 private val JSON = Json {

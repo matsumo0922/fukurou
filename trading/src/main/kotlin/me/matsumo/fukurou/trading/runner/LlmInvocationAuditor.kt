@@ -230,6 +230,7 @@ class LlmInvocationAuditor(
             phase = request.phase,
             phaseManifestId = manifest.phaseManifestId,
             effectiveInvocationHash = manifest.effectiveInvocationHash,
+            terminalEvidenceCaptureEnabled = false,
         )
         try {
             McpLaunchManifestWriter.bindSubmissionSocket(server.manifestPath, socketPath)
