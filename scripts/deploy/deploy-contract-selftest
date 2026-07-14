@@ -27,6 +27,25 @@ expect_rejected() {
   if "$@"; then fail_selftest "${name} was accepted"; fi
 }
 
+signature_test_root="$(mktemp -d)"
+openssl genpkey -algorithm ED25519 -out "${signature_test_root}/private.pem" >/dev/null 2>&1
+openssl pkey -in "${signature_test_root}/private.pem" -pubout -out "${signature_test_root}/public.pem" >/dev/null 2>&1
+printf '%s' '{"candidateSha":"0123456789abcdef0123456789abcdef01234567"}' > "${signature_test_root}/bundle.json"
+openssl pkeyutl -sign -rawin -inkey "${signature_test_root}/private.pem" \
+  -in "${signature_test_root}/bundle.json" -out "${signature_test_root}/bundle.sig"
+verify_bundle_signature \
+  "${signature_test_root}/bundle.json" \
+  "${signature_test_root}/bundle.sig" \
+  "${signature_test_root}/public.pem" || \
+  fail_selftest "regular-file signature rejected"
+printf 'x' >> "${signature_test_root}/bundle.json"
+expect_rejected tampered-regular-file-signature \
+  verify_bundle_signature \
+  "${signature_test_root}/bundle.json" \
+  "${signature_test_root}/bundle.sig" \
+  "${signature_test_root}/public.pem"
+rm -rf "${signature_test_root}"
+
 installed_catalog="$(jq -cS . "${SCRIPT_DIRECTORY}/deploy-capability-catalog-v1.json")"
 installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $1}')"
 baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
@@ -105,4 +124,4 @@ validate_foundation_harness_hash "${harness_hash}" || fail_selftest "signed harn
 expect_rejected tampered-harness-mutation0 validate_foundation_harness_hash "$(printf '0%.0s' {1..64})"
 [[ "${MUTATION_COUNT}" == 0 ]] || fail_selftest "harness mismatch mutated state"
 
-echo "DEPLOY_CONTRACT_SELFTEST_OK superset=accepted-dispatched exact-image-probe=future-rejected-mutation0 durable-dispatch=recorded deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"
+echo "DEPLOY_CONTRACT_SELFTEST_OK signature=regular-file-accepted-tamper-rejected superset=accepted-dispatched exact-image-probe=future-rejected-mutation0 durable-dispatch=recorded deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"
