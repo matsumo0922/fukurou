@@ -42,6 +42,12 @@ jobs:
           scripts/deploy/deploy-postgres-selftest
           scripts/deploy/canary-compose-selftest
 
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
       - name: Run file-level deploy contract test
         env:
           GRADLE_USER_HOME: ${{ runner.temp }}/gradle-deploy-validation
