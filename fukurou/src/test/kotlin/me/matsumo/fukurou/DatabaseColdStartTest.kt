@@ -1,24 +1,26 @@
 package me.matsumo.fukurou
 
-import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import io.ktor.client.call.body
+import io.ktor.client.request.get
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.testing.testApplication
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketAddress
-import java.time.Clock
+import java.sql.DriverManager
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.SocketFactory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /** application poolのcold initialization contractを検証する。 */
 class DatabaseColdStartTest {
     @Test
-    fun coldPoolWaitsPastAcquisitionTimeoutAndBootstrapsSchema() {
+    fun coldPoolStartsProductionApplicationAndBootstrapsRuntimeAndTradingSchemas() {
         if (!DockerClientFactory.instance().isDockerAvailable) return
 
         ColdStartSocketFactory.reset()
@@ -27,15 +29,39 @@ class DatabaseColdStartTest {
             val delayedUrl = container.jdbcUrl.withSocketFactory(ColdStartSocketFactory::class.java.name)
             val startedAt = System.nanoTime()
 
-            createDataSource(DatabaseConfig(delayedUrl, container.username, container.password)).use { dataSource ->
-                val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
+            testApplication {
+                application {
+                    module(
+                        revision = COLD_START_REVISION,
+                        databaseConfig = DatabaseConfig(delayedUrl, container.username, container.password),
+                    )
+                }
 
-                assertTrue(elapsed > Duration.ofMillis(DATABASE_CONNECTION_TIMEOUT_MILLIS))
-                assertEquals(DATABASE_INITIALIZATION_TIMEOUT_MILLIS, dataSource.initializationFailTimeout)
-                assertEquals(DATABASE_CONNECTION_TIMEOUT_MILLIS, dataSource.connectionTimeout)
-                TradingPersistenceBootstrap(ExposedDatabase.connect(dataSource), Clock.systemUTC())
-                    .ensureSchema()
-                    .getOrThrow()
+                val response = client.get("/revision")
+
+                assertEquals(HttpStatusCode.OK, response.status)
+                assertEquals(COLD_START_REVISION, response.body<String>())
+            }
+            val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
+
+            assertTrue(elapsed > Duration.ofMillis(DATABASE_CONNECTION_TIMEOUT_MILLIS))
+            assertEquals(30_000L, DATABASE_INITIALIZATION_RETRY_WINDOW_MILLIS)
+            assertEquals(1, countRows(container, "runtime_config_versions", "status = 'ACTIVE'"))
+            assertEquals(1, countRows(container, "paper_account", "id = 1"))
+        }
+    }
+}
+
+private fun countRows(
+    container: ColdStartPostgresContainer,
+    table: String,
+    condition: String,
+): Int {
+    DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT count(*) FROM $table WHERE $condition").use { rows ->
+                check(rows.next())
+                return rows.getInt(1)
             }
         }
     }
@@ -129,4 +155,5 @@ private fun String.withSocketFactory(factoryName: String): String {
 
 private class ColdStartPostgresContainer : PostgreSQLContainer<ColdStartPostgresContainer>("postgres:16-alpine")
 
+private const val COLD_START_REVISION = "cold-start-composition"
 private const val COLD_CONNECT_DELAY_MILLIS = 750L

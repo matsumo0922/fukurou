@@ -1963,11 +1963,17 @@ class McpDatabaseRoleIntegrationTest {
             assertMcpRoleProvisionRequiresBootstrap(container)
             TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
             seedRequiredMatrixRun(container, clock)
+
+            provisionMcpRole(container)
+            assertRoleBoundary(container)
+
             seedDirtyMcpPrivileges(container)
             provisionMcpRole(container)
+            assertRoleBoundary(container)
+
             provisionMcpRole(container)
             createFuturePrivilegeBoundaryObjects(container)
-            assertRoleBoundary(container)
+            assertRoleBoundary(container, includeFutureBoundary = true)
             appRuntime = TradingRuntimeFactory.postgres(
                 TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
                 clock = clock,
@@ -2181,7 +2187,7 @@ private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
 
 private fun seedDirtyMcpPrivileges(container: PostgreSQLContainer<*>) {
     val sql = """
-        CREATE ROLE $MCP_TEST_ROLE LOGIN PASSWORD '$MCP_TEST_PASSWORD' SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS INHERIT;
+        ALTER ROLE $MCP_TEST_ROLE WITH LOGIN PASSWORD '$MCP_TEST_PASSWORD' SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS INHERIT;
         CREATE ROLE mcp_dirty_parent;
         CREATE ROLE mcp_dirty_child;
         CREATE ROLE mcp_dirty_grantor;
@@ -2329,7 +2335,7 @@ private fun runMcpRoleProvision(container: PostgreSQLContainer<*>): Container.Ex
 }
 
 @Suppress("NestedBlockDepth")
-private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
+private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureBoundary: Boolean = false) {
     DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
         connection.createStatement().use { statement ->
             statement.executeQuery("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'").use { rows ->
@@ -2363,15 +2369,17 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                     "'population_execution_semantics_version','scope_hash')",
                 0,
             )
-            statement.executeQuery(
-                "SELECT " +
-                    "has_table_privilege('public', 'mcp_future_boundary', 'SELECT'), " +
-                    "has_table_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary', 'SELECT'), " +
-                    "has_function_privilege('public', 'mcp_future_boundary_function()', 'EXECUTE'), " +
-                    "has_function_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary_function()', 'EXECUTE')",
-            ).use { rows ->
-                assertTrue(rows.next())
-                (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
+            if (includeFutureBoundary) {
+                statement.executeQuery(
+                    "SELECT " +
+                        "has_table_privilege('public', 'mcp_future_boundary', 'SELECT'), " +
+                        "has_table_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary', 'SELECT'), " +
+                        "has_function_privilege('public', 'mcp_future_boundary_function()', 'EXECUTE'), " +
+                        "has_function_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary_function()', 'EXECUTE')",
+                ).use { rows ->
+                    assertTrue(rows.next())
+                    (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
+                }
             }
             assertSqlCount(
                 statement,

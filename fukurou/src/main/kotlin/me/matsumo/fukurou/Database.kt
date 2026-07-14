@@ -36,8 +36,8 @@ private const val READINESS_EXPECTED_VALUE = 1
 /** production DB poolからconnectionを取得するときの最大待機時間。 */
 internal const val DATABASE_CONNECTION_TIMEOUT_MILLIS = 500L
 
-/** production DB poolの初回connection確立を待つ最大時間。 */
-internal const val DATABASE_INITIALIZATION_TIMEOUT_MILLIS = 30_000L
+/** production DB poolが初回connectionを再試行する時間幅。 */
+internal const val DATABASE_INITIALIZATION_RETRY_WINDOW_MILLIS = 30_000L
 
 /**
  * データベース接続設定。環境変数から組み立てる。
@@ -74,7 +74,8 @@ data class DatabaseConfig(
 
 /**
  * HikariCP の接続プールを生成する。
- * 初回connectionはboundedに確立を待ち、初期化後のconnection取得はfail-fastにする。
+ * 初回connectionは30秒のretry windowに加えて進行中のJDBC connect/validation 1回を待ち、
+ * 初期化後のconnection取得はfail-fastにする。
  */
 fun createDataSource(config: DatabaseConfig): HikariDataSource {
     val hikariConfig = HikariConfig().apply {
@@ -82,7 +83,7 @@ fun createDataSource(config: DatabaseConfig): HikariDataSource {
         username = config.user
         password = config.password
         maximumPoolSize = 4
-        initializationFailTimeout = DATABASE_INITIALIZATION_TIMEOUT_MILLIS
+        initializationFailTimeout = DATABASE_INITIALIZATION_RETRY_WINDOW_MILLIS
         connectionTimeout = DATABASE_CONNECTION_TIMEOUT_MILLIS
     }
 

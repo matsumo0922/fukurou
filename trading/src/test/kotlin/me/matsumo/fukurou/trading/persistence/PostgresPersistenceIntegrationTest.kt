@@ -6098,8 +6098,8 @@ class PostgresPersistenceIntegrationTest {
             postgresRepositoryRoot()
                 .resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/runtime/TradingRuntime.kt"),
         )
-        assertTrue("INITIALIZATION_FAIL_TIMEOUT_MILLIS = 30_000L" in runtimeSource)
-        assertTrue("initializationFailTimeout = INITIALIZATION_FAIL_TIMEOUT_MILLIS" in runtimeSource)
+        assertTrue("INITIALIZATION_RETRY_WINDOW_MILLIS = 30_000L" in runtimeSource)
+        assertTrue("initializationFailTimeout = INITIALIZATION_RETRY_WINDOW_MILLIS" in runtimeSource)
         assertTrue("CONNECTION_TIMEOUT_MILLIS = 500L" in runtimeSource)
         assertTrue("connectionTimeout = CONNECTION_TIMEOUT_MILLIS" in runtimeSource)
     }
