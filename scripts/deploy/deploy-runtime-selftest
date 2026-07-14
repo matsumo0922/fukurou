@@ -17,6 +17,8 @@ PRODUCTION_TIMEOUT_DEFINITION="$(declare -f timeout | sed '1s/^timeout/productio
 boottime_seconds() { printf '1\n'; }
 
 DB_CALLS="${SELFTEST_ROOT}/db-calls"
+DB_STATE_ROOT="${SELFTEST_ROOT}/db-state"
+mkdir -p "${DB_STATE_ROOT}/gaps"
 OBSERVATION_MODE=stopped
 DB_MODE=success
 
@@ -31,7 +33,20 @@ timeout() {
       snapshot) printf '{"runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture"}\n' ;;
       active-launch-count) printf '0\n' ;;
       gap-state)
-        if [[ "${2:-}" == *fixture-close && "${2:-}" != *-recovery ]]; then printf 'CLOSED\n'; else printf 'OPEN\n'; fi
+        [[ -f "${DB_STATE_ROOT}/gaps/${2}" ]] && cat "${DB_STATE_ROOT}/gaps/${2}" || printf 'MISSING\n'
+        ;;
+      maintenance-cas)
+        printf '%s|%s|%s\n' "$5" "$6" "$7" > "${DB_STATE_ROOT}/maintenance"
+        ;;
+      ensure-maintenance)
+        printf '%s|true|%s\n' "$2" "$3" > "${DB_STATE_ROOT}/maintenance"
+        ;;
+      append-gap)
+        case "$3" in
+          OPEN) printf 'OPEN\n' > "${DB_STATE_ROOT}/gaps/${2}" ;;
+          CLOSE) printf 'CLOSED\n' > "${DB_STATE_ROOT}/gaps/${2}" ;;
+          *) return 1 ;;
+        esac
         ;;
       *) printf '1\n' ;;
     esac
@@ -96,6 +111,7 @@ create_recovery_fixture() {
   local state_dir="${STATE_ROOT}/${deployment_id}"
   mkdir -p "${state_dir}"
   write_recovery_state "${state_dir}" "${deployment_id}"
+  printf 'OPEN\n' > "${DB_STATE_ROOT}/gaps/${deployment_id}"
   ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
   journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
   journal_state CAPTURED '{"fixture":true}'
@@ -109,7 +125,7 @@ create_recovery_fixture() {
     DB_MAINTENANCE_CLEARED) FUKUROU_DEPLOY_CRASH_AT=AFTER_DB_MAINTENANCE_CLEAR ;;
     ENABLE_ACKED) FUKUROU_DEPLOY_CRASH_AT=AFTER_ENABLE_ACK ;;
     GAP_CLOSE_APPENDED) FUKUROU_DEPLOY_CRASH_AT=AFTER_GAP_CLOSE_APPEND; expected_state=ENABLE_ACKED ;;
-    GAP_CLOSED) FUKUROU_DEPLOY_CRASH_AT=AFTER_GAP_CLOSE ;;
+    GAP_CLOSED) FUKUROU_DEPLOY_CRASH_AT=AFTER_GAP_CLOSE; printf 'CLOSED\n' > "${DB_STATE_ROOT}/gaps/${deployment_id}" ;;
   esac
   if (resume_launches >/dev/null 2>&1); then
     echo "deploy-runtime-selftest: crash injection did not interrupt ${terminal_state}" >&2
@@ -143,7 +159,46 @@ create_disable_crash_fixture() {
 }
 
 create_disable_crash_fixture fixture-maintenance-cas AFTER_MAINTENANCE_CAS
+[[ "$(cat "${DB_STATE_ROOT}/maintenance")" == '7|true|fixture-maintenance-cas' ]]
+[[ ! -f "${DB_STATE_ROOT}/gaps/fixture-maintenance-cas" ]]
 create_disable_crash_fixture fixture-gap-open AFTER_GAP_OPEN_APPEND
+[[ "$(cat "${DB_STATE_ROOT}/maintenance")" == '7|true|fixture-gap-open' ]]
+[[ "$(cat "${DB_STATE_ROOT}/gaps/fixture-gap-open")" == OPEN ]]
+
+append_legacy_journal_entry() {
+  local target="$1" state="$2" details="${3:-{}}"
+  local previous_state="" previous_hash="" previous_sequence=0 payload payload_hash
+  if [[ -f "${target}" ]]; then
+    previous_state="$(tail -n 1 "${target}" | jq -er '.state')"
+    previous_hash="$(tail -n 1 "${target}" | jq -er '.payloadHash')"
+    previous_sequence="$(tail -n 1 "${target}" | jq -er '.sequence')"
+  fi
+  payload="$(jq -cS -n --arg state "${state}" --arg previousState "${previous_state}" --arg previousHash "${previous_hash}" \
+    --argjson sequence "$((previous_sequence + 1))" --argjson details "${details}" \
+    '{version:1,sequence:$sequence,previousState:$previousState,previousHash:$previousHash,state:$state,at:"2025-12-31T00:00:00.000000Z",details:$details}')"
+  payload_hash="$(printf '%s' "${payload}" | sha256sum | awk '{print $1}')"
+  jq -cS --arg payloadHash "${payload_hash}" '. + {payloadHash:$payloadHash}' <<<"${payload}" >> "${target}"
+}
+
+create_legacy_fixture() {
+  local deployment_id="$1" unfinished_state="$2" state_dir="${STATE_ROOT}/$1"
+  mkdir -p "${state_dir}"
+  write_recovery_state "${state_dir}" "${deployment_id}"
+  append_legacy_journal_entry "${state_dir}/journal.jsonl" CAPTURED
+  [[ "${unfinished_state}" == CAPTURED ]] || append_legacy_journal_entry "${state_dir}/journal.jsonl" LAUNCHES_DISABLED
+  [[ "${unfinished_state}" != COMPLETE ]] || {
+    append_legacy_journal_entry "${state_dir}/journal.jsonl" CANDIDATE_HEALTHY
+    append_legacy_journal_entry "${state_dir}/journal.jsonl" DB_MAINTENANCE_CLEARED
+    append_legacy_journal_entry "${state_dir}/journal.jsonl" ENABLE_ACKED
+    append_legacy_journal_entry "${state_dir}/journal.jsonl" GAP_CLOSED
+    append_legacy_journal_entry "${state_dir}/journal.jsonl" COMPLETE
+  }
+}
+
+create_legacy_fixture fixture-legacy-terminal COMPLETE
+create_legacy_fixture fixture-legacy-captured CAPTURED
+create_legacy_fixture fixture-legacy-disabled LAUNCHES_DISABLED
+printf 'OPEN\n' > "${DB_STATE_ROOT}/gaps/fixture-legacy-disabled"
 
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do validate_journal_history "${journal}"; done
 cp "${STATE_ROOT}/fixture-clear/journal.jsonl" "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl"
@@ -154,19 +209,51 @@ if validate_journal_history "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl" 
   echo "deploy-runtime-selftest: payload-hash corruption was accepted" >&2
   exit 1
 fi
+cp "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" "${STATE_ROOT}/fixture-legacy-captured/journal-illegal.jsonl"
+append_legacy_journal_entry "${STATE_ROOT}/fixture-legacy-captured/journal-illegal.jsonl" ENABLE_ACKED
+if validate_journal_history "${STATE_ROOT}/fixture-legacy-captured/journal-illegal.jsonl" >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: illegal legacy transition was accepted" >&2
+  exit 1
+fi
+cp "${STATE_ROOT}/fixture-legacy-disabled/journal.jsonl" "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.jsonl"
+jq -c 'if .sequence==1 then .details={tampered:true} else . end' \
+  "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.jsonl" > "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.tmp"
+mv "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.tmp" "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.jsonl"
+if validate_journal_history "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.jsonl" >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: legacy payload-hash corruption was accepted" >&2
+  exit 1
+fi
+
+ROLLBACK_STATE_DIR=""
+set +e
+(on_signal TERM 143)
+early_signal_status="$?"
+set -e
+[[ "${early_signal_status}" == 143 ]]
 
 DEPLOYMENT_ID=new-candidate
 recover_unfinished_deployments
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do
-  [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK ]]
+  [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK || \
+     "$(tail -n 1 "${journal}" | jq -r '.state')" == COMPLETE ]]
   validate_journal_history "${journal}"
 done
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-terminal/journal.jsonl" | jq -r '.state')" == COMPLETE ]]
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-disabled/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
 grep -Fq 'ensure-maintenance 7 fixture-clear' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-enable' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-close-append' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-close' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-maintenance-cas' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-gap-open' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-legacy-disabled' "${DB_CALLS}"
+if grep -Fq 'ensure-maintenance 7 fixture-legacy-captured' "${DB_CALLS}"; then
+  echo "deploy-runtime-selftest: legacy CAPTURED recovery crossed the safety boundary" >&2
+  exit 1
+fi
+grep -Fq 'append-gap fixture-maintenance-cas OPEN' "${DB_CALLS}"
+grep -Fq 'append-gap fixture-maintenance-cas CLOSE' "${DB_CALLS}"
 grep -Fq 'append-gap fixture-close-recovery OPEN' "${DB_CALLS}"
 grep -Fq 'append-gap fixture-close-recovery CLOSE' "${DB_CALLS}"
 

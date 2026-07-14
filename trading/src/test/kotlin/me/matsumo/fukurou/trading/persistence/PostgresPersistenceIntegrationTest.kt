@@ -7666,6 +7666,23 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(10, result.attributionCoverage.total)
         assertTrue(EvaluationMath.summarizeBySetup(result.trades).isNotEmpty())
         assertTrue(EvaluationMath.calibrationBySetup(result.trades).isNotEmpty())
+        val intentlessOrders = exposedTransaction(database) {
+            prepare(
+                "SELECT side, COUNT(*) FROM orders WHERE intent_id IS NULL GROUP BY side ORDER BY side",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    buildMap {
+                        while (rows.next()) put(rows.getString(1), rows.getInt(2))
+                    }
+                }
+            }
+        }
+        assertEquals(mapOf("SELL" to 20), intentlessOrders)
+        val eligiblePopulation = repository.fetchExclusionSummary(
+            EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+        ).getOrThrow().populationByEntityType
+        assertEquals(0, eligiblePopulation.getValue("POSITION").attributionMissing)
+        assertEquals(0, eligiblePopulation.getValue("TRADE").attributionMissing)
 
         exposedTransaction(database) {
             prepare("UPDATE orders SET intent_id=NULL WHERE id=?").use { statement ->
@@ -7678,7 +7695,12 @@ class PostgresPersistenceIntegrationTest {
             scope = scope,
         ).getOrThrow()
         assertEquals(10, withMissing.trades.size)
-        assertEquals(0, withMissing.attributionCoverage.missing)
+        assertEquals(1, withMissing.attributionCoverage.missing)
+        val missingPopulation = repository.fetchExclusionSummary(
+            EvaluationPeriod(fixedInstant().minusSeconds(1), fixedInstant().plusSeconds(1)),
+        ).getOrThrow().populationByEntityType
+        assertEquals(1, missingPopulation.getValue("POSITION").attributionMissing)
+        assertEquals(1, missingPopulation.getValue("TRADE").attributionMissing)
 
         exposedTransaction(database) {
             prepare(
@@ -7966,6 +7988,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, executions.count { execution -> execution.side == OrderSide.BUY })
         assertEquals(2, executions.count { execution -> execution.side == OrderSide.SELL })
         assertEquals("0.005", trade.sizeBtc.stripTrailingZeros().toPlainString())
+        assertEquals("0.95", trade.estimatedWinProbability?.stripTrailingZeros()?.toPlainString())
         assertEquals("10005000", trade.averageEntryPriceJpy.stripTrailingZeros().toPlainString())
         assertEquals("9758000", trade.entryWeightedProtectiveStopPriceJpy?.stripTrailingZeros()?.toPlainString())
         assertEquals(expectedPnl.toPlainString(), trade.tradePnlJpy.toPlainString())
@@ -9524,6 +9547,7 @@ private fun insertFinishedLlmRun(
     finishedAt: Instant = fixedInstant(),
 ) {
     exposedTransaction(database) {
+        acquireGapPopulationGenerationToken()
         prepare(
             """
                 INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)

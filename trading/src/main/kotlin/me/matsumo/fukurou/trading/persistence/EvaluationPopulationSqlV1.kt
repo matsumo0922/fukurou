@@ -118,7 +118,7 @@ internal fun evaluationExecutionCausalMissingSql(
         ${evaluationOrderCausalMissingSql(orderAlias, intentAlias, decisionAlias, runAlias)})
 """.trimIndent()
 
-/** position direct runと全execution/orderのcausal chainを一つのmissing predicateへ畳み込む。 */
+/** position direct run、semantic entryのexact lineage、全execution/orderを一つのmissing predicateへ畳み込む。 */
 internal fun evaluationPositionCausalMissingSql(
     positionAlias: String,
     entryOrderAlias: String,
@@ -126,7 +126,7 @@ internal fun evaluationPositionCausalMissingSql(
     decisionAlias: String,
     runAlias: String,
 ): String {
-    val orderMissing = evaluationOrderCausalMissingSql(entryOrderAlias, intentAlias, decisionAlias, runAlias)
+    val orderMissing = evaluationOrderLineageMissingSql(entryOrderAlias, intentAlias, decisionAlias, runAlias)
     val executionMissing = evaluationExecutionCausalMissingSql(
         executionAlias = "position_execution",
         orderAlias = "execution_order",

@@ -23,9 +23,9 @@ static int fukurou_supervisor_proxy(
         .version = FUKUROU_PROTOCOL_VERSION,
         .header_size = sizeof(struct fukurou_launch_header),
         .profile = (uint16_t)profile,
-        .fd_role_bitmap = descriptor_count == 3 ? 0x7U : descriptor_count == 5 ? 0x1fU : 0U,
+        .fd_role_bitmap = descriptor_count == 3 ? 0x7U : descriptor_count == 6 ? 0x3fU : 0U,
     };
-    if ((descriptor_count != 3 && descriptor_count != 5) || getrandom(header.request_nonce, sizeof(header.request_nonce), 0) != sizeof(header.request_nonce)) return 126;
+    if ((descriptor_count != 3 && descriptor_count != 6) || getrandom(header.request_nonce, sizeof(header.request_nonce), 0) != sizeof(header.request_nonce)) return 126;
     char payload[FUKUROU_PROTOCOL_MAX_PAYLOAD];
     size_t payload_size = 0;
     for (size_t index = 0; arguments[index] != NULL; index++) {
@@ -60,7 +60,7 @@ static int fukurou_supervisor_proxy(
         {.iov_base = &header, .iov_len = sizeof(header)},
         {.iov_base = payload, .iov_len = payload_size},
     };
-    char control[CMSG_SPACE(sizeof(int) * 5)] = {0};
+    char control[CMSG_SPACE(sizeof(int) * 6)] = {0};
     struct msghdr message = {.msg_iov = vector, .msg_iovlen = 2};
     if (descriptor_count > 0) {
         message.msg_control = control;
@@ -69,7 +69,7 @@ static int fukurou_supervisor_proxy(
         control_header->cmsg_level = SOL_SOCKET;
         control_header->cmsg_type = SCM_RIGHTS;
         control_header->cmsg_len = CMSG_LEN(sizeof(int) * descriptor_count);
-        int descriptors[5] = {0, 1, 2, 3, 4};
+        int descriptors[6] = {0, 1, 2, 3, 4, 5};
         memcpy(CMSG_DATA(control_header), descriptors, sizeof(int) * descriptor_count);
     }
     if (sendmsg(socket_fd, &message, MSG_NOSIGNAL) != (ssize_t)(sizeof(header) + payload_size)) {

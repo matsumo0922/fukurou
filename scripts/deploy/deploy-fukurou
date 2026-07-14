@@ -39,6 +39,9 @@ on_signal() {
   local signal_name="$1" code="$2"
   SIGNAL_NAME="${signal_name}"
   terminate_active_external_process_group
+  if [[ -z "${ROLLBACK_STATE_DIR:-}" || ! -f "${ROLLBACK_STATE_DIR}/journal.jsonl" ]]; then
+    exit "${code}"
+  fi
   journal_state SIGNAL_RECEIVED "{\"signal\":\"${signal_name}\"}" 2>/dev/null || true
   (exit "${code}")
   rollback_on_error
@@ -54,6 +57,17 @@ terminate_active_external_process_group() {
 
 check_forward_deadline() {
   [[ "$(boottime_seconds)" -lt "${FORWARD_DEADLINE_BOOTTIME}" ]] || fail "FORWARD_DEADLINE_EXCEEDED"
+}
+
+start_forward_deadline_watchdog() {
+  if [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]]; then
+    kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
+    wait "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true
+  fi
+  local remaining=$((FORWARD_DEADLINE_BOOTTIME - $(boottime_seconds)))
+  (( remaining > 0 )) || fail "FORWARD_DEADLINE_EXCEEDED"
+  (sleep "${remaining}"; kill -USR1 "$$" 2>/dev/null || true) &
+  DEADLINE_WATCHDOG_PID="$!"
 }
 
 timeout() {
@@ -422,7 +436,12 @@ rollback_on_error() {
   local exit_code="$?"
   trap - ERR
   if [[ -n "${DEADLINE_WATCHDOG_PID:-}" ]]; then kill "${DEADLINE_WATCHDOG_PID}" 2>/dev/null || true; fi
-  RECOVERY_DEADLINE_BOOTTIME=$(( $(boottime_seconds) + 300 ))
+  if [[ -z "${ROLLBACK_STATE_DIR:-}" || ! -f "${ROLLBACK_STATE_DIR}/journal.jsonl" ]]; then
+    echo "deploy-fukurou: deployment failed before rollback state was captured" >&2
+    exit "${exit_code}"
+  fi
+  RECOVERY_DEADLINE_BOOTTIME="${RECOVERY_LIMIT_BOOTTIME:-$(( $(boottime_seconds) + 300 ))}"
+  (( $(boottime_seconds) < RECOVERY_DEADLINE_BOOTTIME )) || exit "${exit_code}"
   echo "deploy-fukurou: deployment failed; entering durable recovery" >&2
   [[ "${RECOVERY_ALREADY_STARTED:-false}" == true ]] || journal_state RECOVERY_STARTED "{\"failedExitCode\":${exit_code}}" || true
   local origin_state
@@ -495,16 +514,28 @@ reassert_recovery_safe_boundary() {
     [[ "$(timeout 10 "${DB_HELPER}" active-launch-count)" == 0 ]] || return 1
   fi
   gap_state="$(timeout 10 "${DB_HELPER}" gap-state "${DEPLOYMENT_ID}")" || return 1
-  if [[ "${origin_state}" == GAP_CLOSED ]]; then
-    [[ "${gap_state}" == CLOSED ]] || return 1
-    GAP_DEPLOYMENT_ID="${DEPLOYMENT_ID:0:80}-recovery"
-    prepare_gap_event OPEN
-    append_prepared_gap_event
-    [[ "$(timeout 10 "${DB_HELPER}" gap-state "${GAP_DEPLOYMENT_ID}")" == OPEN ]] || return 1
-  else
-    [[ "${gap_state}" == OPEN ]] || return 1
-    GAP_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
-  fi
+  case "${gap_state}" in
+    MISSING)
+      if load_prepared_gap_event OPEN; then
+        GAP_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
+        append_prepared_gap_event
+      else
+        GAP_DEPLOYMENT_ID="${DEPLOYMENT_ID:0:80}-recovery"
+        prepare_gap_event OPEN
+        append_prepared_gap_event
+      fi
+      ;;
+    OPEN)
+      GAP_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
+      ;;
+    CLOSED)
+      GAP_DEPLOYMENT_ID="${DEPLOYMENT_ID:0:80}-recovery"
+      prepare_gap_event OPEN
+      append_prepared_gap_event
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$(timeout 10 "${DB_HELPER}" gap-state "${GAP_DEPLOYMENT_ID}")" == OPEN ]] || return 1
 }
 
 recovery_origin_state() {
@@ -635,6 +666,20 @@ journal_transition_allowed() {
   esac
 }
 
+legacy_journal_transition_allowed() {
+  case "$1:$2" in
+    :CAPTURED|CAPTURED:LAUNCHES_DISABLED|LAUNCHES_DISABLED:CANDIDATE_HEALTHY|\
+    CANDIDATE_HEALTHY:DB_MAINTENANCE_CLEARED|DB_MAINTENANCE_CLEARED:ENABLE_ACKED|\
+    ENABLE_ACKED:GAP_CLOSED|GAP_CLOSED:COMPLETE|\
+    CAPTURED:RECOVERY_STARTED|LAUNCHES_DISABLED:RECOVERY_STARTED|CANDIDATE_HEALTHY:RECOVERY_STARTED|\
+    DB_MAINTENANCE_CLEARED:RECOVERY_STARTED|ENABLE_ACKED:RECOVERY_STARTED|GAP_CLOSED:RECOVERY_STARTED|\
+    CAPTURED:SIGNAL_RECEIVED|LAUNCHES_DISABLED:SIGNAL_RECEIVED|CANDIDATE_HEALTHY:SIGNAL_RECEIVED|\
+    DB_MAINTENANCE_CLEARED:SIGNAL_RECEIVED|ENABLE_ACKED:SIGNAL_RECEIVED|GAP_CLOSED:SIGNAL_RECEIVED|\
+    SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 validate_journal_history() {
   local target="$1"
   jq -s -e '
@@ -646,10 +691,21 @@ validate_journal_history() {
       $entry.previousHash == (if $index == 0 then "" else $entries[$index - 1].payloadHash end) and
       ($entry.payloadHash | test("^[0-9a-f]{64}$")))
   ' "${target}" >/dev/null
-  local previous_state="" previous_hash="" line canonical observed_hash calculated_hash state
+  local previous_state="" previous_hash="" line canonical observed_hash calculated_hash state journal_format=""
   while IFS= read -r line; do
     state="$(jq -er '.state' <<<"${line}")"
-    journal_transition_allowed "${previous_state}" "${state}" || return 1
+    if [[ -z "${journal_format}" ]]; then
+      case "${state}" in
+        PREPARED) journal_format=current ;;
+        CAPTURED) journal_format=legacy ;;
+        *) return 1 ;;
+      esac
+    fi
+    if [[ "${journal_format}" == legacy ]]; then
+      legacy_journal_transition_allowed "${previous_state}" "${state}" || return 1
+    else
+      journal_transition_allowed "${previous_state}" "${state}" || return 1
+    fi
     observed_hash="$(jq -er '.payloadHash' <<<"${line}")"
     canonical="$(jq -cS 'del(.payloadHash)' <<<"${line}")"
     calculated_hash="$(printf '%s' "${canonical}" | sha256sum | awk '{print $1}')"
@@ -799,6 +855,24 @@ prepare_gap_event() {
   mv "${ROLLBACK_STATE_DIR}/gap-${boundary}.json.tmp" "${ROLLBACK_STATE_DIR}/gap-${boundary}.json"; sync -f "${ROLLBACK_STATE_DIR}"
   GAP_EVENT_DEPLOYMENT_ID="${gap_deployment_id}"; GAP_EVENT_BOUNDARY="${boundary}"
   GAP_EVENT_OCCURRED_AT="${occurred_at}"; GAP_EVENT_PAYLOAD_HASH="${payload_hash}"
+}
+
+load_prepared_gap_event() {
+  local boundary="$1" prepared payload
+  prepared="${ROLLBACK_STATE_DIR}/gap-${boundary}.json"
+  [[ -f "${prepared}" ]] || return 1
+  jq -e --arg boundary "${boundary}" --arg deploymentId "${DEPLOYMENT_ID}" '
+    .version == 1 and .boundary == $boundary and .deploymentId == $deploymentId and
+    .reason == "DEPLOY_MAINTENANCE" and
+    (.eventId | type == "string" and length > 0) and
+    (.gapId | type == "string" and length > 0) and
+    (.occurredAt | type == "string" and length > 0)
+  ' "${prepared}" >/dev/null || return 1
+  payload="$(jq -cS . "${prepared}")" || return 1
+  GAP_EVENT_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
+  GAP_EVENT_BOUNDARY="${boundary}"
+  GAP_EVENT_OCCURRED_AT="$(jq -er '.occurredAt' <<<"${payload}")"
+  GAP_EVENT_PAYLOAD_HASH="$(printf '%s' "${payload}" | sha256sum | awk '{print $1}')"
 }
 
 append_prepared_gap_event() {
@@ -1031,17 +1105,24 @@ main() {
   exec 9>"${LOCK_FILE}"
   flock -n 9 || fail "another deployment is already running"
 
-  recover_unfinished_deployments
-  probe_candidate_operations
-  capture_rollback_state
+  DEPLOY_START_BOOTTIME="$(boottime_seconds)"
+  FORWARD_DEADLINE_BOOTTIME=$((DEPLOY_START_BOOTTIME + 1200))
+  RECOVERY_LIMIT_BOOTTIME=$((DEPLOY_START_BOOTTIME + 1500))
   trap rollback_on_error ERR
   trap 'on_signal TERM 143' TERM
   trap 'on_signal INT 130' INT
   trap 'on_signal HUP 129' HUP
   trap 'on_signal DEADLINE 124' USR1
-  (sleep 1200; kill -USR1 "$$" 2>/dev/null || true) &
-  DEADLINE_WATCHDOG_PID="$!"
-  FORWARD_DEADLINE_BOOTTIME=$(( $(boottime_seconds) + 1200 ))
+  start_forward_deadline_watchdog
+
+  check_forward_deadline
+  recover_unfinished_deployments
+  ROLLBACK_STATE_DIR=""
+  start_forward_deadline_watchdog
+  check_forward_deadline
+  probe_candidate_operations
+  check_forward_deadline
+  capture_rollback_state
   journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
   journal_state CAPTURED
   accept_capability_catalog

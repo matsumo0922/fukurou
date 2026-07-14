@@ -95,15 +95,25 @@ class ReleaseDeployFoundationContractTest {
         val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
         val migration = Files.readString(root.resolve("scripts/deploy/sql/deploy-foundation-v1.sql"))
         val compose = Files.readString(root.resolve("docker-compose.prod.yml"))
+        val main = executor.substringAfter("main() {")
 
         assertTrue(migration.contains("infrastructure_gap_events"))
         assertFalse(migration.contains("UPDATE infrastructure_gap_events"))
         assertTrue(migration.contains("llm_pid_registrations"))
         assertTrue(compose.contains("FUKUROU_IMAGE_REFERENCE"))
-        assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
+        assertFalse(compose.contains("image: ghcr.io/matsumo0922/fukurou:\${FUKUROU_IMAGE_TAG"))
         assertTrue(executor.contains("MANUAL_RECOVERY_REQUIRED"))
         assertTrue(executor.contains("maintenance-cas"))
         assertTrue(executor.contains("CAPABILITY_CATALOG_REDEFINITION_OR_FORK"))
+        assertTrue(executor.contains("FORWARD_DEADLINE_BOOTTIME=\$((DEPLOY_START_BOOTTIME + 1200))"))
+        assertTrue(executor.contains("RECOVERY_LIMIT_BOOTTIME=\$((DEPLOY_START_BOOTTIME + 1500))"))
+        assertTrue(
+            main.substringAfter("recover_unfinished_deployments")
+                .substringBefore("probe_candidate_operations")
+                .contains("start_forward_deadline_watchdog"),
+        )
+        assertTrue(executor.contains("legacy_journal_transition_allowed"))
+        assertTrue(executor.contains("load_prepared_gap_event OPEN"))
     }
 }
 

@@ -273,7 +273,7 @@ static int receive_request(int fd, struct launch_request *request) {
         request->header.header_size != sizeof(request->header) || request->header.total_length > sizeof(request->header) + sizeof(request->payload) ||
         received != (ssize_t)request->header.total_length ||
         request->header.argc == 0 || request->header.argc > FUKUROU_PROTOCOL_MAX_ITEMS ||
-        request->header.envc > FUKUROU_PROTOCOL_MAX_ITEMS || request->descriptor_count > 5 ||
+        request->header.envc > FUKUROU_PROTOCOL_MAX_ITEMS || request->descriptor_count > 6 ||
         __builtin_popcount(request->header.fd_role_bitmap) != request->descriptor_count) return -1;
     return 0;
 }
@@ -524,21 +524,38 @@ static int canary_environment_allowed(char **arguments, char **environment) {
         config_hash != NULL && strcmp(config_hash, "canary-config-hash") == 0;
 }
 
+static int rro_action_allowed(const char *action) {
+    return strcmp(action, "NO_TRADE") == 0 || strcmp(action, "EXIT") == 0 ||
+        strcmp(action, "REDUCE") == 0 || strcmp(action, "ADJUST_PROTECTION") == 0 ||
+        strcmp(action, "ENTER") == 0 || strcmp(action, "ADD_LONG") == 0;
+}
+
+static int canary_arguments_allowed(struct launch_request *request, char **arguments) {
+    if ((request->header.argc != 4 && request->header.argc != 5) ||
+        strcmp(arguments[0], "node") != 0 ||
+        strcmp(arguments[1], "/usr/local/libexec/fukurou-mcp-canary-client.mjs") != 0 ||
+        !lowercase_hex(arguments[2], 48)) return 0;
+    if (request->header.argc == 4) {
+        return strcmp(arguments[3], "PROPOSER") == 0 || strcmp(arguments[3], "FALSIFIER") == 0;
+    }
+    return request->header.argc == 5 && strcmp(arguments[3], "RISK_REDUCTION_ONLY") == 0 &&
+        rro_action_allowed(arguments[4]);
+}
+
 static int request_shape_allowed(struct launch_request *request, char **arguments, char **environment) {
     if ((request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request->header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) &&
         request->header.fd_role_bitmap == 0x7U &&
         strcmp(arguments[0], request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? "claude" : "codex") == 0) {
         if (request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? !claude_arguments_allowed(request, arguments, environment) : !codex_arguments_allowed(request, arguments)) return 0;
     } else if (request->header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 && request->header.fd_role_bitmap == 0x7U &&
-        request->header.argc == 4 && strcmp(arguments[0], "node") == 0 &&
-        strcmp(arguments[1], "/usr/local/libexec/fukurou-mcp-canary-client.mjs") == 0 &&
-        lowercase_hex(arguments[2], 48) &&
-        (strcmp(arguments[3], "PROPOSER") == 0 || strcmp(arguments[3], "FALSIFIER") == 0) &&
+        canary_arguments_allowed(request, arguments) &&
         canary_environment_allowed(arguments, environment)) {
         /* Exact signed fixture profile is accepted. */
-    } else if (request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && request->header.fd_role_bitmap == 0x1fU &&
-        request->header.argc == 3 && strcmp(arguments[0], "java") == 0 &&
-        strcmp(arguments[1], "-jar") == 0 && strcmp(arguments[2], "/app/fukurou-mcp-all.jar") == 0) {
+    } else if (request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 && request->header.fd_role_bitmap == 0x3fU &&
+        request->header.argc == 5 && strcmp(arguments[0], "java") == 0 &&
+        strcmp(arguments[1], "--add-opens=java.base/java.io=ALL-UNNAMED") == 0 &&
+        strcmp(arguments[2], "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED") == 0 &&
+        strcmp(arguments[3], "-jar") == 0 && strcmp(arguments[4], "/app/fukurou-mcp-all.jar") == 0) {
         /* MCP has a fixed argv contract. */
     } else {
         return 0;
@@ -930,7 +947,10 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
         "node", "/usr/local/libexec/fukurou-mcp-canary-client.mjs",
         "0123456789abcdef0123456789abcdef0123456789abcdef", "PROPOSER",
     };
-    const char *mcp_arguments[] = {"java", "-jar", "/app/fukurou-mcp-all.jar"};
+    const char *mcp_arguments[] = {
+        "java", "--add-opens=java.base/java.io=ALL-UNNAMED",
+        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED", "-jar", "/app/fukurou-mcp-all.jar",
+    };
     const char *canary_environment[] = {
         "FUKUROU_INVOCATION_ID=accept-fixture",
         "PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -957,7 +977,7 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
     };
     const char **arguments = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_arguments : canary_arguments;
     const char **environment = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_environment : canary_environment;
-    uint16_t argument_count = test_case == ACCEPT_RECEIPT_FAILURE ? 3 : 4;
+    uint16_t argument_count = test_case == ACCEPT_RECEIPT_FAILURE ? 5 : 4;
     uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 2 : 13;
     const char *mutated_arguments[5];
     memcpy(mutated_arguments, canary_arguments, sizeof(canary_arguments));
@@ -1001,7 +1021,7 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
         .profile = test_case == ACCEPT_RECEIPT_FAILURE ? FUKUROU_PROFILE_MCP_CURRENT_V1 : FUKUROU_PROFILE_FOUNDATION_CANARY_V1,
         .argc = argument_count,
         .envc = environment_count,
-        .fd_role_bitmap = test_case == ACCEPT_RECEIPT_FAILURE ? 0x1fU : 0x7U,
+        .fd_role_bitmap = test_case == ACCEPT_RECEIPT_FAILURE ? 0x3fU : 0x7U,
     };
     header.request_nonce[0] = (unsigned char)(nonce_seed + 1U);
     char payload[FUKUROU_PROTOCOL_MAX_PAYLOAD];
@@ -1015,8 +1035,8 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
     if (test_case == ACCEPT_TRAILING_PAYLOAD) payload[payload_length++] = 'x';
     header.total_length = sizeof(header) + (uint32_t)payload_length;
 
-    uint16_t descriptor_count = test_case == ACCEPT_RECEIPT_FAILURE ? 5 : 3;
-    int descriptors[5];
+    uint16_t descriptor_count = test_case == ACCEPT_RECEIPT_FAILURE ? 6 : 3;
+    int descriptors[6];
     for (size_t index = 0; index < descriptor_count; index++) {
         char template[] = "/tmp/fukurou-accept-selftest-XXXXXX";
         descriptors[index] = mkstemp(template);
@@ -1099,6 +1119,14 @@ static int protocol_selftest(void) {
     char *root_environment[] = {"HOME=/root", NULL};
     char *bad_value_environment[] = {"PATH=\x01", NULL};
     char *missing_invocation_environment[] = {"FUKUROU_INVOCATION_ID=", NULL};
+    char *rro_arguments[] = {
+        "node", "/usr/local/libexec/fukurou-mcp-canary-client.mjs",
+        "0123456789abcdef0123456789abcdef0123456789abcdef", "RISK_REDUCTION_ONLY", "EXIT", NULL,
+    };
+    struct launch_request rro_request = {.header = {.argc = 5}};
+    if (!canary_arguments_allowed(&rro_request, rro_arguments)) return 125;
+    rro_arguments[4] = "BUY";
+    if (canary_arguments_allowed(&rro_request, rro_arguments)) return 125;
     if (environment_entries_allowed(FUKUROU_PROFILE_MCP_CURRENT_V1, duplicate_environment, 2) ||
         environment_entries_allowed(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, root_environment, 1) ||
         environment_entries_allowed(FUKUROU_PROFILE_CLAUDE_CURRENT_V1, bad_value_environment, 1) ||
