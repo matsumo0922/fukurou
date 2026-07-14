@@ -42,11 +42,6 @@ export FUKUROU_MCP_DB_USER=fukurou_mcp
 # shellcheck source=fukurou-deploy-db
 source "${ROOT}/scripts/deploy/fukurou-deploy-db"
 
-timeout() {
-  shift
-  "$@"
-}
-
 assert_equal() {
   local label="$1" expected="$2" actual="$3"
   [[ "${actual}" == "${expected}" ]] || {
