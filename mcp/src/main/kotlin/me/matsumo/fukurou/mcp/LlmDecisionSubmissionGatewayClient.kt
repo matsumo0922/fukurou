@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.runner.LlmSubmissionGatewayCodec
 import me.matsumo.fukurou.trading.runner.OPERATION_SUBMIT_DECISION
 import me.matsumo.fukurou.trading.runner.OPERATION_SUBMIT_FALSIFICATION
+import me.matsumo.fukurou.trading.runner.gatewayFrameFits
 import java.io.FileDescriptor
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
@@ -19,7 +20,7 @@ class LlmDecisionSubmissionGatewayClient private constructor(
     private val channel: SocketChannel,
     private val binding: McpSubmissionGatewayBinding,
 ) : AutoCloseable {
-    private var terminalEvidenceProvider: () -> TerminalToolEvidenceBundle = TerminalToolEvidenceBundle::disabled
+    private var terminalEvidenceProvider: (() -> TerminalToolEvidenceBundle)? = null
 
     internal fun bindTerminalEvidenceProvider(provider: () -> TerminalToolEvidenceBundle) {
         terminalEvidenceProvider = provider
@@ -38,19 +39,31 @@ class LlmDecisionSubmissionGatewayClient private constructor(
     override fun close() = channel.close()
 
     private fun submit(operation: String, payload: JsonObject): JsonObject {
-        val request = LlmSubmissionGatewayCodec.request(
-            operation = operation,
-            invocationId = binding.invocationId,
-            phase = binding.phase,
-            phaseManifestId = binding.phaseManifestId,
-            effectiveInvocationHash = binding.effectiveInvocationHash,
-            payload = payload,
-            terminalEvidence = terminalEvidenceProvider(),
-        )
-        val boundedRequest = if (LlmSubmissionGatewayCodec.fitsFrame(request)) {
+        val provider = terminalEvidenceProvider
+        val request = if (provider == null) {
+            LlmSubmissionGatewayCodec.request(
+                operation = operation,
+                invocationId = binding.invocationId,
+                phase = binding.phase,
+                phaseManifestId = binding.phaseManifestId,
+                effectiveInvocationHash = binding.effectiveInvocationHash,
+                payload = payload,
+            )
+        } else {
+            LlmSubmissionGatewayCodec.requestWithTerminalEvidence(
+                operation = operation,
+                invocationId = binding.invocationId,
+                phase = binding.phase,
+                phaseManifestId = binding.phaseManifestId,
+                effectiveInvocationHash = binding.effectiveInvocationHash,
+                payload = payload,
+                terminalEvidence = provider(),
+            )
+        }
+        val boundedRequest = if (provider == null || gatewayFrameFits(request)) {
             request
         } else {
-            LlmSubmissionGatewayCodec.request(
+            LlmSubmissionGatewayCodec.requestWithTerminalEvidence(
                 operation = operation,
                 invocationId = binding.invocationId,
                 phase = binding.phase,

@@ -41,15 +41,41 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     @Test
-    fun `versioned terminal request includes disabled evidence bundle`() {
+    fun `disabled terminal request preserves legacy version and field set`() {
         val request = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
-        val bundle = LlmTerminalEvidenceCodec.decodeBundle(
-            request.getValue("terminalEvidence") as JsonObject,
+
+        assertEquals("1", request.getValue("version").toString())
+        assertFalse("terminalEvidence" in request)
+        assertEquals(TerminalToolEvidenceBundle.disabled(), decodeTerminalEvidenceBundle(request, false))
+        assertTrue(gatewayFrameFits(request))
+    }
+
+    @Test
+    fun `enabled terminal request requires version two and evidence field`() {
+        val request = LlmSubmissionGatewayCodec.requestWithTerminalEvidence(
+            operation = OPERATION_SUBMIT_DECISION,
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+            payload = LlmSubmissionGatewayCodec.encodeDecision(decision(DecisionAction.NO_TRADE)),
+            terminalEvidence = TerminalToolEvidenceBundle.disabled(),
         )
 
         assertEquals("2", request.getValue("version").toString())
-        assertEquals(TerminalToolEvidenceBundle.disabled(), bundle)
-        assertTrue(LlmSubmissionGatewayCodec.fitsFrame(request))
+        assertEquals(TerminalToolEvidenceBundle.disabled(), decodeTerminalEvidenceBundle(request, true))
+        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(request, false) }
+    }
+
+    @Test
+    fun `activation and protocol version mismatch is rejected`() {
+        val legacy = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+        val versionTwoWithoutEvidence = legacy.toMutableMap()
+            .also { request -> request["version"] = JsonPrimitive(2) }
+            .let(::JsonObject)
+
+        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(legacy, true) }
+        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(versionTwoWithoutEvidence, true) }
     }
 
     @Test

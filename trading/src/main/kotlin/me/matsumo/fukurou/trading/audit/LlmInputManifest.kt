@@ -5,6 +5,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmProvider
@@ -165,6 +166,29 @@ data class TrustedTerminalToolEvidenceBundle(
     val bundle: TerminalToolEvidenceBundle,
 )
 
+/** canonical responseから再導出したsource timestampと状態。 */
+data class TerminalEvidenceSourceTimestamp(
+    val value: Instant?,
+    val status: ToolEvidenceSourceTimestampStatus,
+)
+
+/** response projectionの`freshness.sourceTimestamp`を例外なくtyped状態へ変換する。 */
+fun JsonElement.terminalEvidenceSourceTimestamp(): TerminalEvidenceSourceTimestamp {
+    val timestampElement = (this as? JsonObject)
+        ?.get("freshness")
+        ?.let { freshness -> (freshness as? JsonObject)?.get("sourceTimestamp") }
+        ?: return TerminalEvidenceSourceTimestamp(null, ToolEvidenceSourceTimestampStatus.MISSING)
+    val timestampText = (timestampElement as? JsonPrimitive)?.contentOrNull
+        ?: return TerminalEvidenceSourceTimestamp(null, ToolEvidenceSourceTimestampStatus.INVALID)
+    val timestamp = runCatching { Instant.parse(timestampText) }.getOrNull()
+
+    return if (timestamp == null) {
+        TerminalEvidenceSourceTimestamp(null, ToolEvidenceSourceTimestampStatus.INVALID)
+    } else {
+        TerminalEvidenceSourceTimestamp(timestamp, ToolEvidenceSourceTimestampStatus.PRESENT)
+    }
+}
+
 /** tool evidence response JSON を key-order 非依存の文字列へ正規化する。 */
 fun JsonElement.toTerminalEvidenceCanonicalString(): String = when (this) {
     is JsonObject -> entries.sortedBy { entry -> entry.key }.joinToString(prefix = "{", postfix = "}") { entry ->
@@ -188,3 +212,6 @@ const val MAX_TERMINAL_TOOL_EVIDENCE_COUNT = 48
 
 /** terminal frameへ同梱する前のbundle byte上限。 */
 const val MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES = 96 * 1024
+
+/** response以外のversioned entry metadataへ予約する保守的byte数。 */
+const val TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES = 512

@@ -210,9 +210,7 @@ class LlmDecisionSubmissionGateway private constructor(
             effectiveInvocationHash: String,
             terminalEvidenceCaptureEnabled: Boolean,
         ): JsonObject {
-            require(request.requiredString("version") == GATEWAY_PROTOCOL_VERSION.toString()) {
-                "Submission gateway protocol version rejected."
-            }
+            val terminalEvidence = decodeTerminalEvidenceBundle(request, terminalEvidenceCaptureEnabled)
             require(request.requiredString("invocationId") == invocationId) { "Gateway invocation binding mismatch." }
             require(request.requiredString("phase") == phase.name) { "Gateway phase binding mismatch." }
             require(request.requiredString("phaseManifestId") == phaseManifestId) { "Gateway manifest binding mismatch." }
@@ -220,9 +218,6 @@ class LlmDecisionSubmissionGateway private constructor(
                 "Gateway effective invocation binding mismatch."
             }
             val payload = request.getValue("payload").jsonObject
-            val terminalEvidence = LlmTerminalEvidenceCodec.decodeBundle(
-                request.getValue("terminalEvidence").jsonObject,
-            )
             val trustedTerminalEvidence = TrustedTerminalToolEvidenceBundle(
                 invocationId = invocationId,
                 phaseManifestId = phaseManifestId,
@@ -230,9 +225,6 @@ class LlmDecisionSubmissionGateway private constructor(
                 captureEnabled = terminalEvidenceCaptureEnabled,
                 bundle = terminalEvidence,
             )
-            require(terminalEvidence == TerminalToolEvidenceBundle.disabled()) {
-                "Terminal evidence capture is unavailable in this binary."
-            }
 
             return when (request.requiredString("operation")) {
                 OPERATION_SUBMIT_DECISION -> {
@@ -284,9 +276,27 @@ object LlmSubmissionGatewayCodec {
         phaseManifestId: String,
         effectiveInvocationHash: String,
         payload: JsonObject,
-        terminalEvidence: TerminalToolEvidenceBundle = TerminalToolEvidenceBundle.disabled(),
     ): JsonObject = buildJsonObject {
-        put("version", GATEWAY_PROTOCOL_VERSION)
+        put("version", LEGACY_GATEWAY_PROTOCOL_VERSION)
+        put("operation", operation)
+        put("invocationId", invocationId)
+        put("phase", phase.name)
+        put("phaseManifestId", phaseManifestId)
+        put("effectiveInvocationHash", effectiveInvocationHash)
+        put("payload", payload)
+    }
+
+    @Suppress("LongParameterList")
+    fun requestWithTerminalEvidence(
+        operation: String,
+        invocationId: String,
+        phase: LlmInvocationPhase,
+        phaseManifestId: String,
+        effectiveInvocationHash: String,
+        payload: JsonObject,
+        terminalEvidence: TerminalToolEvidenceBundle,
+    ): JsonObject = buildJsonObject {
+        put("version", TERMINAL_EVIDENCE_GATEWAY_PROTOCOL_VERSION)
         put("operation", operation)
         put("invocationId", invocationId)
         put("phase", phase.name)
@@ -295,9 +305,6 @@ object LlmSubmissionGatewayCodec {
         put("payload", payload)
         put("terminalEvidence", LlmTerminalEvidenceCodec.encodeBundle(terminalEvidence))
     }
-
-    fun fitsFrame(payload: JsonObject): Boolean = payload.toString().encodeToByteArray().size in
-        1..MAX_GATEWAY_FRAME_BYTES
 
     fun encodeDecision(submission: DecisionSubmission): JsonObject = buildJsonObject {
         putNullableString("invocationId", submission.invocationId)
@@ -520,9 +527,33 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.putStringList(name: Str
     putJsonArray(name) { values.forEach { value -> add(kotlinx.serialization.json.JsonPrimitive(value)) } }
 }
 
+/** activationとwire versionの組み合わせを検証し、trusted bundle候補へ正規化する。 */
+internal fun decodeTerminalEvidenceBundle(request: JsonObject, captureEnabled: Boolean): TerminalToolEvidenceBundle {
+    val version = request.requiredString("version").toInt()
+    val terminalEvidence = request["terminalEvidence"]
+    if (!captureEnabled) {
+        require(version == LEGACY_GATEWAY_PROTOCOL_VERSION && terminalEvidence == null) {
+            "Disabled terminal evidence requires the legacy gateway request."
+        }
+
+        return TerminalToolEvidenceBundle.disabled()
+    }
+
+    require(version == TERMINAL_EVIDENCE_GATEWAY_PROTOCOL_VERSION && terminalEvidence != null) {
+        "Enabled terminal evidence requires the versioned evidence request."
+    }
+
+    return LlmTerminalEvidenceCodec.decodeBundle(terminalEvidence.jsonObject)
+}
+
+/** serialized gateway payloadが既存単一frame上限内かを返す。 */
+fun gatewayFrameFits(payload: JsonObject): Boolean = payload.toString().encodeToByteArray().size in
+    1..MAX_GATEWAY_FRAME_BYTES
+
 const val OPERATION_SUBMIT_DECISION = "SUBMIT_DECISION"
 const val OPERATION_SUBMIT_FALSIFICATION = "SUBMIT_FALSIFICATION"
-private const val GATEWAY_PROTOCOL_VERSION = 2
+private const val LEGACY_GATEWAY_PROTOCOL_VERSION = 1
+private const val TERMINAL_EVIDENCE_GATEWAY_PROTOCOL_VERSION = 2
 const val MAX_GATEWAY_FRAME_BYTES = 128 * 1024
 private const val MAX_UNIX_SOCKET_PATH_BYTES = 103
 private const val GATEWAY_CLOSE_WAIT_MILLIS = 500L

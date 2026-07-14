@@ -6,9 +6,13 @@ import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_BUNDLE_VERSION
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_VERSION
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.terminalEvidenceSourceTimestamp
 import me.matsumo.fukurou.trading.audit.toTerminalEvidenceCanonicalString
 import me.matsumo.fukurou.trading.decision.DecisionRecord
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -663,6 +667,9 @@ private suspend fun <T> submitWithoutTerminalEvidence(
 
 private fun JdbcTransaction.validateTrustedTerminalEvidence(evidence: TrustedTerminalToolEvidenceBundle) {
     require(evidence.captureEnabled) { "Terminal evidence capture must be enabled explicitly." }
+    require(evidence.bundle.version == TERMINAL_TOOL_EVIDENCE_BUNDLE_VERSION) {
+        "Terminal evidence bundle version mismatch."
+    }
     require(evidence.bundle.status == TerminalToolEvidenceBundleStatus.COMPLETE) {
         "Only complete terminal evidence bundles can be persisted by the Stage 1 foundation."
     }
@@ -673,18 +680,29 @@ private fun JdbcTransaction.validateTrustedTerminalEvidence(evidence: TrustedTer
     require(evidence.bundle.entries.map { entry -> entry.ordinal } == evidence.bundle.entries.indices.toList()) {
         "Terminal evidence ordinals must be contiguous."
     }
-    val totalBytes = evidence.bundle.entries.sumOf { entry -> entry.responseJson.encodeToByteArray().size.toLong() }
+    val totalBytes = evidence.bundle.entries.sumOf { entry ->
+        entry.responseJson.encodeToByteArray().size.toLong() + TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
+    }
     require(totalBytes <= MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES) {
         "Terminal evidence bytes exceed the canonical limit."
     }
     evidence.bundle.entries.forEach { entry ->
+        require(entry.version == TERMINAL_TOOL_EVIDENCE_VERSION) { "Terminal evidence entry version mismatch." }
         require(entry.toolName !in TERMINAL_EVIDENCE_SUBMISSION_TOOLS) { "Terminal submission responses are not evidence." }
-        val canonical = Json.parseToJsonElement(entry.responseJson).toTerminalEvidenceCanonicalString()
+        val response = Json.parseToJsonElement(entry.responseJson)
+        val canonical = response.toTerminalEvidenceCanonicalString()
         require(canonical == entry.responseJson) { "Terminal evidence response is not canonical." }
         require(ManifestPersistencePolicy.sha256(canonical) == entry.responseHash) {
             "Terminal evidence response hash mismatch."
         }
         ManifestPersistencePolicy.validatePersistedStrings(entry.toolName, canonical)
+        val sourceTimestamp = response.terminalEvidenceSourceTimestamp()
+        require(
+            entry.sourceTimestamp == sourceTimestamp.value &&
+                entry.sourceTimestampStatus == sourceTimestamp.status,
+        ) {
+            "Terminal evidence source timestamp mismatch."
+        }
     }
     jdbcConnection().prepareStatement(
         "SELECT invocation_id, phase FROM llm_phase_input_manifests WHERE phase_manifest_id = ?",

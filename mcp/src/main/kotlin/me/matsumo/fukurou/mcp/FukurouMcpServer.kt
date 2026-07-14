@@ -38,11 +38,12 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidence
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
-import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
+import me.matsumo.fukurou.trading.audit.terminalEvidenceSourceTimestamp
 import me.matsumo.fukurou.trading.audit.toTerminalEvidenceCanonicalString
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.AccountStatusWithUpdatedAt
@@ -345,8 +346,6 @@ private const val MIN_SIMULATED_TIMEOUT_DELAY_MS = 1L
  */
 private const val MAX_SIMULATED_TIMEOUT_DELAY_MS = 120_000L
 
-private const val EVIDENCE_ENTRY_OVERHEAD_BYTES = 512
-
 private val TERMINAL_SUBMISSION_TOOLS = setOf(SUBMIT_DECISION_TOOL, SUBMIT_FALSIFICATION_TOOL)
 
 /**
@@ -505,8 +504,10 @@ class FukurouMcpServer(
 
     init {
         requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
-        toolCallLimiter.bindResultObserver(terminalEvidenceCollector::capture)
-        submissionGatewayClient?.bindTerminalEvidenceProvider(terminalEvidenceCollector::snapshot)
+        if (terminalEvidenceCaptureEnabled) {
+            toolCallLimiter.bindResultObserver(terminalEvidenceCollector::capture)
+            submissionGatewayClient?.bindTerminalEvidenceProvider(terminalEvidenceCollector::snapshot)
+        }
     }
 
     /**
@@ -636,7 +637,7 @@ class FukurouMcpServer(
 }
 
 /** process-local で finalized response だけを bounded terminal bundle へ集める collector。 */
-private class TerminalToolEvidenceCollector(enabled: Boolean) {
+internal class TerminalToolEvidenceCollector(enabled: Boolean) {
     private val entries = mutableListOf<TerminalToolEvidence>()
     private var status = if (enabled) {
         TerminalToolEvidenceBundleStatus.COMPLETE
@@ -656,7 +657,9 @@ private class TerminalToolEvidenceCollector(enabled: Boolean) {
         }
 
         val entry = createEntry(toolName, result) ?: return
-        val nextBytes = encodedBytes + entry.responseJson.encodeToByteArray().size + EVIDENCE_ENTRY_OVERHEAD_BYTES
+        val nextBytes = encodedBytes +
+            entry.responseJson.encodeToByteArray().size +
+            TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
         if (nextBytes > MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES) {
             markIncomplete(TerminalToolEvidenceIncompleteReason.BYTE_LIMIT)
 
@@ -698,23 +701,14 @@ private class TerminalToolEvidenceCollector(enabled: Boolean) {
             return null
         }
 
-        val sourceTimestampValue = structuredContent["freshness"]
-            ?.let { freshness -> runCatching { freshness.jsonObject["sourceTimestamp"] }.getOrNull() }
-            ?.jsonPrimitive
-            ?.contentOrNull
-        val sourceTimestamp = sourceTimestampValue?.let { value -> runCatching { Instant.parse(value) }.getOrNull() }
-        val sourceTimestampStatus = when {
-            sourceTimestampValue == null -> ToolEvidenceSourceTimestampStatus.MISSING
-            sourceTimestamp == null -> ToolEvidenceSourceTimestampStatus.INVALID
-            else -> ToolEvidenceSourceTimestampStatus.PRESENT
-        }
+        val sourceTimestamp = structuredContent.terminalEvidenceSourceTimestamp()
         return TerminalToolEvidence(
             ordinal = entries.size,
             toolName = toolName,
             responseJson = responseJson,
             responseHash = ManifestPersistencePolicy.sha256(responseJson),
-            sourceTimestamp = sourceTimestamp,
-            sourceTimestampStatus = sourceTimestampStatus,
+            sourceTimestamp = sourceTimestamp.value,
+            sourceTimestampStatus = sourceTimestamp.status,
             isError = result.isError == true,
         )
     }
