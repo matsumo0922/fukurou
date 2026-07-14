@@ -12,10 +12,16 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicReference
 import javax.sql.DataSource
 
 private val INGRESS_COMMIT_RESERVE: Duration = Duration.ofMillis(250)
+private val INGRESS_ABORT_RESERVE: Duration = Duration.ofMillis(100)
 private val INGRESS_LOCK_RETRY_DELAY: Duration = Duration.ofMillis(25)
 
 /** PostgreSQL advisory authorityとprivate tableを使うdurable ingress repository。 */
@@ -149,29 +155,88 @@ class ExposedDurableMarketEventIngress(
     private suspend fun <T> mutate(deadline: IngressOperationDeadline, mutation: (Connection) -> T): Result<T> =
         withContext(Dispatchers.IO) {
             runCatching {
-                deadline.requireRemaining()
-                dataSource.connection.use { connection ->
-                    deadline.requireRemaining()
-                    connection.autoCommit = false
-                    armTimeouts(connection, deadline)
-                    acquireAuthority(connection, deadline)
+                val connection = AtomicReference<Connection?>()
+                val executor = Executors.newSingleThreadExecutor { runnable ->
+                    Thread(runnable, "durable-ingress-jdbc").apply { isDaemon = true }
+                }
+                val abortExecutor = AtomicReference<java.util.concurrent.ExecutorService?>()
+                val operation = executor.submit<T> { mutateOnConnection(deadline, connection, mutation) }
+                executor.shutdown()
 
-                    try {
-                        val result = mutation(connection)
-                        requireCommitBudget(deadline)
-                        connection.commit()
-                        deadline.requireRemaining()
-                        result
-                    } catch (throwable: Throwable) {
-                        runCatching { connection.rollback() }
-                        throw throwable
-                    } finally {
-                        releaseAuthority(connection)
-                        deadline.requireRemaining()
+                try {
+                    val waitMillis = deadline.requireRemaining().minus(INGRESS_ABORT_RESERVE).toMillis()
+                    if (waitMillis <= 0) throw SQLTimeoutException("No durable ingress operation budget remains.")
+                    operation.get(waitMillis, TimeUnit.MILLISECONDS)
+                } catch (failure: TimeoutException) {
+                    val abortFailure = runCatching {
+                        connection.get()?.let { acquiredConnection ->
+                            val abortWorker = Executors.newSingleThreadExecutor { runnable ->
+                                Thread(runnable, "durable-ingress-abort").apply { isDaemon = true }
+                            }
+                            abortExecutor.set(abortWorker)
+                            acquiredConnection.abort(abortWorker)
+                            abortWorker.shutdown()
+                        }
+                    }.exceptionOrNull()
+                    operation.cancel(true)
+                    throw SQLTimeoutException("Durable ingress JDBC operation exceeded its deadline.").apply {
+                        initCause(failure)
+                        abortFailure?.let(::addSuppressed)
+                    }
+                } catch (failure: ExecutionException) {
+                    throw failure.cause ?: failure
+                } finally {
+                    operation.cancel(true)
+                    executor.shutdownNow()
+                    val terminated = executor.awaitTermination(
+                        deadline.remaining().toMillis().coerceAtLeast(1),
+                        TimeUnit.MILLISECONDS,
+                    )
+                    if (!terminated) throw SQLTimeoutException("Durable ingress JDBC worker outlived its deadline.")
+                    abortExecutor.get()?.let { abortWorker ->
+                        if (!abortWorker.awaitTermination(1, TimeUnit.MILLISECONDS)) {
+                            abortWorker.shutdownNow()
+                        }
                     }
                 }
             }
         }
+
+    private fun <T> mutateOnConnection(
+        deadline: IngressOperationDeadline,
+        connectionReference: AtomicReference<Connection?>,
+        mutation: (Connection) -> T,
+    ): T {
+        deadline.requireRemaining()
+        val connection = dataSource.connection
+        connectionReference.set(connection)
+        try {
+            deadline.requireRemaining()
+            connection.autoCommit = false
+            armTimeouts(connection, deadline)
+            acquireAuthority(connection, deadline)
+
+            try {
+                val result = mutation(connection)
+                requireCommitBudget(deadline)
+                connection.commit()
+                deadline.requireRemaining()
+                return result
+            } catch (throwable: Throwable) {
+                runCatching { connection.rollback() }
+                throw throwable
+            } finally {
+                releaseAuthority(connection)
+                deadline.requireRemaining()
+            }
+        } finally {
+            try {
+                connection.close()
+            } finally {
+                connectionReference.compareAndSet(connection, null)
+            }
+        }
+    }
 
     private fun armTimeouts(connection: Connection, deadline: IngressOperationDeadline) {
         val operationMillis = deadline.requireRemaining().minus(INGRESS_COMMIT_RESERVE).toMillis()

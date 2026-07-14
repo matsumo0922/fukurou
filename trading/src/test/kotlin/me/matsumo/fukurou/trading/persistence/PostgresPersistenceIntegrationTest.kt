@@ -919,6 +919,53 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun durableIngressSchemaVerifier_rejectsWrongColumnContract() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE market_data_ingress_sessions ALTER COLUMN provider TYPE TEXT")
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun durableIngressSchemaVerifier_rejectsMissingForeignKey() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                DO ${'$'}${'$'}
+                DECLARE foreign_key_name TEXT;
+                BEGIN
+                    SELECT conname INTO foreign_key_name FROM pg_constraint
+                    WHERE conrelid='market_data_ingress_sessions'::regclass AND contype='f';
+                    EXECUTE format('ALTER TABLE market_data_ingress_sessions DROP CONSTRAINT %I', foreign_key_name);
+                END ${'$'}${'$'}
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun durableIngressSchemaVerifier_rejectsWrongIdentityIndex() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("DROP INDEX idx_market_data_ingress_sessions_identity")
+            executeUpdate(
+                "CREATE INDEX idx_market_data_ingress_sessions_identity " +
+                    "ON market_data_ingress_sessions(provider, symbol, starting_at DESC, channel)",
+            )
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
     fun terminalEvidenceFoundation_bootstrapsDefaultOffWithoutRows() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 

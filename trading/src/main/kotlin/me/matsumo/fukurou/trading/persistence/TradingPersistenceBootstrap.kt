@@ -468,18 +468,90 @@ private const val ENSURE_MARKET_DATA_INGRESS_IDENTITY_INDEX_SQL = """
     ON market_data_ingress_sessions (provider, symbol, channel, starting_at DESC)
 """
 
-/** private durable ingress tableのexact column setを確認するSQL。 */
-private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_SCHEMA_SQL = """
+/** private durable ingress tableのexact column contractを確認するSQL。 */
+private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_COLUMNS_SQL = """
+    SELECT 1
+    WHERE NOT EXISTS (
+        SELECT * FROM (VALUES
+            (1, 'session_id', 'uuid', 'NO', ''),
+            (2, 'provider', 'character varying', 'NO', ''),
+            (3, 'symbol', 'character varying', 'NO', ''),
+            (4, 'channel', 'character varying', 'NO', ''),
+            (5, 'state', 'character varying', 'NO', ''),
+            (6, 'last_received_sequence', 'bigint', 'NO', '0'),
+            (7, 'starting_at', 'bigint', 'NO', ''),
+            (8, 'connected_at', 'bigint', 'YES', ''),
+            (9, 'stopping_at', 'bigint', 'YES', ''),
+            (10, 'disconnected_at', 'bigint', 'YES', ''),
+            (11, 'disconnect_source', 'character varying', 'YES', '')
+        ) expected(ordinal_position, column_name, data_type, is_nullable, column_default)
+        EXCEPT
+        SELECT ordinal_position, column_name::text, data_type::text, is_nullable::text,
+            CASE WHEN column_name = 'last_received_sequence' AND column_default IN ('0', '0::bigint')
+                THEN '0' ELSE COALESCE(column_default, '') END
+        FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'market_data_ingress_sessions'
+    ) AND NOT EXISTS (
+        SELECT ordinal_position, column_name::text, data_type::text, is_nullable::text,
+            CASE WHEN column_name = 'last_received_sequence' AND column_default IN ('0', '0::bigint')
+                THEN '0' ELSE COALESCE(column_default, '') END
+        FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'market_data_ingress_sessions'
+        EXCEPT
+        SELECT * FROM (VALUES
+            (1, 'session_id', 'uuid', 'NO', ''), (2, 'provider', 'character varying', 'NO', ''),
+            (3, 'symbol', 'character varying', 'NO', ''), (4, 'channel', 'character varying', 'NO', ''),
+            (5, 'state', 'character varying', 'NO', ''), (6, 'last_received_sequence', 'bigint', 'NO', '0'),
+            (7, 'starting_at', 'bigint', 'NO', ''), (8, 'connected_at', 'bigint', 'YES', ''),
+            (9, 'stopping_at', 'bigint', 'YES', ''), (10, 'disconnected_at', 'bigint', 'YES', ''),
+            (11, 'disconnect_source', 'character varying', 'YES', '')
+        ) expected(ordinal_position, column_name, data_type, is_nullable, column_default)
+    )
+"""
+
+/** private durable ingress tableのprimary/foreign key contractを確認するSQL。 */
+private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_KEYS_SQL = """
     SELECT 1
     WHERE (
-        SELECT array_agg(column_name ORDER BY ordinal_position)
-        FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'market_data_ingress_sessions'
-    ) = ARRAY[
-        'session_id', 'provider', 'symbol', 'channel', 'state', 'last_received_sequence',
-        'starting_at', 'connected_at', 'stopping_at', 'disconnected_at', 'disconnect_source'
-    ]::information_schema.sql_identifier[]
+        SELECT COUNT(*) FROM pg_constraint
+        WHERE conrelid = 'market_data_ingress_sessions'::regclass AND contype IN ('p', 'f')
+    ) = 2
+      AND (
+        SELECT COUNT(*) FROM pg_constraint
+        WHERE conrelid = 'market_data_ingress_sessions'::regclass
+          AND contype = 'p'
+          AND pg_get_constraintdef(oid) = 'PRIMARY KEY (session_id)'
+      ) = 1
+      AND (
+        SELECT COUNT(*) FROM pg_constraint
+        WHERE conrelid = 'market_data_ingress_sessions'::regclass
+          AND contype = 'f'
+          AND confrelid = 'market_data_sessions'::regclass
+          AND pg_get_constraintdef(oid) LIKE
+              'FOREIGN KEY (session_id) REFERENCES market_data_sessions(id)%'
+      ) = 1
+"""
+
+/** private durable ingress identity indexのexact definitionを確認するSQL。 */
+private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_INDEX_SQL = """
+    SELECT 1
+    FROM pg_index index_metadata
+    JOIN pg_class index_class ON index_class.oid = index_metadata.indexrelid
+    WHERE index_class.relname = 'idx_market_data_ingress_sessions_identity'
+      AND index_metadata.indrelid = 'market_data_ingress_sessions'::regclass
+      AND NOT index_metadata.indisunique
+      AND index_metadata.indisvalid
+      AND index_metadata.indpred IS NULL
+      AND index_metadata.indexprs IS NULL
+      AND index_metadata.indnkeyatts = 4
+      AND pg_get_indexdef(index_metadata.indexrelid, 1, TRUE) = 'provider'
+      AND pg_get_indexdef(index_metadata.indexrelid, 2, TRUE) = 'symbol'
+      AND pg_get_indexdef(index_metadata.indexrelid, 3, TRUE) = 'channel'
+      AND pg_get_indexdef(index_metadata.indexrelid, 4, TRUE) = 'starting_at'
+      AND index_metadata.indoption[0] = 0
+      AND index_metadata.indoption[1] = 0
+      AND index_metadata.indoption[2] = 0
+      AND index_metadata.indoption[3] = 3
 """
 
 /** symbol ごとの open opportunity episode を一意にする partial unique index。 */
@@ -1646,8 +1718,16 @@ private fun Duration.toPostgresTimeout(): String = "${toMillis()}ms"
  */
 private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
     verifyExistsBySql(
-        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_SCHEMA_SQL,
-        missingMessage = "market_data_ingress_sessions exact schema was not initialized.",
+        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_COLUMNS_SQL,
+        missingMessage = "market_data_ingress_sessions exact columns were not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_KEYS_SQL,
+        missingMessage = "market_data_ingress_sessions exact keys were not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_INDEX_SQL,
+        missingMessage = "market_data_ingress_sessions exact identity index was not initialized.",
     )
     verifyRuntimeConfigSchema()
     verifyGapPopulationLifecycleSchema()
