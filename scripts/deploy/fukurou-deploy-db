@@ -148,9 +148,9 @@ snapshot() {
     pid_summary="$(psql_exec -Atc "SELECT jsonb_build_object('active',count(*) FILTER (WHERE state<>'TERMINAL'),'total',count(*)) FROM llm_pid_registrations")"
   fi
   if [[ "${has_runtime}" != "t" ]]; then
-    base="$(psql_exec -Atc "SELECT jsonb_build_object('captureDbTimestamp',to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),'runtimeConfigVersion','','runtimeConfigHash','','preFilterActive','','foundationCatalogFingerprint',md5(COALESCE((SELECT string_agg(relname || ':' || relkind,E'\\n' ORDER BY relname) FROM pg_class WHERE relname LIKE 'infrastructure_gap_events%' OR relname LIKE 'llm_pid_registrations%' OR relname='llm_launch_maintenance'),'')))::text")"
+    base="$(psql_exec -Atc "SELECT jsonb_build_object('captureDbTimestamp',to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),'runtimeConfigVersion','','runtimeConfigHash','','preFilterActive','','foundationCatalogFingerprint',md5(COALESCE((SELECT string_agg(relname || ':' || relkind::text,E'\\n' ORDER BY relname) FROM pg_class WHERE relname LIKE 'infrastructure_gap_events%' OR relname LIKE 'llm_pid_registrations%' OR relname='llm_launch_maintenance'),'')))::text")"
   else
-    base="$(psql_exec -At <<'SQL'
+    base="$(psql_exec -Atq <<'SQL'
 BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL statement_timeout = '5s';
 WITH active_config AS (
@@ -162,7 +162,7 @@ WITH active_config AS (
     FROM active_config LEFT JOIN runtime_config_values ON runtime_config_values.version_id = active_config.id
     GROUP BY active_config.id
 ), catalog AS (
-    SELECT COALESCE(string_agg(c.relname || ':' || c.relkind || ':' || COALESCE(pg_get_expr(i.indpred, i.indrelid), ''), E'\n' ORDER BY c.relname), '') value
+    SELECT COALESCE(string_agg(c.relname || ':' || c.relkind::text || ':' || COALESCE(pg_get_expr(i.indpred, i.indrelid), ''), E'\n' ORDER BY c.relname), '') value
     FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid = c.oid
     WHERE c.relname LIKE 'infrastructure_gap_events%' OR c.relname LIKE 'llm_pid_registrations%' OR c.relname = 'llm_launch_maintenance'
 )
