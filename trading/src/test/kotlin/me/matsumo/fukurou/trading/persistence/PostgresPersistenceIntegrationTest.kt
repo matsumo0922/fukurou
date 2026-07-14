@@ -119,8 +119,10 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.market.IngressOperationDeadline
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.MarketStreamIdentity
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
@@ -883,6 +885,96 @@ private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
  * Exposed/Postgres 実装の DB 契約を実 Postgres で検証するテスト。
  */
 class PostgresPersistenceIntegrationTest {
+
+    @Test
+    fun durableIngressFoundation_bootstrapsPrivateEmptyTableWithoutBackfill() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        TradingPersistenceBootstrap(database, fixedClock()).verifySchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM market_data_ingress_sessions", 0)
+            assertSqlCount("SELECT COUNT(*) FROM market_data_sessions", 0)
+        }
+    }
+
+    @Test
+    fun durableIngressRegistration_isConditionalAndMonotonic() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedDurableMarketEventIngress(dataSource, fixedClock())
+        val sessionId = UUID.randomUUID()
+        val identity = MarketStreamIdentity("GMO_COIN", "BTC_JPY", "TRADES")
+
+        repository.begin(sessionId, identity, IngressOperationDeadline.start()).getOrThrow()
+        assertTrue(repository.activate(sessionId, IngressOperationDeadline.start()).getOrThrow())
+        assertTrue(repository.registerReceived(sessionId, 1, IngressOperationDeadline.start()).getOrThrow())
+        assertFalse(repository.registerReceived(sessionId, 3, IngressOperationDeadline.start()).getOrThrow())
+
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM market_data_ingress_sessions " +
+                    "WHERE session_id='$sessionId' AND state='CONNECTED' AND last_received_sequence=1",
+                1,
+            )
+        }
+    }
+
+    @Test
+    fun durableIngressSchemaVerifier_rejectsWrongColumnContract() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE market_data_ingress_sessions ALTER COLUMN provider TYPE TEXT")
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun durableIngressSchemaVerifier_rejectsWrongVarcharLength() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("ALTER TABLE market_data_ingress_sessions ALTER COLUMN provider TYPE VARCHAR(64)")
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun durableIngressSchemaVerifier_rejectsMissingForeignKey() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                DO ${'$'}${'$'}
+                DECLARE foreign_key_name TEXT;
+                BEGIN
+                    SELECT conname INTO foreign_key_name FROM pg_constraint
+                    WHERE conrelid='market_data_ingress_sessions'::regclass AND contype='f';
+                    EXECUTE format('ALTER TABLE market_data_ingress_sessions DROP CONSTRAINT %I', foreign_key_name);
+                END ${'$'}${'$'}
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
+
+    @Test
+    fun durableIngressSchemaVerifier_rejectsWrongIdentityIndex() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("DROP INDEX idx_market_data_ingress_sessions_identity")
+            executeUpdate(
+                "CREATE INDEX idx_market_data_ingress_sessions_identity " +
+                    "ON market_data_ingress_sessions(provider, symbol, starting_at DESC, channel)",
+            )
+        }
+
+        assertTrue(bootstrap.verifySchema().isFailure)
+    }
 
     @Test
     fun terminalEvidenceFoundation_bootstrapsDefaultOffWithoutRows() = runPostgresTest {

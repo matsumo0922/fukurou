@@ -154,6 +154,7 @@ flowchart LR
 #### 2.3.1 市場データの流れ
 
 1. `ProtectionReconciler` は GMO Public WebSocket `trades/BTC` を接続単位で直列消費し、realtime trade event だけで resting entry と保護を前進させる。subscription acknowledgement とPing/Pongはtransport livenessを更新するが、約定、sequence、gap recoveryを前進させない。
+   `market_data_ingress_sessions`、single monotonic deadline、paused durable listenerは非接続のfoundationとして存在する。production compositionはlegacy streamを選択し、durable writerを起動しない。
 2. connection session と local sequence、exchange/received time、gap、recovery、約定 source evidence を PostgreSQL に保存し、event と ledger cursor を同一 transaction で確定する。
 3. RESTで5分・1時間・日足のOHLCVを補完する。
 4. `MarketDataSource` 実装が、ローソク足、板、約定、指標、マイクロストラクチャ要約を統一モデルへ変換する。
