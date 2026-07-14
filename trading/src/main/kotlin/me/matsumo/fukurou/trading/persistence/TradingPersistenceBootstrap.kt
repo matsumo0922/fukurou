@@ -462,6 +462,26 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE state = 'CONNECTED'
 """
 
+/** stable resourceからdurable ingress sessionを引くindexを作るSQL。 */
+private const val ENSURE_MARKET_DATA_INGRESS_IDENTITY_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_market_data_ingress_sessions_identity
+    ON market_data_ingress_sessions (provider, symbol, channel, starting_at DESC)
+"""
+
+/** private durable ingress tableのexact column setを確認するSQL。 */
+private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_SCHEMA_SQL = """
+    SELECT 1
+    WHERE (
+        SELECT array_agg(column_name ORDER BY ordinal_position)
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'market_data_ingress_sessions'
+    ) = ARRAY[
+        'session_id', 'provider', 'symbol', 'channel', 'state', 'last_received_sequence',
+        'starting_at', 'connected_at', 'stopping_at', 'disconnected_at', 'disconnect_source'
+    ]::information_schema.sql_identifier[]
+"""
+
 /** symbol ごとの open opportunity episode を一意にする partial unique index。 */
 private const val ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_episodes_symbol_open_unique
@@ -1213,6 +1233,7 @@ class TradingPersistenceBootstrap(
                     OrdersTable,
                     ExecutionsTable,
                     MarketDataSessionsTable,
+                    MarketDataIngressSessionsTable,
                     MarketDataGapsTable,
                     EvaluationExclusionsTable,
                     CommandEventLogTable,
@@ -1528,6 +1549,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
     executeUpdate(ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_INGRESS_IDENTITY_INDEX_SQL)
     executeUpdate(ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
@@ -1623,6 +1645,10 @@ private fun Duration.toPostgresTimeout(): String = "${toMillis()}ms"
  * runtime schema と補助 index が存在することを確認する。
  */
 private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
+    verifyExistsBySql(
+        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_SCHEMA_SQL,
+        missingMessage = "market_data_ingress_sessions exact schema was not initialized.",
+    )
     verifyRuntimeConfigSchema()
     verifyGapPopulationLifecycleSchema()
     verifyAccountRuntimeSchemaObjects()
