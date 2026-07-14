@@ -5177,27 +5177,33 @@ class PostgresPersistenceIntegrationTest {
         )
 
         coroutineScope {
-            listOf(
-                async(Dispatchers.IO) {
-                    repository.finish(
-                        LlmLaunchReservationFinish(
-                            invocationId = "terminal-race",
-                            status = LlmLaunchReservationStatus.FINISHED,
-                            reason = "runner",
-                            finishedAt = now.plusSeconds(600),
-                            claimantToken = "race-token",
-                        ),
-                    ).getOrThrow()
-                },
-                async(Dispatchers.IO) {
-                    repository.recoverStaleExecutionClaim(
-                        request = recoveryRequest,
-                        deadline = recoveryDeadline(),
-                        retryPermit = LlmExecutionRecoveryRetryPermit(),
-                    ).getOrThrow()
-                },
-                async(Dispatchers.IO) { bootstrap.recoverPreviousGeneration().getOrThrow() },
-            ).map { it.await() }
+            val runnerFinish = async(Dispatchers.IO) {
+                repository.finish(
+                    LlmLaunchReservationFinish(
+                        invocationId = "terminal-race",
+                        status = LlmLaunchReservationStatus.FINISHED,
+                        reason = "runner",
+                        finishedAt = now.plusSeconds(600),
+                        claimantToken = "race-token",
+                    ),
+                )
+            }
+            val sweeperRecovery = async(Dispatchers.IO) {
+                repository.recoverStaleExecutionClaim(
+                    request = recoveryRequest,
+                    deadline = recoveryDeadline(),
+                    retryPermit = LlmExecutionRecoveryRetryPermit(),
+                )
+            }
+            val bootstrapRecovery = async(Dispatchers.IO) { bootstrap.recoverPreviousGeneration() }
+
+            val finishFailure = runnerFinish.await().exceptionOrNull()
+            if (finishFailure != null) {
+                assertIs<IllegalArgumentException>(finishFailure)
+                assertTrue(finishFailure.message.orEmpty().contains("LLM launch reservation was not found"))
+            }
+            sweeperRecovery.await().getOrThrow()
+            bootstrapRecovery.await().getOrThrow()
         }
         val winningReason = requireNotNull(selectReservationReason(database, "terminal-race"))
         assertTrue(
@@ -5206,7 +5212,7 @@ class PostgresPersistenceIntegrationTest {
                 winningReason == LlmRunTerminalCause.RESTART_INTERRUPTED.name,
         )
 
-        repository.finish(
+        val overwriteFailure = repository.finish(
             LlmLaunchReservationFinish(
                 invocationId = "terminal-race",
                 status = LlmLaunchReservationStatus.FAILED,
@@ -5214,7 +5220,9 @@ class PostgresPersistenceIntegrationTest {
                 finishedAt = now.plusSeconds(601),
                 claimantToken = "race-token",
             ),
-        ).getOrThrow()
+        ).exceptionOrNull()
+        assertIs<IllegalArgumentException>(overwriteFailure)
+        assertTrue(overwriteFailure.message.orEmpty().contains("LLM launch reservation was not found"))
         assertIs<LlmExecutionRecoveryOutcome.TerminalObserved>(
             repository.recoverStaleExecutionClaim(
                 request = recoveryRequest,
@@ -5854,9 +5862,9 @@ class PostgresPersistenceIntegrationTest {
             repository.tryReserve(llmLaunchReservationRequest("statement-budget", LlmRunnerConfig(), now)).getOrThrow(),
         )
         assertEquals(
-            11,
+            12,
             statementCount.get(),
-            "two admission checks, token acquisition, risk/active/usage reads, and reservation insert",
+            "two admission checks, token acquisition, risk/active/usage reads, reservation insert, and PID registration",
         )
 
         val lockConnection = dataSource.connection
@@ -5906,7 +5914,11 @@ class PostgresPersistenceIntegrationTest {
         )
 
         assertEquals(1, recoveryService.tick().getOrThrow())
-        assertEquals(37, statementCount.get(), "scan, mutation, exact readback, and commit re-arm the page deadline")
+        assertEquals(
+            39,
+            statementCount.get(),
+            "scan, mutation, PID terminalization, exact readback, and commit re-arm the page deadline",
+        )
         assertEquals(10, queryTimeouts.size)
         assertTrue(queryTimeouts.all { timeout -> timeout in 1..5 })
         assertTrue(queryTimeouts.zipWithNext().all { (current, next) -> current >= next })
@@ -5916,9 +5928,10 @@ class PostgresPersistenceIntegrationTest {
     fun hundredCandidateRecoveryUsesBoundedSequentialEntityScopeTransactions() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val now = fixedInstant()
+        val candidateCount = 100
         insertRecoverableAvailableReservations(
             database = database,
-            rowCount = 100,
+            rowCount = candidateCount,
             reservedAt = now.minusSeconds(1_800),
         )
         val statementCount = AtomicInteger()
@@ -5938,8 +5951,13 @@ class PostgresPersistenceIntegrationTest {
             clock = Clock.fixed(now, ZoneOffset.UTC),
         )
 
-        assertEquals(100, service.tick().getOrThrow())
-        assertTrue(statementCount.get() <= 3_300, "recovery statement count=${statementCount.get()}")
+        assertEquals(candidateCount, service.tick().getOrThrow())
+        val fixedPageStatementCount = 5
+        val baseStatementsPerCandidate = 32
+        val pidTerminalizationStatementsPerCandidate = 2
+        val expectedStatementCount = fixedPageStatementCount +
+            candidateCount * (baseStatementsPerCandidate + pidTerminalizationStatementsPerCandidate)
+        assertEquals(expectedStatementCount, statementCount.get(), "recovery statement count")
         assertEquals(1_102, executedSql.count { sql -> sql.startsWith("SET LOCAL lock_timeout") })
         assertEquals(1_102, executedSql.count { sql -> sql.startsWith("SET LOCAL statement_timeout") })
         val statementTimeoutMillis = executedSql.recoveryTimeoutMillis("SET LOCAL statement_timeout")
@@ -7865,10 +7883,11 @@ class PostgresPersistenceIntegrationTest {
                 ),
             ).getOrThrow()
             exposedTransaction(database) {
+                acquireGapPopulationGenerationToken()
                 prepare(
                     """
                         INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)
-                        VALUES (?,'PAPER','BTC_JPY','FINISHED',?,?)
+                        VALUES (?,'PAPER','BTC','FINISHED',?,?)
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setString(1, runId)
