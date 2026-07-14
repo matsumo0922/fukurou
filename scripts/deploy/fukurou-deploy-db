@@ -219,7 +219,7 @@ SQL
 }
 
 cleanup_terminal_pid_registrations() {
-  psql_exec -At <<'SQL'
+  psql_exec -Atq <<'SQL'
 BEGIN;
 SET LOCAL lock_timeout = '250ms';
 SET LOCAL statement_timeout = '1s';

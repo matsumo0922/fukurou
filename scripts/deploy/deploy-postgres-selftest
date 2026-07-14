@@ -38,6 +38,14 @@ timeout() {
   "$@"
 }
 
+assert_equal() {
+  local label="$1" expected="$2" actual="$3"
+  [[ "${actual}" == "${expected}" ]] || {
+    printf 'deploy-postgres-selftest: assertion=%s expected=%q actual=%q\n' "${label}" "${expected}" "${actual}" >&2
+    exit 1
+  }
+}
+
 pre_foundation_snapshot="$(snapshot)"
 [[ "$(jq -r '.installKind' <<<"${pre_foundation_snapshot}")" == PRE_FOUNDATION ]]
 [[ "$(jq -r '.maintenance.enabled' <<<"${pre_foundation_snapshot}")" == false ]]
@@ -95,13 +103,16 @@ INSERT INTO llm_pid_registrations(
 );
 SQL
 
-[[ "$(active_launch_count)" == 2 ]]
+assert_equal active-launch-count-before-interrupt 2 "$(active_launch_count)"
 interrupt_active_launches fixture >/dev/null
-[[ "$(active_launch_count)" == 0 ]]
-[[ "$(psql_exec -Atc "SELECT status || ':' || reason FROM llm_launch_reservations WHERE invocation_id='active-fixture'")" == 'FAILED:DEPLOY_MAINTENANCE_INTERRUPTED:fixture' ]]
-[[ "$(psql_exec -Atc "SELECT status || ':' || terminal_cause FROM llm_runs WHERE invocation_id='active-fixture'")" == 'FAILED:RESTART_INTERRUPTED' ]]
-[[ "$(cleanup_terminal_pid_registrations)" == 1 ]]
-[[ "$(psql_exec -Atc "SELECT COUNT(*) FROM llm_pid_registrations WHERE registration_id='00000000-0000-0000-0000-000000000020'")" == 0 ]]
+assert_equal active-launch-count-after-interrupt 0 "$(active_launch_count)"
+assert_equal interrupted-reservation 'FAILED:DEPLOY_MAINTENANCE_INTERRUPTED:fixture' \
+  "$(psql_exec -Atc "SELECT status || ':' || reason FROM llm_launch_reservations WHERE invocation_id='active-fixture'")"
+assert_equal interrupted-run 'FAILED:RESTART_INTERRUPTED' \
+  "$(psql_exec -Atc "SELECT status || ':' || terminal_cause FROM llm_runs WHERE invocation_id='active-fixture'")"
+assert_equal terminal-pid-cleanup-count 1 "$(cleanup_terminal_pid_registrations)"
+assert_equal old-terminal-pid-count 0 \
+  "$(psql_exec -Atc "SELECT COUNT(*) FROM llm_pid_registrations WHERE registration_id='00000000-0000-0000-0000-000000000020'")"
 
 maintenance_cas 0 false "" 1 true fixture >/dev/null
 if (maintenance_cas 0 false "" 2 true wrong-fixture >/dev/null 2>&1); then
@@ -109,9 +120,9 @@ if (maintenance_cas 0 false "" 2 true wrong-fixture >/dev/null 2>&1); then
   exit 1
 fi
 maintenance_snapshot="$(snapshot)"
-[[ "$(jq -r '.maintenance.generation' <<<"${maintenance_snapshot}")" == 1 ]]
-[[ "$(jq -r '.maintenance.enabled' <<<"${maintenance_snapshot}")" == true ]]
-[[ "$(jq -r '.maintenance.deploymentId' <<<"${maintenance_snapshot}")" == fixture ]]
+assert_equal maintenance-generation 1 "$(jq -r '.maintenance.generation' <<<"${maintenance_snapshot}")"
+assert_equal maintenance-enabled true "$(jq -r '.maintenance.enabled' <<<"${maintenance_snapshot}")"
+assert_equal maintenance-deployment fixture "$(jq -r '.maintenance.deploymentId' <<<"${maintenance_snapshot}")"
 ensure_maintenance 1 fixture >/dev/null
 if (ensure_maintenance 2 fixture >/dev/null 2>&1); then
   echo "deploy-postgres-selftest: mismatched maintenance recovery was accepted" >&2
@@ -122,14 +133,14 @@ timestamp="$(database_timestamp)"
 payload_hash="$(printf fixture | sha256sum | awk '{print $1}')"
 append_gap fixture OPEN "${timestamp}" "${payload_hash}" >/dev/null
 append_gap fixture OPEN "${timestamp}" "${payload_hash}" >/dev/null
-[[ "$(gap_state fixture)" == OPEN ]]
+assert_equal gap-open-state OPEN "$(gap_state fixture)"
 conflicting_hash="$(printf conflict | sha256sum | awk '{print $1}')"
 if (append_gap fixture OPEN "${timestamp}" "${conflicting_hash}" >/dev/null 2>&1); then
   echo "deploy-postgres-selftest: conflicting immutable gap event was accepted" >&2
   exit 1
 fi
 append_gap fixture CLOSE "${timestamp}" "${payload_hash}" >/dev/null
-[[ "$(gap_state fixture)" == CLOSED ]]
+assert_equal gap-closed-state CLOSED "$(gap_state fixture)"
 
 psql_exec <<'SQL'
 CREATE TABLE runtime_config_versions (id uuid PRIMARY KEY, status text NOT NULL);
