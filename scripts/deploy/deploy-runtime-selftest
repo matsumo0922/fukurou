@@ -70,7 +70,7 @@ docker() {
       [[ -z "${control}" ]] || printf 'ACK %s %s\n' "${control}" "${generation}"
       ;;
     top)
-      [[ "${OBSERVATION_MODE}" != top-failed ]] || return 1
+      [[ "${OBSERVATION_MODE}" != top-failed && "${OBSERVATION_MODE}" != top-failed-running ]] || return 1
       [[ "${OBSERVATION_MODE}" != children ]] || printf '10001\n10002\n10003\n'
       [[ "${OBSERVATION_MODE}" == children ]] || printf '10001\n'
       ;;
@@ -79,7 +79,7 @@ docker() {
       case "${3:-}" in
         *State.Running*)
           case "${OBSERVATION_MODE}" in
-            running) printf 'true|42\n' ;;
+            running|top-failed-running) printf 'true|42\n' ;;
             absent) return 1 ;;
             *) printf 'false|0\n' ;;
           esac
@@ -357,8 +357,10 @@ fi
 OBSERVATION_MODE=children
 [[ "$(observe_runtime_children)" == 2 ]]
 OBSERVATION_MODE=top-failed
+[[ "$(observe_runtime_children)" == 0 ]]
+OBSERVATION_MODE=top-failed-running
 if (observe_runtime_children >/dev/null 2>&1); then
-  echo "deploy-runtime-selftest: failed process observation was accepted" >&2
+  echo "deploy-runtime-selftest: failed running-process observation was accepted" >&2
   exit 1
 fi
 
