@@ -124,6 +124,7 @@ import org.testcontainers.containers.PostgreSQLContainer
 import org.testcontainers.utility.MountableFile
 import java.math.BigDecimal
 import java.net.InetSocketAddress
+import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.DriverManager
 import java.time.Clock
@@ -1962,11 +1963,17 @@ class McpDatabaseRoleIntegrationTest {
             assertMcpRoleProvisionRequiresBootstrap(container)
             TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
             seedRequiredMatrixRun(container, clock)
+
+            provisionMcpRole(container)
+            assertRoleBoundary(container)
+
             seedDirtyMcpPrivileges(container)
             provisionMcpRole(container)
+            assertRoleBoundary(container)
+
             provisionMcpRole(container)
             createFuturePrivilegeBoundaryObjects(container)
-            assertRoleBoundary(container)
+            assertRoleBoundary(container, includeFutureBoundary = true)
             appRuntime = TradingRuntimeFactory.postgres(
                 TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
                 clock = clock,
@@ -2180,7 +2187,7 @@ private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
 
 private fun seedDirtyMcpPrivileges(container: PostgreSQLContainer<*>) {
     val sql = """
-        CREATE ROLE $MCP_TEST_ROLE LOGIN PASSWORD '$MCP_TEST_PASSWORD' SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS INHERIT;
+        ALTER ROLE $MCP_TEST_ROLE WITH LOGIN PASSWORD '$MCP_TEST_PASSWORD' SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS INHERIT;
         CREATE ROLE mcp_dirty_parent;
         CREATE ROLE mcp_dirty_child;
         CREATE ROLE mcp_dirty_grantor;
@@ -2279,6 +2286,9 @@ private suspend fun seedRequiredMatrixRun(container: PostgreSQLContainer<*>, clo
 private fun provisionMcpRole(container: PostgreSQLContainer<*>) {
     val result = runMcpRoleProvision(container)
     check(result.exitCode == 0) { "MCP role SQL failed: ${result.stderr}" }
+    check(MCP_TEST_PASSWORD !in result.stdout && MCP_TEST_PASSWORD !in result.stderr) {
+        "MCP role wrapper disclosed its password."
+    }
     val roleCheck = container.execInContainer(
         "psql", "-U", container.username, "-d", container.databaseName,
         "-Atc", "SELECT rolname FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'",
@@ -2299,20 +2309,33 @@ private fun assertMcpRoleProvisionRequiresBootstrap(container: PostgreSQLContain
 }
 
 private fun runMcpRoleProvision(container: PostgreSQLContainer<*>): Container.ExecResult {
-    val sqlPath = generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path -> path.parent }
-        .map { path -> path.resolve("scripts/deploy/sql/mcp-role.sql") }
-        .first { path -> java.nio.file.Files.isRegularFile(path) }
-    container.copyFileToContainer(MountableFile.forHostPath(sqlPath), "/tmp/mcp-role.sql")
-    return container.execInContainer(
-        "psql", "-U", container.username, "-d", container.databaseName,
-        "-v", "mcp_role=$MCP_TEST_ROLE", "-v", "mcp_password=$MCP_TEST_PASSWORD",
-        "-v", "database_name=${container.databaseName}", "-v", "app_role=${container.username}",
-        "-f", "/tmp/mcp-role.sql",
-    )
+    val repositoryRoot = generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path ->
+        path.parent
+    }.first { path -> Files.isRegularFile(path.resolve("scripts/deploy/provision-fukurou-mcp-role")) }
+    val wrapperPath = repositoryRoot.resolve("scripts/deploy/provision-fukurou-mcp-role")
+    val sqlPath = repositoryRoot.resolve("scripts/deploy/sql/mcp-role.sql")
+    val passwordPath = Files.createTempFile("fukurou-mcp-password", ".txt")
+
+    return try {
+        Files.writeString(passwordPath, "$MCP_TEST_PASSWORD\n")
+        container.copyFileToContainer(MountableFile.forHostPath(wrapperPath, 493), "/tmp/deploy/provision-fukurou-mcp-role")
+        container.copyFileToContainer(MountableFile.forHostPath(sqlPath), "/tmp/deploy/sql/mcp-role.sql")
+        container.copyFileToContainer(MountableFile.forHostPath(passwordPath), "/tmp/mcp-password")
+
+        container.execInContainer(
+            "/tmp/deploy/provision-fukurou-mcp-role",
+            "postgresql://${container.username}:${container.password}@127.0.0.1:5432/${container.databaseName}",
+            container.databaseName,
+            container.username,
+            "/tmp/mcp-password",
+        )
+    } finally {
+        Files.deleteIfExists(passwordPath)
+    }
 }
 
 @Suppress("NestedBlockDepth")
-private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
+private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureBoundary: Boolean = false) {
     DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
         connection.createStatement().use { statement ->
             statement.executeQuery("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'").use { rows ->
@@ -2346,15 +2369,17 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>) {
                     "'population_execution_semantics_version','scope_hash')",
                 0,
             )
-            statement.executeQuery(
-                "SELECT " +
-                    "has_table_privilege('public', 'mcp_future_boundary', 'SELECT'), " +
-                    "has_table_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary', 'SELECT'), " +
-                    "has_function_privilege('public', 'mcp_future_boundary_function()', 'EXECUTE'), " +
-                    "has_function_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary_function()', 'EXECUTE')",
-            ).use { rows ->
-                assertTrue(rows.next())
-                (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
+            if (includeFutureBoundary) {
+                statement.executeQuery(
+                    "SELECT " +
+                        "has_table_privilege('public', 'mcp_future_boundary', 'SELECT'), " +
+                        "has_table_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary', 'SELECT'), " +
+                        "has_function_privilege('public', 'mcp_future_boundary_function()', 'EXECUTE'), " +
+                        "has_function_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary_function()', 'EXECUTE')",
+                ).use { rows ->
+                    assertTrue(rows.next())
+                    (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
+                }
             }
             assertSqlCount(
                 statement,
