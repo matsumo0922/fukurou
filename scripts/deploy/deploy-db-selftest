@@ -10,16 +10,17 @@ export FUKUROU_MCP_DB_USER=fukurou_mcp_fixture
 
 # shellcheck source=fukurou-deploy-db
 source "$(dirname "$0")/fukurou-deploy-db"
+grep -Fq 'command timeout --foreground --signal=TERM --kill-after=5' < <(declare -f psql_exec_impl)
 
 MODE=PRE_FOUNDATION
 LAST_PSQL_ARGS="${SELFTEST_ROOT}/psql-args"
+LAST_PSQL_TIMEOUT="${SELFTEST_ROOT}/psql-timeout"
 LAST_SNAPSHOT_QUERY="${SELFTEST_ROOT}/snapshot-query"
 HAS_RUNTIME_CONFIG=false
 docker() {
   if [[ "$1" == "inspect" && "${*: -1}" == "${APPLICATION_CONTAINER}" ]]; then return 1; fi
   return 1
 }
-timeout() { shift; "$@"; }
 psql_exec() {
   printf '%s\n' "$*" > "${LAST_PSQL_ARGS}"
   local query="$*"
@@ -45,10 +46,18 @@ psql_exec() {
     printf '{"captureDbTimestamp":"2026-07-13T00:00:00.000000Z","runtimeConfigVersion":"","runtimeConfigHash":"","preFilterActive":"","foundationCatalogFingerprint":"fixture"}\n'
   fi
 }
+psql_exec_with_timeout() {
+  printf '%s\n' "$1" > "${LAST_PSQL_TIMEOUT}"
+  shift
+  psql_exec "$@"
+}
 
 [[ -z "$(application_value FUKUROU_MCP_DB_USER)" ]]
 install_foundation >/dev/null
 grep -Fq -- '--set=mcp_role=fukurou_mcp_fixture' "${LAST_PSQL_ARGS}"
+grep -Fxq -- '60' "${LAST_PSQL_TIMEOUT}"
+install_indexes >/dev/null
+grep -Fxq -- '300' "${LAST_PSQL_TIMEOUT}"
 
 pre_snapshot="$(snapshot)"
 [[ "$(jq -r '.installKind' <<<"${pre_snapshot}")" == PRE_FOUNDATION ]]

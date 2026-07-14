@@ -15,12 +15,24 @@ application_value() {
   { docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${APPLICATION_CONTAINER}" 2>/dev/null || true; } \
     | awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
 }
-psql_exec() {
+psql_exec_impl() {
+  local timeout_seconds="$1"
+  shift
   local user database
   user="$(postgres_value POSTGRES_USER)"; database="$(postgres_value POSTGRES_DB)"
   [[ -n "${user}" && -n "${database}" ]] || fail "PostgreSQL identity is unavailable"
-  docker exec -i "${POSTGRES_CONTAINER}" psql -X -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" "$@"
+  local -a psql_command=(
+    docker exec -i "${POSTGRES_CONTAINER}"
+    psql -X -v ON_ERROR_STOP=1 -U "${user}" -d "${database}"
+  )
+  if [[ -n "${timeout_seconds}" ]]; then
+    command timeout --foreground --signal=TERM --kill-after=5 "${timeout_seconds}" "${psql_command[@]}" "$@"
+  else
+    "${psql_command[@]}" "$@"
+  fi
 }
+psql_exec() { psql_exec_impl "" "$@"; }
+psql_exec_with_timeout() { local timeout_seconds="$1"; shift; psql_exec_impl "${timeout_seconds}" "$@"; }
 validate_deployment_id() { [[ "$1" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || fail "invalid deployment id"; }
 validate_generation() { [[ "$1" =~ ^[0-9]+$ && "$1" -le 9223372036854775807 ]] || fail "invalid generation"; }
 validate_hash() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"; }
@@ -28,11 +40,11 @@ validate_hash() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"; }
 install_foundation() {
   [[ -f "${FOUNDATION_SQL}" ]] || fail "foundation migration is missing"
   local mcp_role; mcp_role="$(application_value FUKUROU_MCP_DB_USER)"; [[ -n "${mcp_role}" ]] || mcp_role="${MCP_DATABASE_ROLE}"
-  timeout 60 psql_exec --set=mcp_role="${mcp_role}" < "${FOUNDATION_SQL}"
+  psql_exec_with_timeout 60 --set=mcp_role="${mcp_role}" < "${FOUNDATION_SQL}"
 }
 install_indexes() {
   [[ -f "${FOUNDATION_INDEX_SQL}" ]] || fail "foundation index migration is missing"
-  timeout 300 psql_exec < "${FOUNDATION_INDEX_SQL}"
+  psql_exec_with_timeout 300 < "${FOUNDATION_INDEX_SQL}"
 }
 
 database_timestamp() { psql_exec -Atc "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"; }
