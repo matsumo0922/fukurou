@@ -767,11 +767,16 @@ assert_application_pid_zero() {
 
 observe_runtime_children() {
   local process_table
-  process_table="$(timeout 10 docker top fukurou-ktor -eo uid=)" || {
-    fail "RUNTIME_PROCESS_OBSERVATION_FAILED"
-    return 1
-  }
-  awk '$1 == "10002" || $1 == "10003" { count++ } END { print count + 0 }' <<<"${process_table}"
+  if process_table="$(timeout 10 docker top fukurou-ktor -eo uid=)"; then
+    awk '$1 == "10002" || $1 == "10003" { count++ } END { print count + 0 }' <<<"${process_table}"
+    return 0
+  fi
+  if assert_application_pid_zero; then
+    printf '0\n'
+    return 0
+  fi
+  fail "RUNTIME_PROCESS_OBSERVATION_FAILED"
+  return 1
 }
 
 write_fence_fallback() {
