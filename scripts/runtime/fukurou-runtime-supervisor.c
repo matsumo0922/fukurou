@@ -445,8 +445,12 @@ static int descriptors_allowed(struct launch_request *request) {
             (index == 3 || index == 4) && S_ISREG(current.st_mode) && seals >= 0 &&
             (seals & (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE)) ==
                 (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+        struct sockaddr_storage socket_address = {0};
+        socklen_t socket_address_length = sizeof(socket_address);
         int mcp_submission_socket = request->header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 &&
-            index == 5 && S_ISSOCK(current.st_mode);
+            index == 5 && S_ISSOCK(current.st_mode) &&
+            getsockname(request->descriptors[index], (struct sockaddr *)&socket_address, &socket_address_length) == 0 &&
+            socket_address.ss_family == AF_UNIX;
         int type_allowed = standard_descriptor || mcp_sealed_input || mcp_submission_socket;
         if (!type_allowed) return 0;
         for (size_t previous = 0; previous < index; previous++) {
@@ -1177,6 +1181,12 @@ static int protocol_selftest(void) {
     mcp_descriptors.descriptors[5] = create_sealed_selftest_descriptor();
     if (descriptors_allowed(&mcp_descriptors)) return 125;
     close(mcp_descriptors.descriptors[5]);
+    mcp_descriptors.descriptors[5] = submission_socket;
+    int inet_submission_socket = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (inet_submission_socket < 0) return 125;
+    mcp_descriptors.descriptors[5] = inet_submission_socket;
+    if (descriptors_allowed(&mcp_descriptors)) return 125;
+    close(inet_submission_socket);
     mcp_descriptors.descriptors[5] = submission_socket;
     int sealed_manifest = mcp_descriptors.descriptors[3];
     mcp_descriptors.descriptors[3] = submission_socket;
