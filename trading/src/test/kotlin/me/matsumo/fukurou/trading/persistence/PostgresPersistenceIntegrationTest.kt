@@ -134,6 +134,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
+import me.matsumo.fukurou.trading.market.MarketEventReceiptIntegrityConflictException
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
@@ -8033,6 +8034,170 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun paper_market_receipt_schema_is_additive_for_fresh_upgrade_and_old_reader_rollback() = runPostgresTest {
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE TABLE market_data_sessions (
+                        id UUID PRIMARY KEY,
+                        state VARCHAR(32) NOT NULL,
+                        connected_at BIGINT NOT NULL,
+                        disconnected_at BIGINT NULL,
+                        last_processed_sequence BIGINT NOT NULL DEFAULT 0,
+                        last_received_at BIGINT NULL,
+                        last_transport_activity_at BIGINT NULL,
+                        last_trade_at BIGINT NULL,
+                        last_maintenance_at BIGINT NULL,
+                        disconnect_reason VARCHAR(64) NULL
+                    )
+                """.trimIndent(),
+            )
+            prepare(
+                """
+                    INSERT INTO market_data_sessions (
+                        id, state, connected_at, disconnected_at, last_processed_sequence, last_received_at
+                    ) VALUES (?, 'DISCONNECTED', ?, ?, 7, ?)
+                """,
+            ).use { statement ->
+                statement.setObject(1, UUID.fromString("00000000-0000-0000-0000-000000000183"))
+                statement.setLong(2, fixedInstant().toEpochMilli())
+                statement.setLong(3, fixedInstant().plusSeconds(1).toEpochMilli())
+                statement.setLong(4, 123L)
+                assertEquals(1, statement.executeUpdate())
+            }
+        }
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+
+        repeat(2) { bootstrap.ensureSchema().getOrThrow() }
+        bootstrap.verifySchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertEquals(123L, selectLongForTest("SELECT last_received_at FROM market_data_sessions LIMIT 1"))
+            assertEquals(0L, selectLongForTest("SELECT COUNT(*) FROM paper_market_event_receipts"))
+            assertEquals(
+                2L,
+                selectLongForTest(
+                    "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() " +
+                        "AND indexname LIKE 'idx_paper_market_receipts_%'",
+                ),
+            )
+            assertEquals(
+                1L,
+                selectLongForTest("SELECT COUNT(*) FROM pg_class WHERE relname = 'paper_market_admission_ordinal_seq'"),
+            )
+        }
+        assertEquals(7, ExposedMarketDataIntegrityRepository(database).snapshot().getOrThrow().lastProcessedSequence)
+
+        exposedTransaction(database) { executeUpdate("CREATE SCHEMA receipt_fresh") }
+        createDataSource("SET search_path TO receipt_fresh").use { freshDataSource ->
+            val freshDatabase = ExposedDatabase.connect(freshDataSource)
+            val freshBootstrap = TradingPersistenceBootstrap(freshDatabase, fixedClock())
+
+            freshBootstrap.ensureSchema().getOrThrow()
+            freshBootstrap.verifySchema().getOrThrow()
+            assertEquals(
+                0L,
+                exposedTransaction(freshDatabase) {
+                    selectLongForTest("SELECT COUNT(*) FROM paper_market_event_receipts")
+                },
+            )
+        }
+    }
+
+    @Test
+    fun paper_market_receipt_duplicate_is_noop_and_changed_payload_is_typed_conflict() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedPaperMarketEventReceiptRepository(database)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000184")
+        val event = paperTradeEvent(sessionId, sequence = 1, sizeBtc = "0.0010")
+
+        val first = repository.commit(event).getOrThrow()
+        val sequenceAfterFirst = exposedTransaction(database) {
+            selectLongForTest("SELECT last_value FROM paper_market_admission_ordinal_seq")
+        }
+        val duplicate = repository.commit(
+            event.copy(
+                priceJpy = BigDecimal("9990000.000"),
+                sizeBtc = BigDecimal("0.001000"),
+                receivedAt = event.receivedAt.plusMillis(1),
+            ),
+        ).getOrThrow()
+        val conflict = repository.commit(event.copy(priceJpy = BigDecimal("9990001")))
+
+        assertEquals(first.receiptId, duplicate.receiptId)
+        assertEquals(first.admissionOrdinal, duplicate.admissionOrdinal)
+        assertEquals(first.payloadHash, duplicate.payloadHash)
+        assertTrue(duplicate.duplicate)
+        assertIs<MarketEventReceiptIntegrityConflictException>(conflict.exceptionOrNull())
+        exposedTransaction(database) {
+            assertEquals(1L, selectLongForTest("SELECT COUNT(*) FROM paper_market_event_receipts"))
+            assertEquals(sequenceAfterFirst, selectLongForTest("SELECT last_value FROM paper_market_admission_ordinal_seq"))
+            assertEquals(0L, selectLongForTest("SELECT COUNT(*) FROM market_data_sessions"))
+        }
+    }
+
+    @Test
+    fun paper_market_receipt_session_advisory_wait_is_bounded_and_independent_between_sessions() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedPaperMarketEventReceiptRepository(database)
+        val blockedSessionId = UUID.fromString("00000000-0000-0000-0000-000000000185")
+        val otherSessionId = UUID.fromString("00000000-0000-0000-0000-000000000186")
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.prepareStatement("SELECT pg_advisory_xact_lock(?)").use { statement ->
+            statement.setLong(1, paperMarketSessionAdvisoryLockKey(blockedSessionId))
+            statement.executeQuery().use { rows -> assertTrue(rows.next()) }
+        }
+
+        coroutineScope {
+            val blockedCommit = async(Dispatchers.IO) {
+                repository.commit(paperTradeEvent(blockedSessionId, 1, "0.0010"))
+            }
+            awaitAdvisoryLockWait(dataSource)
+
+            val independentCommit = repository.commit(paperTradeEvent(otherSessionId, 1, "0.0010")).getOrThrow()
+            assertEquals(1L, independentCommit.admissionOrdinal)
+
+            lockConnection.commit()
+            lockConnection.close()
+            val committed = blockedCommit.await().getOrThrow()
+
+            assertTrue(committed.advisoryWaitNanos > 0)
+            assertEquals(2L, committed.admissionOrdinal)
+        }
+        exposedTransaction(database) {
+            assertEquals(2L, selectLongForTest("SELECT COUNT(*) FROM paper_market_event_receipts"))
+            assertEquals(0L, selectLongForTest("SELECT COUNT(*) FROM market_data_sessions"))
+        }
+    }
+
+    @Test
+    fun paper_market_receipt_commit_emits_wal_and_capacity_inputs_without_payload_logs() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedPaperMarketEventReceiptRepository(database)
+        val walBefore = selectTextForTest(database, "SELECT pg_current_wal_insert_lsn()::text")
+
+        val commit = repository.commit(
+            paperTradeEvent(
+                sessionId = UUID.fromString("00000000-0000-0000-0000-000000000187"),
+                sequence = 1,
+                sizeBtc = "0.0010",
+            ),
+        ).getOrThrow()
+        val walAfter = selectTextForTest(database, "SELECT pg_current_wal_insert_lsn()::text")
+        val walBytes = selectWalDifferenceForTest(database, walAfter, walBefore)
+        val relationBytes = exposedTransaction(database) {
+            selectLongForTest("SELECT pg_total_relation_size('paper_market_event_receipts')")
+        }
+
+        assertTrue(commit.transactionDurationNanos > 0)
+        assertTrue(commit.advisoryWaitNanos >= 0)
+        assertTrue(walBytes > BigDecimal.ZERO)
+        assertTrue(relationBytes > 0)
+        assertEquals("on", selectTextForTest(database, "SELECT current_setting('synchronous_commit')"))
+    }
+
+    @Test
     fun paper_market_event_cursor_queue_fill_and_gap_impact_are_atomic_in_postgres_path() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val integrityRepository = ExposedMarketDataIntegrityRepository(database)
@@ -10138,6 +10303,43 @@ private fun JdbcTransaction.assertSqlCount(sql: String, expected: Int) {
         statement.executeQuery().use { rows ->
             assertTrue(rows.next())
             assertEquals(expected, rows.getInt(1))
+        }
+    }
+}
+
+private fun JdbcTransaction.selectLongForTest(sql: String): Long {
+    return prepare(sql).use { statement ->
+        statement.executeQuery().use { rows ->
+            check(rows.next()) { "long test query returned no rows." }
+            rows.getLong(1)
+        }
+    }
+}
+
+private fun selectTextForTest(database: ExposedDatabase, sql: String): String {
+    return exposedTransaction(database) {
+        prepare(sql).use { statement ->
+            statement.executeQuery().use { rows ->
+                check(rows.next()) { "text test query returned no rows." }
+                rows.getString(1)
+            }
+        }
+    }
+}
+
+private fun selectWalDifferenceForTest(
+    database: ExposedDatabase,
+    after: String,
+    before: String,
+): BigDecimal {
+    return exposedTransaction(database) {
+        prepare("SELECT pg_wal_lsn_diff(CAST(? AS pg_lsn), CAST(? AS pg_lsn))").use { statement ->
+            statement.setString(1, after)
+            statement.setString(2, before)
+            statement.executeQuery().use { rows ->
+                check(rows.next()) { "WAL difference query returned no rows." }
+                rows.getBigDecimal(1)
+            }
         }
     }
 }

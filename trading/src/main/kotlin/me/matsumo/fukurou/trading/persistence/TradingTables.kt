@@ -817,6 +817,22 @@ object MarketDataSessionsTable : Table("market_data_sessions") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** application queue へ渡す前の WebSocket trade を保存する durable receipt journal。 */
+object PaperMarketEventReceiptsTable : Table("paper_market_event_receipts") {
+    val id = uuid("id")
+    val sessionId = uuid("session_id")
+    val sourceSequence = long("source_sequence")
+    val sourceTimestamp = long("source_timestamp")
+    val socketObservedAt = long("socket_observed_at")
+    val normalizedPayload = text("normalized_payload")
+    val payloadHash = varchar("payload_hash", length = 64)
+    val admissionOrdinal = long("admission_ordinal")
+    val advisoryWaitNanos = long("advisory_wait_nanos")
+    val recordedAt = long("recorded_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
 /** market-data gap の監査記録。 */
 object MarketDataGapsTable : Table("market_data_gaps") {
     val id = uuid("id")

@@ -21,11 +21,14 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketMarketEventStream
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptRepository
+import me.matsumo.fukurou.trading.market.UnavailablePaperMarketEventReceiptRepository
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedMarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
+import me.matsumo.fukurou.trading.persistence.ExposedPaperMarketEventReceiptRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedSafetyViolationRepository
@@ -182,7 +185,11 @@ private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): Protecti
         tradingLock = PostgresGlobalTradingLock(dataSource, clock),
         marketDataSource = marketDataSource,
         broker = broker,
-        marketEventStream = createGmoMarketEventStream(tradingConfig, clock),
+        marketEventStream = createGmoMarketEventStream(
+            tradingConfig = tradingConfig,
+            clock = clock,
+            receiptRepository = repositories.marketEventReceiptRepository,
+        ),
     )
 }
 
@@ -190,11 +197,13 @@ private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): Protecti
 internal fun createGmoMarketEventStream(
     tradingConfig: TradingBotConfig,
     clock: Clock,
+    receiptRepository: PaperMarketEventReceiptRepository = UnavailablePaperMarketEventReceiptRepository,
 ): GmoPublicWebSocketMarketEventStream {
     return GmoPublicWebSocketMarketEventStream(
         config = tradingConfig.gmoPublicWebSocket,
         symbol = tradingConfig.symbol,
         clock = clock,
+        receiptRepository = receiptRepository,
     )
 }
 
@@ -207,6 +216,7 @@ private fun ProtectionReconcilerWorkerInputs.createRepositories(): ProtectionRec
         safetyViolationRepository = ExposedSafetyViolationRepository(database),
         ledgerRepository = ExposedPaperLedgerRepository(database),
         marketDataIntegrityRepository = ExposedMarketDataIntegrityRepository(database),
+        marketEventReceiptRepository = ExposedPaperMarketEventReceiptRepository(database),
     )
 }
 
@@ -290,6 +300,7 @@ private data class ProtectionReconcilerWorkerInputs(
  * @param riskStateCommandService risk_state command service
  * @param safetyViolationRepository safety violation repository
  * @param ledgerRepository paper ledger repository
+ * @param marketEventReceiptRepository durable market-event receipt repository
  */
 private data class ProtectionReconcilerRepositories(
     val riskStateRepository: ExposedRiskStateRepository,
@@ -299,6 +310,7 @@ private data class ProtectionReconcilerRepositories(
     val safetyViolationRepository: ExposedSafetyViolationRepository,
     val ledgerRepository: ExposedPaperLedgerRepository,
     val marketDataIntegrityRepository: ExposedMarketDataIntegrityRepository,
+    val marketEventReceiptRepository: ExposedPaperMarketEventReceiptRepository,
 )
 
 /**

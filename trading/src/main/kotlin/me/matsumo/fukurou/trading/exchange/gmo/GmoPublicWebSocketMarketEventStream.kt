@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.exchange.gmo
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -11,11 +12,16 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptIntegrityConflictException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
 import me.matsumo.fukurou.trading.market.MarketEventSession
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptCommit
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptRepository
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.TransportActivityKind
+import me.matsumo.fukurou.trading.market.UnavailablePaperMarketEventReceiptRepository
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.WebSocket
@@ -23,11 +29,17 @@ import java.nio.ByteBuffer
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionStage
+import java.util.concurrent.Executor
+import java.util.concurrent.ForkJoinPool
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.logging.Logger
 
 private const val MARKET_EVENT_BUFFER_CAPACITY = 1_024
+
+private val RECEIPT_LOGGER = Logger.getLogger(GmoPublicWebSocketMarketEventStream::class.java.name)
 
 /**
  * GMO Public WebSocket `trades` channel を paper execution event に変換する stream。
@@ -35,12 +47,16 @@ private const val MARKET_EVENT_BUFFER_CAPACITY = 1_024
  * @param config WebSocket endpoint / timeout 設定
  * @param symbol subscribe 対象 symbol
  * @param clock local receive time に使う clock
+ * @param receiptRepository application queue より先に commit する durable receipt repository
  * @param httpClient JDK WebSocket client
  */
 class GmoPublicWebSocketMarketEventStream(
     private val config: GmoPublicWebSocketConfig = GmoPublicWebSocketConfig(),
     private val symbol: TradingSymbol = TradingSymbol.BTC,
     private val clock: Clock = Clock.systemUTC(),
+    private val receiptRepository: PaperMarketEventReceiptRepository =
+        UnavailablePaperMarketEventReceiptRepository,
+    private val receiptExecutor: Executor = ForkJoinPool.commonPool(),
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(config.connectTimeout)
         .build(),
@@ -65,6 +81,8 @@ class GmoPublicWebSocketMarketEventStream(
                 messages = sessionMessages,
                 decoder = GmoTradeMessageDecoder(symbol, sessionId),
                 clock = clock,
+                receiptRepository = receiptRepository,
+                receiptExecutor = receiptExecutor,
             )
             val connectedSocket = httpClient.newWebSocketBuilder()
                 .connectTimeout(config.connectTimeout)
@@ -199,6 +217,9 @@ internal class GmoWebSocketListener(
     private val messages: Channel<Result<MarketEventSessionSignal>>,
     private val decoder: GmoTradeMessageDecoder,
     private val clock: Clock,
+    private val receiptRepository: PaperMarketEventReceiptRepository =
+        UnavailablePaperMarketEventReceiptRepository,
+    private val receiptExecutor: Executor = ForkJoinPool.commonPool(),
     private val terminalFailure: AtomicReference<Throwable?> = AtomicReference(),
     private val afterTerminalClaim: () -> Unit = {},
 ) : WebSocket.Listener {
@@ -214,37 +235,69 @@ internal class GmoWebSocketListener(
         data: CharSequence,
         last: Boolean,
     ): CompletionStage<*>? {
-        synchronized(fragments) {
+        val dispatch = synchronized(fragments) {
             fragments.append(data)
 
-            if (last) {
-                val receivedAt = clock.instant()
-                val decoded = runCatching {
-                    decoder.decode(fragments.toString(), receivedAt)
-                }
-                decoded.exceptionOrNull()?.let { throwable ->
-                    sendTerminalFailure(throwable)
-                }
-                if (decoded.isSuccess) {
-                    decoded.getOrNull()?.let { event ->
-                        sendResult(Result.success(MarketEventSessionSignal.Trade(event)))
-                    } ?: run {
-                        sendResult(
-                            Result.success(
-                                MarketEventSessionSignal.TransportActivity(
-                                    observedAt = receivedAt,
-                                    kind = TransportActivityKind.SUBSCRIPTION_ACKNOWLEDGED,
-                                ),
-                            ),
-                        )
-                    }
-                }
-                fragments.setLength(0)
+            if (!last) {
+                webSocket.request(1)
+                return@synchronized null
+            }
+
+            val socketObservedAt = clock.instant()
+            val payload = fragments.toString()
+            fragments.setLength(0)
+            val decoded = runCatching { decoder.decode(payload, socketObservedAt) }
+            decoded.exceptionOrNull()?.let { throwable -> sendTerminalFailure(throwable) }
+
+            if (decoded.isFailure) return@synchronized null
+
+            decoded.getOrNull()?.let { event ->
+                persistReceiptThenDispatch(webSocket, event)
+            } ?: run {
+                sendResult(
+                    Result.success(
+                        MarketEventSessionSignal.TransportActivity(
+                            observedAt = socketObservedAt,
+                            kind = TransportActivityKind.SUBSCRIPTION_ACKNOWLEDGED,
+                        ),
+                    ),
+                )
+                webSocket.request(1)
+                null
             }
         }
-        webSocket.request(1)
 
-        return null
+        return dispatch
+    }
+
+    private fun persistReceiptThenDispatch(
+        webSocket: WebSocket,
+        event: PaperMarketTradeEvent,
+    ): CompletableFuture<Void> {
+        return CompletableFuture.runAsync(
+            {
+                val result = runCatching { runBlocking { receiptRepository.commit(event) } }
+                    .getOrElse { throwable ->
+                        val typedFailure = when (throwable) {
+                            is MarketEventReceiptIntegrityConflictException,
+                            is MarketEventReceiptPersistenceException,
+                            -> throwable
+
+                            else -> MarketEventReceiptPersistenceException(throwable)
+                        }
+                        Result.failure(typedFailure)
+                    }
+                result.fold(
+                    onSuccess = { commit ->
+                        logReceiptCommit(commit)
+                        sendResult(Result.success(MarketEventSessionSignal.Trade(event)))
+                        webSocket.request(1)
+                    },
+                    onFailure = ::sendTerminalFailure,
+                )
+            },
+            receiptExecutor,
+        )
     }
 
     override fun onPing(webSocket: WebSocket, message: ByteBuffer): CompletionStage<*> {
@@ -304,6 +357,16 @@ internal class GmoWebSocketListener(
         messages.trySend(Result.failure(throwable))
         messages.close(throwable)
     }
+}
+
+private fun logReceiptCommit(commit: PaperMarketEventReceiptCommit) {
+    RECEIPT_LOGGER.fine(paperMarketReceiptCommitLogMessage(commit))
+}
+
+internal fun paperMarketReceiptCommitLogMessage(commit: PaperMarketEventReceiptCommit): String {
+    return "paper market-event receipt committed " +
+        "duplicate=${commit.duplicate} transactionNanos=${commit.transactionDurationNanos} " +
+        "advisoryWaitNanos=${commit.advisoryWaitNanos}"
 }
 
 private fun subscribeMessage(symbol: TradingSymbol): String {
