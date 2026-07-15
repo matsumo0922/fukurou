@@ -32,7 +32,7 @@ timeout() {
     case "${1:-}" in
       timestamp) printf '2026-01-01T00:00:00.000000Z\n' ;;
       snapshot) printf '{"runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture"}\n' ;;
-      active-launch-count) printf '0\n' ;;
+      active-launch-count) printf '%s\n' "${ACTIVE_LAUNCH_COUNT_MODE:-0}" ;;
       gap-state)
         [[ -f "${DB_STATE_ROOT}/gaps/${2}" ]] && cat "${DB_STATE_ROOT}/gaps/${2}" || printf 'MISSING\n'
         ;;
@@ -63,6 +63,10 @@ docker() {
   printf '%s\n' "$*" >> "${DOCKER_CALLS}"
   case "${operation}" in
     exec)
+      if [[ "$*" == *" test -x "* ]]; then
+        [[ "${SUPERVISOR_PRESENT_MODE:-present}" == present ]] || return 1
+        return 0
+      fi
       while [[ "$#" -gt 0 ]]; do
         if [[ "$1" == --control ]]; then control="$2"; generation="$3"; break; fi
         shift
@@ -71,8 +75,9 @@ docker() {
       ;;
     top)
       [[ "${OBSERVATION_MODE}" != top-failed && "${OBSERVATION_MODE}" != top-failed-running ]] || return 1
-      [[ "${OBSERVATION_MODE}" != children ]] || printf '10001\n10002\n10003\n'
-      [[ "${OBSERVATION_MODE}" == children ]] || printf '10001\n'
+      printf 'PID UID\n'
+      [[ "${OBSERVATION_MODE}" != children ]] || printf '11 10001\n12 10002\n13 10003\n'
+      [[ "${OBSERVATION_MODE}" == children ]] || printf '11 10001\n'
       ;;
     inspect)
       [[ "${OBSERVATION_MODE}" != failed ]] || return 1
@@ -174,6 +179,35 @@ write_fence_fallback DISABLED_PENDING_DB 7
 grep -Fq \
   "run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges=true --mount type=bind,src=${FENCE_ROOT},dst=/var/lib/fukurou/launch-fence --entrypoint ${SUPERVISOR_BINARY} ${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST} --fence-write DISABLED_PENDING_DB 7" \
   "${DOCKER_CALLS}"
+
+SUPERVISOR_PRESENT_MODE=present
+TARGET_GENERATION=9
+: > "${DOCKER_CALLS}"
+enable_restored_runtime
+[[ "${RESTORED_ENABLE_METHOD}" == supervisor ]]
+grep -Fq -- "--control ENABLE 9" "${DOCKER_CALLS}"
+if grep -Fq -- "--fence-write ENABLED 9" "${DOCKER_CALLS}"; then
+  echo "deploy-runtime-selftest: supervisor enable used fence fallback" >&2
+  exit 1
+fi
+
+SUPERVISOR_PRESENT_MODE=absent
+: > "${DOCKER_CALLS}"
+enable_restored_runtime
+[[ "${RESTORED_ENABLE_METHOD}" == fence-fallback ]]
+grep -Fq -- "--fence-write ENABLED 9" "${DOCKER_CALLS}"
+if grep -Fq -- "--control ENABLE 9" "${DOCKER_CALLS}"; then
+  echo "deploy-runtime-selftest: fence fallback still requested supervisor enable" >&2
+  exit 1
+fi
+
+ACTIVE_LAUNCH_COUNT_MODE=1
+if (enable_restored_runtime >/dev/null 2>&1); then
+  echo "deploy-runtime-selftest: fence fallback ignored active launches" >&2
+  exit 1
+fi
+ACTIVE_LAUNCH_COUNT_MODE=0
+SUPERVISOR_PRESENT_MODE=present
 
 create_recovery_fixture() {
   local deployment_id="$1" terminal_state="$2"
@@ -303,8 +337,18 @@ set -e
 
 DEPLOYMENT_ID=new-candidate
 unset FUKUROU_IMAGE_REFERENCE FUKUROU_IMAGE_TAG
+# production と同じく ERR trap を装着した状態で resume する。subshell recovery の
+# 非ゼロ終了へ trap が再発火して executor を終了させる回帰をここで捕捉する。
+set -E
+trap 'echo "deploy-runtime-selftest: parent ERR trap fired during resume" >&2; exit 1' ERR
 recover_unfinished_deployments
+trap - ERR
+set +E
 [[ "${FUKUROU_IMAGE_TAG}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
+if [[ -n "${GAP_DEPLOYMENT_ID:-}" ]]; then
+  echo "deploy-runtime-selftest: resume leaked GAP_DEPLOYMENT_ID=${GAP_DEPLOYMENT_ID}" >&2
+  exit 1
+fi
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do
   [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK || \
      "$(tail -n 1 "${journal}" | jq -r '.state')" == COMPLETE ]]

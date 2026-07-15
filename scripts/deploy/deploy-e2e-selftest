@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# production-like E2E selftest。
+#
+# 実 deploy executor を Linux harness container 内で root 実行し、local registry へ
+# push した実 candidate image・使い捨て PostgreSQL・実 lifecycle canary で、
+# deploy transaction 全体を production と同じ経路で完走させる。
+#
+# シナリオ:
+#   1: 稼働中 PRE_FOUNDATION production への foundation 初回導入 → cutover 成功
+#   2: candidate preflight (canary) 失敗 → durable recovery → 旧 image への
+#      fence-fallback ENABLE を含む ROLLED_BACK terminal
+#   3: 未終端 RECOVERY_STARTED journal + maintenance enabled + fence
+#      DISABLED_PENDING_DB + supervisor 非搭載旧 image という production 再現状態
+#      からの次 deploy 起動 → 自動 recovery 完遂 → 本 deploy 成功
+#
+# 手動実行前提（CI 常時実行には重い）。Docker daemon・外向き network・数十分の
+# 実行時間（初回は image build を含む）が必要。
+#
+# 環境変数:
+#   FUKUROU_E2E_SCENARIOS  実行シナリオ（default: "1 2 3"）
+#   FUKUROU_E2E_KEEP=1     失敗調査用に sandbox とコンテナ群を残す
+#   FUKUROU_E2E_CANDIDATE_IMAGE  build 済み candidate image を再利用する
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+readonly HEAD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+readonly SCENARIOS="${FUKUROU_E2E_SCENARIOS:-1 2 3}"
+
+readonly REGISTRY_NAME="fukurou-e2e-registry"
+readonly REGISTRY_PORT=5001
+readonly LOCAL_REPOSITORY="localhost:${REGISTRY_PORT}/fukurou-e2e"
+readonly HARNESS_IMAGE="fukurou-e2e-harness:local"
+
+sandbox_base=/tmp
+[[ -d /private/tmp ]] && sandbox_base=/private/tmp
+WORK="$(mktemp -d "${sandbox_base}/fukurou-e2e.XXXXXX")"
+readonly WORK
+readonly DEPLOY_ROOT="${WORK}/root"
+readonly COMPOSE_FILE="${DEPLOY_ROOT}/repo/docker-compose.prod.yml"
+
+log() { printf 'deploy-e2e-selftest: %s\n' "$*" >&2; }
+fail() { log "FAIL: $*"; exit 1; }
+
+# compose の `name: fukurou` を上書きし、ローカル開発 DB（fukurou_pgdata 等）と
+# volume / network を完全に分離する。container_name（fukurou-ktor 等）は
+# compose file 側で固定のため、既存 container が居る環境では実行を拒否する。
+readonly COMPOSE_PROJECT_NAME=fukurou-e2e
+export COMPOSE_PROJECT_NAME
+
+compose() {
+  docker compose --env-file "${DEPLOY_ROOT}/.env" -f "${COMPOSE_FILE}" "$@"
+}
+
+require_exclusive_container_names() {
+  local existing
+  existing="$(docker ps -a --filter name='^fukurou-(ktor|postgres|cloudflared)$' \
+    --format '{{.Names}} {{.Label "com.docker.compose.project"}}' \
+    | awk -v project="${COMPOSE_PROJECT_NAME}" '$2 != project { print $1 }')"
+  [[ -z "${existing}" ]] || \
+    fail "production container names are in use by another compose project: ${existing}. Stop local dev containers first."
+}
+
+cleanup() {
+  local status=$?
+  if [[ "${FUKUROU_E2E_KEEP:-0}" == 1 ]]; then
+    log "keeping sandbox at ${WORK} (FUKUROU_E2E_KEEP=1)"
+    return "${status}"
+  fi
+  FUKUROU_IMAGE_REFERENCE="${LOCAL_REPOSITORY}:cleanup" FUKUROU_IMAGE_TAG="${LOCAL_REPOSITORY}:cleanup" \
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+  docker rm -f "${REGISTRY_NAME}" >/dev/null 2>&1 || true
+  # E2E の deployment ID は e2e- prefix 固定。実 deploy の canary（fukurou-canary-github-*）を
+  # 共有ホストで巻き込まないよう、削除対象を E2E 由来の canary に限定する。
+  docker ps -aq --filter "name=fukurou-canary-e2e-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+  rm -rf "${WORK}"
+  return "${status}"
+}
+trap cleanup EXIT
+
+require_command() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
+for command in docker git jq openssl shasum; do require_command "${command}"; done
+
+sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+# --- 1. local registry と image 群 ---------------------------------------
+
+provision_registry() {
+  docker rm -f "${REGISTRY_NAME}" >/dev/null 2>&1 || true
+  docker run -d --name "${REGISTRY_NAME}" -p "127.0.0.1:${REGISTRY_PORT}:5000" registry:2 >/dev/null
+}
+
+resolve_pushed_digest() {
+  docker image inspect --format '{{join .RepoDigests "\n"}}' "$1" \
+    | awk -F@ -v repo="${LOCAL_REPOSITORY}" '$1 == repo { print $2; exit }'
+}
+
+build_and_push_images() {
+  local candidate_tag="${LOCAL_REPOSITORY}:candidate"
+
+  if [[ -n "${FUKUROU_E2E_CANDIDATE_IMAGE:-}" ]]; then
+    docker tag "${FUKUROU_E2E_CANDIDATE_IMAGE}" "${candidate_tag}"
+  else
+    log "building candidate image from ${HEAD_SHA} (initial build takes a while)"
+    docker build --build-arg "FUKUROU_REVISION=${HEAD_SHA}" -t "${candidate_tag}" "${REPO_ROOT}"
+  fi
+  docker push "${candidate_tag}" >/dev/null
+  CANDIDATE_DIGEST="$(resolve_pushed_digest "${candidate_tag}")"
+  [[ "${CANDIDATE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "candidate digest is unavailable"
+
+  # production の旧 revision 相当: supervisor 非搭載・java 直接起動の PRE_FOUNDATION image。
+  log "building PRE_FOUNDATION (supervisor-less) image"
+  docker build -t "${LOCAL_REPOSITORY}:old" - <<DOCKERFILE >/dev/null
+FROM ${LOCAL_REPOSITORY}:candidate
+USER root
+RUN rm /usr/local/libexec/fukurou-runtime-supervisor
+ENV FUKUROU_REVISION=e2e-pre-foundation
+USER 10001
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+DOCKERFILE
+  docker push "${LOCAL_REPOSITORY}:old" >/dev/null
+  OLD_DIGEST="$(resolve_pushed_digest "${LOCAL_REPOSITORY}:old")"
+  [[ "${OLD_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "old image digest is unavailable"
+
+  log "building executor harness image"
+  docker build -t "${HARNESS_IMAGE}" - <<'DOCKERFILE' >/dev/null
+FROM docker:27-cli
+RUN apk add --no-cache bash coreutils util-linux git jq openssl grep gawk findutils \
+    && install -m 0555 /bin/true /usr/local/libexec/fukurou-runtime-supervisor
+DOCKERFILE
+}
+
+# --- 2. sandbox（NAS の /srv/fukurou 相当） --------------------------------
+
+provision_sandbox() {
+  mkdir -p "${DEPLOY_ROOT}/deploy-state" "${DEPLOY_ROOT}/secrets" "${WORK}/bin" "${WORK}/share" "${WORK}/keys" "${WORK}/tmp"
+  # flock は executor process の終了で解放される。scenario 間で lock file を削除すると
+  # Docker Desktop の共有 filesystem が次の mount で stale ENOENT を返すことがあるため、
+  # 一度だけ作成してそのまま使い回す。
+  touch "${WORK}/deploy.lock"
+
+  # executor は「candidate SHA が origin/main の祖先」を要求するため、sandbox 内の
+  # bare origin に refs/heads/main を HEAD へ向けて production の checkout 契約を再現する。
+  git clone --quiet --bare "${REPO_ROOT}" "${WORK}/origin.git"
+  git -C "${WORK}/origin.git" update-ref refs/heads/main "${HEAD_SHA}"
+  git clone --quiet "${WORK}/origin.git" "${DEPLOY_ROOT}/repo"
+  git -C "${DEPLOY_ROOT}/repo" checkout --quiet --detach "${HEAD_SHA}"
+
+  cp "${REPO_ROOT}/scripts/deploy/deploy-fukurou" "${WORK}/bin/deploy-fukurou"
+  cp "${REPO_ROOT}/scripts/deploy/fukurou-deploy-db" "${WORK}/bin/fukurou-deploy-db"
+  cp "${REPO_ROOT}/scripts/mcp-credential-isolation-check" "${WORK}/bin/mcp-credential-isolation-check"
+  cp "${REPO_ROOT}/scripts/deploy/sql/mcp-role.sql" "${WORK}/share/mcp-role.sql"
+  cp "${REPO_ROOT}/scripts/deploy/sql/deploy-foundation-v1.sql" "${WORK}/share/deploy-foundation-v1.sql"
+  cp "${REPO_ROOT}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql" "${WORK}/share/deploy-foundation-v1-indexes.sql"
+  cp "${REPO_ROOT}/scripts/deploy/deploy-capability-catalog-v1.json" "${WORK}/share/deploy-capability-catalog-v1.json"
+  chmod 0755 "${WORK}/bin/"*
+
+  openssl genpkey -algorithm ED25519 -out "${WORK}/keys/e2e-private.pem"
+  openssl pkey -in "${WORK}/keys/e2e-private.pem" -pubout -out "${WORK}/keys/e2e-public.pem"
+
+  printf 'e2e-mcp-password\n' > "${WORK}/mcp-db-password"
+  chmod 0600 "${WORK}/mcp-db-password"
+  mkdir -p "${WORK}/obsidian-vault"
+
+  # 値はすべて E2E 専用のダミー。secret は含まない。
+  cat > "${DEPLOY_ROOT}/.env" <<ENV
+POSTGRES_DB=fukurou
+POSTGRES_USER=fukurou
+POSTGRES_PASSWORD=fukurou-e2e-local
+FUKUROU_PUBLIC_ORIGIN=http://127.0.0.1:8080
+FUKUROU_MCP_DB_PASSWORD_FILE=${WORK}/mcp-db-password
+FUKUROU_OBSIDIAN_VAULT_PATH_HOST=${WORK}/obsidian-vault
+FUKUROU_LAUNCH_FENCE_ROOT_HOST=${DEPLOY_ROOT}/runtime/launch-fence
+CLOUDFLARED_TUNNEL_TOKEN=e2e-dummy-token
+ENV
+}
+
+# --- 3. 署名付き typed bundle（deploy workflow と同形） --------------------
+
+make_bundle() {
+  local deployment_id="$1" harness_path="$2"
+  local bundle_path="${WORK}/${deployment_id}-bundle.json"
+  local executor_hash foundation_harness_hash public_key_hash capability_catalog catalog_hash
+
+  executor_hash="$(sha256_file "${WORK}/bin/deploy-fukurou")"
+  foundation_harness_hash="$( { sha256_file "${harness_path}"; sha256_file "${WORK}/share/mcp-role.sql"; } | shasum -a 256 | awk '{print $1}')"
+  public_key_hash="$(sha256_file "${WORK}/keys/e2e-public.pem")"
+  capability_catalog="$(jq -cS . "${WORK}/share/deploy-capability-catalog-v1.json")"
+  catalog_hash="$(printf '%s' "${capability_catalog}" | shasum -a 256 | awk '{print $1}')"
+
+  jq -cS -n \
+    --arg deploymentId "${deployment_id}" \
+    --arg candidateSha "${HEAD_SHA}" \
+    --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
+    --arg executorSha256 "${executor_hash}" \
+    --arg foundationHarnessSha256 "${foundation_harness_hash}" \
+    --arg publicKeySha256 "${public_key_hash}" \
+    --argjson capabilityCatalog "${capability_catalog}" \
+    --arg capabilityCatalogHash "${catalog_hash}" \
+    '{deploymentId:$deploymentId,candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,
+      minimumContractVersion:1,
+      requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
+      requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+      capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
+      executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,foundationHarnessSha256:$foundationHarnessSha256,
+      operations:[
+        {capability:"CREATE_DIR_V1",operationId:"LAUNCH_FENCE_ROOT"},
+        {capability:"INSTALL_SECRET_REF_V1",operationId:"LLM_LAUNCH_SIGNING_KEY_V1"},
+        {capability:"DB_MIGRATION_V1",operationId:"INSTALL_FOUNDATION_V1"},
+        {capability:"DB_MAINTENANCE_V1",operationId:"SET_LAUNCH_MAINTENANCE"},
+        {capability:"DB_MAINTENANCE_V1",operationId:"OPEN_INFRASTRUCTURE_GAP"},
+        {capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_PREFLIGHT_V1"},
+        {capability:"RUN_COMPOSE_PROJECT_V1",operationId:"PRODUCTION"},
+        {capability:"DB_MAINTENANCE_V1",operationId:"CLOSE_INFRASTRUCTURE_GAP"},
+        {capability:"DB_MAINTENANCE_V1",operationId:"CLEAR_LAUNCH_MAINTENANCE"}
+      ]}' > "${bundle_path}"
+  openssl pkeyutl -sign -rawin -inkey "${WORK}/keys/e2e-private.pem" \
+    -in "${bundle_path}" -out "${bundle_path%.json}.sig"
+  printf '%s' "${bundle_path}"
+}
+
+# --- 4. harness container での executor 実行 -------------------------------
+
+run_executor() {
+  local bundle_path="$1" harness_path="$2"
+  shift 2
+  docker run --rm \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "${WORK}:${WORK}" \
+    -e "FUKUROU_DEPLOY_ROOT=${DEPLOY_ROOT}" \
+    -e "FUKUROU_DEPLOY_LOCK=${WORK}/deploy.lock" \
+    -e "FUKUROU_DEPLOY_PUBLIC_KEY=${WORK}/keys/e2e-public.pem" \
+    -e "FUKUROU_DEPLOY_CATALOG=${WORK}/share/deploy-capability-catalog-v1.json" \
+    -e "FUKUROU_DEPLOY_DB_HELPER=${WORK}/bin/fukurou-deploy-db" \
+    -e "FUKUROU_FOUNDATION_HARNESS=${harness_path}" \
+    -e "FUKUROU_FOUNDATION_HARNESS_SQL=${WORK}/share/mcp-role.sql" \
+    -e "FUKUROU_FOUNDATION_SQL=${WORK}/share/deploy-foundation-v1.sql" \
+    -e "FUKUROU_FOUNDATION_INDEX_SQL=${WORK}/share/deploy-foundation-v1-indexes.sql" \
+    -e "FUKUROU_IMAGE_REPOSITORY=${LOCAL_REPOSITORY}" \
+    -e "COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}" \
+    -e "TMPDIR=${WORK}/tmp" \
+    -e "FUKUROU_DEPLOY_HEALTH_TIMEOUT=360" \
+    "$@" \
+    "${HARNESS_IMAGE}" \
+    bash ${FUKUROU_E2E_TRACE:+-x} "${WORK}/bin/deploy-fukurou" --bundle "${bundle_path}" --signature "${bundle_path%.json}.sig" "${HEAD_SHA}"
+}
+
+run_in_harness() {
+  docker run --rm \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "${WORK}:${WORK}" \
+    -e "FUKUROU_DEPLOY_ROOT=${DEPLOY_ROOT}" \
+    -e "FUKUROU_DEPLOY_DB_HELPER=${WORK}/bin/fukurou-deploy-db" \
+    -e "FUKUROU_FOUNDATION_SQL=${WORK}/share/deploy-foundation-v1.sql" \
+    -e "FUKUROU_FOUNDATION_INDEX_SQL=${WORK}/share/deploy-foundation-v1-indexes.sql" \
+    -e "FUKUROU_IMAGE_REPOSITORY=${LOCAL_REPOSITORY}" \
+    -e "COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}" \
+    -e "TMPDIR=${WORK}/tmp" \
+    "${HARNESS_IMAGE}" bash -c "$1"
+}
+
+# --- 5. 検証ヘルパー -------------------------------------------------------
+
+production_psql() {
+  docker exec fukurou-postgres psql -X -v ON_ERROR_STOP=1 -U fukurou -d fukurou -Atc "$1"
+}
+
+journal_tail_state() {
+  tail -n 1 "${DEPLOY_ROOT}/deploy-state/$1/journal.jsonl" | jq -er '.state'
+}
+
+journal_tail_details() {
+  tail -n 1 "${DEPLOY_ROOT}/deploy-state/$1/journal.jsonl" | jq -cer '.details'
+}
+
+fence_state() {
+  jq -er '.state + ":" + (.generation | tostring)' "${DEPLOY_ROOT}/runtime/launch-fence/fence-v1"
+}
+
+application_revision() {
+  docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/revision
+}
+
+wait_for_application() {
+  local attempt=0
+  until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null 2>&1 \
+    && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    [[ "${attempt}" -lt 90 ]] || { docker logs --tail 40 fukurou-ktor >&2 || true; fail "application did not become healthy"; }
+    sleep 2
+  done
+}
+
+assert_equals() {
+  local label="$1" expected="$2" actual="$3"
+  [[ "${actual}" == "${expected}" ]] || fail "${label}: expected=${expected} actual=${actual}"
+}
+
+start_pre_foundation_production() {
+  FUKUROU_IMAGE_REFERENCE="${LOCAL_REPOSITORY}@${OLD_DIGEST}" FUKUROU_IMAGE_TAG="${LOCAL_REPOSITORY}@${OLD_DIGEST}" \
+    compose up -d --quiet-pull ktor >/dev/null
+  wait_for_application
+}
+
+reset_production() {
+  FUKUROU_IMAGE_REFERENCE="${LOCAL_REPOSITORY}@${OLD_DIGEST}" FUKUROU_IMAGE_TAG="${LOCAL_REPOSITORY}@${OLD_DIGEST}" \
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "${DEPLOY_ROOT}/deploy-state" "${DEPLOY_ROOT}/runtime" "${DEPLOY_ROOT}/secrets" "${DEPLOY_ROOT}/deploy-catalog-ledger"
+  mkdir -p "${DEPLOY_ROOT}/deploy-state" "${DEPLOY_ROOT}/secrets"
+}
+
+# --- シナリオ 1: PRE_FOUNDATION 稼働環境への初回 foundation 導入 -----------
+
+scenario_one() {
+  log "scenario 1: foundation install over running PRE_FOUNDATION production"
+  reset_production
+  start_pre_foundation_production
+
+  local bundle
+  bundle="$(make_bundle e2e-fresh-1 "${WORK}/bin/mcp-credential-isolation-check")"
+  run_executor "${bundle}" "${WORK}/bin/mcp-credential-isolation-check" \
+    || fail "scenario 1: executor failed"
+
+  assert_equals "scenario 1 journal" COMPLETE "$(journal_tail_state e2e-fresh-1)"
+  assert_equals "scenario 1 fence" "ENABLED:1" "$(fence_state)"
+  assert_equals "scenario 1 revision" "${HEAD_SHA}" "$(application_revision)"
+  assert_equals "scenario 1 maintenance" "f" "$(production_psql 'SELECT enabled FROM llm_launch_maintenance')"
+  assert_equals "scenario 1 gap" "CLOSE" \
+    "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-fresh-1' ORDER BY occurred_at DESC LIMIT 1")"
+  [[ -z "$(docker ps -aq --filter 'name=fukurou-canary-e2e-')" ]] || fail "scenario 1: canary containers were left behind"
+  log "scenario 1 PASS"
+}
+
+# --- シナリオ 2: canary 失敗 → fence-fallback 付き ROLLED_BACK -------------
+
+scenario_two() {
+  log "scenario 2: canary failure recovers to ROLLED_BACK with fence fallback"
+  reset_production
+  start_pre_foundation_production
+
+  printf '#!/bin/sh\nexit 1\n' > "${WORK}/bin/failing-canary"
+  chmod 0755 "${WORK}/bin/failing-canary"
+
+  local bundle
+  bundle="$(make_bundle e2e-canary-fail-1 "${WORK}/bin/failing-canary")"
+  if run_executor "${bundle}" "${WORK}/bin/failing-canary"; then
+    fail "scenario 2: executor unexpectedly succeeded"
+  fi
+
+  assert_equals "scenario 2 journal" ROLLED_BACK "$(journal_tail_state e2e-canary-fail-1)"
+  assert_equals "scenario 2 restore method" '{"restoredEnable":"fence-fallback"}' \
+    "$(journal_tail_details e2e-canary-fail-1)"
+  assert_equals "scenario 2 fence" "ENABLED:1" "$(fence_state)"
+  wait_for_application
+  assert_equals "scenario 2 revision" "e2e-pre-foundation" "$(application_revision)"
+  assert_equals "scenario 2 maintenance" "f" "$(production_psql 'SELECT enabled FROM llm_launch_maintenance')"
+  assert_equals "scenario 2 gap" "CLOSE" \
+    "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-canary-fail-1' ORDER BY occurred_at DESC LIMIT 1")"
+  log "scenario 2 PASS"
+}
+
+# --- シナリオ 3: production 再現の未終端 recovery からの resume ------------
+
+craft_dangling_recovery_state() {
+  local deployment_id="$1" state_dir="${DEPLOY_ROOT}/deploy-state/$1"
+  mkdir -p "${state_dir}" "${DEPLOY_ROOT}/runtime/launch-fence"
+
+  # 実 DB の runtime config snapshot と一致させる（recovery の CAS 検証対象）。
+  local snapshot
+  snapshot="$(run_in_harness "\"${WORK}/bin/fukurou-deploy-db\" snapshot")"
+
+  jq -n \
+    --arg deploymentId "${deployment_id}" \
+    --arg previousRepoSha "${HEAD_SHA}" \
+    --arg reference "${LOCAL_REPOSITORY}@${OLD_DIGEST}" \
+    --arg runtimeConfigVersion "$(jq -er '.runtimeConfigVersion' <<<"${snapshot}")" \
+    --arg runtimeConfigHash "$(jq -er '.runtimeConfigHash' <<<"${snapshot}")" \
+    '{deploymentId:$deploymentId,installKind:"FOUNDATION_V1",previousRepoSha:$previousRepoSha,
+      runtimeConfigVersion:$runtimeConfigVersion,runtimeConfigHash:$runtimeConfigHash,
+      launchMaintenance:{generation:1,enabled:true,deploymentId:$deploymentId},
+      runningContainer:{configuredImageReference:$reference,repoDigests:[$reference],revision:"e2e-pre-foundation"}}' \
+    > "${state_dir}/state.json"
+
+  cp "${COMPOSE_FILE}" "${state_dir}/docker-compose.prod.yml"
+
+  # 実 executor の journal_state を source して、production と同じ
+  # PREPARED → … → RECOVERY_STARTED の hash-chain journal を作る。
+  run_in_harness "
+    set -Eeuo pipefail
+    source '${WORK}/bin/deploy-fukurou'
+    ROLLBACK_STATE_DIR='${state_dir}'
+    journal_state PREPARED '{\"forwardBudgetSeconds\":1200,\"recoveryBudgetSeconds\":300}'
+    journal_state CAPTURED
+    journal_state SAFETY_MUTATION_STARTED
+    journal_state LAUNCHES_DISABLED
+    journal_state RECOVERY_STARTED '{\"failedExitCode\":1}'
+    CANDIDATE_DIGEST='${CANDIDATE_DIGEST}'
+    write_fence_fallback DISABLED_PENDING_DB 2
+    '${WORK}/bin/fukurou-deploy-db' maintenance-cas 0 false '' 2 true '${deployment_id}'
+    DEPLOYMENT_ID='${deployment_id}'
+    GAP_DEPLOYMENT_ID='${deployment_id}'
+    prepare_gap_event OPEN
+    append_prepared_gap_event
+  "
+}
+
+scenario_three() {
+  log "scenario 3: resume from production-shaped dangling recovery state"
+  reset_production
+  start_pre_foundation_production
+
+  # foundation 適用済み DB（installKind=FOUNDATION_V1 前提）を先に用意する。
+  run_in_harness "
+    set -Eeuo pipefail
+    '${WORK}/bin/fukurou-deploy-db' install-foundation
+    '${WORK}/bin/fukurou-deploy-db' install-indexes
+  "
+  craft_dangling_recovery_state e2e-dangling-1
+
+  local bundle
+  bundle="$(make_bundle e2e-resume-1 "${WORK}/bin/mcp-credential-isolation-check")"
+  run_executor "${bundle}" "${WORK}/bin/mcp-credential-isolation-check" \
+    || fail "scenario 3: executor failed"
+
+  assert_equals "scenario 3 recovered journal" ROLLED_BACK "$(journal_tail_state e2e-dangling-1)"
+  assert_equals "scenario 3 recovered method" '{"restoredEnable":"fence-fallback"}' \
+    "$(journal_tail_details e2e-dangling-1)"
+  assert_equals "scenario 3 deploy journal" COMPLETE "$(journal_tail_state e2e-resume-1)"
+  assert_equals "scenario 3 revision" "${HEAD_SHA}" "$(application_revision)"
+  assert_equals "scenario 3 maintenance" "f" "$(production_psql 'SELECT enabled FROM llm_launch_maintenance')"
+  assert_equals "scenario 3 recovered gap" "CLOSE" \
+    "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-dangling-1' ORDER BY occurred_at DESC LIMIT 1")"
+  assert_equals "scenario 3 deploy gap" "CLOSE" \
+    "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-resume-1' ORDER BY occurred_at DESC LIMIT 1")"
+  log "scenario 3 PASS"
+}
+
+# --- 実行 -------------------------------------------------------------------
+
+log "sandbox: ${WORK}"
+require_exclusive_container_names
+provision_registry
+build_and_push_images
+provision_sandbox
+
+for scenario in ${SCENARIOS}; do
+  case "${scenario}" in
+    1) scenario_one ;;
+    2) scenario_two ;;
+    3) scenario_three ;;
+    *) fail "unknown scenario: ${scenario}" ;;
+  esac
+done
+
+log "DEPLOY_E2E_SELFTEST_OK scenarios=${SCENARIOS// /,} head=${HEAD_SHA}"

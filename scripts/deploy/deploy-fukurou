@@ -10,7 +10,7 @@ readonly FENCE_ROOT="${DEPLOY_ROOT}/runtime/launch-fence"
 readonly LOCK_FILE="${FUKUROU_DEPLOY_LOCK:-/var/lock/fukurou-deploy.lock}"
 readonly COMPOSE_FILE="${REPO_DIR}/docker-compose.prod.yml"
 readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
-readonly IMAGE_REPOSITORY="ghcr.io/matsumo0922/fukurou"
+readonly IMAGE_REPOSITORY="${FUKUROU_IMAGE_REPOSITORY:-ghcr.io/matsumo0922/fukurou}"
 readonly PUBLIC_KEY="${FUKUROU_DEPLOY_PUBLIC_KEY:-/usr/local/share/fukurou/deploy-public-key.pem}"
 readonly INSTALLED_CATALOG="${FUKUROU_DEPLOY_CATALOG:-/usr/local/share/fukurou/deploy-capability-catalog-v1.json}"
 readonly CATALOG_LEDGER="${FUKUROU_DEPLOY_CATALOG_LEDGER:-${DEPLOY_ROOT}/deploy-catalog-ledger}"
@@ -21,6 +21,7 @@ readonly FOUNDATION_HARNESS_SQL="${FUKUROU_FOUNDATION_HARNESS_SQL:-/usr/local/sh
 readonly CANARY_PRIVATE_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519"
 readonly CANARY_PUBLIC_KEY="${DEPLOY_ROOT}/secrets/llm-launch-ed25519.pub"
 readonly IMAGE_RETENTION_COUNT="${FUKUROU_IMAGE_RETENTION_COUNT:-10}"
+readonly APPLICATION_HEALTH_TIMEOUT="${FUKUROU_DEPLOY_HEALTH_TIMEOUT:-120}"
 readonly APPLICATION_UID=10001
 readonly APPLICATION_GID=10001
 
@@ -599,6 +600,7 @@ rollback_on_error() {
   local origin_state
   origin_state="$(recovery_origin_state "${ROLLBACK_STATE_DIR}/journal.jsonl")"
   bind_recovery_image_reference || {
+    journal_state MANUAL_RECOVERY_REQUIRED '{"reason":"image-reference"}' || true
     echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_IMAGE_REFERENCE" >&2
     exit "${exit_code}"
   }
@@ -624,15 +626,18 @@ rollback_on_error() {
   [[ "${previous_reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || \
     previous_reference="${FUKUROU_IMAGE_REFERENCE}"
   [[ "${previous_reference}" =~ ^${IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$ ]] || {
+    journal_state MANUAL_RECOVERY_REQUIRED '{"reason":"previous-digest"}' || true
     echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_PREVIOUS_DIGEST" >&2; exit "${exit_code}";
   }
   previous_revision="$(jq -er '.runningContainer.revision | select(type == "string" and length > 0)' \
     "${ROLLBACK_STATE_DIR}/state.json")" || {
+    journal_state MANUAL_RECOVERY_REQUIRED '{"reason":"previous-revision"}' || true
     echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_PREVIOUS_REVISION" >&2; exit "${exit_code}";
   }
   current_snapshot="$(timeout 30 "${DB_HELPER}" snapshot)" || { echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_DB" >&2; exit "${exit_code}"; }
   [[ "$(jq -er '.runtimeConfigVersion' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_VERSION}" && \
       "$(jq -er '.runtimeConfigHash' <<<"${current_snapshot}")" == "${RUNTIME_CONFIG_HASH}" ]] || {
+    journal_state MANUAL_RECOVERY_REQUIRED '{"reason":"runtime-config-cas"}' || true
     echo "deploy-fukurou: RUNTIME_CONFIG_CAS_MISMATCH" >&2; exit "${exit_code}";
   }
   (( $(boottime_seconds) < RECOVERY_DEADLINE_BOOTTIME )) || exit "${exit_code}"
@@ -643,11 +648,13 @@ rollback_on_error() {
   timeout 120 docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d --no-build || exit "${exit_code}"
   [[ "$(timeout 10 docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${previous_reference}" ]] || exit "${exit_code}"
   [[ "$(timeout 10 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${previous_revision}" ]] || exit "${exit_code}"
-  timeout 120 bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done' || exit "${exit_code}"
+  timeout "${APPLICATION_HEALTH_TIMEOUT}" bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done' || exit "${exit_code}"
   timeout 30 "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}" || exit "${exit_code}"
-  if ! request_supervisor ENABLE "${TARGET_GENERATION}" >/dev/null; then
+  if ! enable_restored_runtime; then
     timeout 30 "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}" \
       "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" || true
+    journal_state MANUAL_RECOVERY_REQUIRED "{\"reason\":\"restored-runtime-enable-failed\",\"method\":\"${RESTORED_ENABLE_METHOD}\"}" || true
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_RESTORED_RUNTIME_ENABLE" >&2
     exit "${exit_code}"
   fi
   prepare_gap_event CLOSE || exit "${exit_code}"
@@ -655,7 +662,7 @@ rollback_on_error() {
     restore_disabled_after_resume_failure || true
     exit "${exit_code}"
   fi
-  journal_state ROLLED_BACK || true
+  journal_state ROLLED_BACK "{\"restoredEnable\":\"${RESTORED_ENABLE_METHOD}\"}" || true
   exit "${exit_code}"
 }
 
@@ -747,6 +754,25 @@ request_supervisor() {
     | grep -Fx "ACK ${operation} ${generation}"
 }
 
+restored_supervisor_available() {
+  timeout 10 docker exec fukurou-ktor test -x "${SUPERVISOR_BINARY}" >/dev/null 2>&1
+}
+
+enable_restored_runtime() {
+  RESTORED_ENABLE_METHOD=supervisor
+  if restored_supervisor_available; then
+    request_supervisor ENABLE "${TARGET_GENERATION}" >/dev/null
+    return
+  fi
+
+  # PRE_FOUNDATION image には supervisor が無く ENABLE を ACK できないため、
+  # supervisor の ENABLE と同じ前提（maintenance 解除済み・active launch 0）を
+  # executor 側で検証してから fence を ENABLED へ進める。
+  RESTORED_ENABLE_METHOD=fence-fallback
+  [[ "$(timeout 10 "${DB_HELPER}" active-launch-count)" == 0 ]] || return 1
+  write_fence_fallback ENABLED "${TARGET_GENERATION}"
+}
+
 assert_application_pid_zero() {
   local inspection existing_names running pid
   if inspection="$(timeout 10 docker inspect --format '{{.State.Running}}|{{.State.Pid}}' fukurou-ktor 2>/dev/null)"; then
@@ -767,8 +793,8 @@ assert_application_pid_zero() {
 
 observe_runtime_children() {
   local process_table
-  if process_table="$(timeout 10 docker top fukurou-ktor -eo uid=)"; then
-    awk '$1 == "10002" || $1 == "10003" { count++ } END { print count + 0 }' <<<"${process_table}"
+  if process_table="$(timeout 10 docker top fukurou-ktor -eo pid,uid)"; then
+    awk 'NR > 1 && ($2 == "10002" || $2 == "10003") { count++ } END { print count + 0 }' <<<"${process_table}"
     return 0
   fi
   if assert_application_pid_zero; then
@@ -921,15 +947,19 @@ recover_unfinished_deployments() {
     esac
     reassert_recovery_safe_boundary "${origin_state}" || fail "RECOVERY_SAFE_BOUNDARY_UNPROVEN:${DEPLOYMENT_ID}:${origin_state}"
     [[ "${last_state}" != RECOVERY_STARTED ]] || RECOVERY_ALREADY_STARTED=true
-    set +e
-    (false; rollback_on_error)
-    set -e
+    # subshell 内の rollback_on_error は明示呼び出しの1回に限定する。継承 ERR trap を
+    # 外さないと `false` で二重起動し、さらに subshell の非ゼロ終了に親の ERR trap が
+    # 再発火して、recovery 完了後の executor 本体を終了させる（`|| true` で抑止する）。
+    (set +e; trap - ERR; false; rollback_on_error) || true
     RECOVERY_ALREADY_STARTED=false
     recovered_state="$(tail -n 1 "${journal}" | jq -er '.state')" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
     [[ "${recovered_state}" == "ROLLED_BACK" ]] || fail "UNFINISHED_DEPLOYMENT_RECOVERY_FAILED:${DEPLOYMENT_ID}"
   done
   shopt -u nullglob
   DEPLOYMENT_ID="${candidate_deployment_id}"
+  # recovery が束縛した gap 対象を残すと、この後の forward path の OPEN が
+  # 旧 deployment の immutable boundary へ衝突する。
+  GAP_DEPLOYMENT_ID=""
 }
 
 accept_capability_catalog() {
@@ -991,20 +1021,21 @@ write_canary_compose() {
     --arg publicKey "${public_key}" --arg digest "${CANDIDATE_DIGEST}" --arg catalogHash "${CANDIDATE_CATALOG_HASH}" \
     --arg commandJson "${command_json}" \
     --argjson entrypoint "${entrypoint_json}" '
-      "services:\n  ktor:\n    container_name: \($containerName)\n    restart: \"no\"\n    pids_limit: 64\n    cap_add: !override [SETGID, SETUID]\n    depends_on: !reset {}\n    environment:\n      DB_URL: null\n      DB_USER: null\n      DB_PASSWORD: null\n      FUKUROU_CANDIDATE_DIGEST: \"\($digest)\"\n      FUKUROU_CANDIDATE_CATALOG_HASH: \"\($catalogHash)\"\n    volumes: !override\n      - type: bind\n        source: \($token)\n        target: /canary-token.json\n        read_only: true\n      - type: bind\n        source: \($signature)\n        target: /canary-token.sig\n        read_only: true\n      - type: bind\n        source: \($publicKey)\n        target: /canary-public.pem\n        read_only: true\n    networks: !override [fixture]\n    command: \($commandJson)\n  postgres:\n    profiles: [production-only]\n  cloudflared:\n    profiles: [production-only]\nnetworks:\n  fixture:\n    internal: true\n"' > "${output}"
+      "services:\n  ktor:\n    container_name: \($containerName)\n    restart: \"no\"\n    pids_limit: 64\n    cap_add: !override [SETGID, SETPCAP, SETUID]\n    depends_on: !reset {}\n    environment:\n      DB_URL: null\n      DB_USER: null\n      DB_PASSWORD: null\n      FUKUROU_CANDIDATE_DIGEST: \"\($digest)\"\n      FUKUROU_CANDIDATE_CATALOG_HASH: \"\($catalogHash)\"\n    volumes: !override\n      - type: bind\n        source: \($token)\n        target: /canary-token.json\n        read_only: true\n      - type: bind\n        source: \($signature)\n        target: /canary-token.sig\n        read_only: true\n      - type: bind\n        source: \($publicKey)\n        target: /canary-public.pem\n        read_only: true\n    networks: !override [fixture]\n    command: \($commandJson)\n  postgres:\n    profiles: [production-only]\n  cloudflared:\n    profiles: [production-only]\nnetworks:\n  fixture:\n    internal: true\n"' > "${output}"
 }
 
 validate_canary_compose_json() {
-  jq -e --arg digest "${CANDIDATE_DIGEST}" --arg catalogHash "${CANDIDATE_CATALOG_HASH}" '
+  jq -e --arg digest "${CANDIDATE_DIGEST}" --arg catalogHash "${CANDIDATE_CATALOG_HASH}" \
+    --arg repository "${IMAGE_REPOSITORY}" '
     (.services | keys) == ["ktor"] and
     .services.ktor.read_only == true and .services.ktor.pids_limit == 64 and
     (.services.ktor.depends_on // {}) == {} and
     (.services.ktor.cap_drop | index("ALL")) != null and
-    (.services.ktor.cap_add | sort) == ["SETGID","SETUID"] and
+    (.services.ktor.cap_add | sort) == ["SETGID","SETPCAP","SETUID"] and
     ([.services.ktor.environment | to_entries[] | select(.key | startswith("DB_")) | select(.value != null)] | length) == 0 and
     .services.ktor.environment.FUKUROU_CANDIDATE_DIGEST == $digest and
     .services.ktor.environment.FUKUROU_CANDIDATE_CATALOG_HASH == $catalogHash and
-    .services.ktor.environment.FUKUROU_LLM_IMAGE_DIGEST == ("ghcr.io/matsumo0922/fukurou@" + $digest) and
+    .services.ktor.environment.FUKUROU_LLM_IMAGE_DIGEST == ($repository + "@" + $digest) and
     (.services.ktor.networks | keys) == ["fixture"] and
     .networks.fixture.internal == true and
     (.services.ktor.volumes | length) == 3 and
@@ -1205,7 +1236,7 @@ deploy_compose() {
   [[ "$(timeout 10 docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${FUKUROU_IMAGE_REFERENCE}" ]] || fail "COMPOSE_CONFIG_IMAGE_MISMATCH"
   [[ "$(timeout 10 docker image inspect --format '{{join .RepoDigests "|"}}' "$(timeout 10 docker inspect --format '{{.Image}}' fukurou-ktor)")" == *"${FUKUROU_IMAGE_REFERENCE}"* ]] || fail "RUNNING_IMAGE_DIGEST_MISMATCH"
   [[ "$(timeout 10 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${DEPLOY_SHA}" ]] || fail "RUNNING_REVISION_MISMATCH"
-  timeout 120 bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done'
+  timeout "${APPLICATION_HEALTH_TIMEOUT}" bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done'
   [[ "$(timeout 10 docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/revision)" == *"${DEPLOY_SHA}"* ]] || fail "HTTP_REVISION_MISMATCH"
   journal_state CANDIDATE_HEALTHY
   record_operation_dispatch PRODUCTION

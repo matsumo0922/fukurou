@@ -44,8 +44,10 @@ class ProcessLlmCliVersionProbe(
 
     private fun probeOnce(request: LlmCliVersionProbeRequest): Result<String> = runCatching {
         require(request.command.isNotEmpty()) { "CLI version probe command is empty." }
+        // stdout と stderr を同一 pipe へ束ねると supervisor の duplicate-descriptor 検査が
+        // spawn を拒否するため、stderr は分離して破棄し、version は stdout だけから読む。
         val process = ProcessBuilder(request.command)
-            .redirectErrorStream(true)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
             .start()
         val completed = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)
         if (!completed) {

@@ -205,6 +205,18 @@ docker build --target launcher-build -t fukurou-launcher-build:selftest .
 docker run --rm fukurou-launcher-build:selftest ./fukurou-runtime-supervisor --protocol-selftest
 ```
 
+`deploy-e2e-selftest` は deploy transaction 全体の production-like E2E である。local registry へ push した実 candidate image、supervisor 非搭載の PRE_FOUNDATION 相当 image、使い捨て PostgreSQL、実 lifecycle canary を使い、実 executor を Linux harness container 内で root 実行する。scenario は (1) 稼働中 PRE_FOUNDATION production への foundation 導入成功、(2) canary 失敗から旧 image への fence-fallback ENABLE を含む `ROLLED_BACK` terminal、(3) 未終端 `RECOVERY_STARTED` journal・maintenance enabled・fence `DISABLED_PENDING_DB` という状態からの次 deploy 起動と自動 recovery 完遂をカバーする。実行時間が長いため手動実行前提とし、deploy executor・DB helper・lifecycle canary・compose・foundation schema のいずれかを変更する PR は、merge 前に同一 HEAD でこの selftest を完走させた evidence を PR に添付する。selftest は compose project `fukurou-e2e` に隔離して実行する（ローカル開発 DB の volume には触れない）が、`fukurou-ktor` / `fukurou-postgres` の container 名は production compose 側で固定のため、同名 container が稼働中の環境では実行を拒否する。
+
+```sh
+scripts/deploy/deploy-e2e-selftest                     # 全 scenario
+FUKUROU_E2E_SCENARIOS="2 3" scripts/deploy/deploy-e2e-selftest  # scenario 選択
+FUKUROU_E2E_KEEP=1 scripts/deploy/deploy-e2e-selftest  # 失敗調査時に sandbox を残す
+```
+
+executor は `FUKUROU_IMAGE_REPOSITORY`（default `ghcr.io/matsumo0922/fukurou`）と `FUKUROU_DEPLOY_HEALTH_TIMEOUT`（application health 待ちの秒数、default 120）を env で上書きできる。どちらも E2E selftest が local registry と遅い開発機のために使う seam であり、production（NAS）は default 値で運用する。
+
+recovery が復元した container に supervisor が存在しない場合（PRE_FOUNDATION image への rollback）、executor は supervisor ENABLE の代わりに active launch 0 を検証したうえで launch fence を直接 `ENABLED` へ書き込み、journal の `ROLLED_BACK` に `restoredEnable: "fence-fallback"` を記録する。recovery が deterministic に継続不能な場合（state.json の image reference / revision 不正、runtime config CAS 不一致、restored runtime の ENABLE 失敗）は terminal `MANUAL_RECOVERY_REQUIRED` を理由付きで journal へ書く。transient な失敗（docker / DB timeout 等）は journal を `RECOVERY_STARTED` のまま残し、次回 deploy 起動時の自動 recovery で再試行される。
+
 production cutoverとLLM phase manifestのimage referenceは、どちらもcandidate digestを含む同じimmutable referenceである。executorはcheckout前とrollback時に保存済みcomposeとの互換変数にも同じimmutable referenceを束縛し、tagへ退行させない。commit tagは表示用で、pull、create、health後にconfigured reference、image ID/repo digest、`/revision`を照合する。executorはrollback capture前にproduction composeをrender検証し、失敗時はstageとstable reasonを出して未確定の一時stateを削除する。executorはlock取得の共通起点からforward 20分、recoveryは同じ起点から25分（forward終了後は最大5分）のabsolute budgetを持ち、TERM/INT/HUP/deadlineでもjournalからrecoveryへ入る。`FRESH` / `PRE_FOUNDATION`は旧serviceを自動再開せず、maintenance/fence/gapを閉じない。
 
 ## NAS image 保持
