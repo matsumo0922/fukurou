@@ -37,10 +37,7 @@ class ExposedRestingOrderMaintenanceService(
     override suspend fun observe(observedAt: Instant): Result<Unit> = runCatching {
         tradingLock.withLock(LIFECYCLE_LOCK_OWNER) {
             withContext(Dispatchers.IO) {
-                transaction(database) {
-                    acquireGapPopulationGenerationToken()
-                    closePersistedTerminalEpisodes(observedAt)
-                }
+                transaction(database) { closePersistedTerminalEpisodes(observedAt) }
             }
         }
     }
@@ -306,7 +303,6 @@ class ExposedRestingOrderMaintenanceService(
     private suspend fun observeTerminalLifecycle(observation: MaintenanceObservation) = withContext(Dispatchers.IO) {
         val identity = observation.identity ?: return@withContext
         transaction(database) {
-            acquireGapPopulationGenerationToken()
             val terminalReason = when {
                 observation.invalidationState == TradePlanInvalidationState.INVALIDATED -> "TYPED_INVALIDATION"
                 hasFilledEntry(identity.episodeId) -> "ENTRY_FILL"

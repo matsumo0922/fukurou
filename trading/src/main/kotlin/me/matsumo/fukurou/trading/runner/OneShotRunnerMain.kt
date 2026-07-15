@@ -8,7 +8,6 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LLM_LAUNCH_DISABLED
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
-import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
@@ -120,11 +119,6 @@ internal suspend fun launchOneShotRunnerWithRuntime(
             hourlyWindow = Duration.ofHours(1),
             dailyWindow = Duration.ofHours(24),
             activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
-            populationScope = LlmLaunchReservationPopulationScope(
-                kind = "SYMBOL",
-                mode = tradingConfig.mode,
-                symbol = tradingConfig.symbol,
-            ),
         ),
     ).getOrThrow()
     check(reservation is LlmLaunchReservationOutcome.Reserved) {

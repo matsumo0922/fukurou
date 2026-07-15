@@ -112,13 +112,13 @@ SELECT format(
     :'mcp_role'
 )
 FROM (VALUES
-    ('command_event_log'), ('paper_account'), ('risk_state'),
+    ('command_event_log'), ('paper_account'), ('positions'), ('orders'), ('risk_state'),
     ('executions'), ('market_data_sessions'), ('market_data_gaps'), ('trade_intents'),
     ('trade_plans'), ('falsifications'), ('trade_intent_consumptions'), ('decisions'),
     ('evaluation_exclusions'), ('infrastructure_gap_events'), ('safety_violations'),
     ('decision_material_state_manifests'), ('decision_identity_schema_boundaries'),
     ('decision_identity_generation_failures'),
-    ('dedupe_shadow_observations'), ('dedupe_shadow_resolutions'),
+    ('opportunity_episodes'), ('dedupe_shadow_observations'), ('dedupe_shadow_resolutions'),
     ('mcp_current_evaluation_scope'), ('mcp_evaluation_epochs')
 ) AS inventory(table_name) \gexec
 

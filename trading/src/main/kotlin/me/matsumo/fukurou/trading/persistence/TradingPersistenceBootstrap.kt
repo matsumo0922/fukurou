@@ -1271,7 +1271,6 @@ class TradingPersistenceBootstrap(
                 }
                 ensurePaperAccount(now, paperAccountConfig)
                 ensureLegacyPaperAccountEpoch(now)
-                acquireGapPopulationGenerationToken()
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
                 jdbcConnection().prepareStatement(
@@ -1285,6 +1284,11 @@ class TradingPersistenceBootstrap(
                     statement.setString(2, LLM_RUN_STATUS_RUNNING)
                     statement.executeUpdate()
                 }
+                recoverStaleLlmRunLifecycle(
+                    now = now,
+                    threshold = staleLlmRunRecoveryThreshold,
+                    previousGenerationTerminated = false,
+                )
             }
 
             Unit
@@ -1378,25 +1382,12 @@ class TradingPersistenceBootstrap(
 
     /** single-instance の旧 process generation 終了確認後だけ CLAIMED stale lifecycle を回収する。 */
     fun recoverPreviousGeneration(): Result<Int> = runCatching {
-        recoverStaleLlmRunLifecycles(
-            now = Instant.now(clock),
-            previousGenerationTerminated = true,
-        )
-    }
-
-    /** immutable scope ごとの transaction で stale lifecycle を回収する。 */
-    private fun recoverStaleLlmRunLifecycles(now: Instant, previousGenerationTerminated: Boolean): Int {
-        val invocationIds = exposedTransaction(database) { selectLlmLifecycleInvocationIds() }
-
-        return invocationIds.sumOf { invocationId ->
-            exposedTransaction(database) {
-                recoverStaleLlmRunLifecycle(
-                    invocationId = invocationId,
-                    now = now,
-                    threshold = staleLlmRunRecoveryThreshold,
-                    previousGenerationTerminated = previousGenerationTerminated,
-                )
-            }
+        exposedTransaction(database) {
+            recoverStaleLlmRunLifecycle(
+                now = Instant.now(clock),
+                threshold = staleLlmRunRecoveryThreshold,
+                previousGenerationTerminated = true,
+            )
         }
     }
 }
@@ -1624,7 +1615,6 @@ private fun Duration.toPostgresTimeout(): String = "${toMillis()}ms"
  */
 private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
     verifyRuntimeConfigSchema()
-    verifyGapPopulationLifecycleSchema()
     verifyAccountRuntimeSchemaObjects()
     verifyLedgerRuntimeSchemaObjects()
     verifyDecisionRuntimeSchemaObjects()
@@ -1846,17 +1836,22 @@ internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
     }
 }
 
-/** stale run と対応する RUNNING reservation を entity scope transaction 内で回収する。 */
+/**
+ * stale な RUNNING llm_runs を FAILED へ回収する。
+ */
+internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Duration): Int {
+    return recoverStaleLlmRunLifecycle(now, threshold, previousGenerationTerminated = false)
+}
+
+/** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
 internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
-    invocationId: String,
     now: Instant,
     threshold: Duration,
     previousGenerationTerminated: Boolean = false,
 ): Int {
-    acquireLlmLifecycleGapPopulationToken(invocationId)
     val cutoff = now.minus(threshold)
-    val reservations = selectRunningLlmReservationsForUpdate(invocationId)
-    val runs = selectLifecycleRunsForUpdate(invocationId)
+    val reservations = selectRunningLlmReservationsForUpdate()
+    val runs = selectLifecycleRunsForUpdate()
     val runsByInvocationId = runs.associateBy(LockedLlmRun::invocationId)
     val reservationsByInvocationId = reservations.associateBy(LockedLlmReservation::invocationId)
     val recoveries = (runsByInvocationId.keys + reservationsByInvocationId.keys)
@@ -1874,68 +1869,6 @@ internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
     recoveries.forEach { recovery -> insertLlmInvocationRecoveryEvent(recovery, now) }
 
     return recoveries.count { recovery -> recovery.runRecovered }
-}
-
-private fun JdbcTransaction.selectLlmLifecycleInvocationIds(): List<String> {
-    val sql = """
-        SELECT run.invocation_id
-        FROM llm_runs AS run
-        WHERE run.status = ?
-            AND (
-                EXISTS (
-                    SELECT 1
-                    FROM llm_launch_reservations AS reservation
-                    JOIN gap_population_entity_scopes AS scope
-                        ON scope.entity_type = 'LLM_RESERVATION' AND scope.entity_id = reservation.id::text
-                    WHERE reservation.invocation_id = run.invocation_id
-                )
-                OR (
-                    NOT EXISTS (
-                        SELECT 1 FROM llm_launch_reservations AS reservation
-                        WHERE reservation.invocation_id = run.invocation_id
-                    )
-                    AND EXISTS (
-                        SELECT 1 FROM gap_population_entity_scopes AS scope
-                        WHERE scope.entity_type = 'LLM_RUN' AND scope.entity_id = run.invocation_id
-                    )
-                )
-            )
-        UNION
-        SELECT reservation.invocation_id
-        FROM llm_launch_reservations AS reservation
-        WHERE reservation.status = ?
-            AND EXISTS (
-                SELECT 1 FROM gap_population_entity_scopes AS scope
-                WHERE scope.entity_type = 'LLM_RESERVATION' AND scope.entity_id = reservation.id::text
-            )
-        ORDER BY invocation_id ASC
-    """.trimIndent()
-
-    return jdbcConnection().prepareStatement(sql).use { statement ->
-        statement.setString(1, LLM_RUN_STATUS_RUNNING)
-        statement.setString(2, "RUNNING")
-        statement.executeQuery().use { resultSet ->
-            buildList {
-                while (resultSet.next()) add(resultSet.getString(1))
-            }
-        }
-    }
-}
-
-private fun JdbcTransaction.acquireLlmLifecycleGapPopulationToken(invocationId: String) {
-    val reservationEntityId = jdbcConnection().prepareStatement(
-        "SELECT id::text FROM llm_launch_reservations WHERE invocation_id = ?",
-    ).use { statement ->
-        statement.setString(1, invocationId)
-        statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.getString(1) else null
-        }
-    }
-    if (reservationEntityId != null) {
-        acquireGapPopulationGenerationTokenForEntity("LLM_RESERVATION", reservationEntityId)
-    } else {
-        acquireGapPopulationGenerationTokenForEntity("LLM_RUN", invocationId)
-    }
 }
 
 private data class LockedLlmRun(
@@ -1974,20 +1907,19 @@ private data class StaleLlmInvocationRecovery(
     val runtimeConfigHash: String?,
 )
 
-private fun JdbcTransaction.selectLifecycleRunsForUpdate(invocationId: String): List<LockedLlmRun> {
+private fun JdbcTransaction.selectLifecycleRunsForUpdate(): List<LockedLlmRun> {
     val sql = """
         SELECT invocation_id, status, trigger_kind, started_at, runtime_config_version_id, runtime_config_hash
         FROM llm_runs
-        WHERE (status = ? OR invocation_id IN (
+        WHERE status = ? OR invocation_id IN (
             SELECT invocation_id FROM llm_launch_reservations WHERE status = 'RUNNING'
-        )) AND invocation_id = ?
+        )
         ORDER BY invocation_id ASC
         FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, LLM_RUN_STATUS_RUNNING)
-        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
@@ -2007,19 +1939,18 @@ private fun JdbcTransaction.selectLifecycleRunsForUpdate(invocationId: String): 
     }
 }
 
-private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(invocationId: String): List<LockedLlmReservation> {
+private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<LockedLlmReservation> {
     val sql = """
         SELECT invocation_id, trigger_kind, trigger_key, reserved_at, execution_claim_state,
             execution_claim_token, execution_claimed_at, execution_claim_heartbeat_at
         FROM llm_launch_reservations
-        WHERE status = ? AND invocation_id = ?
+        WHERE status = ?
         ORDER BY invocation_id ASC
         FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, "RUNNING")
-        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {

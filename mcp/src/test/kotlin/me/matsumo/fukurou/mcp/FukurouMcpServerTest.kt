@@ -2479,11 +2479,8 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
                     "JOIN pg_class relation ON relation.oid=attribute.attrelid " +
                     "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace " +
                     "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl " +
-                    "WHERE namespace.nspname='public' AND acl.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')) " +
-                    "AND attribute.attname IN ('birth_sequence','population_scope_kind','population_mode'," +
-                    "'population_symbol','population_account_epoch_id','population_cohort'," +
-                    "'population_execution_semantics_version','scope_hash')",
-                0,
+                    "WHERE namespace.nspname='public' AND acl.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'))",
+                2,
             )
             if (includeFutureBoundary) {
                 statement.executeQuery(
@@ -2508,16 +2505,6 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
             assertSqlCount(
                 statement,
                 "SELECT count(*) FROM information_schema.role_usage_grants WHERE grantee='$MCP_TEST_ROLE' AND object_schema='public'",
-                0,
-            )
-            assertSqlCount(
-                statement,
-                "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='$MCP_TEST_ROLE' " +
-                    "AND table_name IN ('gap_population_control','market_data_gap_work','market_data_gap_work_evidence'," +
-                    "'market_data_gap_population_generations','market_data_gap_population_members'," +
-                    "'market_data_gap_terminal_journal','market_data_gap_recovery_progress'," +
-                    "'gap_population_entity_scopes','gap_population_unattributed_containments'," +
-                    "'gap_population_unattributed_containment_works')",
                 0,
             )
         }

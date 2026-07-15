@@ -455,9 +455,6 @@ class ExposedDecisionRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    submission.entryIntent?.let { intent ->
-                        acquireOpportunityEpisodeGapPopulationToken(intent.symbol.apiSymbol)
-                    }
                     insertDecisionSubmission(submission, clock.instant(), maxTradePlanRevisions)
                 }
             }

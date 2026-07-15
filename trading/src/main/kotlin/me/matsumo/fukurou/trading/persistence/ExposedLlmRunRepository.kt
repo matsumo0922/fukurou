@@ -119,7 +119,6 @@ class ExposedLlmRunRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     insertRunningLlmRun(start)
                 }
             }
@@ -130,7 +129,6 @@ class ExposedLlmRunRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     finishLlmRun(finish)
                 }
             }

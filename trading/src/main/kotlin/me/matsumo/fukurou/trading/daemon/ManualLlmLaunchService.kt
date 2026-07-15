@@ -144,7 +144,16 @@ class DefaultManualLlmLaunchService(
         }
 
         val invocationId = idGenerator().toString()
-        val reservationRequest = createReservationRequest(invocationId, observedAt)
+        val reservationRequest = LlmLaunchReservationRequest(
+            invocationId = invocationId,
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+            triggerKey = LLM_MANUAL_TRIGGER_KEY,
+            reservedAt = observedAt,
+            runnerConfig = tradingConfig.runner,
+            hourlyWindow = MAX_INVOCATION_COUNT_WINDOW,
+            dailyWindow = MAX_DAILY_INVOCATION_COUNT_WINDOW,
+            activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
+        )
         val reservationOutcome = launchReservationRepository.tryReserve(reservationRequest).getOrThrow()
 
         if (reservationOutcome is LlmLaunchReservationOutcome.Rejected) {
@@ -173,24 +182,6 @@ class DefaultManualLlmLaunchService(
         return ManualLlmLaunchResult.Accepted(
             invocationId = reservedOutcome.invocationId,
             triggerKind = LlmDaemonTriggerKind.MANUAL,
-        )
-    }
-
-    private fun createReservationRequest(invocationId: String, observedAt: Instant): LlmLaunchReservationRequest {
-        return LlmLaunchReservationRequest(
-            invocationId = invocationId,
-            triggerKind = LlmDaemonTriggerKind.MANUAL,
-            triggerKey = LLM_MANUAL_TRIGGER_KEY,
-            reservedAt = observedAt,
-            runnerConfig = tradingConfig.runner,
-            hourlyWindow = MAX_INVOCATION_COUNT_WINDOW,
-            dailyWindow = MAX_DAILY_INVOCATION_COUNT_WINDOW,
-            activeReservationStaleAfter = tradingConfig.daemon.launchReservationStaleAfter,
-            populationScope = LlmLaunchReservationPopulationScope(
-                kind = "SYMBOL",
-                mode = tradingConfig.mode,
-                symbol = tradingConfig.symbol,
-            ),
         )
     }
 

@@ -54,14 +54,8 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
         status,
         reserved_at,
         finished_at,
-        reason,
-        execution_claim_state,
-        population_scope_kind,
-        population_mode,
-        population_symbol,
-        population_account_epoch_id,
-        population_cohort,
-        population_execution_semantics_version
+        reason
+        , execution_claim_state
     )
     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?,
         COALESCE(?::uuid,(SELECT scope_account_epoch_id FROM gap_population_control WHERE id=1)), ?, ?)
@@ -283,23 +277,6 @@ class ExposedLlmLaunchReservationRepository(
             runCatching {
                 LlmExecutionAdmissionHealth.withHealthyAdmission {
                     exposedTransaction(database) {
-                        requireFullGapPopulationAdmission("LLM launch reservation")
-                        val scope = request.populationScope
-                        val epochId = scope.accountEpochId
-                        if (epochId == null) {
-                            acquireGapPopulationGenerationToken()
-                        } else {
-                            acquireGapPopulationGenerationToken(
-                                GapPopulationScope(
-                                    kind = scope.kind,
-                                    mode = scope.mode.name,
-                                    symbol = scope.symbol?.apiSymbol,
-                                    accountEpochId = UUID.fromString(epochId),
-                                    cohort = scope.cohort,
-                                    executionSemanticsVersion = scope.executionSemanticsVersion,
-                                ),
-                            )
-                        }
                         tryReserveLlmLaunchInTransaction(request)
                     }
                 }
@@ -311,7 +288,6 @@ class ExposedLlmLaunchReservationRepository(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationTokenForEntity("LLM_RESERVATION", reservationId(finish.invocationId))
                     finishLlmLaunchInTransaction(finish)
                 }
             }
@@ -784,7 +760,6 @@ fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
     request: LlmLaunchReservationRequest,
 ): LlmLaunchReservationOutcome {
     check(LlmExecutionAdmissionHealth.isHealthy()) { "LLM execution admission is fail-closed." }
-    requireFullGapPopulationAdmission("LLM launch reservation")
     val riskState = selectRiskState(forUpdate = true)
 
     if (riskState.state == RiskHaltState.HARD_HALT) {
@@ -889,18 +864,6 @@ private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationReque
     }
 
     return true
-}
-
-private fun JdbcTransaction.reservationId(invocationId: String): String {
-    return jdbcConnection().prepareStatement(
-        "SELECT id::text FROM llm_launch_reservations WHERE invocation_id=?",
-    ).use { statement ->
-        statement.setString(1, invocationId)
-        statement.executeQuery().use { rows ->
-            require(rows.next()) { "LLM launch reservation was not found." }
-            rows.getString(1)
-        }
-    }
 }
 
 /** 既存予約を同じ caller transaction 内で terminal にする。 */
