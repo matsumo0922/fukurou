@@ -1463,6 +1463,57 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun auditPrune_completeExpiredFixtureDeletesFiniteGraphAndKeepsDecisionAndRun() = runPostgresTest {
+        val now = fixedInstant()
+        val fixture = insertCompleteAuditFixture(
+            database = database,
+            invocationId = "audit-prune-complete",
+            capturedAt = now.minus(Duration.ofDays(31)),
+        )
+        val phaseManifestId = "${fixture.invocationId}:PROPOSER"
+        val evidenceId = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "SELECT id::text FROM llm_tool_evidence WHERE phase_manifest_id=?",
+            ).use { statement ->
+                statement.setString(1, phaseManifestId)
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getString(1)
+                }
+            }
+        }
+
+        val result = ExposedLlmDecisionReconstructionRepository(database)
+            .pruneExpiredAuditRoots(now)
+            .getOrThrow()
+
+        assertEquals(1, result.deletedRootCount)
+        assertFalse(result.hasMore)
+        exposedTransaction(database) {
+            listOf(
+                "SELECT COUNT(*) FROM llm_invocation_audit_roots WHERE root_id='${fixture.invocationId}'",
+                "SELECT COUNT(*) FROM llm_run_input_manifests WHERE root_id='${fixture.invocationId}'",
+                "SELECT COUNT(*) FROM llm_phase_input_manifests WHERE root_id='${fixture.invocationId}'",
+                "SELECT COUNT(*) FROM llm_phase_observations WHERE phase_manifest_id='$phaseManifestId'",
+                "SELECT COUNT(*) FROM llm_tool_evidence WHERE phase_manifest_id='$phaseManifestId'",
+                "SELECT COUNT(*) FROM llm_terminal_evidence_links WHERE evidence_id='$evidenceId'",
+                "SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage " +
+                    "WHERE phase_manifest_id='$phaseManifestId'",
+                "SELECT COUNT(*) FROM decision_material_state_manifests " +
+                    "WHERE invocation_id='${fixture.invocationId}'",
+            ).forEach { sql -> assertSqlCount(sql, 0) }
+            assertSqlCount(
+                "SELECT COUNT(*) FROM decisions WHERE invocation_id='${fixture.invocationId}'",
+                1,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM llm_runs WHERE invocation_id='${fixture.invocationId}'",
+                1,
+            )
+        }
+    }
+
+    @Test
     fun auditPrune_withoutBoundaryDoesNotChangeExistingRoots() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         insertAuditRoot(database, "prune-no-boundary", fixedInstant().minus(Duration.ofDays(90)))
