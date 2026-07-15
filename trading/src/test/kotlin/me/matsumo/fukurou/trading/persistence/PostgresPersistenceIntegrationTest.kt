@@ -119,10 +119,8 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
-import me.matsumo.fukurou.trading.market.IngressOperationDeadline
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
-import me.matsumo.fukurou.trading.market.MarketStreamIdentity
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
@@ -885,96 +883,6 @@ private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
  * Exposed/Postgres 実装の DB 契約を実 Postgres で検証するテスト。
  */
 class PostgresPersistenceIntegrationTest {
-
-    @Test
-    fun durableIngressFoundation_bootstrapsPrivateEmptyTableWithoutBackfill() = runPostgresTest {
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        TradingPersistenceBootstrap(database, fixedClock()).verifySchema().getOrThrow()
-
-        exposedTransaction(database) {
-            assertSqlCount("SELECT COUNT(*) FROM market_data_ingress_sessions", 0)
-            assertSqlCount("SELECT COUNT(*) FROM market_data_sessions", 0)
-        }
-    }
-
-    @Test
-    fun durableIngressRegistration_isConditionalAndMonotonic() = runPostgresTest {
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        val repository = ExposedDurableMarketEventIngress(dataSource, fixedClock())
-        val sessionId = UUID.randomUUID()
-        val identity = MarketStreamIdentity("GMO_COIN", "BTC_JPY", "TRADES")
-
-        repository.begin(sessionId, identity, IngressOperationDeadline.start()).getOrThrow()
-        assertTrue(repository.activate(sessionId, IngressOperationDeadline.start()).getOrThrow())
-        assertTrue(repository.registerReceived(sessionId, 1, IngressOperationDeadline.start()).getOrThrow())
-        assertFalse(repository.registerReceived(sessionId, 3, IngressOperationDeadline.start()).getOrThrow())
-
-        exposedTransaction(database) {
-            assertSqlCount(
-                "SELECT COUNT(*) FROM market_data_ingress_sessions " +
-                    "WHERE session_id='$sessionId' AND state='CONNECTED' AND last_received_sequence=1",
-                1,
-            )
-        }
-    }
-
-    @Test
-    fun durableIngressSchemaVerifier_rejectsWrongColumnContract() = runPostgresTest {
-        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
-        bootstrap.ensureSchema().getOrThrow()
-        exposedTransaction(database) {
-            executeUpdate("ALTER TABLE market_data_ingress_sessions ALTER COLUMN provider TYPE TEXT")
-        }
-
-        assertTrue(bootstrap.verifySchema().isFailure)
-    }
-
-    @Test
-    fun durableIngressSchemaVerifier_rejectsWrongVarcharLength() = runPostgresTest {
-        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
-        bootstrap.ensureSchema().getOrThrow()
-        exposedTransaction(database) {
-            executeUpdate("ALTER TABLE market_data_ingress_sessions ALTER COLUMN provider TYPE VARCHAR(64)")
-        }
-
-        assertTrue(bootstrap.verifySchema().isFailure)
-    }
-
-    @Test
-    fun durableIngressSchemaVerifier_rejectsMissingForeignKey() = runPostgresTest {
-        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
-        bootstrap.ensureSchema().getOrThrow()
-        exposedTransaction(database) {
-            executeUpdate(
-                """
-                DO ${'$'}${'$'}
-                DECLARE foreign_key_name TEXT;
-                BEGIN
-                    SELECT conname INTO foreign_key_name FROM pg_constraint
-                    WHERE conrelid='market_data_ingress_sessions'::regclass AND contype='f';
-                    EXECUTE format('ALTER TABLE market_data_ingress_sessions DROP CONSTRAINT %I', foreign_key_name);
-                END ${'$'}${'$'}
-                """.trimIndent(),
-            )
-        }
-
-        assertTrue(bootstrap.verifySchema().isFailure)
-    }
-
-    @Test
-    fun durableIngressSchemaVerifier_rejectsWrongIdentityIndex() = runPostgresTest {
-        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
-        bootstrap.ensureSchema().getOrThrow()
-        exposedTransaction(database) {
-            executeUpdate("DROP INDEX idx_market_data_ingress_sessions_identity")
-            executeUpdate(
-                "CREATE INDEX idx_market_data_ingress_sessions_identity " +
-                    "ON market_data_ingress_sessions(provider, symbol, starting_at DESC, channel)",
-            )
-        }
-
-        assertTrue(bootstrap.verifySchema().isFailure)
-    }
 
     @Test
     fun terminalEvidenceFoundation_bootstrapsDefaultOffWithoutRows() = runPostgresTest {
@@ -6161,11 +6069,7 @@ class PostgresPersistenceIntegrationTest {
             Duration.ofNanos(System.nanoTime() - startedAt)
         }
         assertTrue(lockElapsed >= Duration.ofMillis(250), "risk row lock elapsed=$lockElapsed")
-        assertEquals(
-            9,
-            statementCount.get(),
-            "two admission checks, token acquisition, risk lock, and active reservation read",
-        )
+        assertEquals(2, statementCount.get())
 
         repository.finish(
             LlmLaunchReservationFinish(
@@ -6198,7 +6102,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun hundredCandidateRecoveryUsesBoundedSequentialEntityScopeTransactions() = runPostgresTest {
+    fun hundredCandidateRecoveryUsesOneSelectAndOneBatchUpdate() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val now = fixedInstant()
         val candidateCount = 100
@@ -11885,21 +11789,14 @@ private fun assertExecutionClaimIndexDefinitions(definitions: Map<String, String
 
 private fun insertTerminalReservationHistory(database: ExposedDatabase, rowCount: Int) {
     exposedTransaction(database) {
-        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
-                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason,
-                    execution_claim_state, population_scope_kind, population_mode, population_symbol,
-                    population_account_epoch_id, population_cohort, population_execution_semantics_version
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason
                 )
                 SELECT gen_random_uuid(), 'terminal-history-' || value, 'FLAT_HEARTBEAT',
-                    'terminal-history:' || value, 'FINISHED', value, value, 'fixture', NULL,
-                    control.scope_kind, control.scope_mode, control.scope_symbol, control.scope_account_epoch_id,
-                    control.scope_cohort, control.scope_execution_semantics_version
+                    'terminal-history:' || value, 'FINISHED', value, value, 'fixture'
                 FROM generate_series(1, ?) AS value
-                CROSS JOIN gap_population_control AS control
-                WHERE control.id = 1 AND control.token_txid = txid_current()
             """.trimIndent(),
         ).use { statement ->
             statement.setInt(1, rowCount)
@@ -11914,21 +11811,14 @@ private fun insertStaleLegacyRunningReservationHistory(
     now: Instant,
 ) {
     exposedTransaction(database) {
-        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
-                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason,
-                    execution_claim_state, population_scope_kind, population_mode, population_symbol,
-                    population_account_epoch_id, population_cohort, population_execution_semantics_version
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at, finished_at, reason
                 )
                 SELECT gen_random_uuid(), 'stale-legacy-running-' || value, 'FLAT_HEARTBEAT',
-                    'stale-legacy-running:' || value, 'RUNNING', ? - value, NULL, NULL, NULL,
-                    control.scope_kind, control.scope_mode, control.scope_symbol, control.scope_account_epoch_id,
-                    control.scope_cohort, control.scope_execution_semantics_version
+                    'stale-legacy-running:' || value, 'RUNNING', ? - value, NULL, NULL
                 FROM generate_series(1, ?) AS value
-                CROSS JOIN gap_population_control AS control
-                WHERE control.id = 1 AND control.token_txid = txid_current()
             """.trimIndent(),
         ).use { statement ->
             statement.setLong(1, now.minus(Duration.ofDays(1)).toEpochMilli())
@@ -12064,22 +11954,15 @@ private fun insertRecoverableAvailableReservations(
     reservedAt: Instant,
 ) {
     exposedTransaction(database) {
-        acquireGapPopulationGenerationToken()
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
                     id, invocation_id, trigger_kind, trigger_key, status, reserved_at,
-                    finished_at, reason, execution_claim_state,
-                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
-                    population_cohort, population_execution_semantics_version
+                    finished_at, reason, execution_claim_state
                 )
                 SELECT gen_random_uuid(), 'batch-recovery-' || value, 'FLAT_HEARTBEAT',
-                    'batch-recovery:' || value, 'RUNNING', ? - value, NULL, NULL, 'AVAILABLE',
-                    control.scope_kind, control.scope_mode, control.scope_symbol, control.scope_account_epoch_id,
-                    control.scope_cohort, control.scope_execution_semantics_version
+                    'batch-recovery:' || value, 'RUNNING', ? - value, NULL, NULL, 'AVAILABLE'
                 FROM generate_series(1, ?) AS value
-                CROSS JOIN gap_population_control AS control
-                WHERE control.id = 1 AND control.token_txid = txid_current()
             """.trimIndent(),
         ).use { statement ->
             statement.setLong(1, reservedAt.toEpochMilli())
