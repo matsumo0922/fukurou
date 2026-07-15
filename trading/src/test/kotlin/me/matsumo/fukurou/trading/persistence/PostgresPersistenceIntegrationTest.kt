@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BY
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidence
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
 import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
 import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
@@ -876,14 +877,34 @@ private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
 class PostgresPersistenceIntegrationTest {
 
     @Test
-    fun terminalEvidenceFoundation_bootstrapsDefaultOffWithoutRows() = runPostgresTest {
+    fun terminalEvidenceActivation_bootstrapsOnceWithoutRewritingTimestamp() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val activatedAt = selectEvidenceActivationBoundary(database)
+        TradingPersistenceBootstrap(
+            database,
+            Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+        ).ensureSchema().getOrThrow()
 
         exposedTransaction(database) {
-            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 0)
             assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 0)
             assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 0)
+        }
+        assertEquals(fixedInstant(), activatedAt)
+        assertEquals(activatedAt, selectEvidenceActivationBoundary(database))
+    }
+
+    @Test
+    fun terminalEvidenceActivation_explicitDisabledCompatibilityKeepsBoundaryAbsent() = runPostgresTest {
+        TradingPersistenceBootstrap(
+            database = database,
+            clock = fixedClock(),
+            terminalEvidenceActivationEnabled = false,
+        ).ensureSchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 0)
         }
     }
 
@@ -925,7 +946,7 @@ class PostgresPersistenceIntegrationTest {
             assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
-            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 1)
         }
 
         val baseEntry = evidence.bundle.entries.single()
@@ -1043,6 +1064,64 @@ class PostgresPersistenceIntegrationTest {
             assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+        }
+    }
+
+    @Test
+    fun terminalEvidenceActivation_incompleteRiskMatrixFailsClosedAndPreservesSafeResults() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        seedTerminalEvidencePhaseManifest(database)
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val incomplete = TrustedTerminalToolEvidenceBundle(
+            invocationId = TERMINAL_EVIDENCE_INVOCATION_ID,
+            phaseManifestId = TERMINAL_EVIDENCE_PHASE_MANIFEST_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            captureEnabled = true,
+            bundle = TerminalToolEvidenceBundle(
+                status = TerminalToolEvidenceBundleStatus.INCOMPLETE,
+                incompleteReason = TerminalToolEvidenceIncompleteReason.FRAME_LIMIT,
+                entries = emptyList(),
+            ),
+        )
+
+        assertTrue(
+            repository.submitTerminalDecision(
+                enterDecisionSubmission().copy(invocationId = TERMINAL_EVIDENCE_INVOCATION_ID),
+                incomplete,
+            ).isFailure,
+        )
+        repository.submitTerminalDecision(
+            noTradeDecisionSubmission().copy(invocationId = TERMINAL_EVIDENCE_INVOCATION_ID),
+            incomplete,
+        ).getOrThrow()
+
+        val intentId = requireNotNull(repository.submitDecision(enterDecisionSubmission()).getOrThrow().tradeIntent).intentId
+        val falsifierIncomplete = incomplete.copy(
+            phaseManifestId = TERMINAL_EVIDENCE_FALSIFIER_PHASE_MANIFEST_ID,
+            phase = LlmInvocationPhase.FALSIFIER,
+        )
+        val approved = FalsificationSubmission(
+            intentId = intentId,
+            verdict = FalsificationVerdict.APPROVED,
+            llmProvider = "fixture",
+            reasonJa = "fixture",
+        )
+        assertTrue(repository.submitTerminalFalsification(approved, falsifierIncomplete).isFailure)
+        repository.submitTerminalFalsification(
+            approved.copy(verdict = FalsificationVerdict.REJECTED),
+            falsifierIncomplete,
+        ).getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 2)
+            assertSqlCount("SELECT COUNT(*) FROM falsifications", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 0)
+            assertSqlCount(
+                "SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage " +
+                    "WHERE status='TERMINAL_BUNDLE_INCOMPLETE' AND incomplete_reason='FRAME_LIMIT'",
+                2,
+            )
         }
     }
 
@@ -1327,6 +1406,28 @@ class PostgresPersistenceIntegrationTest {
             LlmDecisionReconstructionClassification.LEGACY_PRE_EVIDENCE,
             ExposedLlmDecisionReconstructionRepository(database).findDecision(legacyId).getOrThrow()?.classification,
         )
+    }
+
+    @Test
+    fun auditCoverage_appliesTransactionLocalJitOffWithoutLeakingToReconstructionOrPrune() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val executedSql = mutableListOf<String>()
+        val instrumented = instrumentedDataSource(
+            dataSource = dataSource,
+            statementCount = AtomicInteger(),
+            queryTimeouts = mutableListOf(),
+            executedSql = executedSql,
+        )
+        val instrumentedDatabase = ExposedDatabase.connect(instrumented)
+        val repository = ExposedLlmDecisionReconstructionRepository(instrumentedDatabase)
+        val originalJit = exposedTransaction(instrumentedDatabase) { currentPostgresSettingForTest("jit") }
+
+        repository.summarizeCoverage(fixedInstant().minus(Duration.ofDays(14)), fixedInstant()).getOrThrow()
+        repository.findDecision(UUID.randomUUID()).getOrThrow()
+        repository.pruneExpiredAuditRoots(fixedInstant()).getOrThrow()
+
+        assertEquals(1, executedSql.count { sql -> sql.trim() == "SET LOCAL jit=off" })
+        assertEquals(originalJit, exposedTransaction(instrumentedDatabase) { currentPostgresSettingForTest("jit") })
     }
 
     @Test
@@ -10050,6 +10151,16 @@ private fun JdbcTransaction.countRowsForTest(table: String): Int {
     }
 }
 
+private fun JdbcTransaction.currentPostgresSettingForTest(name: String): String {
+    return prepare("SELECT current_setting(?)").use { statement ->
+        statement.setString(1, name)
+        statement.executeQuery().use { rows ->
+            require(rows.next())
+            rows.getString(1)
+        }
+    }
+}
+
 private fun countingDataSource(
     dataSource: DataSource,
     detailLookupCount: AtomicInteger,
@@ -11883,10 +11994,21 @@ private fun insertEvidenceActivationBoundary(database: ExposedDatabase, activate
     exposedTransaction(database) {
         jdbcConnection().prepareStatement(
             "INSERT INTO llm_tool_evidence_activation_boundaries(schema_version,activated_at) VALUES(1,?) " +
-                "ON CONFLICT(schema_version) DO NOTHING",
+                "ON CONFLICT(schema_version) DO UPDATE SET activated_at=EXCLUDED.activated_at",
         ).use { statement ->
             statement.setLong(1, activatedAt.toEpochMilli())
             statement.executeUpdate()
+        }
+    }
+}
+
+private fun selectEvidenceActivationBoundary(database: ExposedDatabase): Instant = exposedTransaction(database) {
+    jdbcConnection().prepareStatement(
+        "SELECT activated_at FROM llm_tool_evidence_activation_boundaries WHERE schema_version=1",
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            check(rows.next())
+            Instant.ofEpochMilli(rows.getLong(1))
         }
     }
 }

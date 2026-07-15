@@ -7,6 +7,8 @@ import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.TERMINAL_EVIDENCE_ACTIVATION_SCHEMA_VERSION
+import me.matsumo.fukurou.trading.audit.TERMINAL_EVIDENCE_CAPTURE_ENABLED
 import me.matsumo.fukurou.trading.broker.PaperAccountConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
@@ -1194,6 +1196,7 @@ private const val VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL = """
  * @param paperAccountConfig paper account 初期化設定
  * @param staleLlmRunRecoveryThreshold stale な RUNNING llm_runs と判定する経過時間
  * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
+ * @param terminalEvidenceActivationEnabled terminal evidence boundary を確立する code-owned policy
  */
 class TradingPersistenceBootstrap(
     private val database: ExposedDatabase,
@@ -1202,6 +1205,7 @@ class TradingPersistenceBootstrap(
     private val staleLlmRunRecoveryThreshold: Duration =
         TradingBotConfig.fromEnvironment().staleLlmRunRecoveryThreshold(),
     private val onStaleLlmRunsRecovered: (Int) -> Unit = {},
+    private val terminalEvidenceActivationEnabled: Boolean = TERMINAL_EVIDENCE_CAPTURE_ENABLED,
 ) {
 
     init {
@@ -1285,6 +1289,12 @@ class TradingPersistenceBootstrap(
                 setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
                 ensureLaunchFoundationSchema()
                 val now = Instant.now(clock)
+
+                if (terminalEvidenceActivationEnabled) {
+                    ensureTerminalEvidenceActivationBoundary(now)
+                } else {
+                    verifyTerminalEvidenceActivationBoundary(expectedEnabled = false)
+                }
 
                 jdbcConnection().prepareStatement(
                     "INSERT INTO decision_identity_schema_boundaries (schema_version, activated_at) VALUES (1, ?) " +
@@ -1401,6 +1411,7 @@ class TradingPersistenceBootstrap(
         return runCatching {
             exposedTransaction(database) {
                 verifyRuntimeSchemaObjects()
+                verifyTerminalEvidenceActivationBoundary(terminalEvidenceActivationEnabled)
                 selectRiskState(forUpdate = false)
                 selectPaperAccount()
             }
@@ -1415,6 +1426,38 @@ class TradingPersistenceBootstrap(
                 threshold = staleLlmRunRecoveryThreshold,
                 previousGenerationTerminated = true,
             )
+        }
+    }
+}
+
+private fun JdbcTransaction.ensureTerminalEvidenceActivationBoundary(now: Instant) {
+    jdbcConnection().prepareStatement(
+        "INSERT INTO llm_tool_evidence_activation_boundaries (schema_version, activated_at) VALUES (?, ?) " +
+            "ON CONFLICT (schema_version) DO NOTHING",
+    ).use { statement ->
+        statement.setInt(1, TERMINAL_EVIDENCE_ACTIVATION_SCHEMA_VERSION)
+        statement.setLong(2, now.toEpochMilli())
+        statement.executeUpdate()
+    }
+    verifyTerminalEvidenceActivationBoundary(expectedEnabled = true)
+}
+
+private fun JdbcTransaction.verifyTerminalEvidenceActivationBoundary(expectedEnabled: Boolean) {
+    jdbcConnection().prepareStatement(
+        "SELECT schema_version, activated_at FROM llm_tool_evidence_activation_boundaries ORDER BY schema_version",
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            if (!expectedEnabled) {
+                require(!rows.next()) { "Terminal evidence activation boundary must remain absent." }
+                return
+            }
+
+            require(rows.next()) { "Terminal evidence activation boundary is missing." }
+            require(rows.getInt("schema_version") == TERMINAL_EVIDENCE_ACTIVATION_SCHEMA_VERSION) {
+                "Terminal evidence activation schema version mismatch."
+            }
+            require(rows.getLong("activated_at") > 0) { "Terminal evidence activation timestamp is invalid." }
+            require(!rows.next()) { "Terminal evidence activation boundary must contain exactly one row." }
         }
     }
 }

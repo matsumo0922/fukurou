@@ -118,9 +118,6 @@ class LlmDecisionSubmissionGateway private constructor(
             hooks: LlmDecisionSubmissionGatewayStartHooks,
             terminalEvidenceCaptureEnabled: Boolean = false,
         ): LlmDecisionSubmissionGateway {
-            require(!terminalEvidenceCaptureEnabled) {
-                "Terminal evidence capture is unavailable in this binary."
-            }
             require(socketPath.toString().toByteArray().size <= MAX_UNIX_SOCKET_PATH_BYTES) {
                 "Submission socket path is too long."
             }

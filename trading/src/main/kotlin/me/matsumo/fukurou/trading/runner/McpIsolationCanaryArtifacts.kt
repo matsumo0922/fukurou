@@ -5,6 +5,8 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -17,6 +19,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.McpLaunchCapability
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
 import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
@@ -70,13 +73,18 @@ private fun probeGatewayRejection(manifestId: String, mismatch: String) {
     require(mismatch == MANIFEST_MISMATCH || mismatch == HASH_MISMATCH) { "Unknown gateway mismatch probe." }
     val manifestPath = Path.of(DEFAULT_MCP_MANIFEST_DIRECTORY, "$manifestId.json")
     val manifest = Json.decodeFromString<McpLaunchManifest>(Files.readString(manifestPath))
-    val request = LlmSubmissionGatewayCodec.request(
+    val request = LlmSubmissionGatewayCodec.requestWithTerminalEvidence(
         operation = "submit_decision",
         invocationId = manifest.invocationId,
         phase = LlmInvocationPhase.valueOf(manifest.phase),
         phaseManifestId = if (mismatch == MANIFEST_MISMATCH) "cross-manifest" else manifest.phaseManifestId,
         effectiveInvocationHash = if (mismatch == HASH_MISMATCH) "0".repeat(64) else manifest.effectiveInvocationHash,
         payload = LlmSubmissionGatewayCodec.encodeDecision(canaryNoTradeDecision()),
+        terminalEvidence = TerminalToolEvidenceBundle(
+            status = TerminalToolEvidenceBundleStatus.COMPLETE,
+            incompleteReason = null,
+            entries = emptyList(),
+        ),
     )
     SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
         channel.connect(UnixDomainSocketAddress.of(manifestPath.resolveSibling("$manifestId.sock")))
@@ -138,6 +146,7 @@ private fun serveGateway(manifestId: String) {
         phase = LlmInvocationPhase.valueOf(manifest.phase),
         phaseManifestId = manifest.phaseManifestId,
         effectiveInvocationHash = manifest.effectiveInvocationHash,
+        terminalEvidenceCaptureEnabled = manifest.terminalEvidenceCaptureEnabled,
     ).use { gateway ->
         println("GATEWAY_READY=$socketPath")
         System.out.flush()
@@ -207,6 +216,7 @@ private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) 
             command = DEFAULT_RUNNER_MCP_SERVER_COMMAND,
             manifestId = capability.id,
             manifestPath = capability.path,
+            terminalEvidenceCaptureEnabled = capability.terminalEvidenceCaptureEnabled,
             autoApprovedTools = emptyList(),
         ),
         environment = System.getenv(),
@@ -214,8 +224,15 @@ private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) 
         effort = LlmEffort.LOW,
     )
     val rendered = DefaultLlmCommandRenderer().render(request).getOrThrow()
+    printGeneratedArtifacts(capability, rendered)
+}
+
+private fun printGeneratedArtifacts(capability: McpLaunchCapability, rendered: RenderedLlmCommand) {
+    val manifest = Json.decodeFromString<McpLaunchManifest>(Files.readString(capability.path))
 
     println("MANIFEST_ID=${capability.id}")
+    println("PHASE_MANIFEST_ID=${manifest.phaseManifestId}")
+    println("EFFECTIVE_INVOCATION_HASH=${manifest.effectiveInvocationHash}")
     rendered.cleanupPaths.forEach { path -> println("ARTIFACT=$path") }
 }
 
