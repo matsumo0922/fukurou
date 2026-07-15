@@ -8108,6 +8108,171 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun restingFillInvariantViolationCancelsWithoutTradeMutationAndPersistsTypedDetail() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000187")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val riskStateRepository = ExposedRiskStateRepository(database)
+        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+            Orderbook(
+                symbol = "BTC",
+                bids = listOf(OrderbookLevel(price = "9990000", size = "0.0010")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "0.0010", receivedAt = fixedInstant())).getOrThrow()
+        val clientRequestId = "fill-invariant-old-reader"
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+                clientRequestId = clientRequestId,
+            ),
+        )
+        val orderId = broker.placeOrder(command).getOrThrow().orderIds.single()
+        val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
+        riskStateRepository.setSoftHalt("integration fill invariant", fixedInstant()).getOrThrow()
+
+        val result = broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0100",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+        val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val persisted = selectFillInvariantCancellation(database, orderId)
+
+        assertEquals(listOf(orderId), result.canceledOrderIds)
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
+        assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
+        assertEquals(OrderStatus.CANCELED.name, persisted.status)
+        assertEquals(PaperOrderCancelReason.LEGACY_UNCLASSIFIED, PaperOrderCancelReason.fromWireCode(persisted.outerReason))
+        assertEquals("FILL_INVARIANT_VIOLATION", persisted.kind)
+        assertEquals(SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED.name, persisted.code)
+        assertEquals(1, persisted.violationCount)
+
+        exposedTransaction(database) { executeUpdate("DROP TABLE paper_order_cancellation_details") }
+        val oldReaderResult = ExposedPaperLedgerRepository(database)
+            .findPlaceOrderResultByClientRequestId(clientRequestId)
+            .getOrThrow()
+        assertEquals(OrderStatus.CANCELED, requireNotNull(oldReaderResult).status)
+    }
+
+    @Test
+    fun parallelRestingFillAndExitUseCommonLockOrderWithoutDuplicateMutation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000188")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+            Orderbook(
+                symbol = "BTC",
+                bids = listOf(OrderbookLevel(price = "10000000", size = "0.0010")),
+                asks = listOf(OrderbookLevel(price = "10100000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 1,
+                sizeBtc = "0.0010",
+                priceJpy = "10100000",
+                receivedAt = fixedInstant(),
+            ),
+        ).getOrThrow()
+        val initialEntry = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("12000000"),
+            ),
+        )
+        broker.placeOrder(initialEntry).getOrThrow()
+        broker.maintainProtections(watermarkTickSnapshot("11000000")).getOrThrow()
+        marketDataSource.orderbook = Orderbook(
+            symbol = "BTC",
+            bids = listOf(OrderbookLevel(price = "10600000", size = "0.0010")),
+            asks = listOf(OrderbookLevel(price = "11000000", size = "1.0000")),
+        )
+        val restingEntry = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("10600000"),
+                sizeBtc = BigDecimal("0.0002"),
+                takeProfitPriceJpy = BigDecimal("11500000"),
+            ),
+        )
+        val restingResult = broker.placeOrder(restingEntry).getOrThrow()
+        assertTrue(restingResult.accepted, restingResult.messageJa)
+        val restingOrderId = restingResult.orderIds.single()
+        val initialPositionId = UUID.fromString(ledgerRepository.getOpenPositions().getOrThrow().single().positionId)
+
+        val results = coroutineScope {
+            val exitResult = async(Dispatchers.IO) {
+                broker.closePosition(
+                    ClosePositionCommand(
+                        commandId = UUID.randomUUID(),
+                        positionId = initialPositionId,
+                        closeAll = true,
+                        reasonJa = "parallel EXIT integration",
+                        auditContext = PaperTradeAuditContext.EMPTY,
+                    ),
+                )
+            }
+            val fillResult = async(Dispatchers.IO) {
+                broker.applyMarketEvent(
+                    paperTradeEvent(
+                        sessionId = sessionId,
+                        sequence = 2,
+                        sizeBtc = "0.0100",
+                        priceJpy = "10600000",
+                        receivedAt = fixedInstant().plusSeconds(2),
+                    ),
+                )
+            }
+
+            listOf(exitResult.await(), fillResult.await())
+        }
+
+        results.forEach { result -> assertTrue(result.isSuccess, result.exceptionOrNull()?.message) }
+        val executions = ledgerRepository.getExecutions().getOrThrow()
+
+        assertEquals(2, executions.count { execution -> execution.side == OrderSide.BUY })
+        assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+        assertEquals(1, ledgerRepository.getOpenPositions().getOrThrow().size)
+        assertEquals(1, executions.count { execution -> execution.orderId == restingOrderId })
+    }
+
+    @Test
     fun paper_market_events_trigger_buy_stop_then_virtual_take_profit_on_later_events() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000164")
@@ -11756,6 +11921,43 @@ private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-02T00:00:00Z")
 }
+
+private fun selectFillInvariantCancellation(database: ExposedDatabase, orderId: String): FillInvariantCancellationRow {
+    return exposedTransaction(database) {
+        prepare(
+            """
+                SELECT orders.status,
+                    orders.cancel_reason,
+                    detail.kind,
+                    detail.code,
+                    (SELECT COUNT(*) FROM safety_violations violation WHERE violation.order_id = orders.id) AS violation_count
+                FROM orders
+                JOIN paper_order_cancellation_details detail ON detail.order_id = orders.id
+                WHERE orders.id = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, UUID.fromString(orderId))
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "fill invariant cancellation was not found." }
+                FillInvariantCancellationRow(
+                    status = resultSet.getString("status"),
+                    outerReason = resultSet.getString("cancel_reason"),
+                    kind = resultSet.getString("kind"),
+                    code = resultSet.getString("code"),
+                    violationCount = resultSet.getInt("violation_count"),
+                )
+            }
+        }
+    }
+}
+
+private data class FillInvariantCancellationRow(
+    val status: String,
+    val outerReason: String,
+    val kind: String,
+    val code: String,
+    val violationCount: Int,
+)
 
 private fun postgresRepositoryRoot(): Path {
     return generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path -> path.parent }

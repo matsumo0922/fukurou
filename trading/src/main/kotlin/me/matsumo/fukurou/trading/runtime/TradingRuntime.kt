@@ -545,6 +545,9 @@ private fun createPostgresBroker(
         ledgerRepository = ExposedPaperLedgerRepository(
             database = connection.database,
             fallbackSymbolRules = context.tradingConfig.paperMarket.toSymbolRules(context.tradingConfig.symbol),
+            clock = context.clock,
+            safetyFloorConfig = context.tradingConfig.safetyFloor,
+            paperExecutionConfig = context.tradingConfig.paperExecution,
         ),
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = riskStateCommandService,

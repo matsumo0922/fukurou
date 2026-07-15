@@ -664,6 +664,82 @@ class SafetyFloorTest {
 
         assertTrue(measuredValue.contains("takerFee must be greater than 0."))
     }
+
+    @Test
+    fun restingFillEvaluator_doesNotReevaluateConsumedIntent() {
+        val command = entryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+        )
+        val consumedIntent = approvedIntentSnapshot(command).copy(consumed = true)
+        val context = safetyContext(
+            positions = emptyList(),
+            atr14Jpy = null,
+            entryIntent = consumedIntent,
+            marketDataObservedAt = fixedInstant(),
+        )
+
+        val placementVerdict = SafetyFloor(clock = fixedClock()).evaluatePlaceOrder(command, context)
+        val fillVerdict = RestingEntryFillInvariantEvaluator(SafetyFloor(clock = fixedClock())).evaluate(command, context)
+
+        assertEquals(SafetyFloorRule.INTENT_CONSUMED, assertIs<SafetyFloorVerdict.Rejected>(placementVerdict).violation.rule)
+        assertIs<SafetyFloorVerdict.Accepted>(fillVerdict)
+    }
+
+    @Test
+    fun restingFillEvaluator_resultIsIndependentOfOneShotIntentState() {
+        val evaluator = RestingEntryFillInvariantEvaluator(SafetyFloor(clock = fixedClock()))
+
+        repeat(32) { index ->
+            val command = entryCommand(
+                orderType = OrderType.LIMIT,
+                sizeBtc = BigDecimal("0.${(index + 1).toString().padStart(4, '0')}"),
+                priceJpy = BigDecimal(9_900_000 + index * 1_000),
+            )
+            val approvedIntent = approvedIntentSnapshot(command)
+            val changedOneShotState = approvedIntent.copy(
+                falsification = requireNotNull(approvedIntent.falsification).copy(
+                    verdict = if (index % 2 == 0) FalsificationVerdict.APPROVED else FalsificationVerdict.REJECTED,
+                    createdAt = fixedInstant().minusSeconds(index.toLong() + 1),
+                ),
+                consumed = index % 3 == 0,
+                freshApproved = index % 5 == 0,
+            )
+            val context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+                entryIntent = changedOneShotState,
+                marketDataObservedAt = fixedInstant(),
+            )
+
+            assertIs<SafetyFloorVerdict.Accepted>(evaluator.evaluate(command, context))
+        }
+    }
+
+    @Test
+    fun restingFillEvaluator_rejectsCurrentSoftHalt() {
+        val command = entryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10000000"),
+        )
+        val context = safetyContext(
+            positions = emptyList(),
+            atr14Jpy = null,
+            marketDataObservedAt = fixedInstant(),
+        ).copy(
+            riskState = RiskState(
+                state = me.matsumo.fukurou.trading.risk.RiskHaltState.SOFT_HALT,
+                updatedAt = fixedInstant(),
+            ),
+        )
+
+        val verdict = RestingEntryFillInvariantEvaluator(SafetyFloor(clock = fixedClock())).evaluate(command, context)
+
+        assertEquals(
+            SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED,
+            assertIs<SafetyFloorVerdict.Rejected>(verdict).violation.rule,
+        )
+    }
 }
 
 private fun entryCommand(
