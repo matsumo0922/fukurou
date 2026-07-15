@@ -43,6 +43,21 @@ internal val ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT: Duration = Duration.
 /** economic-event migration の SQL 実行上限。既存 bounded recovery と同じ値を使う。 */
 internal val ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT: Duration = Duration.ofSeconds(5)
 
+private val GAP_POPULATION_ENFORCEMENT_TRIGGERS = listOf(
+    "orders" to "orders_gap_population_create",
+    "orders" to "orders_gap_population_terminal",
+    "positions" to "positions_gap_population_create",
+    "positions" to "positions_gap_population_terminal",
+    "llm_runs" to "llm_runs_gap_population_create",
+    "llm_runs" to "llm_runs_gap_population_terminal",
+    "llm_launch_reservations" to "llm_launch_reservations_gap_population_create",
+    "llm_launch_reservations" to "llm_launch_reservations_gap_population_terminal",
+    "opportunity_episodes" to "opportunity_episodes_gap_population_create",
+    "opportunity_episodes" to "opportunity_episodes_gap_population_terminal",
+    "evaluation_report_jobs" to "evaluation_report_jobs_gap_population_create",
+    "evaluation_report_jobs" to "evaluation_report_jobs_gap_population_terminal",
+)
+
 /** economic-event migration の partial unique index step 結果。 */
 internal enum class EconomicEventAttemptMigrationIndexOutcome {
     /** index を新規作成し、定義を検証した。 */
@@ -1249,6 +1264,7 @@ class TradingPersistenceBootstrap(
                     value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
                 )
                 ensureRuntimeSchemaObjects(migrationObservation)
+                removeGapPopulationEnforcementTriggers()
                 setLocalPostgresSetting("lock_timeout", previousLockTimeout)
                 setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
                 ensureLaunchFoundationSchema()
@@ -1767,6 +1783,20 @@ internal fun JdbcTransaction.verifyExistsBySql(sql: String, missingMessage: Stri
 internal fun JdbcTransaction.executeUpdate(sql: String) {
     jdbcConnection().prepareStatement(sql).use { statement ->
         statement.executeUpdate()
+    }
+}
+
+/** 現行の mutation path と競合する gap population enforcement trigger を削除する。 */
+internal fun JdbcTransaction.removeGapPopulationEnforcementTriggers() {
+    GAP_POPULATION_ENFORCEMENT_TRIGGERS.forEach { (table, trigger) ->
+        val tableExists = prepare("SELECT to_regclass(?) IS NOT NULL").use { statement ->
+            statement.setString(1, "public.$table")
+            statement.executeQuery().use { rows ->
+                check(rows.next())
+                rows.getBoolean(1)
+            }
+        }
+        if (tableExists) executeUpdate("DROP TRIGGER IF EXISTS $trigger ON $table")
     }
 }
 

@@ -1060,6 +1060,42 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun bootstrap_removesGapPopulationEnforcementTriggersFromExistingDatabase() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+        bootstrap.ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    CREATE FUNCTION obsolete_gap_population_trigger() RETURNS trigger AS ${'$'}body${'$'}
+                    BEGIN
+                        RETURN NEW;
+                    END
+                    ${'$'}body${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            executeUpdate(
+                "CREATE TRIGGER orders_gap_population_create BEFORE INSERT ON orders " +
+                    "FOR EACH ROW EXECUTE FUNCTION obsolete_gap_population_trigger()",
+            )
+            executeUpdate(
+                "CREATE TRIGGER llm_runs_gap_population_terminal BEFORE UPDATE ON llm_runs " +
+                    "FOR EACH ROW EXECUTE FUNCTION obsolete_gap_population_trigger()",
+            )
+        }
+
+        bootstrap.ensureSchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM pg_trigger WHERE tgname IN " +
+                    "('orders_gap_population_create','llm_runs_gap_population_terminal')",
+                0,
+            )
+            executeUpdate("DROP FUNCTION obsolete_gap_population_trigger()")
+        }
+    }
+
+    @Test
     fun market_data_connected_session_is_unique_at_database_boundary() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedMarketDataIntegrityRepository(database)
