@@ -15,6 +15,16 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.LlmAuditRootKind
+import me.matsumo.fukurou.trading.audit.LlmDecisionReconstructionClassification
+import me.matsumo.fukurou.trading.audit.LlmDecisionReconstructionReason
+import me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus
+import me.matsumo.fukurou.trading.audit.LlmInvocationAuditRoot
+import me.matsumo.fukurou.trading.audit.LlmManifestJsonCodec
+import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
+import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
+import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
+import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
@@ -115,10 +125,12 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
@@ -1031,6 +1043,428 @@ class PostgresPersistenceIntegrationTest {
             assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
             assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+        }
+    }
+
+    @Test
+    fun auditReconstruction_classifiesMissingPendingAndPreBoundaryTerminalWithoutGraphReads() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val pendingId = insertAuditDecision(
+            database = database,
+            invocationId = "audit-pending",
+            decisionAt = fixedInstant(),
+            runStartedAt = fixedInstant().minusSeconds(1),
+            terminal = false,
+        )
+        val legacyId = insertAuditDecision(
+            database = database,
+            invocationId = "audit-legacy",
+            decisionAt = fixedInstant(),
+            runStartedAt = fixedInstant().minusSeconds(1),
+            terminal = true,
+        )
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        assertNull(repository.findDecision(UUID.randomUUID()).getOrThrow())
+        val pending = requireNotNull(repository.findDecision(pendingId).getOrThrow())
+        val legacy = requireNotNull(repository.findDecision(legacyId).getOrThrow())
+
+        assertEquals(LlmDecisionReconstructionClassification.PENDING, pending.classification)
+        assertEquals(LlmDecisionReconstructionReason.RUN_IN_PROGRESS, pending.reason)
+        assertEquals(LlmDecisionReconstructionClassification.LEGACY_PRE_EVIDENCE, legacy.classification)
+        assertEquals(LlmDecisionReconstructionReason.PRE_EVIDENCE, legacy.reason)
+    }
+
+    @Test
+    fun auditReconstruction_preBoundaryRunningTransitionsToLegacyOnlyAfterTerminal() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertEvidenceActivationBoundary(database, fixedInstant().plusSeconds(10))
+        val decisionId = insertAuditDecision(
+            database = database,
+            invocationId = "audit-pre-boundary-running",
+            decisionAt = fixedInstant(),
+            runStartedAt = fixedInstant(),
+            terminal = false,
+        )
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        assertEquals(
+            LlmDecisionReconstructionClassification.PENDING,
+            repository.findDecision(decisionId).getOrThrow()?.classification,
+        )
+        finishAuditRun(database, "audit-pre-boundary-running", fixedInstant().plusSeconds(20))
+        assertEquals(
+            LlmDecisionReconstructionClassification.LEGACY_PRE_EVIDENCE,
+            repository.findDecision(decisionId).getOrThrow()?.classification,
+        )
+    }
+
+    @Test
+    fun auditReconstruction_completeGraphUsesAtMostFourSelectsAndMaintenanceIndexesExist() = runPostgresTest {
+        val fixture = insertCompleteAuditFixture(
+            database = database,
+            invocationId = "audit-complete",
+            capturedAt = fixedInstant(),
+        )
+        val executedSql = mutableListOf<String>()
+        val instrumented = instrumentedDataSource(
+            dataSource = dataSource,
+            statementCount = AtomicInteger(),
+            queryTimeouts = mutableListOf(),
+            executedSql = executedSql,
+        )
+        val repository = ExposedLlmDecisionReconstructionRepository(ExposedDatabase.connect(instrumented))
+
+        val reconstruction = requireNotNull(repository.findDecision(fixture.decisionId).getOrThrow())
+
+        assertEquals(LlmDecisionReconstructionClassification.COMPLETE, reconstruction.classification)
+        assertEquals(1, reconstruction.phaseCount)
+        assertEquals(1, reconstruction.evidenceCount)
+        assertTrue(executedSql.count { sql -> sql.trimStart().startsWith("SELECT") } <= 4)
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM llm_invocation_audit_roots root " +
+                    "JOIN llm_run_input_manifests run ON run.root_id=root.root_id " +
+                    "JOIN decision_material_state_manifests material " +
+                    "ON material.invocation_id=run.material_invocation_id " +
+                    "WHERE root.root_id='${fixture.invocationId}' " +
+                    "AND run.invocation_id=root.root_id AND material.invocation_id=root.root_id",
+                1,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM pg_indexes WHERE indexname IN (" +
+                    "'idx_decisions_audit_coverage_created','idx_llm_audit_roots_retention'," +
+                    "'idx_llm_phase_manifests_root','idx_llm_tool_evidence_phase'," +
+                    "'idx_llm_evidence_coverage_phase','idx_llm_terminal_links_evidence')",
+                6,
+            )
+        }
+    }
+
+    @Test
+    fun auditReconstruction_rejectsPhaseAndPerPhaseEvidenceBoundsWithoutTruncating() = runPostgresTest {
+        val phaseFixture = insertCompleteAuditFixture(database, "audit-phase-bound", fixedInstant())
+        val evidenceFixture = insertCompleteAuditFixture(
+            database,
+            "audit-evidence-bound",
+            fixedInstant().plusSeconds(1),
+        )
+        exposedTransaction(database) {
+            executeUpdate(
+                "INSERT INTO llm_phase_input_manifests " +
+                    "SELECT phase_manifest_id || ':' || value,root_id,invocation_id,run_manifest_invocation_id," +
+                    "run_manifest_content_hash,material_invocation_id,material_content_hash,phase," +
+                    "effective_invocation_hash,captured_at,manifest_json " +
+                    "FROM llm_phase_input_manifests CROSS JOIN generate_series(1,3) value " +
+                    "WHERE invocation_id='${phaseFixture.invocationId}' AND phase_manifest_id NOT LIKE '%:%:%'",
+            )
+            executeUpdate(
+                "INSERT INTO llm_tool_evidence " +
+                    "SELECT gen_random_uuid(),phase_manifest_id,value,tool_name,source_timestamp," +
+                    "source_timestamp_status,response_json,response_hash,is_error,captured_at,state " +
+                    "FROM llm_tool_evidence CROSS JOIN generate_series(1,48) value " +
+                    "WHERE phase_manifest_id='${evidenceFixture.invocationId}:PROPOSER' AND ordinal=0",
+            )
+        }
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        val phaseBound = requireNotNull(repository.findDecision(phaseFixture.decisionId).getOrThrow())
+        val evidenceBound = requireNotNull(repository.findDecision(evidenceFixture.decisionId).getOrThrow())
+
+        assertEquals(LlmDecisionReconstructionClassification.INCOMPLETE, phaseBound.classification)
+        assertEquals(LlmDecisionReconstructionReason.BOUND_EXCEEDED, phaseBound.reason)
+        assertEquals(LlmDecisionReconstructionClassification.INCOMPLETE, evidenceBound.classification)
+        assertEquals(LlmDecisionReconstructionReason.BOUND_EXCEEDED, evidenceBound.reason)
+    }
+
+    @Test
+    fun auditReconstruction_classifiesMissingGraphAndLinkOrdinalTamperAsIncomplete() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertEvidenceActivationBoundary(database, fixedInstant().minusSeconds(1))
+        val missingId = insertAuditDecision(
+            database = database,
+            invocationId = "audit-missing-graph",
+            decisionAt = fixedInstant(),
+            runStartedAt = fixedInstant().minusSeconds(1),
+            terminal = true,
+        )
+        val tampered = insertCompleteAuditFixture(database, "audit-link-tamper", fixedInstant().plusSeconds(1))
+        exposedTransaction(database) {
+            executeUpdate(
+                "UPDATE llm_terminal_evidence_links SET ordinal=7 WHERE entity_id='${tampered.decisionId}'",
+            )
+        }
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        val missing = requireNotNull(repository.findDecision(missingId).getOrThrow())
+        val association = requireNotNull(repository.findDecision(tampered.decisionId).getOrThrow())
+
+        assertEquals(LlmDecisionReconstructionClassification.INCOMPLETE, missing.classification)
+        assertEquals(LlmDecisionReconstructionReason.GRAPH_MISSING, missing.reason)
+        assertEquals(LlmDecisionReconstructionClassification.INCOMPLETE, association.classification)
+        assertEquals(LlmDecisionReconstructionReason.ASSOCIATION_MISMATCH, association.reason)
+    }
+
+    @Test
+    fun auditReconstruction_classifiesLinkTargetTamperAsStructuralNotCryptographicMismatch() = runPostgresTest {
+        val fixture = insertCompleteAuditFixture(database, "audit-target-tamper", fixedInstant())
+        exposedTransaction(database) {
+            executeUpdate(
+                "UPDATE llm_terminal_evidence_links SET entity_id=gen_random_uuid() " +
+                    "WHERE entity_id='${fixture.decisionId}'",
+            )
+        }
+
+        val reconstruction = requireNotNull(
+            ExposedLlmDecisionReconstructionRepository(database).findDecision(fixture.decisionId).getOrThrow(),
+        )
+
+        assertEquals(LlmDecisionReconstructionClassification.INCOMPLETE, reconstruction.classification)
+        assertEquals(LlmDecisionReconstructionReason.ASSOCIATION_MISMATCH, reconstruction.reason)
+    }
+
+    @Test
+    fun auditReconstruction_detectsCanonicalAndReferenceHashTamperAcrossFiniteInventory() = runPostgresTest {
+        val tamperCases = listOf(
+            "material" to "UPDATE decision_material_state_manifests SET content_hash=repeat('0',64) WHERE invocation_id=?",
+            "run" to "UPDATE llm_run_input_manifests SET content_hash=repeat('0',64) WHERE invocation_id=?",
+            "phase" to "UPDATE llm_phase_input_manifests SET effective_invocation_hash=repeat('0',64) WHERE invocation_id=?",
+            "observation" to "UPDATE llm_phase_observations SET content_hash=repeat('0',64) " +
+                "WHERE phase_manifest_id=(SELECT phase_manifest_id FROM llm_phase_input_manifests WHERE invocation_id=?)",
+            "evidence" to "UPDATE llm_tool_evidence SET response_hash=repeat('0',64) " +
+                "WHERE phase_manifest_id=(SELECT phase_manifest_id FROM llm_phase_input_manifests WHERE invocation_id=?)",
+        )
+        val fixtures = tamperCases.mapIndexed { index, tamperCase ->
+            tamperCase to insertCompleteAuditFixture(
+                database,
+                "audit-hash-${tamperCase.first}",
+                fixedInstant().plusSeconds(index.toLong()),
+            )
+        }
+        exposedTransaction(database) {
+            fixtures.forEach { (tamperCase, fixture) ->
+                jdbcConnection().prepareStatement(tamperCase.second).use { statement ->
+                    statement.setString(1, fixture.invocationId)
+                    assertEquals(1, statement.executeUpdate())
+                }
+            }
+        }
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        fixtures.forEach { (_, fixture) ->
+            val reconstruction = requireNotNull(repository.findDecision(fixture.decisionId).getOrThrow())
+            assertEquals(LlmDecisionReconstructionClassification.HASH_MISMATCH, reconstruction.classification)
+            assertTrue(
+                reconstruction.reason in setOf(
+                    LlmDecisionReconstructionReason.CONTENT_HASH_MISMATCH,
+                    LlmDecisionReconstructionReason.REFERENCE_HASH_MISMATCH,
+                ),
+            )
+        }
+
+        val malformed = insertCompleteAuditFixture(database, "audit-malformed-canonical", fixedInstant().plusSeconds(6))
+        exposedTransaction(database) {
+            executeUpdate(
+                "UPDATE llm_run_input_manifests SET manifest_json='not-json' " +
+                    "WHERE invocation_id='${malformed.invocationId}'",
+            )
+        }
+        val malformedReconstruction = requireNotNull(repository.findDecision(malformed.decisionId).getOrThrow())
+        assertEquals(LlmDecisionReconstructionClassification.HASH_MISMATCH, malformedReconstruction.classification)
+        assertEquals(LlmDecisionReconstructionReason.MALFORMED_CANONICAL_VALUE, malformedReconstruction.reason)
+    }
+
+    @Test
+    fun auditCoverage_separatesTerminalPendingLegacyIncompleteNoDecisionAndBoundaryStraddles() = runPostgresTest {
+        val from = fixedInstant().minus(Duration.ofDays(14))
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val legacyId = insertAuditDecision(
+            database,
+            "coverage-legacy",
+            from.plusSeconds(1),
+            from.plusSeconds(1),
+            terminal = true,
+        )
+        insertEvidenceActivationBoundary(database, from.plusSeconds(2))
+        insertCompleteAuditFixture(database, "coverage-complete", from.plusSeconds(3))
+        val tampered = insertCompleteAuditFixture(database, "coverage-association-tamper", from.plusSeconds(3))
+        exposedTransaction(database) {
+            executeUpdate(
+                "UPDATE llm_terminal_evidence_links SET ordinal=9 WHERE entity_id='${tampered.decisionId}'",
+            )
+        }
+        insertAuditDecision(database, "coverage-pending", from.plusSeconds(4), from.plusSeconds(4), terminal = false)
+        insertAuditDecision(database, "coverage-incomplete", from.plusSeconds(5), from.plusSeconds(5), terminal = true)
+        insertAuditRun(database, "coverage-no-decision", from.plusSeconds(6), terminal = true)
+        insertAuditDecision(
+            database,
+            "coverage-run-before-window",
+            from.plusSeconds(7),
+            from.minusMillis(1),
+            terminal = true,
+        )
+        insertAuditDecision(
+            database,
+            "coverage-decision-before-window",
+            from.minusMillis(1),
+            from.plusSeconds(8),
+            terminal = true,
+        )
+
+        val summary = ExposedLlmDecisionReconstructionRepository(database)
+            .summarizeCoverage(from, fixedInstant())
+            .getOrThrow()
+
+        assertEquals(6, summary.decisionCount)
+        assertEquals(5, summary.terminalDecisionCount)
+        assertEquals(1, summary.structurallyCompleteDecisionCount)
+        assertEquals(3, summary.structurallyIncompleteDecisionCount)
+        assertEquals(1, summary.pendingDecisionCount)
+        assertEquals(0, summary.incompleteRunDecisionCount)
+        assertEquals(1, summary.legacyTerminalDecisionCount)
+        assertEquals(1, summary.terminalNoDecisionRunCount)
+        assertEquals(
+            LlmDecisionReconstructionClassification.LEGACY_PRE_EVIDENCE,
+            ExposedLlmDecisionReconstructionRepository(database).findDecision(legacyId).getOrThrow()?.classification,
+        )
+    }
+
+    @Test
+    fun auditPrune_usesStrictThirtyDayCutoffAndActivationBoundary() = runPostgresTest {
+        val now = fixedInstant()
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertEvidenceActivationBoundary(database, now.minus(Duration.ofDays(40)))
+        insertAuditRoot(database, "prune-old", now.minus(Duration.ofDays(31)))
+        insertAuditRoot(database, "prune-not-full-thirty", now.minus(Duration.ofDays(30)).plusNanos(1_000_000))
+        insertAuditRoot(database, "prune-pre-boundary", now.minus(Duration.ofDays(41)))
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        val result = repository.pruneExpiredAuditRoots(now).getOrThrow()
+
+        assertEquals(1, result.deletedRootCount)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM llm_invocation_audit_roots WHERE root_id='prune-old'", 0)
+            assertSqlCount("SELECT COUNT(*) FROM llm_invocation_audit_roots WHERE root_id='prune-not-full-thirty'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_invocation_audit_roots WHERE root_id='prune-pre-boundary'", 1)
+        }
+    }
+
+    @Test
+    fun auditPrune_completeExpiredFixtureDeletesFiniteGraphAndKeepsDecisionAndRun() = runPostgresTest {
+        val now = fixedInstant()
+        val fixture = insertCompleteAuditFixture(
+            database = database,
+            invocationId = "audit-prune-complete",
+            capturedAt = now.minus(Duration.ofDays(31)),
+        )
+        val phaseManifestId = "${fixture.invocationId}:PROPOSER"
+        val evidenceId = exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                "SELECT id::text FROM llm_tool_evidence WHERE phase_manifest_id=?",
+            ).use { statement ->
+                statement.setString(1, phaseManifestId)
+                statement.executeQuery().use { rows ->
+                    assertTrue(rows.next())
+                    rows.getString(1)
+                }
+            }
+        }
+
+        val result = ExposedLlmDecisionReconstructionRepository(database)
+            .pruneExpiredAuditRoots(now)
+            .getOrThrow()
+
+        assertEquals(1, result.deletedRootCount)
+        assertFalse(result.hasMore)
+        exposedTransaction(database) {
+            listOf(
+                "SELECT COUNT(*) FROM llm_invocation_audit_roots WHERE root_id='${fixture.invocationId}'",
+                "SELECT COUNT(*) FROM llm_run_input_manifests WHERE root_id='${fixture.invocationId}'",
+                "SELECT COUNT(*) FROM llm_phase_input_manifests WHERE root_id='${fixture.invocationId}'",
+                "SELECT COUNT(*) FROM llm_phase_observations WHERE phase_manifest_id='$phaseManifestId'",
+                "SELECT COUNT(*) FROM llm_tool_evidence WHERE phase_manifest_id='$phaseManifestId'",
+                "SELECT COUNT(*) FROM llm_terminal_evidence_links WHERE evidence_id='$evidenceId'",
+                "SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage " +
+                    "WHERE phase_manifest_id='$phaseManifestId'",
+                "SELECT COUNT(*) FROM decision_material_state_manifests " +
+                    "WHERE invocation_id='${fixture.invocationId}'",
+            ).forEach { sql -> assertSqlCount(sql, 0) }
+            assertSqlCount(
+                "SELECT COUNT(*) FROM decisions WHERE invocation_id='${fixture.invocationId}'",
+                1,
+            )
+            assertSqlCount(
+                "SELECT COUNT(*) FROM llm_runs WHERE invocation_id='${fixture.invocationId}'",
+                1,
+            )
+        }
+    }
+
+    @Test
+    fun auditPrune_withoutBoundaryDoesNotChangeExistingRoots() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertAuditRoot(database, "prune-no-boundary", fixedInstant().minus(Duration.ofDays(90)))
+
+        val result = ExposedLlmDecisionReconstructionRepository(database)
+            .pruneExpiredAuditRoots(fixedInstant())
+            .getOrThrow()
+
+        assertEquals(0, result.deletedRootCount)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM llm_invocation_audit_roots WHERE root_id='prune-no-boundary'", 1)
+        }
+    }
+
+    @Test
+    fun auditPrune_limitsEachBatchToFiveHundredRoots() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertEvidenceActivationBoundary(database, fixedInstant().minus(Duration.ofDays(60)))
+        insertAuditRoots(database, count = 501, capturedAt = fixedInstant().minus(Duration.ofDays(31)))
+        val repository = ExposedLlmDecisionReconstructionRepository(database)
+
+        val first = repository.pruneExpiredAuditRoots(fixedInstant()).getOrThrow()
+        val second = repository.pruneExpiredAuditRoots(fixedInstant()).getOrThrow()
+
+        assertEquals(500, first.deletedRootCount)
+        assertTrue(first.hasMore)
+        assertEquals(1, second.deletedRootCount)
+        assertFalse(second.hasMore)
+    }
+
+    @Test
+    fun auditPrune_failureRollsBackEveryAuditChildAndKeepsDecisionAndRun() = runPostgresTest {
+        val fixture = insertCompleteAuditFixture(
+            database,
+            "audit-prune-rollback",
+            fixedInstant().minus(Duration.ofDays(31)),
+        )
+        exposedTransaction(database) {
+            executeUpdate(
+                "CREATE FUNCTION fail_audit_phase_delete() RETURNS trigger LANGUAGE plpgsql AS " +
+                    "'BEGIN RAISE EXCEPTION ''fixture delete failure''; END'",
+            )
+            executeUpdate(
+                "CREATE TRIGGER fail_audit_phase_delete BEFORE DELETE ON llm_phase_input_manifests " +
+                    "FOR EACH ROW EXECUTE FUNCTION fail_audit_phase_delete()",
+            )
+        }
+
+        val result = ExposedLlmDecisionReconstructionRepository(database).pruneExpiredAuditRoots(fixedInstant())
+
+        assertTrue(result.isFailure)
+        exposedTransaction(database) {
+            listOf(
+                "llm_invocation_audit_roots",
+                "decision_material_state_manifests",
+                "llm_run_input_manifests",
+                "llm_phase_input_manifests",
+                "llm_phase_observations",
+                "llm_tool_evidence",
+                "llm_terminal_evidence_links",
+                "llm_decision_phase_evidence_coverage",
+            ).forEach { table -> assertSqlCount("SELECT COUNT(*) FROM $table", 1) }
+            assertSqlCount("SELECT COUNT(*) FROM decisions WHERE id='${fixture.decisionId}'", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_runs WHERE invocation_id='${fixture.invocationId}'", 1)
         }
     }
 
@@ -11269,6 +11703,226 @@ private fun updateOpenPositionDecisionRun(database: ExposedDatabase, decisionRun
  */
 private fun fixedClock(): Clock {
     return Clock.fixed(fixedInstant(), ZoneOffset.UTC)
+}
+
+private data class CompleteAuditFixture(
+    val decisionId: UUID,
+    val invocationId: String,
+)
+
+private suspend fun insertCompleteAuditFixture(
+    database: ExposedDatabase,
+    invocationId: String,
+    capturedAt: Instant,
+): CompleteAuditFixture {
+    TradingPersistenceBootstrap(database, Clock.fixed(capturedAt, ZoneOffset.UTC)).ensureSchema().getOrThrow()
+    insertEvidenceActivationBoundary(database, capturedAt.minusSeconds(1))
+    val material = identityManifest(invocationId).copy(capturedAt = capturedAt)
+    val runWithoutHash = LlmRunInputManifest(
+        invocationId = invocationId,
+        rootId = invocationId,
+        trigger = LlmRunTriggerSnapshot(
+            kind = "TEST",
+            observedAt = capturedAt,
+            measurements = emptyList(),
+            entities = emptyList(),
+            notApplicableReason = null,
+        ),
+        runtimeConfigVersion = null,
+        runtimeConfigHash = null,
+        runtimeConfigSnapshot = "{}",
+        materialInvocationId = invocationId,
+        materialContentHash = material.persistedSnapshotHash(),
+        schemaVersion = 1,
+        capturedAt = capturedAt,
+        canonicalContentHash = "",
+    )
+    val runManifest = runWithoutHash.copy(
+        canonicalContentHash = LlmManifestJsonCodec.contentHash(runWithoutHash),
+    )
+    val phaseId = "$invocationId:PROPOSER"
+    val phaseWithoutHash = LlmPhaseInputManifest(
+        phaseManifestId = phaseId,
+        rootId = invocationId,
+        invocationId = invocationId,
+        phase = LlmInvocationPhase.PROPOSER,
+        prompt = "fixture prompt",
+        role = "fixture",
+        provider = LlmProvider.CODEX,
+        configuredModel = null,
+        configuredEffort = LlmEffort.HIGH,
+        renderedEffort = "high",
+        cliVersion = "fixture",
+        toolAllowlist = listOf("get_ticker"),
+        canonicalToolSchema = "{}",
+        runtimeConfigHash = null,
+        runtimeConfigSnapshot = "{}",
+        runManifestInvocationId = invocationId,
+        runManifestContentHash = runManifest.canonicalContentHash,
+        materialInvocationId = invocationId,
+        materialContentHash = material.persistedSnapshotHash(),
+        notApplicableReason = null,
+        capturedAt = capturedAt,
+        effectiveInvocationHash = "",
+    )
+    val phaseManifest = phaseWithoutHash.copy(
+        effectiveInvocationHash = LlmManifestJsonCodec.effectiveInvocationHash(phaseWithoutHash),
+    )
+    val manifestRepository = ExposedLlmInputManifestRepository(database, emptySet())
+    manifestRepository.appendRoot(
+        LlmInvocationAuditRoot(invocationId, LlmAuditRootKind.DECISION_ATTEMPT, capturedAt),
+    ).getOrThrow()
+    manifestRepository.appendRunWithMaterial(material, runManifest).getOrThrow()
+    manifestRepository.appendPhase(phaseManifest).getOrThrow()
+    manifestRepository.appendObservation(
+        LlmPhaseObservation(
+            phaseManifestId = phaseId,
+            observedModels = listOf("fixture"),
+            observedEffort = "high",
+            modelCoverageStatus = LlmIdentityCoverageStatus.OBSERVED,
+            effortCoverageStatus = LlmIdentityCoverageStatus.OBSERVED,
+            terminatedAt = capturedAt.plusSeconds(1),
+        ),
+    ).getOrThrow()
+    insertAuditRun(database, invocationId, capturedAt, terminal = true)
+    val responseJson = "{\"price\":\"100\"}"
+    val evidence = TrustedTerminalToolEvidenceBundle(
+        invocationId = invocationId,
+        phaseManifestId = phaseId,
+        phase = LlmInvocationPhase.PROPOSER,
+        captureEnabled = true,
+        bundle = TerminalToolEvidenceBundle(
+            status = TerminalToolEvidenceBundleStatus.COMPLETE,
+            incompleteReason = null,
+            entries = listOf(
+                TerminalToolEvidence(
+                    ordinal = 0,
+                    toolName = "get_ticker",
+                    responseJson = responseJson,
+                    responseHash = ManifestPersistencePolicy.sha256(responseJson),
+                    sourceTimestamp = null,
+                    sourceTimestampStatus = ToolEvidenceSourceTimestampStatus.MISSING,
+                    isError = false,
+                ),
+            ),
+        ),
+    )
+    val decision = ExposedDecisionRepository(database, Clock.fixed(capturedAt, ZoneOffset.UTC))
+        .submitTerminalDecision(noTradeDecisionSubmission().copy(invocationId = invocationId), evidence)
+        .getOrThrow()
+        .decision
+
+    return CompleteAuditFixture(decision.decisionId, invocationId)
+}
+
+private suspend fun insertAuditDecision(
+    database: ExposedDatabase,
+    invocationId: String,
+    decisionAt: Instant,
+    runStartedAt: Instant,
+    terminal: Boolean,
+): UUID {
+    insertAuditRun(database, invocationId, runStartedAt, terminal)
+    return ExposedDecisionRepository(database, Clock.fixed(decisionAt, ZoneOffset.UTC))
+        .submitDecision(noTradeDecisionSubmission().copy(invocationId = invocationId))
+        .getOrThrow()
+        .decision
+        .decisionId
+}
+
+private suspend fun insertAuditRun(
+    database: ExposedDatabase,
+    invocationId: String,
+    startedAt: Instant,
+    terminal: Boolean,
+) {
+    val repository = ExposedLlmRunRepository(database)
+    val start = LlmRunStart(
+        invocationId = invocationId,
+        mode = TradingMode.PAPER,
+        symbol = TradingSymbol.BTC,
+        triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+        startedAt = startedAt,
+    )
+    repository.insertRunning(start).getOrThrow()
+    if (terminal) {
+        repository.finish(
+            LlmRunFinish(
+                invocationId = invocationId,
+                mode = start.mode,
+                symbol = start.symbol,
+                triggerKind = start.triggerKind,
+                status = "SUCCEEDED",
+                startedAt = startedAt,
+                finishedAt = startedAt.plusSeconds(1),
+                errorMessage = null,
+                terminalCause = LlmRunTerminalCause.NORMAL_COMPLETION,
+            ),
+        ).getOrThrow()
+    }
+}
+
+private fun finishAuditRun(
+    database: ExposedDatabase,
+    invocationId: String,
+    finishedAt: Instant,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "UPDATE llm_runs SET status='SUCCEEDED',finished_at=?,terminal_cause='NORMAL_COMPLETION' " +
+                "WHERE invocation_id=? AND status='RUNNING'",
+        ).use { statement ->
+            statement.setLong(1, finishedAt.toEpochMilli())
+            statement.setString(2, invocationId)
+            assertEquals(1, statement.executeUpdate())
+        }
+    }
+}
+
+private fun insertEvidenceActivationBoundary(database: ExposedDatabase, activatedAt: Instant) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "INSERT INTO llm_tool_evidence_activation_boundaries(schema_version,activated_at) VALUES(1,?) " +
+                "ON CONFLICT(schema_version) DO NOTHING",
+        ).use { statement ->
+            statement.setLong(1, activatedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun insertAuditRoot(
+    database: ExposedDatabase,
+    rootId: String,
+    capturedAt: Instant,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "INSERT INTO llm_invocation_audit_roots(root_id,root_kind,captured_at) " +
+                "VALUES(?,'DECISION_ATTEMPT',?)",
+        ).use { statement ->
+            statement.setString(1, rootId)
+            statement.setLong(2, capturedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun insertAuditRoots(
+    database: ExposedDatabase,
+    count: Int,
+    capturedAt: Instant,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "INSERT INTO llm_invocation_audit_roots(root_id,root_kind,captured_at) " +
+                "SELECT 'bulk-prune-' || value,'DECISION_ATTEMPT',? FROM generate_series(1,?) value",
+        ).use { statement ->
+            statement.setLong(1, capturedAt.toEpochMilli())
+            statement.setInt(2, count)
+            assertEquals(count, statement.executeUpdate())
+        }
+    }
 }
 
 private fun seedTerminalEvidencePhaseManifest(database: ExposedDatabase) {

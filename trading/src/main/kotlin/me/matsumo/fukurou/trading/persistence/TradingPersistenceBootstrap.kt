@@ -622,6 +622,22 @@ private const val ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL = """
     ON llm_runs (started_at)
 """
 
+/** inactive audit reconstruction / coverage / prune のbounded lookup indexを作るSQL。 */
+private const val ENSURE_LLM_AUDIT_MAINTENANCE_INDEXES_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_decisions_audit_coverage_created
+        ON decisions (created_at, id) WHERE invocation_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_llm_audit_roots_retention
+        ON llm_invocation_audit_roots (captured_at, root_id) WHERE root_kind = 'DECISION_ATTEMPT';
+    CREATE INDEX IF NOT EXISTS idx_llm_phase_manifests_root
+        ON llm_phase_input_manifests (root_id, phase_manifest_id);
+    CREATE INDEX IF NOT EXISTS idx_llm_tool_evidence_phase
+        ON llm_tool_evidence (phase_manifest_id, ordinal, id);
+    CREATE INDEX IF NOT EXISTS idx_llm_evidence_coverage_phase
+        ON llm_decision_phase_evidence_coverage (phase_manifest_id, entity_kind, entity_id);
+    CREATE INDEX IF NOT EXISTS idx_llm_terminal_links_evidence
+        ON llm_terminal_evidence_links (evidence_id, ordinal, entity_kind, entity_id)
+"""
+
 /** decision run Activity projection の bounded lookup index を作る SQL。 */
 private const val ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL = """
     CREATE INDEX IF NOT EXISTS idx_llm_runs_decision_activity
@@ -1543,6 +1559,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
     executeUpdate(ENSURE_LLM_LAUNCH_CLAIM_RECOVERY_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_NONCLAIMED_RECENT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_RUNS_STARTED_AT_INDEX_SQL)
+    executeUpdate(ENSURE_LLM_AUDIT_MAINTENANCE_INDEXES_SQL)
     executeUpdate(ENSURE_DECISION_RUN_ACTIVITY_INDEXES_SQL)
     executeUpdate(ENSURE_ORDER_CANCEL_REASON_DOMAIN_SQL)
     executeUpdate(ENSURE_EQUITY_SNAPSHOTS_CAPTURED_AT_INDEX_SQL)
