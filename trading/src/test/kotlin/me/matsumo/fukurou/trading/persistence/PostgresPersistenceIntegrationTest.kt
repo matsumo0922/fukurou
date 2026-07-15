@@ -8177,6 +8177,143 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun restingFillDrawdownHaltUsesHardHaltOuterReasonAndTypedDetail() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000189")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val riskStateRepository = ExposedRiskStateRepository(database)
+        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+            Orderbook(
+                symbol = "BTC",
+                bids = listOf(OrderbookLevel(price = "9990000", size = "0.0010")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "0.0010", receivedAt = fixedInstant())).getOrThrow()
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+        val orderId = broker.placeOrder(command).getOrThrow().orderIds.single()
+        val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
+        riskStateRepository.setHardHalt("maximum drawdown reached", fixedInstant()).getOrThrow()
+        updateRiskStateDrawdownRatio(database, BigDecimal("-0.2000000000"))
+
+        val result = broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0100",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+        val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val persisted = selectFillInvariantCancellation(database, orderId)
+
+        assertEquals(listOf(orderId), result.canceledOrderIds)
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
+        assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
+        assertEquals(OrderStatus.CANCELED.name, persisted.status)
+        assertEquals(PaperOrderCancelReason.HARD_HALT, PaperOrderCancelReason.fromWireCode(persisted.outerReason))
+        assertEquals("FILL_INVARIANT_VIOLATION", persisted.kind)
+        assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT.name, persisted.code)
+        assertEquals(1, persisted.violationCount)
+    }
+
+    @Test
+    fun restingFillExpiredFomcCalendarUsesMarketDataGapOuterReasonAndTypedDetail() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000190")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val expiredFomcConfig = SafetyFloorConfig(
+            economicEventBlackouts = listOf(
+                EconomicEventBlackout(
+                    eventId = "fomc-past-fill",
+                    eventName = "FOMC",
+                    eventAt = Instant.parse("2026-01-01T19:00:00Z"),
+                    blackoutBefore = Duration.ofMinutes(60),
+                    blackoutAfter = Duration.ofMinutes(60),
+                ),
+            ),
+        )
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = fixedClock(),
+            safetyFloorConfig = expiredFomcConfig,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val riskStateRepository = ExposedRiskStateRepository(database)
+        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+            Orderbook(
+                symbol = "BTC",
+                bids = listOf(OrderbookLevel(price = "9990000", size = "0.0010")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+            ),
+        )
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+            requireRealtimeIntegrityForRestingOrders = true,
+            clock = fixedClock(),
+        )
+        broker.applyMarketEvent(paperTradeEvent(sessionId, 1, "0.0010", receivedAt = fixedInstant())).getOrThrow()
+        val command = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+        val orderId = broker.placeOrder(command).getOrThrow().orderIds.single()
+        val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
+
+        val result = broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0100",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+        val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val persisted = selectFillInvariantCancellation(database, orderId)
+
+        assertEquals(listOf(orderId), result.canceledOrderIds)
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
+        assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
+        assertEquals(OrderStatus.CANCELED.name, persisted.status)
+        assertEquals(PaperOrderCancelReason.MARKET_DATA_GAP, PaperOrderCancelReason.fromWireCode(persisted.outerReason))
+        assertEquals("FILL_INVARIANT_VIOLATION", persisted.kind)
+        assertEquals(SafetyFloorRule.FOMC_CALENDAR_EXPIRED.name, persisted.code)
+        assertEquals(1, persisted.violationCount)
+    }
+
+    @Test
     fun parallelRestingFillAndExitUseCommonLockOrderWithoutDuplicateMutation() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000188")
@@ -11947,6 +12084,16 @@ private fun selectFillInvariantCancellation(database: ExposedDatabase, orderId: 
                     violationCount = resultSet.getInt("violation_count"),
                 )
             }
+        }
+    }
+}
+
+private fun updateRiskStateDrawdownRatio(database: ExposedDatabase, drawdownRatio: BigDecimal) {
+    exposedTransaction(database) {
+        prepare("UPDATE risk_state SET drawdown_ratio = ? WHERE id = ?").use { statement ->
+            statement.setBigDecimal(1, drawdownRatio)
+            statement.setInt(2, RISK_STATE_SINGLE_ROW_ID)
+            check(statement.executeUpdate() == 1) { "Expected risk_state drawdown ratio to be updated." }
         }
     }
 }
