@@ -4961,9 +4961,9 @@ class PostgresPersistenceIntegrationTest {
             repository.tryReserve(llmLaunchReservationRequest("statement-budget", LlmRunnerConfig(), now)).getOrThrow(),
         )
         assertEquals(
-            12,
+            5,
             statementCount.get(),
-            "two admission checks, token acquisition, risk/active/usage reads, reservation insert, and PID registration",
+            "risk/active/usage reads and reservation/PID registration inserts",
         )
 
         val lockConnection = dataSource.connection
@@ -5010,11 +5010,11 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(1, recoveryService.tick().getOrThrow())
         assertEquals(
-            39,
+            26,
             statementCount.get(),
             "scan, mutation, PID terminalization, exact readback, and commit re-arm the page deadline",
         )
-        assertEquals(10, queryTimeouts.size)
+        assertEquals(6, queryTimeouts.size)
         assertTrue(queryTimeouts.all { timeout -> timeout in 1..5 })
         assertTrue(queryTimeouts.zipWithNext().all { (current, next) -> current >= next })
     }
@@ -5048,19 +5048,19 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(candidateCount, service.tick().getOrThrow())
         val fixedPageStatementCount = 5
-        val baseStatementsPerCandidate = 32
+        val baseStatementsPerCandidate = 19
         val pidTerminalizationStatementsPerCandidate = 2
         val expectedStatementCount = fixedPageStatementCount +
             candidateCount * (baseStatementsPerCandidate + pidTerminalizationStatementsPerCandidate)
         assertEquals(expectedStatementCount, statementCount.get(), "recovery statement count")
-        assertEquals(1_102, executedSql.count { sql -> sql.startsWith("SET LOCAL lock_timeout") })
-        assertEquals(1_102, executedSql.count { sql -> sql.startsWith("SET LOCAL statement_timeout") })
+        assertEquals(702, executedSql.count { sql -> sql.startsWith("SET LOCAL lock_timeout") })
+        assertEquals(702, executedSql.count { sql -> sql.startsWith("SET LOCAL statement_timeout") })
         val statementTimeoutMillis = executedSql.recoveryTimeoutMillis("SET LOCAL statement_timeout")
         val lockTimeoutMillis = executedSql.recoveryTimeoutMillis("SET LOCAL lock_timeout")
         assertTrue(statementTimeoutMillis.zipWithNext().all { (current, next) -> current >= next })
         assertTrue(lockTimeoutMillis.zip(statementTimeoutMillis).all { (lock, statement) -> lock < statement })
         assertFalse(executedSql.any { sql -> "transaction_timeout" in sql })
-        assertEquals(901, queryTimeouts.size)
+        assertEquals(501, queryTimeouts.size)
         assertTrue(queryTimeouts.all { timeout -> timeout in 1..5 })
         assertTrue(queryTimeouts.zipWithNext().all { (current, next) -> current >= next })
         assertEquals(100, countTerminalBatchRecoveryReservations(database))
@@ -10494,7 +10494,8 @@ private fun insertClaimedLlmReservationFixture(
             """
                 INSERT INTO llm_launch_reservations (
                     id, invocation_id, trigger_kind, trigger_key, status, reserved_at,
-                    execution_claim_state, claimant_token, claimed_at, heartbeat_at
+                    execution_claim_state, execution_claim_token, execution_claimed_at,
+                    execution_claim_heartbeat_at
                 ) VALUES (
                     gen_random_uuid(), ?, 'FLAT_HEARTBEAT', ?, 'RUNNING', ?,
                     'CLAIMED', ?, ?, ?
