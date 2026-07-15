@@ -23,7 +23,7 @@ import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
-import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
@@ -43,6 +43,7 @@ import java.util.UUID
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock paper ledger の作成時刻に使う clock
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 class InMemoryPaperLedgerRepository private constructor(
     private val state: InMemoryPaperLedgerState,
@@ -85,6 +86,7 @@ class InMemoryPaperLedgerRepository private constructor(
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
         accountStateBoundary: InMemoryAccountStateBoundary = InMemoryAccountStateBoundary(),
+        maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(),
     ) : this(
         InMemoryPaperLedgerState(
             account = InMemoryPaperLedgerAccountSeed(
@@ -102,6 +104,7 @@ class InMemoryPaperLedgerRepository private constructor(
                 equitySnapshotRepository = equitySnapshotRepository,
                 fallbackSymbolRules = fallbackSymbolRules,
                 clock = clock,
+                maxDrawdownPolicy = maxDrawdownPolicy,
             ),
             accountStateBoundary = accountStateBoundary,
         ),
@@ -189,11 +192,13 @@ private data class InMemoryClosePositionUpdate(
  * @param equitySnapshotRepository equity snapshot 保存先
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock paper ledger の作成時刻に使う clock
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 private data class InMemoryPaperLedgerRuntime(
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository,
     val fallbackSymbolRules: SymbolRules,
     val clock: Clock,
+    val maxDrawdownPolicy: MaxDrawdownPolicy,
 )
 
 /**
@@ -220,6 +225,7 @@ private class InMemoryPaperLedgerState(
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
+    val maxDrawdownPolicy: MaxDrawdownPolicy = runtime.maxDrawdownPolicy
     val orderMarketEligibility: MutableMap<String, RestingOrderMarketEligibility> = mutableMapOf()
     val orderQueueConsumedBtc: MutableMap<String, BigDecimal> = mutableMapOf()
     val positionMarketEligibility: MutableMap<String, PositionMarketEligibility> = mutableMapOf()
@@ -646,11 +652,11 @@ private class InMemoryPaperLedgerMutationWriter(
 
                 expireRestingEntryOrdersLocked(clock.instant(), progress)
 
-                if (!accountSnapshot.isHardHaltDrawdownReached()) {
-                    if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
+                if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
+                    if (!maxDrawdownPolicy.isHardHalt(accountSnapshot.drawdownRatio.toBigDecimal())) {
                         fillTriggeredEntryOrdersLocked(reconcileContext, progress)
-                        triggerPositionProtectionsLocked(reconcileContext, progress)
                     }
+                    triggerPositionProtectionsLocked(reconcileContext, progress)
                 }
 
                 progress.toPaperReconcileResult()
@@ -717,7 +723,7 @@ private class InMemoryPaperLedgerMutationWriter(
 
                 updateMarksLocked(event.priceJpy, null, fallbackSymbolRules, event.receivedAt)
                 expireRestingEntryOrdersLocked(clock.instant(), progress)
-                if (!accountSnapshot.isHardHaltDrawdownReached()) {
+                if (!maxDrawdownPolicy.isHardHalt(accountSnapshot.drawdownRatio.toBigDecimal())) {
                     val existingPositionIds = positions.mapTo(mutableSetOf(), Position::positionId)
                     fillMarketEventEntryOrdersLocked(event, context, progress)
                     positions
@@ -728,8 +734,8 @@ private class InMemoryPaperLedgerMutationWriter(
                                 event.sequence,
                             )
                         }
-                    triggerPositionProtectionsLocked(context, progress, event)
                 }
+                triggerPositionProtectionsLocked(context, progress, event)
                 lastMarketSequence = event.sequence
 
                 progress.toPaperReconcileResult()
@@ -1687,10 +1693,6 @@ private fun AccountSnapshot.withMarkPrice(markPrice: BigDecimal): AccountSnapsho
         equityPeakJpy = equityPeak.toPlainString(),
         drawdownRatio = drawdownRatio.ratioScale().toPlainString(),
     )
-}
-
-private fun AccountSnapshot.isHardHaltDrawdownReached(): Boolean {
-    return drawdownRatio.toBigDecimal() <= SafetyFloorDefaults.maxDrawdownRatio
 }
 
 private fun Order.isEntryTriggered(context: ReconcileMarketContext): Boolean {

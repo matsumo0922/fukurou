@@ -151,6 +151,30 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
+    fun validate_maxDrawdownRatio_accepts_active_range_and_fails_closed_otherwise() {
+        val defaults = RuntimeConfigCatalog.runtimeDefaultValues()
+        val accepted = RuntimeConfigCandidateValidator.validate(
+            values = defaults + ("safety.maxDrawdownRatio" to "-0.10"),
+            environment = emptyMap(),
+        )
+        val rejectedValues = listOf("-0.16", "0", "not-a-decimal")
+
+        assertTrue(accepted.validation.valid)
+        rejectedValues.forEach { value ->
+            val rejected = RuntimeConfigCandidateValidator.validate(
+                values = defaults + ("safety.maxDrawdownRatio" to value),
+                environment = emptyMap(),
+            )
+
+            assertFalse(rejected.validation.valid, value)
+            assertTrue(
+                rejected.validation.errors.any { error -> error.key == "safety.maxDrawdownRatio" },
+                value,
+            )
+        }
+    }
+
+    @Test
     fun resolve_failsClosedWhenActiveRuntimeConfigIsMissingCatalogKey() {
         val values = RuntimeConfigCatalog.runtimeDefaultValues()
             .filterKeys { key -> key != "runner.maxToolCallsPerRun" }

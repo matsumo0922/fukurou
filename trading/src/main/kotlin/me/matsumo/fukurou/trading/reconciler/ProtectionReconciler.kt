@@ -37,7 +37,7 @@ import me.matsumo.fukurou.trading.market.isFailClosedGmoRequestFailure
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
-import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import java.sql.SQLException
 import java.time.Clock
 import java.time.Duration
@@ -131,6 +131,7 @@ enum class ReconcilePassKind {
  * @param status Reconciler の状態 holder
  * @param clock pass timestamp に使う clock
  * @param warnLogger rate-limited warning logger
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 class ProtectionReconciler(
     private val riskStateRepository: RiskStateRepository,
@@ -150,6 +151,7 @@ class ProtectionReconciler(
         logger = RECONCILER_LOGGER,
         clock = clock,
     ),
+    private val maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(),
 ) {
 
     private var previousPassFailed = false
@@ -368,7 +370,13 @@ class ProtectionReconciler(
     private suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<Unit> {
         return try {
             tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
-                broker?.applyMarketEvent(event)?.getOrThrow()
+                val tickSnapshot = event.toTickSnapshot()
+                val sweptBeforeEvent = enforceHardHaltSweepIfNeeded(tickSnapshot)
+
+                if (!sweptBeforeEvent) {
+                    broker?.applyMarketEvent(event)?.getOrThrow()
+                    enforceHardHaltSweepIfNeeded(tickSnapshot)
+                }
             }
             Result.success(Unit)
         } catch (throwable: CancellationException) {
@@ -570,7 +578,7 @@ class ProtectionReconciler(
 
     private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot): Boolean {
         val currentRiskState = riskStateRepository.current().getOrThrow()
-        val hardHaltReached = currentRiskState.drawdownRatio <= SafetyFloorDefaults.maxDrawdownRatio
+        val hardHaltReached = maxDrawdownPolicy.isHardHalt(currentRiskState.drawdownRatio)
         val hardHaltEnabled = currentRiskState.state == RiskHaltState.HARD_HALT
         val shouldSweep = hardHaltEnabled || hardHaltReached
 
@@ -591,6 +599,18 @@ class ProtectionReconciler(
         broker?.sweepHardHalt(reason, tickSnapshot)?.getOrThrow()
 
         return true
+    }
+
+    private fun PaperMarketTradeEvent.toTickSnapshot(): TickSnapshot {
+        val price = priceJpy.toPlainString()
+
+        return TickSnapshot(
+            symbol = symbol.apiSymbol,
+            observedAt = receivedAt,
+            lastPrice = price,
+            bidPrice = price,
+            askPrice = price,
+        )
     }
 
     private suspend fun recordStarted(): Result<Unit> {

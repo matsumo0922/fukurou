@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperReconcileResult
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
+import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
@@ -62,6 +63,9 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
+import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import java.math.BigDecimal
 import java.sql.SQLException
 import java.time.Clock
@@ -775,6 +779,114 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun reconcile_pass_uses_non_default_policy_for_pre_sweep() = runBlocking {
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val riskStateRepository = InMemoryRiskStateRepository(
+            clock = fixedClock(),
+            initialState = RiskState(
+                drawdownRatio = BigDecimal("-0.1200000000"),
+                equityPeak = BigDecimal("100000"),
+                updatedAt = fixedInstant(),
+            ),
+        )
+        val repository = InMemoryPaperLedgerRepository(maxDrawdownPolicy = policy)
+        val broker = RecordingBroker(
+            delegate = PaperBroker(
+                ledgerRepository = repository,
+                riskStateRepository = riskStateRepository,
+                safetyFloor = SafetyFloor(
+                    config = SafetyFloorConfig(maxDrawdownRatio = BigDecimal("-0.10")),
+                    clock = fixedClock(),
+                    maxDrawdownPolicy = policy,
+                ),
+                maxDrawdownPolicy = policy,
+                marketDataSource = ReconcilerFakeMarketDataSource,
+                clock = fixedClock(),
+            ),
+        )
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = broker,
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            maxDrawdownPolicy = policy,
+        )
+
+        val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
+
+        assertTrue(result.isSuccess)
+        assertEquals(RiskHaltState.HARD_HALT, riskStateRepository.current().getOrThrow().state)
+        assertEquals(1, broker.sweptTicks.size)
+        assertEquals(neutralBtcTickSnapshot(), broker.sweptTicks.single())
+    }
+
+    @Test
+    fun default_equal_drawdown_rollback_resumes_sweep_without_entry_or_duplicate_execution() = runBlocking {
+        val policy = MaxDrawdownPolicy()
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val seedRepository = InMemoryPaperLedgerRepository(maxDrawdownPolicy = policy)
+        val seedBroker = PaperBroker(
+            ledgerRepository = seedRepository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            maxDrawdownPolicy = policy,
+            clock = fixedClock(),
+        )
+        seedBroker.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = restingReconcilerEntryCommand(),
+            ),
+        ).getOrThrow()
+        val restingEntry = seedBroker.getOpenOrders().getOrThrow().single()
+        val rollbackRepository = InMemoryPaperLedgerRepository(
+            accountSnapshot = AccountSnapshot(
+                mode = TradingMode.PAPER,
+                cashJpy = "85000.00000000",
+                initialCashJpy = "100000.00000000",
+                btcQuantity = "0.000000000000",
+                btcMarkPriceJpy = "0.00000000",
+                totalEquityJpy = "85000.00000000",
+                equityPeakJpy = "100000.00000000",
+                drawdownRatio = "-0.1500000000",
+            ),
+            openOrders = listOf(restingEntry),
+            maxDrawdownPolicy = policy,
+        )
+        val riskStateRepository = InMemoryRiskStateRepository(
+            clock = fixedClock(),
+            initialState = RiskState(
+                state = RiskHaltState.HARD_HALT,
+                drawdownRatio = BigDecimal("-0.1500000000"),
+                equityPeak = BigDecimal("100000"),
+                haltReason = "max drawdown reached before crash",
+                haltAt = fixedInstant(),
+                updatedAt = fixedInstant(),
+            ),
+        )
+        val rollbackBroker = PaperBroker(
+            ledgerRepository = rollbackRepository,
+            riskStateRepository = riskStateRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            maxDrawdownPolicy = policy,
+            clock = fixedClock(),
+        )
+        val reconciler = createReconciler(
+            riskStateRepository = riskStateRepository,
+            broker = rollbackBroker,
+            tickStream = SwitchableTickStream(Result.success(drawdownHaltTickSnapshot())),
+            maxDrawdownPolicy = policy,
+        )
+
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+        reconciler.reconcileOnce(ReconcilePassKind.LOOP).getOrThrow()
+
+        assertTrue(rollbackBroker.getOpenOrders().getOrThrow().isEmpty())
+        assertTrue(rollbackRepository.getExecutions().getOrThrow().isEmpty())
+        assertEquals(RiskHaltState.HARD_HALT, riskStateRepository.current().getOrThrow().state)
+    }
+
+    @Test
     fun market_event_loop_applies_event_and_retries_gap_impact_under_global_lock() = runBlocking {
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000163")
         val event = PaperMarketTradeEvent(
@@ -889,6 +1001,63 @@ class ProtectionReconcilerTest {
         assertEquals(listOf(event), broker.appliedEvents)
         assertEquals(0, integrity.markDisconnectedCount)
         assertEquals(0, integrity.applyGapImpactCount)
+    }
+
+    @Test
+    fun market_event_hard_halt_sweeps_with_same_event_snapshot() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000181")
+        val event = PaperMarketTradeEvent(
+            symbol = TradingSymbol.BTC,
+            side = OrderSide.SELL,
+            priceJpy = BigDecimal("8800000"),
+            sizeBtc = BigDecimal("0.0010"),
+            exchangeAt = fixedInstant(),
+            receivedAt = fixedInstant().plusSeconds(1),
+            connectionSessionId = sessionId,
+            sequence = 1,
+        )
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val broker = RecordingBroker(
+            delegate = PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(),
+                riskStateRepository = riskStateRepository,
+                decisionRepository = InMemoryDecisionRepository(fixedClock()),
+                marketDataSource = ReconcilerFakeMarketDataSource,
+                clock = fixedClock(),
+            ),
+            afterApply = {
+                riskStateRepository.setHardHalt("event threshold reached", event.receivedAt).getOrThrow()
+            },
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), listOf(event)),
+            ),
+            marketDataIntegrityRepository = RetryableMarketDataIntegrityRepository(0),
+            broker = broker,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofSeconds(1))
+        }
+
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+            while (broker.sweptTicks.isEmpty()) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        val sweptTick = broker.sweptTicks.single()
+        assertEquals(listOf(event), broker.appliedEvents)
+        assertEquals(event.symbol.apiSymbol, sweptTick.symbol)
+        assertEquals(event.receivedAt, sweptTick.observedAt)
+        assertEquals(event.priceJpy.toPlainString(), sweptTick.lastPrice)
+        assertEquals(event.priceJpy.toPlainString(), sweptTick.bidPrice)
+        assertEquals(event.priceJpy.toPlainString(), sweptTick.askPrice)
     }
 
     @Test
@@ -1180,20 +1349,31 @@ private class CountingTradingLock(
 /** realtime event を実 broker に渡した回数を記録する test adapter。 */
 private class RecordingBroker(
     private val delegate: Broker,
+    private val afterApply: suspend (PaperMarketTradeEvent) -> Unit = {},
 ) : Broker by delegate {
     val appliedEvents = mutableListOf<PaperMarketTradeEvent>()
     var maintenanceCount = 0
         private set
+    val sweptTicks = mutableListOf<TickSnapshot>()
 
     override suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<PaperReconcileResult> {
-        return delegate.applyMarketEvent(event).also {
-            appliedEvents += event
-        }
+        val result = delegate.applyMarketEvent(event)
+
+        if (result.isSuccess) afterApply(event)
+        appliedEvents += event
+
+        return result
     }
 
     override suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
         return delegate.maintainProtections(tickSnapshot).also {
             maintenanceCount += 1
+        }
+    }
+
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
+        return delegate.sweepHardHalt(reasonJa, tickSnapshot).also {
+            sweptTicks += tickSnapshot
         }
     }
 }
@@ -1380,6 +1560,7 @@ private fun createReconciler(
     broker: Broker? = null,
     equitySnapshotRecorder: EquitySnapshotRecorder? = null,
     killCriterionEvaluator: KillCriterionEvaluator? = null,
+    maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(),
 ): ProtectionReconciler {
     return ProtectionReconciler(
         riskStateRepository = riskStateRepository,
@@ -1391,6 +1572,7 @@ private fun createReconciler(
         killCriterionEvaluator = killCriterionEvaluator,
         status = status,
         clock = clock,
+        maxDrawdownPolicy = maxDrawdownPolicy,
     )
 }
 

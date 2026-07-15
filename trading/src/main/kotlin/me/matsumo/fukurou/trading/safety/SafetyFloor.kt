@@ -284,6 +284,33 @@ data class SafetyFloorConfig(
 }
 
 /**
+ * active runtime config に束縛された最大 drawdown 判定 policy。
+ *
+ * @param thresholdRatio HARD_HALT に到達したとみなす drawdown ratio
+ */
+class MaxDrawdownPolicy(
+    val thresholdRatio: BigDecimal = SafetyFloorDefaults.maxDrawdownRatio,
+) {
+    init {
+        require(thresholdRatio < BigDecimal.ZERO) {
+            "thresholdRatio must be less than 0."
+        }
+    }
+
+    /** drawdown が HARD_HALT 閾値へ到達しているなら true を返す。 */
+    fun isHardHalt(drawdownRatio: BigDecimal): Boolean {
+        return drawdownRatio.compareTo(thresholdRatio) <= 0
+    }
+
+    /** active config と policy が同じ数値の threshold に束縛されていることを検証する。 */
+    fun requireMatches(config: SafetyFloorConfig) {
+        require(config.maxDrawdownRatio.compareTo(thresholdRatio) == 0) {
+            "maxDrawdownRatio must match MaxDrawdownPolicy thresholdRatio."
+        }
+    }
+}
+
+/**
  * 市場データ鮮度劣化時に EV 計算だけへ適用する probability cap。
  *
  * @param staleAfter この時間を超えて古い市場データを stale とみなす
@@ -455,14 +482,20 @@ data class SafetyFloorPlaceOrderRiskDetails(
  * @param config 安全床しきい値
  * @param clock violation timestamp に使う clock
  * @param paperExecutionConfig paper 約定近似設定
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 @Suppress("LargeClass") // placement と fill が同じ rule authority を共有するため、rule set を分散させない。
 class SafetyFloor(
     private val config: SafetyFloorConfig = SafetyFloorConfig(),
     private val clock: Clock = Clock.systemUTC(),
     private val paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
+    internal val maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(config.maxDrawdownRatio),
 ) {
     private val riskCalculator = SafetyFloorRiskCalculator(config, clock, paperExecutionConfig)
+
+    init {
+        maxDrawdownPolicy.requireMatches(config)
+    }
 
     /**
      * place_order の entry intent を検証する。
@@ -582,7 +615,7 @@ class SafetyFloor(
         val riskStateDrawdown = context.riskState.drawdownRatio
         val measuredDrawdown = minOf(accountDrawdown, riskStateDrawdown)
         val hardHaltEnabled = context.riskState.state == RiskHaltState.HARD_HALT
-        val hardHaltReached = hardHaltEnabled || measuredDrawdown <= config.maxDrawdownRatio
+        val hardHaltReached = hardHaltEnabled || maxDrawdownPolicy.isHardHalt(measuredDrawdown)
 
         if (!hardHaltReached) {
             return null
@@ -595,7 +628,7 @@ class SafetyFloor(
                 rule = SafetyFloorRule.MAX_DRAWDOWN_HALT,
                 messageJa = "最大 DD が HARD_HALT 閾値に到達したため、全注文取消と全建玉 close を実行して取引を停止します。",
                 measuredValue = measuredDrawdown.toPlainString(),
-                limitValue = config.maxDrawdownRatio.toPlainString(),
+                limitValue = maxDrawdownPolicy.thresholdRatio.toPlainString(),
                 hardHaltRequired = true,
             ),
         )

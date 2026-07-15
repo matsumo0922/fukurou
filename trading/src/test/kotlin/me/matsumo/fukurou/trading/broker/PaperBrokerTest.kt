@@ -47,6 +47,7 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.safety.DataQualityCapConfig
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorContext
@@ -1473,6 +1474,122 @@ class PaperBrokerTest {
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertTrue(result.executionIds.isNotEmpty())
+    }
+
+    @Test
+    fun reconcile_uses_non_default_policy_for_autonomous_halt() = runBlocking {
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshot().copy(
+                cashJpy = "88000.00000000",
+                totalEquityJpy = "88000.00000000",
+                equityPeakJpy = "100000.00000000",
+                drawdownRatio = "-0.1200000000",
+            ),
+            maxDrawdownPolicy = policy,
+        )
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = riskStateRepository,
+            safetyFloor = SafetyFloor(
+                config = SafetyFloorConfig(maxDrawdownRatio = BigDecimal("-0.10")),
+                clock = fixedClock(),
+                maxDrawdownPolicy = policy,
+            ),
+            maxDrawdownPolicy = policy,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.reconcile(watermarkTickSnapshot("10000000")).getOrThrow()
+
+        assertEquals(RiskHaltState.HARD_HALT, riskStateRepository.current().getOrThrow().state)
+    }
+
+    @Test
+    fun in_memory_reconcile_blocks_entry_but_executes_protection_at_threshold() = runBlocking {
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val entryOrder = order(
+            orderId = "20000000-0000-0000-0000-000000000006",
+            positionId = null,
+            orderType = OrderType.LIMIT,
+            side = OrderSide.BUY,
+            status = OrderStatus.OPEN,
+        )
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshot().copy(
+                cashJpy = "0.00000000",
+                btcQuantity = "0.010000000000",
+                btcMarkPriceJpy = "8500000.00000000",
+                totalEquityJpy = "85000.00000000",
+                equityPeakJpy = "100000.00000000",
+                drawdownRatio = "-0.1500000000",
+            ),
+            positions = listOf(protectedPosition().copy(currentStopLossJpy = "8500000.00000000")),
+            openOrders = listOf(
+                entryOrder,
+                linkedStopOrder().copy(triggerPriceJpy = "8500000.00000000"),
+            ),
+            maxDrawdownPolicy = policy,
+        )
+
+        repository.reconcile(
+            tickSnapshot = watermarkTickSnapshot("8500000"),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        val executions = repository.getExecutions().getOrThrow()
+        assertEquals(1, executions.size)
+        assertEquals(OrderSide.SELL, executions.single().side)
+        assertTrue(repository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(entryOrder.orderId, repository.getOpenOrders().getOrThrow().single().orderId)
+    }
+
+    @Test
+    fun in_memory_market_event_blocks_entry_but_executes_protection_at_threshold() = runBlocking {
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val entryOrder = order(
+            orderId = "20000000-0000-0000-0000-000000000007",
+            positionId = null,
+            orderType = OrderType.LIMIT,
+            side = OrderSide.BUY,
+            status = OrderStatus.OPEN,
+        )
+        val repository = InMemoryPaperLedgerRepository(
+            accountSnapshot = accountSnapshot().copy(
+                cashJpy = "0.00000000",
+                btcQuantity = "0.010000000000",
+                btcMarkPriceJpy = "8500000.00000000",
+                totalEquityJpy = "85000.00000000",
+                equityPeakJpy = "100000.00000000",
+                drawdownRatio = "-0.1500000000",
+            ),
+            positions = listOf(protectedPosition().copy(currentStopLossJpy = "8500000.00000000")),
+            openOrders = listOf(
+                entryOrder,
+                linkedStopOrder().copy(triggerPriceJpy = "8500000.00000000"),
+            ),
+            maxDrawdownPolicy = policy,
+        )
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000184")
+
+        repository.applyMarketEvent(
+            event = inMemoryPaperTradeEvent(
+                sessionId = sessionId,
+                sequence = 1,
+                side = OrderSide.SELL,
+                sizeBtc = "0.0100",
+                priceJpy = "8500000",
+            ),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        val executions = repository.getExecutions().getOrThrow()
+        assertEquals(1, executions.size)
+        assertEquals(OrderSide.SELL, executions.single().side)
+        assertTrue(repository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(entryOrder.orderId, repository.getOpenOrders().getOrThrow().single().orderId)
     }
 
     @Test

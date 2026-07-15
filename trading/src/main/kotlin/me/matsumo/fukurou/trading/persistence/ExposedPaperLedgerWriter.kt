@@ -74,6 +74,7 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorContext
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyFloorVerdict
 import me.matsumo.fukurou.trading.safety.SafetyViolation
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -90,6 +91,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  * @param database Exposed database
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock DB 更新時刻に使う clock
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 internal class ExposedPaperLedgerWriter(
     private val database: ExposedDatabase,
@@ -98,6 +100,7 @@ internal class ExposedPaperLedgerWriter(
     private val fillInvariantEvaluator: RestingEntryFillInvariantEvaluator = RestingEntryFillInvariantEvaluator(
         SafetyFloor(),
     ),
+    private val maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(),
 ) : PaperLedgerMutationRepository {
 
     /**
@@ -425,7 +428,7 @@ internal class ExposedPaperLedgerWriter(
                     expireRestingEntryOrders(clock.instant(), progress)
 
                     if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
-                        if (writeContext.baselineAligned) {
+                        if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.baselineAligned) {
                             fillTriggeredEntryOrders(
                                 context = reconcileContext,
                                 progress = progress,
@@ -459,6 +462,7 @@ internal class ExposedPaperLedgerWriter(
                         writeContext = writeContext,
                         fillInvariantEvaluator = fillInvariantEvaluator,
                         clock = clock,
+                        maxDrawdownPolicy = maxDrawdownPolicy,
                     )
                 }
             }
@@ -531,6 +535,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     writeContext: PaperWriteContext,
     fillInvariantEvaluator: RestingEntryFillInvariantEvaluator,
     clock: Clock,
+    maxDrawdownPolicy: MaxDrawdownPolicy,
 ): PaperReconcileResult {
     val cursor = lockMarketDataCursor(event.connectionSessionId)
 
@@ -558,7 +563,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     expireRestingEntryOrders(clock.instant(), progress)
     bindExistingPositionsToSession(event)
 
-    if (writeContext.baselineAligned) {
+    if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.baselineAligned) {
         applyEventToRestingEntries(
             event = event,
             simulator = simulator,
@@ -2268,6 +2273,10 @@ private fun JdbcTransaction.syncRiskStateEquity(
         statement.setInt(4, RISK_STATE_SINGLE_ROW_ID)
         statement.executeUpdate()
     }
+}
+
+private fun JdbcTransaction.paperAccountHardHaltReached(maxDrawdownPolicy: MaxDrawdownPolicy): Boolean {
+    return maxDrawdownPolicy.isHardHalt(selectPaperAccount().drawdownRatio.toBigDecimal())
 }
 
 private fun JdbcTransaction.requireOpenPosition(positionId: UUID): Position {

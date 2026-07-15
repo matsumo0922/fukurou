@@ -33,6 +33,8 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -40,6 +42,55 @@ import kotlin.test.assertTrue
  * SafetyFloor の rule 判定を検証するテスト。
  */
 class SafetyFloorTest {
+
+    @Test
+    fun max_drawdown_policy_uses_compareTo_for_boundary_and_scale() {
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+
+        assertFalse(policy.isHardHalt(BigDecimal("-0.099999")))
+        assertTrue(policy.isHardHalt(BigDecimal("-0.10")))
+        assertTrue(policy.isHardHalt(BigDecimal("-0.1000")))
+        assertTrue(policy.isHardHalt(BigDecimal("-0.100001")))
+        policy.requireMatches(SafetyFloorConfig(maxDrawdownRatio = BigDecimal("-0.1000")))
+    }
+
+    @Test
+    fun max_drawdown_policy_rejects_non_negative_and_mismatched_config() {
+        assertFailsWith<IllegalArgumentException> {
+            MaxDrawdownPolicy(BigDecimal.ZERO)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            MaxDrawdownPolicy(BigDecimal("-0.10"))
+                .requireMatches(SafetyFloorConfig(maxDrawdownRatio = BigDecimal("-0.11")))
+        }
+    }
+
+    @Test
+    fun place_order_uses_non_default_max_drawdown_policy() {
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val verdict = SafetyFloor(
+            config = SafetyFloorConfig(maxDrawdownRatio = BigDecimal("-0.10")),
+            clock = fixedClock(),
+            maxDrawdownPolicy = policy,
+        ).evaluatePlaceOrder(
+            command = entryCommand(),
+            context = safetyContext(
+                positions = emptyList(),
+                atr14Jpy = null,
+            ).copy(
+                account = accountSnapshot().copy(drawdownRatio = "-0.1200000000"),
+                riskState = RiskState(
+                    drawdownRatio = BigDecimal("-0.1200000000"),
+                    updatedAt = fixedInstant(),
+                ),
+            ),
+        )
+
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+
+        assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT, rejected.violation.rule)
+        assertEquals("-0.10", rejected.violation.limitValue)
+    }
 
     @Test
     fun place_order_rejects_entry_during_economic_event_blackout() {

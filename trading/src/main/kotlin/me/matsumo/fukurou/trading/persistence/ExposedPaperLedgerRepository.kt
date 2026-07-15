@@ -39,6 +39,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.RestingEntryFillInvariantEvaluator
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
@@ -894,6 +895,7 @@ private class ExposedPaperLedgerHistoryReader(
  *
  * @param database Exposed database
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 class ExposedPaperLedgerRepository private constructor(
     private val writer: ExposedPaperLedgerWriter,
@@ -912,7 +914,10 @@ class ExposedPaperLedgerRepository private constructor(
         database: ExposedDatabase,
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
-        safetyFloorConfig: SafetyFloorConfig = SafetyFloorConfig(),
+        maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(),
+        safetyFloorConfig: SafetyFloorConfig = SafetyFloorConfig(
+            maxDrawdownRatio = maxDrawdownPolicy.thresholdRatio,
+        ),
         paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
     ) : this(
         writer = ExposedPaperLedgerWriter(
@@ -923,9 +928,11 @@ class ExposedPaperLedgerRepository private constructor(
                     config = safetyFloorConfig,
                     clock = clock,
                     paperExecutionConfig = paperExecutionConfig,
+                    maxDrawdownPolicy = maxDrawdownPolicy,
                 ),
             ),
             clock = clock,
+            maxDrawdownPolicy = maxDrawdownPolicy,
         ),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),

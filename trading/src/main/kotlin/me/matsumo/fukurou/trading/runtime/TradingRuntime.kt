@@ -63,6 +63,7 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import me.matsumo.fukurou.trading.tool.CallerNoTradeGuard
@@ -244,6 +245,7 @@ object TradingRuntimeFactory {
         marketDataSource: MarketDataSource? = null,
         tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(),
     ): TradingRuntime {
+        val maxDrawdownPolicy = MaxDrawdownPolicy(tradingConfig.safetyFloor.maxDrawdownRatio)
         val accountStateBoundary = InMemoryAccountStateBoundary()
         val riskStateRepository = InMemoryRiskStateRepository(
             clock = clock,
@@ -270,6 +272,7 @@ object TradingRuntimeFactory {
             fallbackSymbolRules = tradingConfig.paperMarket.toSymbolRules(tradingConfig.symbol),
             clock = clock,
             accountStateBoundary = accountStateBoundary,
+            maxDrawdownPolicy = maxDrawdownPolicy,
         )
         val brokerRepositories = InMemoryBrokerRepositories(
             ledgerRepository = ledgerRepository,
@@ -283,6 +286,7 @@ object TradingRuntimeFactory {
             marketDataSource = marketDataSource,
             reconcilerStatusProvider = reconcilerStatusProvider,
             clock = clock,
+            maxDrawdownPolicy = maxDrawdownPolicy,
         )
         val tradingLock = InMemoryTradingLock(clock)
         val callerNoTradeGuard = CallerNoTradeGuard(commandEventLog, clock)
@@ -392,7 +396,13 @@ object TradingRuntimeFactory {
         verifyApplicationSchema: Boolean = true,
     ): TradingRuntime {
         val connection = PostgresRuntimeConnection(dataSource, database, closeDataSource)
-        val context = PostgresRuntimeContext(clock, reconcilerStatusProvider, marketDataSource, tradingConfig)
+        val context = PostgresRuntimeContext(
+            clock = clock,
+            reconcilerStatusProvider = reconcilerStatusProvider,
+            marketDataSource = marketDataSource,
+            tradingConfig = tradingConfig,
+            maxDrawdownPolicy = MaxDrawdownPolicy(tradingConfig.safetyFloor.maxDrawdownRatio),
+        )
 
         if (verifyApplicationSchema) verifyPostgresSchema(connection, context)
 
@@ -450,6 +460,7 @@ private fun TradingBotConfig.createInMemoryBroker(
     marketDataSource: MarketDataSource?,
     reconcilerStatusProvider: ReconcilerStatusProvider,
     clock: Clock,
+    maxDrawdownPolicy: MaxDrawdownPolicy,
 ): PaperBroker {
     return PaperBroker(
         ledgerRepository = repositories.ledgerRepository,
@@ -463,7 +474,9 @@ private fun TradingBotConfig.createInMemoryBroker(
             config = safetyFloor,
             clock = clock,
             paperExecutionConfig = paperExecution,
+            maxDrawdownPolicy = maxDrawdownPolicy,
         ),
+        maxDrawdownPolicy = maxDrawdownPolicy,
         marketDataSource = marketDataSource,
         paperExecutionConfig = paperExecution,
         fillSimulator = DefaultPaperExecutionSimulator(paperExecution, clock),
@@ -548,6 +561,7 @@ private fun createPostgresBroker(
             clock = context.clock,
             safetyFloorConfig = context.tradingConfig.safetyFloor,
             paperExecutionConfig = context.tradingConfig.paperExecution,
+            maxDrawdownPolicy = context.maxDrawdownPolicy,
         ),
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = riskStateCommandService,
@@ -559,7 +573,9 @@ private fun createPostgresBroker(
             config = context.tradingConfig.safetyFloor,
             clock = context.clock,
             paperExecutionConfig = context.tradingConfig.paperExecution,
+            maxDrawdownPolicy = context.maxDrawdownPolicy,
         ),
+        maxDrawdownPolicy = context.maxDrawdownPolicy,
         marketDataSource = context.marketDataSource,
         paperExecutionConfig = context.tradingConfig.paperExecution,
         fillSimulator = DefaultPaperExecutionSimulator(context.tradingConfig.paperExecution, context.clock),
@@ -589,12 +605,14 @@ private data class PostgresRuntimeConnection(
  * @param reconcilerStatusProvider injected reconciler status provider
  * @param marketDataSource injected market data source
  * @param tradingConfig trading bot config
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 private data class PostgresRuntimeContext(
     val clock: Clock,
     val reconcilerStatusProvider: ReconcilerStatusProvider?,
     val marketDataSource: MarketDataSource?,
     val tradingConfig: TradingBotConfig,
+    val maxDrawdownPolicy: MaxDrawdownPolicy,
 )
 
 /**
