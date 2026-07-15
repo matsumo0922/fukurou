@@ -71,7 +71,9 @@ cleanup() {
   FUKUROU_IMAGE_REFERENCE="${LOCAL_REPOSITORY}:cleanup" FUKUROU_IMAGE_TAG="${LOCAL_REPOSITORY}:cleanup" \
     compose down -v --remove-orphans >/dev/null 2>&1 || true
   docker rm -f "${REGISTRY_NAME}" >/dev/null 2>&1 || true
-  docker ps -aq --filter "name=fukurou-canary-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+  # E2E の deployment ID は e2e- prefix 固定。実 deploy の canary（fukurou-canary-github-*）を
+  # 共有ホストで巻き込まないよう、削除対象を E2E 由来の canary に限定する。
+  docker ps -aq --filter "name=fukurou-canary-e2e-" | xargs -r docker rm -f >/dev/null 2>&1 || true
   rm -rf "${WORK}"
   return "${status}"
 }
@@ -326,7 +328,7 @@ scenario_one() {
   assert_equals "scenario 1 maintenance" "f" "$(production_psql 'SELECT enabled FROM llm_launch_maintenance')"
   assert_equals "scenario 1 gap" "CLOSE" \
     "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-fresh-1' ORDER BY occurred_at DESC LIMIT 1")"
-  [[ -z "$(docker ps -aq --filter 'name=fukurou-canary-')" ]] || fail "scenario 1: canary containers were left behind"
+  [[ -z "$(docker ps -aq --filter 'name=fukurou-canary-e2e-')" ]] || fail "scenario 1: canary containers were left behind"
   log "scenario 1 PASS"
 }
 
