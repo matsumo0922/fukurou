@@ -1128,6 +1128,7 @@ class PostgresPersistenceIntegrationTest {
     @Test
     fun auditReconstruction_classifiesMissingPendingAndPreBoundaryTerminalWithoutGraphReads() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        insertEvidenceActivationBoundary(database, fixedInstant().plusSeconds(1))
         val pendingId = insertAuditDecision(
             database = database,
             invocationId = "audit-pending",
@@ -11827,7 +11828,7 @@ private suspend fun insertCompleteAuditFixture(
     capturedAt: Instant,
 ): CompleteAuditFixture {
     TradingPersistenceBootstrap(database, Clock.fixed(capturedAt, ZoneOffset.UTC)).ensureSchema().getOrThrow()
-    insertEvidenceActivationBoundary(database, capturedAt.minusSeconds(1))
+    ensureEvidenceActivationBoundaryAtOrBefore(database, capturedAt.minusSeconds(1))
     val material = identityManifest(invocationId).copy(capturedAt = capturedAt)
     val runWithoutHash = LlmRunInputManifest(
         invocationId = invocationId,
@@ -11995,6 +11996,19 @@ private fun insertEvidenceActivationBoundary(database: ExposedDatabase, activate
         jdbcConnection().prepareStatement(
             "INSERT INTO llm_tool_evidence_activation_boundaries(schema_version,activated_at) VALUES(1,?) " +
                 "ON CONFLICT(schema_version) DO UPDATE SET activated_at=EXCLUDED.activated_at",
+        ).use { statement ->
+            statement.setLong(1, activatedAt.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun ensureEvidenceActivationBoundaryAtOrBefore(database: ExposedDatabase, activatedAt: Instant) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "INSERT INTO llm_tool_evidence_activation_boundaries(schema_version,activated_at) VALUES(1,?) " +
+                "ON CONFLICT(schema_version) DO UPDATE SET activated_at=" +
+                "LEAST(llm_tool_evidence_activation_boundaries.activated_at,EXCLUDED.activated_at)",
         ).use { statement ->
             statement.setLong(1, activatedAt.toEpochMilli())
             statement.executeUpdate()
