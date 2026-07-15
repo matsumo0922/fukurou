@@ -46,6 +46,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
+import me.matsumo.fukurou.trading.persistence.ExposedLlmDecisionReconstructionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateRepository
 import me.matsumo.fukurou.trading.persistence.ExposedRuntimeConfigRepository
@@ -878,6 +879,7 @@ private fun startApplicationBackgroundWorkers(
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
             latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         ),
+        llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker(database, runtime.clock),
         obsidianWriterWorker = startObsidianWriterWorker(
             database = database,
             tradingConfig = runtime.tradingConfig,
@@ -891,6 +893,13 @@ private fun startApplicationBackgroundWorkers(
             bootstrap = sharedPersistenceBootstrap,
         ),
     )
+}
+
+private fun startLlmAuditMaintenanceWorker(database: ExposedDatabase, clock: Clock): LlmAuditMaintenanceWorker {
+    return LlmAuditMaintenanceWorker(
+        repository = ExposedLlmDecisionReconstructionRepository(database),
+        clock = clock,
+    ).start()
 }
 
 /** exclusive application startup 後に旧 LLM process generation を補助回収する。 */
@@ -930,6 +939,7 @@ private fun Application.subscribeApplicationShutdown(
     }
 
     monitor.subscribe(ApplicationStopped) {
+        backgroundWorkers.llmAuditMaintenanceWorker?.close()
         backgroundWorkers.reflectionRunnerWorker?.close()
         backgroundWorkers.obsidianWriterWorker?.close()
         backgroundWorkers.llmDaemonWorker?.close()
@@ -1128,6 +1138,7 @@ private data class ApplicationOpsRouteResources(
  *
  * @param reconcilerWorker protection reconciler worker
  * @param llmDaemonWorker LLM daemon scheduler worker
+ * @param llmAuditMaintenanceWorker terminal evidence coverage / retention worker
  * @param obsidianWriterWorker Obsidian writer worker
  * @param reflectionRunnerWorker reflection report worker
  */
@@ -1135,12 +1146,14 @@ private data class ApplicationBackgroundWorkers(
     val llmExecutionRecoveryWorker: LlmExecutionRecoveryWorker? = null,
     val reconcilerWorker: ProtectionReconcilerWorker? = null,
     val llmDaemonWorker: LlmDaemonSchedulerWorker? = null,
+    val llmAuditMaintenanceWorker: LlmAuditMaintenanceWorker? = null,
     val obsidianWriterWorker: ObsidianWriterWorker? = null,
     val reflectionRunnerWorker: ReflectionRunnerWorker? = null,
 ) {
     val hasWorker: Boolean = llmExecutionRecoveryWorker != null ||
         reconcilerWorker != null ||
         llmDaemonWorker != null ||
+        llmAuditMaintenanceWorker != null ||
         obsidianWriterWorker != null ||
         reflectionRunnerWorker != null
 }

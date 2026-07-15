@@ -117,6 +117,21 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(executor.contains("legacy_journal_transition_allowed"))
         assertTrue(executor.contains("load_prepared_gap_event OPEN"))
     }
+
+    @Test
+    fun `terminal evidence activation is wired into runtime canary and bounded maintenance`() {
+        val application = Files.readString(root.resolve("fukurou/src/main/kotlin/me/matsumo/fukurou/Application.kt"))
+        val canary = Files.readString(root.resolve("scripts/mcp-credential-isolation-check"))
+        val releaseBarrier = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+
+        assertTrue(application.contains("llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker("))
+        assertTrue(application.contains("private fun startLlmAuditMaintenanceWorker("))
+        assertTrue(application.contains("ExposedLlmDecisionReconstructionRepository(database)"))
+        assertTrue(application.contains("backgroundWorkers.llmAuditMaintenanceWorker?.close()"))
+        assertTrue(canary.contains("llm_tool_evidence_activation_boundaries"))
+        assertTrue(canary.contains("TERMINAL_BUNDLE_CAPTURED"))
+        assertFalse(releaseBarrier.contains("PREFILTER_ACTIVATION_RELEASED"))
+    }
 }
 
 private fun repositoryRoot(): Path {

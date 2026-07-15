@@ -6,6 +6,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmProvider
@@ -166,6 +168,19 @@ data class TrustedTerminalToolEvidenceBundle(
     val bundle: TerminalToolEvidenceBundle,
 )
 
+/** incomplete evidence で保存してはならない risk-increasing decision かを返す。 */
+fun DecisionAction.requiresCompleteTerminalEvidence(): Boolean = when (this) {
+    DecisionAction.ENTER, DecisionAction.ADD_LONG -> true
+    DecisionAction.EXIT,
+    DecisionAction.REDUCE,
+    DecisionAction.ADJUST_PROTECTION,
+    DecisionAction.NO_TRADE,
+    -> false
+}
+
+/** incomplete evidence で保存してはならない risk-increasing verdict かを返す。 */
+fun FalsificationVerdict.requiresCompleteTerminalEvidence(): Boolean = this == FalsificationVerdict.APPROVED
+
 /** canonical responseから再導出したsource timestampと状態。 */
 data class TerminalEvidenceSourceTimestamp(
     val value: Instant?,
@@ -206,6 +221,12 @@ const val TERMINAL_TOOL_EVIDENCE_VERSION = 1
 
 /** terminal evidence bundle version。 */
 const val TERMINAL_TOOL_EVIDENCE_BUNDLE_VERSION = 1
+
+/** production binary が所有する terminal evidence activation schema version。 */
+const val TERMINAL_EVIDENCE_ACTIVATION_SCHEMA_VERSION = 1
+
+/** production binary の terminal evidence capture activation。 */
+const val TERMINAL_EVIDENCE_CAPTURE_ENABLED = true
 
 /** 1 phaseで収集するtool response上限。 */
 const val MAX_TERMINAL_TOOL_EVIDENCE_COUNT = 48

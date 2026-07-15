@@ -4,8 +4,10 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.requiresCompleteTerminalEvidence
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import java.math.BigDecimal
@@ -23,20 +25,31 @@ import kotlin.test.assertTrue
 
 class LlmDecisionSubmissionGatewayTest {
     @Test
-    fun `Stage 1 gateway rejects enabled terminal evidence activation`() {
+    fun `incomplete evidence risk matrix covers every action and verdict`() {
+        DecisionAction.entries.forEach { action ->
+            assertEquals(action in setOf(DecisionAction.ENTER, DecisionAction.ADD_LONG), action.requiresCompleteTerminalEvidence())
+        }
+        FalsificationVerdict.entries.forEach { verdict ->
+            assertEquals(verdict == FalsificationVerdict.APPROVED, verdict.requiresCompleteTerminalEvidence())
+        }
+    }
+
+    @Test
+    fun `gateway accepts enabled terminal evidence activation`() {
         val path = Path.of("/tmp/fukurou-gateway-activation-${System.nanoTime()}.sock")
 
-        assertFailsWith<IllegalArgumentException> {
-            LlmDecisionSubmissionGateway.start(
-                socketPath = path,
-                repository = InMemoryDecisionRepository(),
-                invocationId = INVOCATION_ID,
-                phase = LlmInvocationPhase.PROPOSER,
-                phaseManifestId = PHASE_MANIFEST_ID,
-                effectiveInvocationHash = EFFECTIVE_HASH,
-                terminalEvidenceCaptureEnabled = true,
-            )
-        }
+        val gateway = LlmDecisionSubmissionGateway.start(
+            socketPath = path,
+            repository = InMemoryDecisionRepository(),
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+            terminalEvidenceCaptureEnabled = true,
+        )
+
+        assertTrue(Files.exists(path))
+        gateway.close()
         assertFalse(Files.exists(path))
     }
 

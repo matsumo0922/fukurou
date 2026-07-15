@@ -12,8 +12,10 @@ import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_VERSION
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.audit.requiresCompleteTerminalEvidence
 import me.matsumo.fukurou.trading.audit.terminalEvidenceSourceTimestamp
 import me.matsumo.fukurou.trading.audit.toTerminalEvidenceCanonicalString
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRecord
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
@@ -481,9 +483,10 @@ class ExposedDecisionRepository(
             runCatching {
                 exposedTransaction(database) {
                     validateTrustedTerminalEvidence(evidence)
+                    requireCompleteEvidenceForDecision(submission, evidence)
                     val now = clock.instant()
                     val result = insertDecisionSubmission(submission, now, maxTradePlanRevisions)
-                    insertTerminalEvidence("DECISION", result.decision.decisionId, evidence, now)
+                    insertTerminalEvidenceAssociation("DECISION", result.decision.decisionId, evidence, now)
 
                     result
                 }
@@ -503,9 +506,10 @@ class ExposedDecisionRepository(
             runCatching {
                 exposedTransaction(database) {
                     validateTrustedTerminalEvidence(evidence)
+                    requireCompleteEvidenceForFalsification(submission, evidence)
                     val now = clock.instant()
                     val result = insertFalsificationSubmission(submission, now)
-                    insertTerminalEvidence("FALSIFICATION", result.falsificationId, evidence, now)
+                    insertTerminalEvidenceAssociation("FALSIFICATION", result.falsificationId, evidence, now)
 
                     result
                 }
@@ -664,10 +668,27 @@ private fun JdbcTransaction.validateTrustedTerminalEvidence(evidence: TrustedTer
     require(evidence.bundle.version == TERMINAL_TOOL_EVIDENCE_BUNDLE_VERSION) {
         "Terminal evidence bundle version mismatch."
     }
-    require(evidence.bundle.status == TerminalToolEvidenceBundleStatus.COMPLETE) {
-        "Only complete terminal evidence bundles can be persisted by the Stage 1 foundation."
+    when (evidence.bundle.status) {
+        TerminalToolEvidenceBundleStatus.COMPLETE -> {
+            require(evidence.bundle.incompleteReason == null) {
+                "Complete terminal evidence cannot have an incomplete reason."
+            }
+            validateCompleteTerminalEvidenceEntries(evidence)
+        }
+        TerminalToolEvidenceBundleStatus.INCOMPLETE -> {
+            require(evidence.bundle.incompleteReason != null && evidence.bundle.entries.isEmpty()) {
+                "Incomplete terminal evidence requires a typed reason and no entries."
+            }
+        }
+        TerminalToolEvidenceBundleStatus.DISABLED -> {
+            error("Enabled terminal evidence cannot use a disabled bundle.")
+        }
     }
-    require(evidence.bundle.incompleteReason == null) { "Complete terminal evidence cannot have an incomplete reason." }
+
+    validateTerminalEvidencePhaseBinding(evidence)
+}
+
+private fun validateCompleteTerminalEvidenceEntries(evidence: TrustedTerminalToolEvidenceBundle) {
     require(evidence.bundle.entries.size <= MAX_TERMINAL_TOOL_EVIDENCE_COUNT) {
         "Terminal evidence count exceeds the canonical limit."
     }
@@ -698,6 +719,9 @@ private fun JdbcTransaction.validateTrustedTerminalEvidence(evidence: TrustedTer
             "Terminal evidence source timestamp mismatch."
         }
     }
+}
+
+private fun JdbcTransaction.validateTerminalEvidencePhaseBinding(evidence: TrustedTerminalToolEvidenceBundle) {
     jdbcConnection().prepareStatement(
         "SELECT invocation_id, phase FROM llm_phase_input_manifests WHERE phase_manifest_id = ?",
     ).use { statement ->
@@ -711,7 +735,29 @@ private fun JdbcTransaction.validateTrustedTerminalEvidence(evidence: TrustedTer
     }
 }
 
-private fun JdbcTransaction.insertTerminalEvidence(
+private fun requireCompleteEvidenceForDecision(
+    submission: DecisionSubmission,
+    evidence: TrustedTerminalToolEvidenceBundle,
+) {
+    if (submission.action.requiresCompleteTerminalEvidence()) {
+        require(evidence.bundle.status == TerminalToolEvidenceBundleStatus.COMPLETE) {
+            "Risk-increasing decisions require complete terminal evidence."
+        }
+    }
+}
+
+private fun requireCompleteEvidenceForFalsification(
+    submission: FalsificationSubmission,
+    evidence: TrustedTerminalToolEvidenceBundle,
+) {
+    if (submission.verdict.requiresCompleteTerminalEvidence()) {
+        require(evidence.bundle.status == TerminalToolEvidenceBundleStatus.COMPLETE) {
+            "Approved falsification requires complete terminal evidence."
+        }
+    }
+}
+
+private fun JdbcTransaction.insertTerminalEvidenceAssociation(
     entityKind: String,
     entityId: UUID,
     evidence: TrustedTerminalToolEvidenceBundle,
@@ -751,18 +797,28 @@ private fun JdbcTransaction.insertTerminalEvidence(
     jdbcConnection().prepareStatement(
         """INSERT INTO llm_decision_phase_evidence_coverage
             (entity_kind, entity_id, phase_manifest_id, status, incomplete_reason, captured_at)
-            VALUES (?, ?, ?, 'TERMINAL_BUNDLE_CAPTURED', NULL, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
         """.trimIndent(),
     ).use { statement ->
         statement.setString(1, entityKind)
         statement.setObject(2, entityId)
         statement.setString(3, evidence.phaseManifestId)
-        statement.setLong(4, now.toEpochMilli())
+        statement.setString(4, evidence.bundle.status.toCoverageStatus())
+        statement.setString(5, evidence.bundle.incompleteReason?.name)
+        statement.setLong(6, now.toEpochMilli())
         statement.executeUpdate()
     }
 }
 
+private fun TerminalToolEvidenceBundleStatus.toCoverageStatus(): String = when (this) {
+    TerminalToolEvidenceBundleStatus.COMPLETE -> TERMINAL_BUNDLE_CAPTURED_STATUS
+    TerminalToolEvidenceBundleStatus.INCOMPLETE -> TERMINAL_BUNDLE_INCOMPLETE_STATUS
+    TerminalToolEvidenceBundleStatus.DISABLED -> error("Disabled terminal evidence has no coverage status.")
+}
+
 private val TERMINAL_EVIDENCE_SUBMISSION_TOOLS = setOf("submit_decision", "submit_falsification")
+private const val TERMINAL_BUNDLE_CAPTURED_STATUS = "TERMINAL_BUNDLE_CAPTURED"
+private const val TERMINAL_BUNDLE_INCOMPLETE_STATUS = "TERMINAL_BUNDLE_INCOMPLETE"
 
 @Suppress("CyclomaticComplexMethod", "LongMethod")
 private fun JdbcTransaction.insertDecisionSubmission(

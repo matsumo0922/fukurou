@@ -72,6 +72,7 @@ enum class LlmInvocationPhase {
  * @param args MCP server 起動引数
  * @param manifestId root-owned launcher が検証する per-run manifest ID
  * @param manifestPath runner が cleanup する manifest path
+ * @param terminalEvidenceCaptureEnabled immutable manifest が宣言した capture state
  * @param autoApprovedTools codex の MCP 承認ゲートを approve で通す tool 名。
  * write tool を phase 単位で最小限指定する
  */
@@ -80,6 +81,7 @@ data class LlmMcpServerConfig(
     val command: String,
     val manifestId: String,
     val manifestPath: Path,
+    val terminalEvidenceCaptureEnabled: Boolean = false,
     val autoApprovedTools: List<String> = emptyList(),
 )
 

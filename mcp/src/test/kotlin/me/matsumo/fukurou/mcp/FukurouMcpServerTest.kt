@@ -1973,6 +1973,17 @@ class McpLaunchBootstrapPolicyTest {
     }
 
     @Test
+    fun bootstrapProjectsEnabledTerminalEvidenceFromManifest() {
+        val clock = fixedClock()
+        val bootstrap = decodeBootstrap(
+            bootstrapManifest(LlmInvocationPhase.PROPOSER, clock).copy(terminalEvidenceCaptureEnabled = true),
+            clock,
+        )
+
+        assertTrue(bootstrap.terminalEvidenceCaptureEnabled)
+    }
+
+    @Test
     fun bothPhasesRejectUnknownTamperedExpiredEmptyAndBudgetExceed() {
         val clock = fixedClock()
         listOf(LlmInvocationPhase.PROPOSER, LlmInvocationPhase.FALSIFIER).forEach { phase ->
@@ -1989,7 +2000,6 @@ class McpLaunchBootstrapPolicyTest {
                 canonical.copy(runtimeEnvironment = emptyMap()),
                 canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
                 canonical.copy(systemPromptVersion = ""),
-                canonical.copy(terminalEvidenceCaptureEnabled = true),
             ).forEach { rejected ->
                 assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
             }

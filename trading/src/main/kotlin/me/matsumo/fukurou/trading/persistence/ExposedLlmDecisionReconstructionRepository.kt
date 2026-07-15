@@ -119,6 +119,7 @@ class ExposedLlmDecisionReconstructionRepository(
         require(from < toExclusive) { "Coverage range must be non-empty." }
 
         return readOnly {
+            executeUpdate(COVERAGE_JIT_SQL)
             jdbcConnection().prepareStatement(COVERAGE_SQL).use { statement ->
                 statement.setLong(1, from.toEpochMilli())
                 statement.setLong(2, toExclusive.toEpochMilli())
@@ -697,4 +698,5 @@ private const val DECISION_ROOT_KIND = "DECISION_ATTEMPT"
 private const val CAPTURED_STATUS = "TERMINAL_BUNDLE_CAPTURED"
 private val RETENTION_DURATION: Duration = Duration.ofDays(30)
 private const val READ_TIMEOUT_SQL = "SET LOCAL statement_timeout='2s'"
+private const val COVERAGE_JIT_SQL = "SET LOCAL jit=off"
 private const val PRUNE_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout='1s'"

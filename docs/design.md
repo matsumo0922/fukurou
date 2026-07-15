@@ -1493,7 +1493,7 @@ current-process recoveryはentityごとに固定attempt UUIDを割り当て、re
 
 [確定] CLIの標準出力を売買判断の一次データにしない。LLMはMCPツール `submit_decision` を必ず呼ぶ。MCPはphase / invocation / effective invocation hashに束縛されたFD 5のUnix socketへ提出し、app-owned gatewayがapp roleでDBへ保存する。daemonはCLI終了後、DB上のdecisionを確認する。
 
-[確定] terminal tool evidenceはactivation時だけ既存FD 5 terminal requestの単一frameへversion 2 bundleとして同梱する。現行binaryはlaunch manifestとbootstrapのcode-owned flagをfalseに固定し、providerをbindせずversion 1のfield setとserialized bytesを維持するため、additive evidence/link/coverage/activation tableにrowを作らない。tool schema、prompt、callerが申告する`tool_evidence_ids`の順序・重複・意味は変えず、server-owned evidence UUIDは別link tableだけで扱う。
+[確定] terminal tool evidenceはcode-owned activationを正本とし、既存FD 5 terminal requestの単一frameへversion 2 bundleとして同梱する。launch manifest、capability、runner、MCP bootstrap、gateway、DB boundaryは同じactivationを投影し、起動transactionがschema version 1のactivation boundaryを一度だけ作る。activationを明示的に無効化した互換fixtureはversion 1のfield setとserialized bytesを維持する。完全bundleはevidence / link / coverageをdecisionまたはfalsificationと同じtransactionで保存し、不完全bundleはrisk-reduction decisionとREJECTED falsificationだけをtyped coverage付きで保存する。ENTER / ADD_LONGとAPPROVED falsificationは完全bundleがなければentity自体を保存しない。tool schema、prompt、callerが申告する`tool_evidence_ids`の順序・重複・意味は変えず、server-owned evidence UUIDは別link tableだけで扱う。
 
 ```kotlin
 package me.matsumo.fukurou.trading.llm

@@ -5,6 +5,7 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.TERMINAL_EVIDENCE_CAPTURE_ENABLED
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -116,6 +117,7 @@ class McpLaunchManifestWriter(
             context.promptHash.orEmpty(),
         ),
         submissionSocketPath: String = "",
+        terminalEvidenceCaptureEnabled: Boolean = TERMINAL_EVIDENCE_CAPTURE_ENABLED,
     ): McpLaunchCapability {
         require(allowedTools.isNotEmpty()) { "MCP manifest allowedTools must not be empty." }
         require(databaseUrl.isNotBlank() && databaseUser.isNotBlank()) { "MCP database identity is required." }
@@ -147,7 +149,7 @@ class McpLaunchManifestWriter(
             effectiveInvocationHash = effectiveInvocationHash,
             toolSchemaHash = McpToolContractCatalog.canonicalSchemaHash(phase),
             submissionSocketPath = submissionSocketPath,
-            terminalEvidenceCaptureEnabled = false,
+            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
         )
 
         try {
@@ -164,7 +166,11 @@ class McpLaunchManifestWriter(
             throw throwable
         }
 
-        return McpLaunchCapability(manifestId, target)
+        return McpLaunchCapability(
+            id = manifestId,
+            path = target,
+            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
+        )
     }
 
     private fun randomManifestId(): String {
@@ -176,7 +182,11 @@ class McpLaunchManifestWriter(
 }
 
 /** renderer に渡す opaque capability と cleanup path。 */
-data class McpLaunchCapability(val id: String, val path: Path)
+data class McpLaunchCapability(
+    val id: String,
+    val path: Path,
+    val terminalEvidenceCaptureEnabled: Boolean,
+)
 
 const val DEFAULT_MCP_MANIFEST_DIRECTORY = "/run/fukurou/mcp-manifests"
 const val MCP_MANIFEST_VERSION = 2

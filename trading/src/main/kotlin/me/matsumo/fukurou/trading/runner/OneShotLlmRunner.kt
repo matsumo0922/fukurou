@@ -2009,6 +2009,7 @@ private class OneShotLlmRequestFactory(
                 command = cliConfig.mcpServerCommand,
                 manifestId = capability.id,
                 manifestPath = capability.path,
+                terminalEvidenceCaptureEnabled = capability.terminalEvidenceCaptureEnabled,
                 autoApprovedTools = autoApprovedTools(provider, allowedTools),
             )
         } catch (throwable: Throwable) {

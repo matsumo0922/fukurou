@@ -33,7 +33,8 @@ class McpLaunchManifestTest {
         assertEquals("2026-07-12T00:01:00Z", manifest.expiresAt)
         assertEquals(listOf("get_balance", "submit_decision"), manifest.allowedTools)
         assertEquals("v1", manifest.systemPromptVersion)
-        assertFalse(manifest.terminalEvidenceCaptureEnabled)
+        assertTrue(manifest.terminalEvidenceCaptureEnabled)
+        assertTrue(first.terminalEvidenceCaptureEnabled)
         assertFalse(content.contains("password", ignoreCase = true))
         assertEquals("rw-------", Files.getPosixFilePermissions(first.path).toPermissionString())
         assertTrue(first.path.parent == second.path.parent)
@@ -43,7 +44,24 @@ class McpLaunchManifestTest {
         Files.deleteIfExists(directory)
     }
 
-    private fun McpLaunchManifestWriter.writeManifest(invocationId: String): McpLaunchCapability {
+    @Test
+    fun write_supportsExplicitDisabledCompatibilityFixture() {
+        val directory = Files.createTempDirectory("fukurou-manifest-disabled-test-")
+        val writer = McpLaunchManifestWriter(directory = directory, clock = Clock.systemUTC())
+
+        val capability = writer.writeManifest("disabled-fixture", terminalEvidenceCaptureEnabled = false)
+        val manifest = Json.decodeFromString<McpLaunchManifest>(Files.readString(capability.path))
+
+        assertFalse(capability.terminalEvidenceCaptureEnabled)
+        assertFalse(manifest.terminalEvidenceCaptureEnabled)
+        Files.deleteIfExists(capability.path)
+        Files.deleteIfExists(directory)
+    }
+
+    private fun McpLaunchManifestWriter.writeManifest(
+        invocationId: String,
+        terminalEvidenceCaptureEnabled: Boolean = true,
+    ): McpLaunchCapability {
         return write(
             invocationId = invocationId,
             phase = LlmInvocationPhase.PROPOSER,
@@ -64,6 +82,7 @@ class McpLaunchManifestTest {
             timeout = Duration.ofMinutes(1),
             totalToolCallLimit = 48,
             actToolCallLimit = 3,
+            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
         )
     }
 }
