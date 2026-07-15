@@ -247,14 +247,12 @@ data class DefaultLlmDaemonPreFilterDependencies(
  * @param preFilter pre-filter 実行境界
  * @param requestBase one-shot runner request
  * @param warnLogger failure warning logger
- * @param releaseBarrier code-owned release 判定。test 以外は既定値を使う
  */
 class LlmDaemonPreFilterGate(
     private val daemonConfig: LlmDaemonConfig,
     private val preFilter: LlmDaemonPreFilter,
     private val requestBase: OneShotRunnerRequest,
     private val warnLogger: RateLimitedWarnLogger,
-    private val releaseBarrier: (Boolean) -> Boolean = LlmLaunchReleaseBarrier::isPreFilterAllowed,
 ) {
     /**
      * pre-filter が必要なら実行し、full run を続けるかを返す。
@@ -267,10 +265,6 @@ class LlmDaemonPreFilterGate(
         triggerSnapshot: LlmRunTriggerSnapshot? = null,
     ): LlmDaemonPreFilterDecision {
         if (!daemonConfig.preFilterEnabled || !triggerKind.shouldRunPreFilter()) {
-            return LlmDaemonPreFilterDecision.RUN_FULL
-        }
-
-        if (!releaseBarrier(daemonConfig.preFilterEnabled)) {
             return LlmDaemonPreFilterDecision.RUN_FULL
         }
 

@@ -853,33 +853,6 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
-    fun releaseBarrierDisablesPreFilterButKeepsFullHeartbeat() = runBlocking {
-        val preFilter = FakePreFilter().apply {
-            decision = LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
-        }
-        val fixture = schedulerFixture(
-            tradingConfig = tradingConfig(
-                daemon = LlmDaemonConfig(
-                    enabled = true,
-                    launchEnabled = true,
-                    priceMoveTriggerEnabled = false,
-                    preFilterEnabled = true,
-                    stopProximityTriggerEnabled = false,
-                ),
-            ),
-            preFilter = preFilter,
-            preFilterReleaseBarrier = { false },
-        )
-
-        val result = fixture.scheduler.tick()
-
-        assertIs<LlmDaemonTickResult.Launched>(result)
-        assertEquals(LlmDaemonTriggerKind.FLAT_HEARTBEAT, result.triggerKind)
-        assertEquals(1, fixture.launches.size)
-        assertEquals(0, preFilter.requests.size)
-    }
-
-    @Test
     fun preFilterNoSkipsFlatHeartbeatWithAuditReason() = runBlocking {
         val preFilter = FakePreFilter()
         preFilter.decision = LlmDaemonPreFilterDecision.SKIP_NO_CHANGE
@@ -1839,7 +1812,6 @@ private fun schedulerFixture(
     positionsReader: FakePositionsReader = FakePositionsReader(),
     entryFillReader: FakeEntryFillReader = FakeEntryFillReader(),
     preFilter: FakePreFilter = FakePreFilter(),
-    preFilterReleaseBarrier: (Boolean) -> Boolean = { true },
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     restingOrderMaintenanceService: RestingOrderMaintenanceService = RestingOrderMaintenanceService { _, _ ->
         Result.success(RestingSuppressionReason.RESTING_ORDER_IDENTITY_UNAVAILABLE)
@@ -1921,7 +1893,6 @@ private fun schedulerFixture(
                 }
             },
             preFilter = preFilter,
-            preFilterReleaseBarrier = preFilterReleaseBarrier,
             clock = clock,
             idGenerator = idGenerator,
         ),
