@@ -145,14 +145,6 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) FROM PUBLIC;
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_unlock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
 SELECT format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) TO %I, %I', :'app_role', :'mcp_role') \gexec
-SELECT format('REVOKE EXECUTE ON FUNCTION public.acquire_gap_population_generation_token() FROM %I', :'mcp_role') \gexec
-SELECT format('GRANT EXECUTE ON FUNCTION public.acquire_gap_population_generation_token() TO %I', :'app_role') \gexec
-SELECT format('REVOKE EXECUTE ON FUNCTION public.acquire_gap_population_generation_token(text,text,text,uuid,text,text) FROM %I', :'mcp_role') \gexec
-SELECT format('GRANT EXECUTE ON FUNCTION public.acquire_gap_population_generation_token(text,text,text,uuid,text,text) TO %I', :'app_role') \gexec
-SELECT format('REVOKE EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text) FROM %I', :'mcp_role') \gexec
-SELECT format('GRANT EXECUTE ON FUNCTION public.acquire_opportunity_episode_gap_population_token(text) TO %I', :'app_role') \gexec
-SELECT format('REVOKE ALL ON gap_population_control, gap_population_entity_scopes, market_data_gap_population_members, market_data_gap_terminal_journal, market_data_gap_work_evidence, gap_population_unattributed_containments, gap_population_unattributed_containment_works FROM %I', :'mcp_role') \gexec
-
 SELECT format('REVOKE %I FROM %I', roleid::regrole, :'mcp_role')
 FROM pg_auth_members
 WHERE member = (SELECT oid FROM pg_roles WHERE rolname = :'mcp_role') \gexec

@@ -3790,49 +3790,6 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun bootstrap_previousEpochReservationRecoversWithImmutableEntityScope() = runPostgresTest {
-        val now = fixedInstant()
-        val bootstrap = TradingPersistenceBootstrap(
-            database = database,
-            clock = Clock.fixed(now.plusSeconds(600), ZoneOffset.UTC),
-            staleLlmRunRecoveryThreshold = Duration.ofMinutes(1),
-        )
-        bootstrap.ensureSchema().getOrThrow()
-        val previousScope = insertAdditionalPaperAccountEpoch(database, now.minusSeconds(1))
-        insertClaimedLlmReservationFixture(
-            database = database,
-            invocationId = "previous-epoch-bootstrap-recovery",
-            scope = previousScope,
-            reservedAt = now,
-            claimantToken = "previous-epoch-bootstrap-token",
-        )
-        insertRunningLlmRunFixture(
-            database = database,
-            invocationId = "previous-epoch-bootstrap-recovery",
-            scope = previousScope,
-            startedAt = now,
-        )
-
-        assertEquals(1, bootstrap.recoverPreviousGeneration().getOrThrow())
-
-        val repository = ExposedLlmLaunchReservationRepository(database)
-        val runRepository = ExposedLlmRunRepository(database)
-        val recovered = requireNotNull(
-            repository.findExecutionClaim("previous-epoch-bootstrap-recovery").getOrThrow(),
-        )
-        assertEquals(LlmLaunchReservationStatus.FAILED, recovered.status)
-        assertEquals(
-            LLM_RUN_STATUS_FAILED,
-            runRepository.findByInvocationId("previous-epoch-bootstrap-recovery").getOrThrow()?.status,
-        )
-        assertTrue(
-            selectRecoveryAuditPayload(database, "previous-epoch-bootstrap-recovery")
-                .contains("previous_process_generation_ended"),
-        )
-        assertPidRegistrationCounts(database, "previous-epoch-bootstrap-recovery", total = 0, active = 0)
-    }
-
-    @Test
     fun currentProcessRecovery_failsRunAndPersistsFenceAuditInSameTransaction() = runPostgresTest {
         val now = fixedInstant()
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
@@ -4224,58 +4181,6 @@ class PostgresPersistenceIntegrationTest {
         } finally {
             LlmExecutionAdmissionHealth.resetForTest()
             LlmExecutionTerminationFenceRegistry.resetForTest()
-        }
-    }
-
-    @Test
-    fun currentProcessBatchRecoveryHandlesMixedCurrentAndPreviousEpochScopes() = runPostgresTest {
-        val now = fixedInstant()
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        val currentScope = exposedTransaction(database) { fixtureGapPopulationScope(TradingMode.PAPER.name) }
-        val previousScope = insertAdditionalPaperAccountEpoch(database, now.minusSeconds(1))
-        val fixtures = listOf(
-            Triple("mixed-current-recovery", currentScope, "mixed-current-token"),
-            Triple("mixed-previous-recovery", previousScope, "mixed-previous-token"),
-        )
-        fixtures.forEach { (invocationId, scope, claimantToken) ->
-            insertClaimedLlmReservationFixture(
-                database = database,
-                invocationId = invocationId,
-                scope = scope,
-                reservedAt = now,
-                claimantToken = claimantToken,
-            )
-        }
-        val repository = ExposedLlmLaunchReservationRepository(database)
-        val requests = fixtures.map { (invocationId, _, claimantToken) ->
-            val snapshot = requireNotNull(repository.findExecutionClaim(invocationId).getOrThrow())
-            LlmExecutionRecoveryRequest(
-                invocationId = invocationId,
-                claimState = LlmExecutionClaimState.CLAIMED,
-                claimantToken = claimantToken,
-                observedHeartbeatAt = snapshot.heartbeatAt,
-                observedReservedAt = snapshot.reservedAt,
-                finishedAt = now.plusSeconds(600),
-                reason = "STALE_CLAIMED_RESERVATION_RECOVERED",
-                terminationFence = "PROCESS_TREE_EXITED",
-            )
-        }
-
-        requests.forEach { request ->
-            assertIs<LlmExecutionRecoveryOutcome.Recovered>(
-                repository.recoverStaleExecutionClaim(
-                    request = request,
-                    deadline = recoveryDeadline(),
-                    retryPermit = LlmExecutionRecoveryRetryPermit(),
-                ).getOrThrow(),
-            )
-        }
-        fixtures.forEach { (invocationId, _, _) ->
-            assertEquals(
-                LlmLaunchReservationStatus.FAILED,
-                repository.findExecutionClaim(invocationId).getOrThrow()?.status,
-            )
-            assertTrue(selectRecoveryAuditPayload(database, invocationId).contains("current_process_periodic_scan"))
         }
     }
 
@@ -5164,55 +5069,10 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun recoveryGapPopulationTokenLockTimesOutClosedWithoutMutationAndRetryConverges() = runPostgresTest {
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        val now = fixedInstant()
-        insertRecoverableAvailableReservations(database, rowCount = 1, reservedAt = now.minusSeconds(1_800))
-        val service = LlmExecutionRecoveryService(
-            repository = ExposedLlmLaunchReservationRepository(database),
-            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
-            clock = Clock.fixed(now, ZoneOffset.UTC),
-        )
-        val lockConnection = dataSource.connection
-        lockConnection.autoCommit = false
-        lockConnection.prepareStatement("SELECT id FROM gap_population_control WHERE id=1 FOR UPDATE").use { statement ->
-            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
-        }
-        LlmExecutionAdmissionHealth.resetForTest()
-
-        try {
-            coroutineScope {
-                val recovery = async(Dispatchers.IO) { service.tick() }
-                awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
-                assertFalse(LlmExecutionAdmissionHealth.isHealthy())
-                assertTrue(recovery.await().isFailure)
-            }
-            assertFalse(LlmExecutionAdmissionHealth.isHealthy())
-            assertEquals(0, countTerminalBatchRecoveryReservations(database))
-            exposedTransaction(database) {
-                assertSqlCount(
-                    "SELECT COUNT(*) FROM command_event_log WHERE decision_run_id='batch-recovery-1' " +
-                        "AND event_type='LLM_INVOCATION_RECOVERED'",
-                    0,
-                )
-            }
-
-            lockConnection.commit()
-            assertEquals(1, service.tick().getOrThrow())
-            assertTrue(LlmExecutionAdmissionHealth.isHealthy())
-            assertEquals(1, countTerminalBatchRecoveryReservations(database))
-        } finally {
-            if (!lockConnection.isClosed) lockConnection.close()
-            LlmExecutionAdmissionHealth.resetForTest()
-        }
-    }
-
-    @Test
     fun latePageStatementTimeoutKeepsCommittedEntitiesAndRetryConvergesRemainingClaim() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val now = fixedInstant()
         val claimedAt = now.minusSeconds(1_800)
-        val scope = exposedTransaction(database) { fixtureGapPopulationScope(TradingMode.PAPER.name) }
         val reservationRepository = ExposedLlmLaunchReservationRepository(database)
         val runRepository = ExposedLlmRunRepository(database)
         val invocationIds = (1..3).map { index -> "late-page-$index" }
@@ -5221,7 +5081,6 @@ class PostgresPersistenceIntegrationTest {
             insertClaimedLlmReservationFixture(
                 database = database,
                 invocationId = invocationId,
-                scope = scope,
                 reservedAt = claimedAt,
                 claimantToken = claimantToken,
             )
@@ -7074,7 +6933,6 @@ class PostgresPersistenceIntegrationTest {
                 ),
             ).getOrThrow()
             exposedTransaction(database) {
-                acquireGapPopulationGenerationToken()
                 prepare(
                     """
                         INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)
@@ -8776,7 +8634,6 @@ private fun insertFinishedLlmRun(
     finishedAt: Instant = fixedInstant(),
 ) {
     exposedTransaction(database) {
-        acquireGapPopulationGenerationToken()
         prepare(
             """
                 INSERT INTO llm_runs(invocation_id,mode,symbol,status,started_at,finished_at)
@@ -9093,11 +8950,6 @@ private fun llmLaunchReservationRequest(
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofHours(24),
         activeReservationStaleAfter = Duration.ofMinutes(30),
-        populationScope = me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope(
-            kind = "SYMBOL",
-            mode = TradingMode.PAPER,
-            symbol = TradingSymbol.BTC,
-        ),
         singleAttemptKey = if (triggerKind == LlmDaemonTriggerKind.ECONOMIC_EVENT) {
             "ECONOMIC_EVENT:$triggerKey"
         } else {
@@ -9120,11 +8972,6 @@ private fun economicEventReservationRequest(
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofHours(24),
         activeReservationStaleAfter = Duration.ofMinutes(30),
-        populationScope = me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope(
-            kind = "SYMBOL",
-            mode = TradingMode.PAPER,
-            symbol = TradingSymbol.BTC,
-        ),
         singleAttemptKey = "ECONOMIC_EVENT:$triggerKey",
     )
 }
@@ -9206,47 +9053,30 @@ private fun createEconomicEventMigrationFixture(database: ExposedDatabase, invoc
     exposedTransaction(database) {
         executeUpdate("DROP INDEX idx_llm_launch_reservations_single_attempt_key_unique")
         executeUpdate("DELETE FROM llm_launch_reservations")
-        val scope = acquireFixtureGapPopulationGenerationToken(TradingMode.PAPER.name)
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
                     id, invocation_id, trigger_kind, trigger_key, single_attempt_key,
-                    status, reserved_at, finished_at, reason,
-                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
-                    population_cohort, population_execution_semantics_version
+                    status, reserved_at, finished_at, reason
                 ) VALUES (
-                    gen_random_uuid(), ?, 'ECONOMIC_EVENT', 'economic-event:timeout', NULL, 'FAILED', 1, 2, NULL,
-                    ?, ?, ?, ?, ?, ?
+                    gen_random_uuid(), ?, 'ECONOMIC_EVENT', 'economic-event:timeout', NULL, 'FAILED', 1, 2, NULL
                 )
             """.trimIndent(),
         ).use { statement ->
             statement.setString(1, invocationId)
-            statement.setString(2, scope.kind)
-            statement.setString(3, scope.mode)
-            statement.setString(4, scope.symbol)
-            statement.setObject(5, scope.accountEpochId)
-            statement.setString(6, scope.cohort)
-            statement.setString(7, scope.executionSemanticsVersion)
             statement.executeUpdate()
         }
         jdbcConnection().prepareStatement(
             """
                 INSERT INTO llm_launch_reservations (
                     id, invocation_id, trigger_kind, trigger_key, single_attempt_key,
-                    status, reserved_at, finished_at, reason,
-                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
-                    population_cohort, population_execution_semantics_version
-                )
-                SELECT
+                    status, reserved_at, finished_at, reason
+                ) VALUES (
                     gen_random_uuid(), 'migration-lock-holder', 'MANUAL', 'manual:lock-holder', NULL,
-                    'FAILED', 3, 4, NULL,
-                    population_scope_kind, population_mode, population_symbol, population_account_epoch_id,
-                    population_cohort, population_execution_semantics_version
-                FROM llm_launch_reservations
-                WHERE invocation_id = ?
+                    'FAILED', 3, 4, NULL
+                )
             """.trimIndent(),
         ).use { statement ->
-            statement.setString(1, invocationId)
             statement.executeUpdate()
         }
     }
@@ -9728,6 +9558,15 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
         }
     } finally {
         container.stop()
+    }
+}
+
+private fun JdbcTransaction.assertSqlCount(sql: String, expected: Int) {
+    prepare(sql).use { statement ->
+        statement.executeQuery().use { rows ->
+            assertTrue(rows.next())
+            assertEquals(expected, rows.getInt(1))
+        }
     }
 }
 
@@ -10604,6 +10443,35 @@ private fun insertRecoverableAvailableReservations(
             statement.setLong(1, reservedAt.toEpochMilli())
             statement.setInt(2, rowCount)
             assertEquals(rowCount, statement.executeUpdate())
+        }
+    }
+}
+
+private fun insertClaimedLlmReservationFixture(
+    database: ExposedDatabase,
+    invocationId: String,
+    reservedAt: Instant,
+    claimantToken: String,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """
+                INSERT INTO llm_launch_reservations (
+                    id, invocation_id, trigger_kind, trigger_key, status, reserved_at,
+                    execution_claim_state, claimant_token, claimed_at, heartbeat_at
+                ) VALUES (
+                    gen_random_uuid(), ?, 'FLAT_HEARTBEAT', ?, 'RUNNING', ?,
+                    'CLAIMED', ?, ?, ?
+                )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, invocationId)
+            statement.setString(2, "recovery:$invocationId")
+            statement.setLong(3, reservedAt.toEpochMilli())
+            statement.setString(4, claimantToken)
+            statement.setLong(5, reservedAt.toEpochMilli())
+            statement.setLong(6, reservedAt.toEpochMilli())
+            assertEquals(1, statement.executeUpdate())
         }
     }
 }

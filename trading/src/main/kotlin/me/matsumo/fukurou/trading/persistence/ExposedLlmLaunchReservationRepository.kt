@@ -57,8 +57,7 @@ private const val INSERT_LLM_LAUNCH_RESERVATION_SQL = """
         reason
         , execution_claim_state
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?,
-        COALESCE(?::uuid,(SELECT scope_account_epoch_id FROM gap_population_control WHERE id=1)), ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
     ON CONFLICT (single_attempt_key) WHERE single_attempt_key IS NOT NULL DO NOTHING
     RETURNING invocation_id
 """
@@ -430,12 +429,6 @@ class ExposedLlmLaunchReservationRepository(
         return runCatching {
             exposedTransaction(database) {
                 maxAttempts = 1
-                acquireGapPopulationGenerationTokenForEntity(
-                    "LLM_RESERVATION",
-                    reservationId(request.invocationId),
-                    deadline,
-                    nanoTime,
-                )
                 if (retryPermit != null && !retryPermit.tryConsume()) return@exposedTransaction null
 
                 val recovered = recoverStaleExecutionClaimInTransaction(request, deadline, nanoTime)
@@ -845,12 +838,6 @@ private fun JdbcTransaction.insertReservation(request: LlmLaunchReservationReque
         statement.setString(6, LlmLaunchReservationStatus.RUNNING.name)
         statement.setLong(7, request.reservedAt.toEpochMilli())
         statement.setString(8, request.triggerKind.executionClaimState().name)
-        statement.setString(9, request.populationScope.kind)
-        statement.setString(10, request.populationScope.mode.name)
-        statement.setString(11, request.populationScope.symbol?.apiSymbol)
-        statement.setString(12, request.populationScope.accountEpochId)
-        statement.setString(13, request.populationScope.cohort)
-        statement.setString(14, request.populationScope.executionSemanticsVersion)
         statement.executeQuery().use { resultSet -> resultSet.next() }
     }
     if (!inserted) return false

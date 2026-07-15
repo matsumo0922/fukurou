@@ -1185,6 +1185,7 @@ class TradingPersistenceBootstrap(
     @Suppress("LongMethod")
     fun ensureSchema(): Result<Unit> {
         val migrationObservation = EconomicEventAttemptMigrationObservation()
+        var recoveredCount = 0
         val schemaResult = runCatching {
             exposedTransaction(database) {
                 maxAttempts = 1
@@ -1250,7 +1251,6 @@ class TradingPersistenceBootstrap(
                 ensureRuntimeSchemaObjects(migrationObservation)
                 setLocalPostgresSetting("lock_timeout", previousLockTimeout)
                 setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
-                ensureGapPopulationLifecycleSchema()
                 ensureLaunchFoundationSchema()
                 val now = Instant.now(clock)
 
@@ -1284,7 +1284,7 @@ class TradingPersistenceBootstrap(
                     statement.setString(2, LLM_RUN_STATUS_RUNNING)
                     statement.executeUpdate()
                 }
-                recoverStaleLlmRunLifecycle(
+                recoveredCount = recoverStaleLlmRunLifecycle(
                     now = now,
                     threshold = staleLlmRunRecoveryThreshold,
                     previousGenerationTerminated = false,
@@ -1299,16 +1299,11 @@ class TradingPersistenceBootstrap(
         )?.let(::emitEconomicEventAttemptMigrationAudit)
         if (schemaResult.isFailure) return schemaResult
 
-        return runCatching {
-            val recoveredCount = recoverStaleLlmRunLifecycles(
-                now = Instant.now(clock),
-                previousGenerationTerminated = false,
-            )
-
-            if (recoveredCount > 0) {
-                onStaleLlmRunsRecovered(recoveredCount)
-            }
+        if (recoveredCount > 0) {
+            onStaleLlmRunsRecovered(recoveredCount)
         }
+
+        return schemaResult
     }
 
     private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.ensureLaunchFoundationSchema() {

@@ -1284,11 +1284,6 @@ class LlmDaemonSchedulerTest {
                 hourlyWindow = Duration.ofHours(1),
                 dailyWindow = Duration.ofHours(24),
                 activeReservationStaleAfter = config.daemon.launchReservationStaleAfter,
-                populationScope = LlmLaunchReservationPopulationScope(
-                    kind = "SYMBOL",
-                    mode = TradingMode.PAPER,
-                    symbol = TradingSymbol.BTC,
-                ),
                 singleAttemptKey = "ECONOMIC_EVENT:$triggerKey",
             ),
         ).getOrThrow()

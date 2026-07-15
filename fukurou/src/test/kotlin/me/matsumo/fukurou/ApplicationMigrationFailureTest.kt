@@ -10,11 +10,8 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
-import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
-import me.matsumo.fukurou.trading.domain.TradingMode
-import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
@@ -81,11 +78,6 @@ class ApplicationMigrationFailureTest {
                         hourlyWindow = Duration.ofHours(1),
                         dailyWindow = Duration.ofHours(24),
                         activeReservationStaleAfter = Duration.ofMinutes(30),
-                        populationScope = LlmLaunchReservationPopulationScope(
-                            kind = "SYMBOL",
-                            mode = TradingMode.PAPER,
-                            symbol = TradingSymbol.BTC,
-                        ),
                         singleAttemptKey = "ECONOMIC_EVENT:$triggerKey",
                     ),
                 ).getOrThrow()

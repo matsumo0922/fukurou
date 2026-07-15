@@ -5,11 +5,8 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
-import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationPopulationScope
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
-import me.matsumo.fukurou.trading.domain.TradingMode
-import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
@@ -90,11 +87,6 @@ private fun recoveryReservationRequest(reservedAt: Instant): LlmLaunchReservatio
         hourlyWindow = Duration.ofHours(1),
         dailyWindow = Duration.ofDays(1),
         activeReservationStaleAfter = Duration.ofMinutes(30),
-        populationScope = LlmLaunchReservationPopulationScope(
-            kind = "SYMBOL",
-            mode = TradingMode.PAPER,
-            symbol = TradingSymbol.BTC,
-        ),
     )
 }
 

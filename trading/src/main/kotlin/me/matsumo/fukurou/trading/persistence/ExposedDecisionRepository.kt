@@ -481,9 +481,6 @@ class ExposedDecisionRepository(
             runCatching {
                 exposedTransaction(database) {
                     validateTrustedTerminalEvidence(evidence)
-                    submission.entryIntent?.let { intent ->
-                        acquireOpportunityEpisodeGapPopulationToken(intent.symbol.apiSymbol)
-                    }
                     val now = clock.instant()
                     val result = insertDecisionSubmission(submission, now, maxTradePlanRevisions)
                     insertTerminalEvidence("DECISION", result.decision.decisionId, evidence, now)

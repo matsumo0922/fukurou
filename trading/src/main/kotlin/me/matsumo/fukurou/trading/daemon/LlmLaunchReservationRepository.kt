@@ -228,7 +228,6 @@ data class LlmLaunchReservationRequest(
     val hourlyWindow: Duration,
     val dailyWindow: Duration,
     val activeReservationStaleAfter: Duration,
-    val populationScope: LlmLaunchReservationPopulationScope,
     val singleAttemptKey: String? = null,
 ) {
     init {
@@ -243,16 +242,6 @@ data class LlmLaunchReservationRequest(
         }
     }
 }
-
-/** reservation creationに必須のtyped population provenance。 */
-data class LlmLaunchReservationPopulationScope(
-    val kind: String,
-    val mode: TradingMode,
-    val symbol: TradingSymbol?,
-    val accountEpochId: String? = null,
-    val cohort: String = "CURRENT",
-    val executionSemanticsVersion: String? = "PAPER_WS_V1",
-)
 
 /**
  * LLM 起動予約完了要求。
