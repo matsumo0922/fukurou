@@ -462,7 +462,7 @@ static int descriptors_allowed(struct launch_request *request) {
     return 1;
 }
 
-static int environment_entries_allowed(uint16_t profile, char **environment, uint16_t environment_count) {
+static int environment_entries_wellformed(uint16_t profile, char **environment, uint16_t environment_count) {
     for (size_t index = 0; index < environment_count; index++) {
         if (!environment_name_allowed(profile, environment[index])) return 0;
         const char *separator = strchr(environment[index], '=');
@@ -473,6 +473,20 @@ static int environment_entries_allowed(uint16_t profile, char **environment, uin
                 environment[previous][name_length] == '=') return 0;
         }
     }
+    return 1;
+}
+
+/* CLI version probe は固定 argv・読み取り専用で、run 用 env 契約を課さない。 */
+static int version_probe_request(struct launch_request *request, char **arguments) {
+    if (request->header.profile != FUKUROU_PROFILE_CLAUDE_CURRENT_V1 &&
+        request->header.profile != FUKUROU_PROFILE_CODEX_CURRENT_V1) return 0;
+    if (request->header.fd_role_bitmap != 0x7U || request->header.argc != 2) return 0;
+    const char *name = request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? "claude" : "codex";
+    return strcmp(arguments[0], name) == 0 && strcmp(arguments[1], "--version") == 0;
+}
+
+static int environment_entries_allowed(uint16_t profile, char **environment, uint16_t environment_count) {
+    if (!environment_entries_wellformed(profile, environment, environment_count)) return 0;
     const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
     if (!canonical_identifier(invocation_id == NULL ? "" : invocation_id, 128)) return 0;
     if (profile == FUKUROU_PROFILE_MCP_CURRENT_V1) {
@@ -556,6 +570,10 @@ static int canary_arguments_allowed(struct launch_request *request, char **argum
 }
 
 static int request_shape_allowed(struct launch_request *request, char **arguments, char **environment) {
+    if (version_probe_request(request, arguments)) {
+        if (!environment_entries_wellformed(request->header.profile, environment, request->header.envc)) return 0;
+        return descriptors_allowed(request);
+    }
     if ((request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 || request->header.profile == FUKUROU_PROFILE_CODEX_CURRENT_V1) &&
         request->header.fd_role_bitmap == 0x7U &&
         strcmp(arguments[0], request->header.profile == FUKUROU_PROFILE_CLAUDE_CURRENT_V1 ? "claude" : "codex") == 0) {
@@ -672,7 +690,8 @@ static void accept_launch(int listener) {
     close(start_gate[0]);
     const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
     const char *registration_role = request.header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 ? "MCP" : "PROVIDER";
-    int receipt_result = request.header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1
+    int receipt_result = request.header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 ||
+            version_probe_request(&request, arguments)
         ? 0 : register_spawn_receipt(registration_role, invocation_id, child);
     if (receipt_result != 0 || write(start_gate[1], "1", 1) != 1) {
         reject_spawned_child(child, start_gate[1], &request);
@@ -934,6 +953,7 @@ enum accept_selftest_case {
     ACCEPT_NONCE_REPLAY,
     ACCEPT_JOB_FULL,
     ACCEPT_RECEIPT_FAILURE,
+    ACCEPT_VERSION_PROBE,
 };
 
 static int append_launch_item(char *payload, size_t *offset, const char *value) {
@@ -998,10 +1018,21 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
     const char *mcp_environment[] = {
         "PATH=/opt/java/openjdk/bin:/usr/bin:/bin", "FUKUROU_INVOCATION_ID=receipt-failure-fixture",
     };
+    const char *version_arguments[] = {"codex", "--version"};
+    const char *version_environment[] = {
+        "PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/tmp/fukurou-cli-home",
+    };
     const char **arguments = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_arguments : canary_arguments;
     const char **environment = test_case == ACCEPT_RECEIPT_FAILURE ? mcp_environment : canary_environment;
     uint16_t argument_count = test_case == ACCEPT_RECEIPT_FAILURE ? 5 : 4;
     uint16_t environment_count = test_case == ACCEPT_RECEIPT_FAILURE ? 2 : 13;
+    if (test_case == ACCEPT_VERSION_PROBE) {
+        arguments = version_arguments;
+        environment = version_environment;
+        argument_count = 2;
+        environment_count = 2;
+    }
     const char *mutated_arguments[5];
     memcpy(mutated_arguments, canary_arguments, sizeof(canary_arguments));
     const char *mutated_environment[13];
@@ -1041,7 +1072,9 @@ static int send_accept_selftest_request(const char *path, enum accept_selftest_c
         .magic = FUKUROU_PROTOCOL_MAGIC,
         .version = FUKUROU_PROTOCOL_VERSION,
         .header_size = sizeof(struct fukurou_launch_header),
-        .profile = test_case == ACCEPT_RECEIPT_FAILURE ? FUKUROU_PROFILE_MCP_CURRENT_V1 : FUKUROU_PROFILE_FOUNDATION_CANARY_V1,
+        .profile = test_case == ACCEPT_RECEIPT_FAILURE ? FUKUROU_PROFILE_MCP_CURRENT_V1
+            : test_case == ACCEPT_VERSION_PROBE ? FUKUROU_PROFILE_CODEX_CURRENT_V1
+            : FUKUROU_PROFILE_FOUNDATION_CANARY_V1,
         .argc = argument_count,
         .envc = environment_count,
         .fd_role_bitmap = test_case == ACCEPT_RECEIPT_FAILURE ? 0x3fU : 0x7U,
@@ -1230,7 +1263,7 @@ static int protocol_selftest(void) {
     close(gate[0]);
     reject_spawned_child(child, gate[1], &failed_receipt);
     launches_enabled = 1;
-    for (enum accept_selftest_case test_case = ACCEPT_BASELINE; test_case <= ACCEPT_RECEIPT_FAILURE; test_case++) {
+    for (enum accept_selftest_case test_case = ACCEPT_BASELINE; test_case <= ACCEPT_VERSION_PROBE; test_case++) {
         unsigned nonce_seed = test_case == ACCEPT_NONCE_REPLAY ? ACCEPT_BASELINE : (unsigned)test_case;
         if (accept_selftest_case(test_case, nonce_seed) != 0) return 125;
     }
@@ -1245,7 +1278,7 @@ static int protocol_selftest(void) {
         strcmp(fixture_mcp, "f02b4431-a53e-e39d-8d42-d7dba634db87") != 0) return 125;
     int after = count_open_descriptors();
     if (after != before) return 125;
-    printf("PROTOCOL_SELFTEST_OK fd_delta=0 child_delta=0 attempts=1000 boundary=real-accept cases=baseline,path-traversal,root-env,bad-path,bad-manifest,bad-phase,bad-provider,bad-hash,unknown-option,permutation,duplicate,trailing-bytes,unknown-ancillary,nonce-replay,job-full,receipt-failure,bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,bad-env-value,missing-invocation,payload-length\n");
+    printf("PROTOCOL_SELFTEST_OK fd_delta=0 child_delta=0 attempts=1000 boundary=real-accept cases=baseline,path-traversal,root-env,bad-path,bad-manifest,bad-phase,bad-provider,bad-hash,unknown-option,permutation,duplicate,trailing-bytes,unknown-ancillary,nonce-replay,job-full,receipt-failure,version-probe,bad-magic,bad-version,bad-header,bad-length,bad-count,missing-fd,msg-ctrunc,duplicate-fd,unexpected-fd,bad-peer,bad-role,duplicate-env,bad-env-value,missing-invocation,payload-length\n");
     return 0;
 }
 
