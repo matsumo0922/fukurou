@@ -43,12 +43,3 @@ tasks.register<JavaExec>("runOneShotLlm") {
     environment("FUKUROU_LLM_WORKING_DIRECTORY", rootProject.projectDir.absolutePath)
     environment("FUKUROU_MCP_JAR_PATH", mcpJarPath)
 }
-
-tasks.register<JavaExec>("runPaperMarketRecovery") {
-    group = "application"
-    description = "Drains durable paper market-data gap work without starting network listeners."
-    dependsOn(tasks.named("classes"))
-    classpath = sourceSets.main.get().runtimeClasspath
-    mainClass.set("me.matsumo.fukurou.trading.runner.PaperMarketRecoveryMainKt")
-    workingDir = rootProject.projectDir
-}

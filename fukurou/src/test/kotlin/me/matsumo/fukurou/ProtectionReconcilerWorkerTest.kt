@@ -44,7 +44,6 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -62,7 +61,6 @@ class ProtectionReconcilerWorkerTest {
 
         val stream = createGmoMarketEventStream(config, Clock.fixed(Instant.EPOCH, ZoneOffset.UTC))
 
-        assertIs<me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketMarketEventStream>(stream)
         assertEquals(Duration.ofSeconds(150), stream.transportLivenessTimeout)
     }
 

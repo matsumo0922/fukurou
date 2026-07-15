@@ -99,8 +99,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    requireFullGapPopulationAdmission("paper entry fill")
-                    acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryFill(
@@ -124,8 +122,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    requireFullGapPopulationAdmission("resting entry order")
-                    acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryOrder(
@@ -167,8 +163,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    requireFullGapPopulationAdmission("paper entry fill with intent")
-                    acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.entry.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
@@ -199,8 +193,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    requireFullGapPopulationAdmission("resting entry order with intent")
-                    acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(request.order.command.auditContext)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
@@ -251,7 +243,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     val writeIntent = resolvePaperWriteContext(command.auditContext)
                         .intent(PaperWritePolicy.RISK_REDUCING)
                     val position = requireOpenPosition(positionId)
@@ -322,7 +313,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     requirePaperWriteAllowed(PaperWritePolicy.PROTECTION_MAINTENANCE, command.auditContext)
                     val position = requireOpenPosition(command.positionId)
                     val newStopPrice = command.newStopPriceJpy
@@ -359,7 +349,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     requirePaperWriteAllowed(PaperWritePolicy.RISK_REDUCING, command.auditContext)
                     val order = requireOpenOrder(command.orderId)
                     val isProtectiveStop = order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.positionId != null
@@ -402,7 +391,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY)
                     val reconcileContext = tickSnapshot.toReconcileMarketContext(
                         fallbackSymbolRules = fallbackSymbolRules,
@@ -442,7 +430,6 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    acquireGapPopulationGenerationToken()
                     val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY)
                     applyPaperMarketEvent(event, simulator, fallbackSymbolRules, writeContext, clock)
                 }

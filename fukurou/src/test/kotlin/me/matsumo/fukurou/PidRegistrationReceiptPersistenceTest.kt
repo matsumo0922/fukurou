@@ -5,7 +5,6 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
-import me.matsumo.fukurou.trading.persistence.acquireGapPopulationGenerationToken
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
@@ -35,15 +34,11 @@ class PidRegistrationReceiptPersistenceTest {
             val providerId = UUID.fromString("d168f815-9f99-90ef-15fa-3853e0742173")
             val mcpId = UUID.fromString("f02b4431-a53e-e39d-8d42-d7dba634db87")
             transaction(database) {
-                acquireGapPopulationGenerationToken()
                 jdbcConnection().prepareStatement(
                     """
                         INSERT INTO llm_launch_reservations(
-                            id,invocation_id,trigger_kind,trigger_key,status,reserved_at,
-                            population_scope_kind,population_mode,population_symbol,population_account_epoch_id,
-                            population_cohort,population_execution_semantics_version
-                        ) VALUES (?,?,'MANUAL','receipt:e2e','RUNNING',?,'SYMBOL','PAPER','BTC',
-                            (SELECT current_epoch_id FROM paper_account WHERE id=1),'CURRENT','PAPER_WS_V1')
+                            id,invocation_id,trigger_kind,trigger_key,status,reserved_at
+                        ) VALUES (?,?,'MANUAL','receipt:e2e','RUNNING',?)
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setObject(1, reservationId)

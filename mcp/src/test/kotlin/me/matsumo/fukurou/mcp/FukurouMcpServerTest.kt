@@ -2473,18 +2473,6 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
                 assertTrue(rows.next())
                 assertFalse(rows.getBoolean(1))
             }
-            assertSqlCount(
-                statement,
-                "SELECT count(*) FROM pg_attribute attribute " +
-                    "JOIN pg_class relation ON relation.oid=attribute.attrelid " +
-                    "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace " +
-                    "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl " +
-                    "WHERE namespace.nspname='public' AND acl.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')) " +
-                    "AND attribute.attname IN ('birth_sequence','population_scope_kind','population_mode'," +
-                    "'population_symbol','population_account_epoch_id','population_cohort'," +
-                    "'population_execution_semantics_version','scope_hash')",
-                0,
-            )
             if (includeFutureBoundary) {
                 statement.executeQuery(
                     "SELECT " +
@@ -2510,21 +2498,11 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
                 "SELECT count(*) FROM information_schema.role_usage_grants WHERE grantee='$MCP_TEST_ROLE' AND object_schema='public'",
                 0,
             )
-            assertSqlCount(
-                statement,
-                "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='$MCP_TEST_ROLE' " +
-                    "AND table_name IN ('gap_population_control','market_data_gap_work','market_data_gap_work_evidence'," +
-                    "'market_data_gap_population_generations','market_data_gap_population_members'," +
-                    "'market_data_gap_terminal_journal','market_data_gap_recovery_progress'," +
-                    "'gap_population_entity_scopes','gap_population_unattributed_containments'," +
-                    "'gap_population_unattributed_containment_works')",
-                0,
-            )
         }
     }
     mcpTestConnection(container).use { connection ->
         connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_column_privilege(current_user, 'orders', 'status', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE'), has_function_privilege(current_user, 'public.acquire_gap_population_generation_token()', 'EXECUTE'), has_function_privilege(current_user, 'public.acquire_opportunity_episode_gap_population_token(text)', 'EXECUTE'), has_column_privilege(current_user, 'opportunity_episodes', 'id', 'INSERT'), has_column_privilege(current_user, 'orders', 'birth_sequence', 'SELECT')").use { rows ->
+            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_column_privilege(current_user, 'orders', 'status', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'id', 'INSERT')").use { rows ->
                 assertTrue(rows.next())
                 assertEquals(true, rows.getBoolean(1))
                 assertEquals(true, rows.getBoolean(2))
@@ -2535,9 +2513,6 @@ private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureB
                 assertEquals(false, rows.getBoolean(7))
                 assertEquals(false, rows.getBoolean(8))
                 assertEquals(false, rows.getBoolean(9))
-                assertEquals(false, rows.getBoolean(10))
-                assertEquals(false, rows.getBoolean(11))
-                assertEquals(false, rows.getBoolean(12))
             }
         }
     }
@@ -2617,7 +2592,6 @@ private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
             "INSERT INTO llm_decision_phase_evidence_coverage DEFAULT VALUES",
             "INSERT INTO llm_tool_evidence_activation_boundaries DEFAULT VALUES",
             "UPDATE opportunity_episodes SET closed_at=closed_at,close_reason=close_reason",
-            "SELECT acquire_opportunity_episode_gap_population_token('BTC')",
             "UPDATE mcp_current_evaluation_scope SET account_initial_cash_jpy=account_initial_cash_jpy",
             "UPDATE mcp_evaluation_epochs SET initial_cash_jpy=initial_cash_jpy",
             "SELECT config_value FROM runtime_config_values LIMIT 1",

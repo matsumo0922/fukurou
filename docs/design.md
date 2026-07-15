@@ -154,7 +154,6 @@ flowchart LR
 #### 2.3.1 市場データの流れ
 
 1. `ProtectionReconciler` は GMO Public WebSocket `trades/BTC` を接続単位で直列消費し、realtime trade event だけで resting entry と保護を前進させる。subscription acknowledgement とPing/Pongはtransport livenessを更新するが、約定、sequence、gap recoveryを前進させない。
-   `market_data_ingress_sessions`、single monotonic deadline、paused durable listenerは非接続のfoundationとして存在する。production compositionはlegacy streamを選択し、durable writerを起動しない。
 2. connection session と local sequence、exchange/received time、gap、recovery、約定 source evidence を PostgreSQL に保存し、event と ledger cursor を同一 transaction で確定する。
 3. RESTで5分・1時間・日足のOHLCVを補完する。
 4. `MarketDataSource` 実装が、ローソク足、板、約定、指標、マイクロストラクチャ要約を統一モデルへ変換する。
@@ -1307,7 +1306,7 @@ entry EV の計算直前に、データ鮮度劣化時の probability cap を適
 
 `llm_runs` は `invocation_id` を primary key とし、`mode`、`symbol`、nullable な daemon `trigger_kind`、`status`、epoch millis の `started_at` / `finished_at`、`error_message`、`terminal_cause`、開始時 runtime config の `runtime_config_version_id` / `runtime_config_hash` を保存する。`terminal_cause` は `NORMAL_COMPLETION`、`NO_TRADE`、`SAFETY_DENIED`、`TIMED_OUT`、`RUNNER_FAILED`、`CALLER_CANCELLED`、`RESTART_INTERRUPTED`、`LEGACY_UNCLASSIFIED` の安定 code を持ち、RUNNING 行だけ null とする。LLM provider は phase ごとの `command_event_log` に残すため run-level には持たない。`stdout_path` / `stderr_path` も持たない。Claude の `error_message` と stdout / stderr は redaction と truncate 後に保存し、stdout / stderr は historical usage fallback に使う。Codex は raw JSONL / stderr と起動境界の例外 message / path を永続化せず、`llm_runs.error_message` は固定文言、runner phase audit は固定 category と安全な例外 class 名だけを保存する。Codex の `NO_TRADE_EXIT` payload も例外 message を省略する。manual launch warning と standalone runner stderr でも元例外の message、path、stack trace は出さず、固定 category と安全な例外 class 名だけを出す。
 
-persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の stale `llm_runs` と対応reservationをinvocationごとに回収する。candidateはimmutable population scopeが存在するinvocationだけに限定し、scopeのないPRE_C invocationはcurrent scopeへ推定せずbootstrap recoveryから除外してglobal containmentへ渡す。各attributed invocationはreservationまたはrunのimmutable population scopeからtokenを取得した個別transactionで処理し、対応するrun、reservation、`LLM_INVOCATION_RECOVERED`をatomicに確定する。`CLAIMED` reservationを含むlifecycleはsingle-instanceの旧container/process generation終了を確認した起動時だけ回収し、通常のschema ensureやrolling coexistence中は変更しない。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回processまたはcontainer shutdownで中断されたrunを示す固定messageを保存し、claim metadataとtermination fenceを`LLM_INVOCATION_RECOVERED`へ残す。current processではbounded periodic scanを別に維持し、DB復旧後にrestartなしで収束する。
+persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の stale `llm_runs` と対応reservationを同一transactionで回収する。`CLAIMED` reservationを含むlifecycleはsingle-instanceの旧container/process generation終了を確認した起動時だけ回収し、通常のschema ensureやrolling coexistence中は変更しない。回収時は `finished_at` に bootstrap 時刻を保存し、`error_message` には前回processまたはcontainer shutdownで中断されたrunを示す固定messageを保存し、claim metadataとtermination fenceを`LLM_INVOCATION_RECOVERED`へ残す。current processではbounded periodic scanを別に維持し、DB復旧後にrestartなしで収束する。
 
 `equity_snapshots` は UUID primary key の append-only table とし、`mode`、`reason`（`FILL` / `DAILY` / `BOOTSTRAP` / `EPOCH_START`）、nullable な `account_epoch_id`、JST `trading_date`、epoch millis の `captured_at`、`cash_jpy`、`btc_quantity`、`btc_mark_price_jpy`、`total_equity_jpy`、`equity_peak_jpy`、`drawdown_ratio` を保存する。日次重複防止のため `reason = 'DAILY'` に限定した `(mode, trading_date)` partial unique index を置き、BOOTSTRAP は `(mode, reason)` partial unique index で防御する。FILL は paper account 更新、EPOCH_START は account reset と同一 transaction で追加する。legacy row の epoch は捏造して backfill しない。
 
@@ -3642,14 +3641,6 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 8. 起動時復旧triggerを保存し、必要ならLLMではなくdaemonが安全バックストップを適用する。
 
 [確定] `ProtectionReconciler` は起動時に必ずfull reconcile passを実行する。これはクラッシュ復元と同じ経路にし、main pushごとのdeploy方針は変えない。`/health/ready` はDB接続だけでなく `lastTransportActivityAt` と `lastMaintenanceAt` の鮮度、接続状態、未回復gapを確認し、保護ループが止まっている状態をreadyにしない。`lastTradeAt` は正常無音を許容するため readiness の必須条件にしない。
-
-[確定] market-data gap の recovery population は `gap_population_control` を transaction 入口で lock して取得する sealed token で直列化する。generic tokenとopportunity episode専用tokenはapp roleだけが取得し、mode、domain symbol、account epoch、cohort、execution semanticsを固定する。MCP roleはpopulation token、birth sequence、private scope/evidence、opportunity episodeのINSERT/UPDATEを持たず、decision submissionはowner-only gatewayからapp roleへ委譲する。order、position、LLM run、LLM reservation、opportunity episode、evaluation report job の creation と terminal mutation は token を先に取得し、trigger は transaction ID、control version、allowed population、immutable scopeを検証する。
-
-gap source は provider、symbol、channel、session、source kind、source episode の canonical identity で `market_data_gap_work` に exactly-once で保存する。同一 stream には active generation を1件だけ置き、重複 source は同じ work ID へ coalesce し、重なる source は FIFO queue へ置く。enqueue 時点で `population_as_of`、birth sequence upper、journal lower を固定し、queued work の journal upper は active generation の終了時に固定する。
-
-population capture は current row と terminal journal を exact scope で union し、`(work, entity type, entity ID)` で deduplicate する。`birth_sequence IS NULL OR birth_sequence <= upper` を使用するが、immutable scope rowを持たないPRE_C active entityはcurrent cohortへ推定せず`UNKNOWN_SCOPE_UNATTRIBUTED`へ終端する。同一entityはentity-global containment ownerへcoalesceする。ORDER、LLM run、LLM reservation、opportunity episode、evaluation report jobはownerと全UNKNOWN workをlockして安全な失敗終端へ更新し、member、journal、scopeを作らない。POSITIONとderived decision runはeconomic closeせず`QUARANTINED`とする。同一 entity の projection hash が一致しない場合は上書きせず `UNKNOWN_DATA_CONFLICT` へ終端する。
-
-capture と impact は page 100、1 invocation 1,000件で進み、phaseとcursorをDBへ保存する。通常runtimeはmaintenance tickで残件をredriveする。queue、evidence、member、未消費terminal journalにはhard capを持ち、切り捨てず一意な`UNKNOWN_OVERFLOW` sentinelとtyped evidenceを残す。standalone recovery commandはnetwork listenerを起動せず1 bounded invocationを実行し、`ALL_APPLIED`だけを成功、`MORE`または明示的な`UNKNOWN`を非成功として機械判定できる形で返す。paper fillの遡及作成、既存履歴のrescale、destructive backfillは行わない。
 
 重大不一致例:
 

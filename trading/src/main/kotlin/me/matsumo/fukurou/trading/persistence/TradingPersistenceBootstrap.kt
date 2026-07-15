@@ -43,6 +43,21 @@ internal val ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOCK_TIMEOUT: Duration = Duration.
 /** economic-event migration の SQL 実行上限。既存 bounded recovery と同じ値を使う。 */
 internal val ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT: Duration = Duration.ofSeconds(5)
 
+private val GAP_POPULATION_ENFORCEMENT_TRIGGERS = listOf(
+    "orders" to "orders_gap_population_create",
+    "orders" to "orders_gap_population_terminal",
+    "positions" to "positions_gap_population_create",
+    "positions" to "positions_gap_population_terminal",
+    "llm_runs" to "llm_runs_gap_population_create",
+    "llm_runs" to "llm_runs_gap_population_terminal",
+    "llm_launch_reservations" to "llm_launch_reservations_gap_population_create",
+    "llm_launch_reservations" to "llm_launch_reservations_gap_population_terminal",
+    "opportunity_episodes" to "opportunity_episodes_gap_population_create",
+    "opportunity_episodes" to "opportunity_episodes_gap_population_terminal",
+    "evaluation_report_jobs" to "evaluation_report_jobs_gap_population_create",
+    "evaluation_report_jobs" to "evaluation_report_jobs_gap_population_terminal",
+)
+
 /** economic-event migration の partial unique index step 結果。 */
 internal enum class EconomicEventAttemptMigrationIndexOutcome {
     /** index を新規作成し、定義を検証した。 */
@@ -460,105 +475,6 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_sessions_connected_unique
     ON market_data_sessions (state)
     WHERE state = 'CONNECTED'
-"""
-
-/** stable resourceからdurable ingress sessionを引くindexを作るSQL。 */
-private const val ENSURE_MARKET_DATA_INGRESS_IDENTITY_INDEX_SQL = """
-    CREATE INDEX IF NOT EXISTS idx_market_data_ingress_sessions_identity
-    ON market_data_ingress_sessions (provider, symbol, channel, starting_at DESC)
-"""
-
-/** private durable ingress tableのexact column contractを確認するSQL。 */
-private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_COLUMNS_SQL = """
-    SELECT 1
-    WHERE NOT EXISTS (
-        SELECT * FROM (VALUES
-            (1, 'session_id', 'uuid', -1, 'NO', ''),
-            (2, 'provider', 'character varying', 32, 'NO', ''),
-            (3, 'symbol', 'character varying', 32, 'NO', ''),
-            (4, 'channel', 'character varying', 32, 'NO', ''),
-            (5, 'state', 'character varying', 32, 'NO', ''),
-            (6, 'last_received_sequence', 'bigint', -1, 'NO', '0'),
-            (7, 'starting_at', 'bigint', -1, 'NO', ''),
-            (8, 'connected_at', 'bigint', -1, 'YES', ''),
-            (9, 'stopping_at', 'bigint', -1, 'YES', ''),
-            (10, 'disconnected_at', 'bigint', -1, 'YES', ''),
-            (11, 'disconnect_source', 'character varying', 32, 'YES', '')
-        ) expected(ordinal_position, column_name, data_type, maximum_length, is_nullable, column_default)
-        EXCEPT
-        SELECT ordinal_position, column_name::text, data_type::text, COALESCE(character_maximum_length, -1),
-            is_nullable::text,
-            CASE WHEN column_name = 'last_received_sequence' AND column_default IN ('0', '0::bigint')
-                THEN '0' ELSE COALESCE(column_default, '') END
-        FROM information_schema.columns
-        WHERE table_schema = current_schema() AND table_name = 'market_data_ingress_sessions'
-    ) AND NOT EXISTS (
-        SELECT ordinal_position, column_name::text, data_type::text, COALESCE(character_maximum_length, -1),
-            is_nullable::text,
-            CASE WHEN column_name = 'last_received_sequence' AND column_default IN ('0', '0::bigint')
-                THEN '0' ELSE COALESCE(column_default, '') END
-        FROM information_schema.columns
-        WHERE table_schema = current_schema() AND table_name = 'market_data_ingress_sessions'
-        EXCEPT
-        SELECT * FROM (VALUES
-            (1, 'session_id', 'uuid', -1, 'NO', ''),
-            (2, 'provider', 'character varying', 32, 'NO', ''),
-            (3, 'symbol', 'character varying', 32, 'NO', ''),
-            (4, 'channel', 'character varying', 32, 'NO', ''),
-            (5, 'state', 'character varying', 32, 'NO', ''),
-            (6, 'last_received_sequence', 'bigint', -1, 'NO', '0'),
-            (7, 'starting_at', 'bigint', -1, 'NO', ''),
-            (8, 'connected_at', 'bigint', -1, 'YES', ''),
-            (9, 'stopping_at', 'bigint', -1, 'YES', ''),
-            (10, 'disconnected_at', 'bigint', -1, 'YES', ''),
-            (11, 'disconnect_source', 'character varying', 32, 'YES', '')
-        ) expected(ordinal_position, column_name, data_type, maximum_length, is_nullable, column_default)
-    )
-"""
-
-/** private durable ingress tableのprimary/foreign key contractを確認するSQL。 */
-private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_KEYS_SQL = """
-    SELECT 1
-    WHERE (
-        SELECT COUNT(*) FROM pg_constraint
-        WHERE conrelid = 'market_data_ingress_sessions'::regclass AND contype IN ('p', 'f')
-    ) = 2
-      AND (
-        SELECT COUNT(*) FROM pg_constraint
-        WHERE conrelid = 'market_data_ingress_sessions'::regclass
-          AND contype = 'p'
-          AND pg_get_constraintdef(oid) = 'PRIMARY KEY (session_id)'
-      ) = 1
-      AND (
-        SELECT COUNT(*) FROM pg_constraint
-        WHERE conrelid = 'market_data_ingress_sessions'::regclass
-          AND contype = 'f'
-          AND confrelid = 'market_data_sessions'::regclass
-          AND pg_get_constraintdef(oid) LIKE
-              'FOREIGN KEY (session_id) REFERENCES market_data_sessions(id)%'
-      ) = 1
-"""
-
-/** private durable ingress identity indexのexact definitionを確認するSQL。 */
-private const val VERIFY_MARKET_DATA_INGRESS_SESSIONS_INDEX_SQL = """
-    SELECT 1
-    FROM pg_index index_metadata
-    JOIN pg_class index_class ON index_class.oid = index_metadata.indexrelid
-    WHERE index_class.relname = 'idx_market_data_ingress_sessions_identity'
-      AND index_metadata.indrelid = 'market_data_ingress_sessions'::regclass
-      AND NOT index_metadata.indisunique
-      AND index_metadata.indisvalid
-      AND index_metadata.indpred IS NULL
-      AND index_metadata.indexprs IS NULL
-      AND index_metadata.indnkeyatts = 4
-      AND pg_get_indexdef(index_metadata.indexrelid, 1, TRUE) = 'provider'
-      AND pg_get_indexdef(index_metadata.indexrelid, 2, TRUE) = 'symbol'
-      AND pg_get_indexdef(index_metadata.indexrelid, 3, TRUE) = 'channel'
-      AND pg_get_indexdef(index_metadata.indexrelid, 4, TRUE) = 'starting_at'
-      AND index_metadata.indoption[0] = 0
-      AND index_metadata.indoption[1] = 0
-      AND index_metadata.indoption[2] = 0
-      AND index_metadata.indoption[3] = 3
 """
 
 /** symbol ごとの open opportunity episode を一意にする partial unique index。 */
@@ -1300,6 +1216,7 @@ class TradingPersistenceBootstrap(
     @Suppress("LongMethod")
     fun ensureSchema(): Result<Unit> {
         val migrationObservation = EconomicEventAttemptMigrationObservation()
+        var recoveredCount = 0
         val schemaResult = runCatching {
             exposedTransaction(database) {
                 maxAttempts = 1
@@ -1328,7 +1245,6 @@ class TradingPersistenceBootstrap(
                     OrdersTable,
                     ExecutionsTable,
                     MarketDataSessionsTable,
-                    MarketDataIngressSessionsTable,
                     MarketDataGapsTable,
                     EvaluationExclusionsTable,
                     CommandEventLogTable,
@@ -1364,9 +1280,9 @@ class TradingPersistenceBootstrap(
                     value = ECONOMIC_EVENT_ATTEMPT_MIGRATION_STATEMENT_TIMEOUT.toPostgresTimeout(),
                 )
                 ensureRuntimeSchemaObjects(migrationObservation)
+                removeGapPopulationEnforcementTriggers()
                 setLocalPostgresSetting("lock_timeout", previousLockTimeout)
                 setLocalPostgresSetting("statement_timeout", previousStatementTimeout)
-                ensureGapPopulationLifecycleSchema()
                 ensureLaunchFoundationSchema()
                 val now = Instant.now(clock)
 
@@ -1387,7 +1303,6 @@ class TradingPersistenceBootstrap(
                 }
                 ensurePaperAccount(now, paperAccountConfig)
                 ensureLegacyPaperAccountEpoch(now)
-                acquireGapPopulationGenerationToken()
                 ensureRiskStateEquityPeak(now, paperAccountConfig.initialCashJpy)
                 ensureBootstrapEquitySnapshot(now)
                 jdbcConnection().prepareStatement(
@@ -1401,6 +1316,11 @@ class TradingPersistenceBootstrap(
                     statement.setString(2, LLM_RUN_STATUS_RUNNING)
                     statement.executeUpdate()
                 }
+                recoveredCount = recoverStaleLlmRunLifecycle(
+                    now = now,
+                    threshold = staleLlmRunRecoveryThreshold,
+                    previousGenerationTerminated = false,
+                )
             }
 
             Unit
@@ -1411,16 +1331,11 @@ class TradingPersistenceBootstrap(
         )?.let(::emitEconomicEventAttemptMigrationAudit)
         if (schemaResult.isFailure) return schemaResult
 
-        return runCatching {
-            val recoveredCount = recoverStaleLlmRunLifecycles(
-                now = Instant.now(clock),
-                previousGenerationTerminated = false,
-            )
-
-            if (recoveredCount > 0) {
-                onStaleLlmRunsRecovered(recoveredCount)
-            }
+        if (recoveredCount > 0) {
+            onStaleLlmRunsRecovered(recoveredCount)
         }
+
+        return schemaResult
     }
 
     private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.ensureLaunchFoundationSchema() {
@@ -1494,25 +1409,12 @@ class TradingPersistenceBootstrap(
 
     /** single-instance の旧 process generation 終了確認後だけ CLAIMED stale lifecycle を回収する。 */
     fun recoverPreviousGeneration(): Result<Int> = runCatching {
-        recoverStaleLlmRunLifecycles(
-            now = Instant.now(clock),
-            previousGenerationTerminated = true,
-        )
-    }
-
-    /** immutable scope ごとの transaction で stale lifecycle を回収する。 */
-    private fun recoverStaleLlmRunLifecycles(now: Instant, previousGenerationTerminated: Boolean): Int {
-        val invocationIds = exposedTransaction(database) { selectLlmLifecycleInvocationIds() }
-
-        return invocationIds.sumOf { invocationId ->
-            exposedTransaction(database) {
-                recoverStaleLlmRunLifecycle(
-                    invocationId = invocationId,
-                    now = now,
-                    threshold = staleLlmRunRecoveryThreshold,
-                    previousGenerationTerminated = previousGenerationTerminated,
-                )
-            }
+        exposedTransaction(database) {
+            recoverStaleLlmRunLifecycle(
+                now = Instant.now(clock),
+                threshold = staleLlmRunRecoveryThreshold,
+                previousGenerationTerminated = true,
+            )
         }
     }
 }
@@ -1644,7 +1546,6 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
     executeUpdate(ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
-    executeUpdate(ENSURE_MARKET_DATA_INGRESS_IDENTITY_INDEX_SQL)
     executeUpdate(ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
@@ -1741,20 +1642,7 @@ private fun Duration.toPostgresTimeout(): String = "${toMillis()}ms"
  * runtime schema と補助 index が存在することを確認する。
  */
 private fun JdbcTransaction.verifyRuntimeSchemaObjects() {
-    verifyExistsBySql(
-        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_COLUMNS_SQL,
-        missingMessage = "market_data_ingress_sessions exact columns were not initialized.",
-    )
-    verifyExistsBySql(
-        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_KEYS_SQL,
-        missingMessage = "market_data_ingress_sessions exact keys were not initialized.",
-    )
-    verifyExistsBySql(
-        sql = VERIFY_MARKET_DATA_INGRESS_SESSIONS_INDEX_SQL,
-        missingMessage = "market_data_ingress_sessions exact identity index was not initialized.",
-    )
     verifyRuntimeConfigSchema()
-    verifyGapPopulationLifecycleSchema()
     verifyAccountRuntimeSchemaObjects()
     verifyLedgerRuntimeSchemaObjects()
     verifyDecisionRuntimeSchemaObjects()
@@ -1915,6 +1803,20 @@ internal fun JdbcTransaction.executeUpdate(sql: String) {
     }
 }
 
+/** 現行の mutation path と競合する gap population enforcement trigger を削除する。 */
+internal fun JdbcTransaction.removeGapPopulationEnforcementTriggers() {
+    GAP_POPULATION_ENFORCEMENT_TRIGGERS.forEach { (table, trigger) ->
+        val tableExists = prepare("SELECT to_regclass(?) IS NOT NULL").use { statement ->
+            statement.setString(1, "public.$table")
+            statement.executeQuery().use { rows ->
+                check(rows.next())
+                rows.getBoolean(1)
+            }
+        }
+        if (tableExists) executeUpdate("DROP TRIGGER IF EXISTS $trigger ON $table")
+    }
+}
+
 /**
  * risk_state single row がなければ作成する。
  */
@@ -1976,17 +1878,22 @@ internal fun JdbcTransaction.ensureBootstrapEquitySnapshot(now: Instant) {
     }
 }
 
-/** stale run と対応する RUNNING reservation を entity scope transaction 内で回収する。 */
+/**
+ * stale な RUNNING llm_runs を FAILED へ回収する。
+ */
+internal fun JdbcTransaction.recoverStaleLlmRuns(now: Instant, threshold: Duration): Int {
+    return recoverStaleLlmRunLifecycle(now, threshold, previousGenerationTerminated = false)
+}
+
+/** stale run と対応する RUNNING reservation を bootstrap transaction 内で回収する。 */
 internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
-    invocationId: String,
     now: Instant,
     threshold: Duration,
     previousGenerationTerminated: Boolean = false,
 ): Int {
-    acquireLlmLifecycleGapPopulationToken(invocationId)
     val cutoff = now.minus(threshold)
-    val reservations = selectRunningLlmReservationsForUpdate(invocationId)
-    val runs = selectLifecycleRunsForUpdate(invocationId)
+    val reservations = selectRunningLlmReservationsForUpdate()
+    val runs = selectLifecycleRunsForUpdate()
     val runsByInvocationId = runs.associateBy(LockedLlmRun::invocationId)
     val reservationsByInvocationId = reservations.associateBy(LockedLlmReservation::invocationId)
     val recoveries = (runsByInvocationId.keys + reservationsByInvocationId.keys)
@@ -2004,68 +1911,6 @@ internal fun JdbcTransaction.recoverStaleLlmRunLifecycle(
     recoveries.forEach { recovery -> insertLlmInvocationRecoveryEvent(recovery, now) }
 
     return recoveries.count { recovery -> recovery.runRecovered }
-}
-
-private fun JdbcTransaction.selectLlmLifecycleInvocationIds(): List<String> {
-    val sql = """
-        SELECT run.invocation_id
-        FROM llm_runs AS run
-        WHERE run.status = ?
-            AND (
-                EXISTS (
-                    SELECT 1
-                    FROM llm_launch_reservations AS reservation
-                    JOIN gap_population_entity_scopes AS scope
-                        ON scope.entity_type = 'LLM_RESERVATION' AND scope.entity_id = reservation.id::text
-                    WHERE reservation.invocation_id = run.invocation_id
-                )
-                OR (
-                    NOT EXISTS (
-                        SELECT 1 FROM llm_launch_reservations AS reservation
-                        WHERE reservation.invocation_id = run.invocation_id
-                    )
-                    AND EXISTS (
-                        SELECT 1 FROM gap_population_entity_scopes AS scope
-                        WHERE scope.entity_type = 'LLM_RUN' AND scope.entity_id = run.invocation_id
-                    )
-                )
-            )
-        UNION
-        SELECT reservation.invocation_id
-        FROM llm_launch_reservations AS reservation
-        WHERE reservation.status = ?
-            AND EXISTS (
-                SELECT 1 FROM gap_population_entity_scopes AS scope
-                WHERE scope.entity_type = 'LLM_RESERVATION' AND scope.entity_id = reservation.id::text
-            )
-        ORDER BY invocation_id ASC
-    """.trimIndent()
-
-    return jdbcConnection().prepareStatement(sql).use { statement ->
-        statement.setString(1, LLM_RUN_STATUS_RUNNING)
-        statement.setString(2, "RUNNING")
-        statement.executeQuery().use { resultSet ->
-            buildList {
-                while (resultSet.next()) add(resultSet.getString(1))
-            }
-        }
-    }
-}
-
-private fun JdbcTransaction.acquireLlmLifecycleGapPopulationToken(invocationId: String) {
-    val reservationEntityId = jdbcConnection().prepareStatement(
-        "SELECT id::text FROM llm_launch_reservations WHERE invocation_id = ?",
-    ).use { statement ->
-        statement.setString(1, invocationId)
-        statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.getString(1) else null
-        }
-    }
-    if (reservationEntityId != null) {
-        acquireGapPopulationGenerationTokenForEntity("LLM_RESERVATION", reservationEntityId)
-    } else {
-        acquireGapPopulationGenerationTokenForEntity("LLM_RUN", invocationId)
-    }
 }
 
 private data class LockedLlmRun(
@@ -2104,20 +1949,19 @@ private data class StaleLlmInvocationRecovery(
     val runtimeConfigHash: String?,
 )
 
-private fun JdbcTransaction.selectLifecycleRunsForUpdate(invocationId: String): List<LockedLlmRun> {
+private fun JdbcTransaction.selectLifecycleRunsForUpdate(): List<LockedLlmRun> {
     val sql = """
         SELECT invocation_id, status, trigger_kind, started_at, runtime_config_version_id, runtime_config_hash
         FROM llm_runs
-        WHERE (status = ? OR invocation_id IN (
+        WHERE status = ? OR invocation_id IN (
             SELECT invocation_id FROM llm_launch_reservations WHERE status = 'RUNNING'
-        )) AND invocation_id = ?
+        )
         ORDER BY invocation_id ASC
         FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, LLM_RUN_STATUS_RUNNING)
-        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {
@@ -2137,19 +1981,18 @@ private fun JdbcTransaction.selectLifecycleRunsForUpdate(invocationId: String): 
     }
 }
 
-private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(invocationId: String): List<LockedLlmReservation> {
+private fun JdbcTransaction.selectRunningLlmReservationsForUpdate(): List<LockedLlmReservation> {
     val sql = """
         SELECT invocation_id, trigger_kind, trigger_key, reserved_at, execution_claim_state,
             execution_claim_token, execution_claimed_at, execution_claim_heartbeat_at
         FROM llm_launch_reservations
-        WHERE status = ? AND invocation_id = ?
+        WHERE status = ?
         ORDER BY invocation_id ASC
         FOR UPDATE
     """.trimIndent()
 
     return jdbcConnection().prepareStatement(sql).use { statement ->
         statement.setString(1, "RUNNING")
-        statement.setString(2, invocationId)
         statement.executeQuery().use { resultSet ->
             buildList {
                 while (resultSet.next()) {

@@ -17,7 +17,7 @@ import javax.sql.DataSource
 /**
  * fukurou 全体で共有する Postgres advisory lock key。
  */
-internal const val GLOBAL_TRADING_AUTHORITY_LOCK_KEY = 9_206_202_601L
+private const val TRADING_LOCK_KEY = 9_206_202_601L
 
 /**
  * Postgres advisory lock の取得を試みる SQL。
@@ -56,7 +56,7 @@ private val POSTGRES_LOCK_LOGGER = Logger.getLogger(PostgresGlobalTradingLock::c
 class PostgresGlobalTradingLock(
     private val dataSource: DataSource,
     private val clock: Clock = Clock.systemUTC(),
-    private val lockKey: Long = GLOBAL_TRADING_AUTHORITY_LOCK_KEY,
+    private val lockKey: Long = TRADING_LOCK_KEY,
     private val lockTimeout: Duration = DEFAULT_LOCK_TIMEOUT,
     private val lockRetryDelay: Duration = DEFAULT_LOCK_RETRY_DELAY,
 ) : TradingLock {

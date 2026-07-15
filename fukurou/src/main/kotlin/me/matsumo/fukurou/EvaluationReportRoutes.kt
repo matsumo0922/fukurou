@@ -67,8 +67,6 @@ internal fun Route.evaluationReportRoutes(dependencies: EvaluationRouteDependenc
                 runnerConfig = dependencies.tradingConfig.runner,
                 staleAfter = dependencies.tradingConfig.daemon.launchReservationStaleAfter,
                 clock = dependencies.clock,
-                mode = dependencies.tradingConfig.mode,
-                symbol = dependencies.tradingConfig.symbol,
             )
         },
         clock = dependencies.clock,

@@ -817,23 +817,6 @@ object MarketDataSessionsTable : Table("market_data_sessions") {
     override val primaryKey = PrimaryKey(id)
 }
 
-/** production未接続のdurable market-data ingress session。 */
-object MarketDataIngressSessionsTable : Table("market_data_ingress_sessions") {
-    val sessionId = uuid("session_id").references(MarketDataSessionsTable.id)
-    val provider = varchar("provider", length = 32)
-    val symbol = varchar("symbol", length = 32)
-    val channel = varchar("channel", length = 32)
-    val state = varchar("state", length = 32)
-    val lastReceivedSequence = long("last_received_sequence").default(0)
-    val startingAt = long("starting_at")
-    val connectedAt = long("connected_at").nullable()
-    val stoppingAt = long("stopping_at").nullable()
-    val disconnectedAt = long("disconnected_at").nullable()
-    val disconnectSource = varchar("disconnect_source", length = 32).nullable()
-
-    override val primaryKey = PrimaryKey(sessionId)
-}
-
 /** market-data gap の監査記録。 */
 object MarketDataGapsTable : Table("market_data_gaps") {
     val id = uuid("id")

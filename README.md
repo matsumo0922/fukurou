@@ -40,10 +40,6 @@ entry decision は full run 前に固定した typed / bounded material-state ma
 
 paper の未約定 LIMIT、BUY STOP、protective STOP、virtual TP は GMO Public WebSocket `trades/BTC` の接続中に受信した realtime event だけで前進します。transport activity、trade、periodic maintenance は別々に監査し、trade 無音だけでは接続障害にしません。close/error、decode failure、buffer overflow、transport liveness timeout は market-data gap として永続化します。deploy maintenance は別の root-owned infrastructure gap として記録し、causal/exposure interval が交差する record と attribution 不能 record を missing population に残したまま strategy KPI から除外します。REST history、candle、再接続後の履歴から遡及約定は作りません。
 
-`market_data_ingress_sessions` と paused durable GMO stream は default-off foundation である。production の `ProtectionReconciler` は legacy `GmoPublicWebSocketMarketEventStream` を使い、private ingress row、paper fill eligibility、shutdown sequenceを変更しない。
-
-market-data gap の影響対象は、DB の control row と transaction-local token で作成・終端処理と直列化して固定します。gap work は transport symbol と domain population symbol、paper account epoch、cohort、execution semantics を固定し、単調な enqueue sequence の FIFO、enqueue 時点の birth upper bound、immutable member、terminal journal を使って復旧します。導入前で immutable scope を持たない active entity は current scope に読み替えず `UNKNOWN_SCOPE_UNATTRIBUTED` とし、entity-global containment owner に集約します。安全な失敗終端を持つentityだけをcontainedにし、POSITIONは約定や close を創作せず `QUARANTINED` に残します。復旧は page 100 / invocation 1,000 の境界で進み、整合性を確定できない work は `UNKNOWN` のまま strategy KPI に混ぜません。
-
 ## Backend / API
 
 Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
