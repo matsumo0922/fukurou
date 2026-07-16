@@ -97,34 +97,6 @@ proposer_phase AS (
         AND decision_run_id IS NOT NULL
     ORDER BY decision_run_id, ts DESC
 ),
-risk_reduction_phase AS (
-    SELECT DISTINCT ON (decision_run_id)
-        decision_run_id,
-        COALESCE(payload::jsonb #>> '{details,processFailureKind}', '<none>') AS process_failure_kind,
-        COALESCE(payload::jsonb #>> '{details,cleanupFailed}', 'false') AS cleanup_failed,
-        COALESCE(payload::jsonb #>> '{details,cliErrorReported}', 'false') AS cli_error_reported,
-        COALESCE(payload::jsonb #>> '{details,authFailureSuspected}', 'false') AS auth_failure_suspected
-    FROM command_event_log
-    WHERE event_type = 'RUNNER_PHASE_COMPLETED'
-        AND payload::jsonb ->> 'phase' = 'risk_reduction_only'
-        AND decision_run_id IS NOT NULL
-    ORDER BY decision_run_id, ts DESC
-),
-standard_material AS (
-    SELECT
-        invocation_id,
-        COALESCE(
-            (
-                SELECT missing_source ->> 'reason'
-                FROM jsonb_array_elements(manifest_json::jsonb -> 'missingSources') AS missing_source
-                WHERE missing_source ->> 'source' = 'STANDARD_CONTEXT'
-                LIMIT 1
-            ),
-            '<none>'
-        ) AS standard_failure_stage,
-        octet_length(manifest_json) AS manifest_bytes
-    FROM decision_material_state_manifests
-),
 no_trade AS (
     SELECT
         decision_run_id,
@@ -172,12 +144,6 @@ SELECT
     || '|' || llm_runs.status
     || '|' || COALESCE(llm_launch_reservations.reason, '<null>')
     || '|' || COALESCE(proposer_phase.process_status, '<none>') || '/' || COALESCE(proposer_phase.exit_code, '<none>') || '/auth=' || COALESCE(proposer_phase.auth_failure_suspected, 'false')
-    || '|standardStage=' || COALESCE(standard_material.standard_failure_stage, '<none>')
-    || '|materialBytes=' || COALESCE(standard_material.manifest_bytes::text, '<none>')
-    || '|rroProcess=' || COALESCE(risk_reduction_phase.process_failure_kind, '<none>')
-    || '/cleanup=' || COALESCE(risk_reduction_phase.cleanup_failed, 'false')
-    || '/cli=' || COALESCE(risk_reduction_phase.cli_error_reported, 'false')
-    || '/auth=' || COALESCE(risk_reduction_phase.auth_failure_suspected, 'false')
     || '|' || COALESCE(no_trade.no_trade_reasons, '<none>')
     || '|' || COALESCE(latest_decision.action, '<none>')
     || '|' || COALESCE(latest_decision.estimated_win_probability::text, '<none>')
@@ -188,8 +154,6 @@ SELECT
 FROM llm_runs
 LEFT JOIN llm_launch_reservations ON llm_launch_reservations.invocation_id = llm_runs.invocation_id
 LEFT JOIN proposer_phase ON proposer_phase.decision_run_id = llm_runs.invocation_id
-LEFT JOIN risk_reduction_phase ON risk_reduction_phase.decision_run_id = llm_runs.invocation_id
-LEFT JOIN standard_material ON standard_material.invocation_id = llm_runs.invocation_id
 LEFT JOIN no_trade ON no_trade.decision_run_id = llm_runs.invocation_id
 LEFT JOIN tool_summary ON tool_summary.decision_run_id = llm_runs.invocation_id
 LEFT JOIN latest_decision ON latest_decision.invocation_id = llm_runs.invocation_id

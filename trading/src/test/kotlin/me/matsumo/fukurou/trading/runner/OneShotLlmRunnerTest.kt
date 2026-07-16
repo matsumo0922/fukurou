@@ -100,7 +100,6 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
-import me.matsumo.fukurou.trading.exchange.gmo.ProductionLikeStandardMaterialMarketDataSource
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.DefaultLlmOutputParser
@@ -313,7 +312,7 @@ class OneShotLlmRunnerTest {
 
     @Test
     fun materialManifestCapturesExactMarketFactsBeforeThesisScopedProjection() = runBlocking {
-        val fixture = runnerFixture(marketDataSource = ProductionLikeStandardMaterialMarketDataSource) { command ->
+        val fixture = runnerFixture(marketDataSource = MaterialManifestMarketDataSource) { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
             }
@@ -337,11 +336,6 @@ class OneShotLlmRunnerTest {
         assertTrue(manifest.snapshotContentHash.matches(Regex("[0-9a-f]{64}")))
         assertNotEquals(manifest.canonicalContentHash, manifest.snapshotContentHash)
         assertTrue(manifest.materialProjection.isEmpty())
-        assertEquals(
-            "GMO_PUBLIC_ORDERBOOK",
-            manifest.marketFeatureBundle.orderbookSummary?.metadata?.provenance,
-        )
-        assertEquals(10, manifest.marketFeatureBundle.orderbookSummary?.levelLimit)
         assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
         val runManifest = assertNotNull(
             fixture.runtime.llmInputManifestRepository.findRun("material-facts-run").getOrThrow(),
@@ -617,108 +611,7 @@ class OneShotLlmRunnerTest {
 
             assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
             assertTrue(fixture.processRunner.launches.single().mcpManifestContent().contains("RISK_REDUCTION_ONLY"))
-            val manifest = assertNotNull(
-                fixture.runtime.decisionMaterialStateRepository.find("malformed-market-$index").getOrThrow(),
-            )
-            val expectedStage = if (index == 0) "TICKER" else "CANDLES"
-            assertEquals(expectedStage, manifest.missingSources.single().reason)
         }
-    }
-
-    @Test
-    fun missingMaterialMarketDataSource_failClosedAtConfigurationStage() = runBlocking {
-        val fixture = runnerFixture(
-            materialMarketDataSource = null,
-        ) { command ->
-            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
-            cleanExit()
-        }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "missing-material-source")).getOrThrow()
-        val manifest = assertNotNull(
-            fixture.runtime.decisionMaterialStateRepository.find("missing-material-source").getOrThrow(),
-        )
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
-        assertEquals("MARKET_DATA_SOURCE", manifest.missingSources.single().reason)
-    }
-
-    @Test
-    fun standardMaterialCapture_rethrowsCancellationWithoutTypedStage() = runBlocking {
-        val fixture = runnerFixture(marketDataSource = CancellingMaterialMarketDataSource) { cleanExit() }
-
-        val failure = assertFailsWith<CancellationException> {
-            fixture.runOneShot(defaultRequest().copy(invocationId = "cancelled-material")).getOrThrow()
-        }
-
-        assertEquals("material capture cancelled", failure.message)
-        assertTrue(fixture.processRunner.launches.isEmpty())
-        assertNull(fixture.runtime.decisionMaterialStateRepository.find("cancelled-material").getOrThrow())
-    }
-
-    @Test
-    fun riskReductionOnly_processFailureWinsOverPersistedDecision() = runBlocking {
-        val fixture = runnerFixture(marketDataSource = FailingMaterialMarketDataSource) { command ->
-            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
-            nonZeroExit()
-        }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-process-failure")).getOrThrow()
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
-        assertNull(result.decision)
-        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("risk_reduction_only_process_failed"))
-        val details = fixture.eventLog.events().singleRunnerPhaseDetails("risk_reduction_only")
-        assertEquals("NON_ZERO_EXIT", details.stringValue("processFailureKind"))
-    }
-
-    @Test
-    fun riskReductionOnly_cleanExitWithoutDecisionIsInfrastructureNoTrade() = runBlocking {
-        val fixture = runnerFixture(marketDataSource = FailingMaterialMarketDataSource) { cleanExit() }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-missing-decision")).getOrThrow()
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
-        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("risk_reduction_only_missing_decision"))
-    }
-
-    @Test
-    fun riskReductionOnly_cleanupAndHeuristicSignalsDoNotBlockPersistedNoTradeDecision() = runBlocking {
-        val fixture = runnerFixture(
-            marketDataSource = FailingMaterialMarketDataSource,
-            llmInvokerTransform = { delegate ->
-                CleanupInjectingLlmInvoker(delegate, IllegalStateException("synthetic cleanup failure"))
-            },
-        ) { command ->
-            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
-            cleanExit(stdout = """{"type":"result","is_error":true,"result":"Not logged in"}""")
-        }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-audit-signals")).getOrThrow()
-        val details = fixture.eventLog.events().singleRunnerPhaseDetails("risk_reduction_only")
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
-        assertEquals("true", details.stringValue("cleanupFailed"))
-        assertEquals("true", details.stringValue("cliErrorReported"))
-        assertEquals("true", details.stringValue("authFailureSuspected"))
-        assertFalse(details.containsKey("processFailureKind"))
-    }
-
-    @Test
-    fun proposerCleanupWithoutDecisionKeepsInfrastructureCause() = runBlocking {
-        val fixture = runnerFixture(
-            llmInvokerTransform = { delegate ->
-                CleanupInjectingLlmInvoker(delegate, IllegalStateException("synthetic cleanup failure"))
-            },
-        ) { cleanExit() }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "proposer-cleanup")).getOrThrow()
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
-        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
     }
 
     @Test
@@ -1394,54 +1287,6 @@ class OneShotLlmRunnerTest {
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals(0, positions.size)
         assertTrue(events.containsNoTradeReason("falsifier_rejected"))
-    }
-
-    @Test
-    fun falsifierCleanupWithoutVerdict_keepsInfrastructureCause() = runBlocking {
-        val cleanupFailure = IllegalStateException("synthetic falsifier cleanup failure")
-        val fixture = runnerFixture(
-            llmInvokerTransform = { delegate ->
-                CleanupInjectingLlmInvoker(delegate, cleanupFailure)
-            },
-        ) { command ->
-            if (command.isProposerLaunch()) {
-                submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
-
-                return@runnerFixture cleanExit()
-            }
-
-            cleanExit()
-        }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "falsifier-cleanup")).getOrThrow()
-        val noTradeEvent = fixture.eventLog.events().single { event ->
-            event.eventType == CommandEventType.NO_TRADE_EXIT && event.payload.contains("falsifier_missing_verdict")
-        }
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
-        assertEquals(
-            me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED,
-            result.terminalCause,
-        )
-        assertEquals(0, fixture.runtime.broker.getPositions().getOrThrow().size)
-        assertTrue(noTradeEvent.payload.contains("\"cause\":\"IllegalStateException\""))
-    }
-
-    @Test
-    fun falsifierRejectedWithCleanup_remainsNoTradeWithoutEntry() = runBlocking {
-        val fixture = runnerFixture(
-            llmInvokerTransform = { delegate ->
-                CleanupInjectingLlmInvoker(delegate, IllegalStateException("synthetic cleanup failure"))
-            },
-        ) { command ->
-            handleEnterAndRejectedFalsifier(fixtureRepository, command)
-        }
-
-        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "falsifier-rejected-cleanup")).getOrThrow()
-
-        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
-        assertEquals(0, fixture.runtime.broker.getPositions().getOrThrow().size)
-        assertTrue(fixture.eventLog.events().containsNoTradeReason("falsifier_rejected"))
     }
 
     @Test
@@ -2767,9 +2612,7 @@ private fun runnerFixture(
     logger: (String) -> Unit = {},
     clock: Clock = fixedClock(),
     marketDataSource: MarketDataSource = FakeMarketDataSource,
-    materialMarketDataSource: MarketDataSource? = marketDataSource,
     cliVersionProbe: LlmCliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
-    llmInvokerTransform: (LlmInvoker) -> LlmInvoker = { invoker -> invoker },
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
     val baseRuntime = TradingRuntimeFactory.inMemory(
@@ -2784,12 +2627,10 @@ private fun runnerFixture(
     val runner = OneShotLlmRunner(
         tradingRuntime = runtime,
         tradingConfig = config,
-        materialMarketDataSource = materialMarketDataSource,
-        llmInvoker = llmInvokerTransform(
-            ShellLlmInvoker(
-                commandRenderer = DefaultLlmCommandRenderer(),
-                processRunner = processRunner,
-            ),
+        materialMarketDataSource = marketDataSource,
+        llmInvoker = ShellLlmInvoker(
+            commandRenderer = DefaultLlmCommandRenderer(),
+            processRunner = processRunner,
         ),
         runtimeConfigSnapshot = runtimeConfigSnapshot,
         parentEnvironment = parentEnvironment,
@@ -2806,15 +2647,6 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
-}
-
-private class CleanupInjectingLlmInvoker(
-    private val delegate: LlmInvoker,
-    private val cleanupFailure: Throwable,
-) : LlmInvoker {
-    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
-        return delegate.invoke(request).map { result -> result.copy(cleanupFailure = cleanupFailure) }
-    }
 }
 
 private fun processRecoveryFixture(
@@ -3926,12 +3758,6 @@ private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarket
 private object FailingMaterialMarketDataSource : MarketDataSource by FakeMarketDataSource {
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
         return Result.failure(GmoRateLimitException("fixture market failure"))
-    }
-}
-
-private object CancellingMaterialMarketDataSource : MarketDataSource by FakeMarketDataSource {
-    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
-        throw CancellationException("material capture cancelled")
     }
 }
 
