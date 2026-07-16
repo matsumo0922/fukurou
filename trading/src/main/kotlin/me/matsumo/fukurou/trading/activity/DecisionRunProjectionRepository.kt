@@ -65,7 +65,13 @@ data class DecisionRunOutcomeEvidence(
 
 /** 保存済み run 証跡から fail-closed な outcome を決定する。 */
 fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRunOutcome {
-    return evidence.lifecycleOutcome() ?: evidence.processOutcome()
+    return evidence.safetyOutcome() ?: evidence.lifecycleOutcome() ?: evidence.processOutcome()
+}
+
+private fun DecisionRunOutcomeEvidence.safetyOutcome(): DecisionRunOutcome? {
+    val denied = terminalCause == LlmRunTerminalCause.SAFETY_DENIED
+
+    return if (denied) DecisionRunOutcome.DENIED else null
 }
 
 private fun DecisionRunOutcomeEvidence.lifecycleOutcome(): DecisionRunOutcome? {
@@ -84,7 +90,6 @@ private fun DecisionRunOutcomeEvidence.lifecycleOutcome(): DecisionRunOutcome? {
 private fun DecisionRunOutcomeEvidence.processOutcome(): DecisionRunOutcome {
     return when {
         status == LLM_RUN_STATUS_RUNNING -> DecisionRunOutcome.RUNNING
-        terminalCause == LlmRunTerminalCause.SAFETY_DENIED -> DecisionRunOutcome.DENIED
         terminalCause == LlmRunTerminalCause.NO_TRADE -> DecisionRunOutcome.NO_ENTRY
         terminalCause in setOf(
             LlmRunTerminalCause.RESTART_INTERRUPTED,

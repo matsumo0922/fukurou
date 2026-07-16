@@ -44,6 +44,7 @@ import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
+import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
@@ -325,7 +326,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         tradingConfig = inputs.tradingConfig,
     )
     requestAuditSink.bind(CommandEventLogGmoPublicRequestAuditSink(tradingRuntime.commandEventLog))
-    val runner = OneShotLlmRunner(
+    val runner = createProductionOneShotLlmRunner(
         tradingRuntime = tradingRuntime,
         tradingConfig = inputs.tradingConfig,
         materialMarketDataSource = marketDataSource,
@@ -362,6 +363,32 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         ),
         launchOneShot = runner.asDaemonLauncher(),
         preFilter = preFilter,
+    )
+}
+
+/** production scheduler と composition test が共有する one-shot runner factory。 */
+@Suppress("LongParameterList")
+internal fun createProductionOneShotLlmRunner(
+    tradingRuntime: TradingRuntime,
+    tradingConfig: TradingBotConfig,
+    materialMarketDataSource: MarketDataSource,
+    llmInvoker: me.matsumo.fukurou.trading.invoker.LlmInvoker,
+    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+    parentEnvironment: Map<String, String>,
+    clock: Clock,
+    commandRendererConfig: LlmCommandRendererConfig,
+    cliVersionProbe: me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe = ProcessScopedLlmCliVersionProbe,
+): OneShotLlmRunner {
+    return OneShotLlmRunner(
+        tradingRuntime = tradingRuntime,
+        tradingConfig = tradingConfig,
+        materialMarketDataSource = materialMarketDataSource,
+        llmInvoker = llmInvoker,
+        runtimeConfigSnapshot = runtimeConfigSnapshot,
+        parentEnvironment = parentEnvironment,
+        clock = clock,
+        commandRendererConfig = commandRendererConfig,
+        cliVersionProbe = cliVersionProbe,
     )
 }
 

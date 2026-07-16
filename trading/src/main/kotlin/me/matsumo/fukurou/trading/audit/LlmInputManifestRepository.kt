@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.audit
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
@@ -30,6 +31,80 @@ interface LlmInputManifestRepository {
     suspend fun findObservation(phaseManifestId: String): Result<LlmPhaseObservation?>
 }
 
+/** standard material snapshot の失敗境界。 */
+enum class StandardMaterialSnapshotStage {
+    CAPTURE,
+    VALIDATION,
+    HASH_SERIALIZATION,
+    PERSISTENCE,
+}
+
+/** message を永続化対象へ持ち込まない standard material snapshot failure。 */
+class StandardMaterialSnapshotException(
+    val stage: StandardMaterialSnapshotStage,
+    cause: Throwable,
+) : RuntimeException(null, cause)
+
+/** standard material snapshot の validation/hash 準備結果。 */
+internal data class PreparedStandardMaterialSnapshot(
+    val materialHash: String,
+    val runJson: String,
+)
+
+/** repository 実装間で共有する standard material snapshot の validation。 */
+internal suspend fun validateStandardMaterialSnapshot(
+    materialManifest: DecisionMaterialStateManifest,
+    runManifest: LlmRunInputManifest,
+    knownSecretValues: Set<String>,
+): Result<Unit> = standardMaterialSnapshotResult(StandardMaterialSnapshotStage.VALIDATION) {
+    ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
+    require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
+    require(materialManifest.invocationId == runManifest.invocationId) {
+        "run manifest material scope mismatch."
+    }
+    require(runManifest.materialInvocationId == materialManifest.invocationId) {
+        "run manifest material reference mismatch."
+    }
+    ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
+}
+
+/** repository 実装間で共有する standard material snapshot の hash/serialization 準備。 */
+internal suspend fun prepareStandardMaterialSnapshot(
+    materialManifest: DecisionMaterialStateManifest,
+    runManifest: LlmRunInputManifest,
+): Result<PreparedStandardMaterialSnapshot> = standardMaterialSnapshotResult(
+    StandardMaterialSnapshotStage.HASH_SERIALIZATION,
+) {
+    materialManifest.requireValidSnapshotHash()
+    val materialHash = materialManifest.persistedSnapshotHash()
+    require(runManifest.materialContentHash == materialHash) {
+        "run manifest material hash mismatch."
+    }
+    val runJson = LlmManifestJsonCodec.encode(runManifest)
+    require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
+        "run manifest canonical hash mismatch."
+    }
+    PreparedStandardMaterialSnapshot(
+        materialHash = materialHash,
+        runJson = runJson,
+    )
+}
+
+internal suspend inline fun <T> standardMaterialSnapshotResult(
+    stage: StandardMaterialSnapshotStage,
+    crossinline block: suspend () -> T,
+): Result<T> {
+    return try {
+        Result.success(block())
+    } catch (throwable: CancellationException) {
+        throw throwable
+    } catch (throwable: StandardMaterialSnapshotException) {
+        Result.failure(throwable)
+    } catch (throwable: Throwable) {
+        Result.failure(StandardMaterialSnapshotException(stage, throwable))
+    }
+}
+
 /** DB 未構成 runtime 用 manifest repository。 */
 class InMemoryLlmInputManifestRepository(
     private val materialRepository: DecisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
@@ -47,26 +122,18 @@ class InMemoryLlmInputManifestRepository(
     override suspend fun appendRunWithMaterial(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
-    ): Result<Unit> = runCatching {
-        materialManifest.requireValidSnapshotHash()
-        ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-        require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-        require(materialManifest.invocationId == runManifest.invocationId) {
-            "run manifest material scope mismatch."
+    ): Result<Unit> {
+        validateStandardMaterialSnapshot(materialManifest, runManifest, knownSecretValues)
+            .getOrElse { return Result.failure(it) }
+
+        prepareStandardMaterialSnapshot(materialManifest, runManifest)
+            .getOrElse { return Result.failure(it) }
+
+        return standardMaterialSnapshotResult(StandardMaterialSnapshotStage.PERSISTENCE) {
+            require(findRoot(runManifest.rootId).getOrThrow() != null) { "run manifest audit root is missing." }
+            materialRepository.append(materialManifest).getOrThrow()
+            appendImmutable(runs, runManifest.invocationId, runManifest, "run manifest").getOrThrow()
         }
-        require(runManifest.materialInvocationId == materialManifest.invocationId) {
-            "run manifest material reference mismatch."
-        }
-        require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
-            "run manifest material hash mismatch."
-        }
-        ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-        require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-            "run manifest canonical hash mismatch."
-        }
-        require(findRoot(runManifest.rootId).getOrThrow() != null) { "run manifest audit root is missing." }
-        materialRepository.append(materialManifest).getOrThrow()
-        appendImmutable(runs, runManifest.invocationId, runManifest, "run manifest").getOrThrow()
     }
 
     override suspend fun appendPhase(manifest: LlmPhaseInputManifest): Result<Unit> {

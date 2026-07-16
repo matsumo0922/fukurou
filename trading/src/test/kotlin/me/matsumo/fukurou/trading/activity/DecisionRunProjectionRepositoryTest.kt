@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.activity
 
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.persistence.STALE_LLM_RUN_RECOVERY_ERROR_MESSAGE
 import java.time.Instant
 import kotlin.test.Test
@@ -163,6 +164,35 @@ class DecisionRunProjectionRepositoryTest {
         assertTrue(summary.matches(DecisionRunFilter.ACTION_REQUIRED))
         assertTrue(summary.matches(DecisionRunFilter.WAITING))
     }
+
+    @Test
+    fun outcomePriorityKeepsSafetyThenLifecycleThenProcessFailureThenNoEntry() {
+        val lifecycle = outcomeEvidence(
+            action = "ENTER",
+            orderCount = 1,
+            filledOrderCount = 1,
+            terminalCause = LlmRunTerminalCause.RUNNER_FAILED,
+        )
+        val safetyWithLifecycle = lifecycle.copy(
+            safetyRule = "EXPECTED_VALUE_GATE",
+            terminalCause = LlmRunTerminalCause.SAFETY_DENIED,
+        )
+        val processFailure = outcomeEvidence(
+            terminalCause = LlmRunTerminalCause.RUNNER_FAILED,
+            action = "NO_TRADE",
+            hasNoTradeExit = true,
+        )
+        val ordinaryNoTrade = outcomeEvidence(
+            terminalCause = LlmRunTerminalCause.NO_TRADE,
+            action = "NO_TRADE",
+            hasNoTradeExit = true,
+        )
+
+        assertEquals(DecisionRunOutcome.DENIED, classifyDecisionRunOutcome(safetyWithLifecycle))
+        assertEquals(DecisionRunOutcome.FILLED, classifyDecisionRunOutcome(lifecycle))
+        assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(processFailure))
+        assertEquals(DecisionRunOutcome.NO_ENTRY, classifyDecisionRunOutcome(ordinaryNoTrade))
+    }
 }
 
 private fun outcomeEvidence(
@@ -176,12 +206,15 @@ private fun outcomeEvidence(
     ttlCanceledOrderCount: Int = 0,
     canceledEntryOrderCount: Int = 0,
     actorCanceledOrderCount: Int = 0,
+    terminalCause: LlmRunTerminalCause? = null,
+    safetyRule: String? = null,
 ): DecisionRunOutcomeEvidence {
     return DecisionRunOutcomeEvidence(
         status = status,
         errorMessage = errorMessage,
         action = action,
-        safetyRule = null,
+        terminalCause = terminalCause,
+        safetyRule = safetyRule,
         orderCount = orderCount,
         filledOrderCount = filledOrderCount,
         executionCount = 0,

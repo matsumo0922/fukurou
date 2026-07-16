@@ -28,6 +28,8 @@ import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_BUNDLE_BYTES
 import me.matsumo.fukurou.trading.audit.MAX_TERMINAL_TOOL_EVIDENCE_COUNT
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotException
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotStage
 import me.matsumo.fukurou.trading.audit.TERMINAL_TOOL_EVIDENCE_ENTRY_OVERHEAD_BYTES
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidence
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
@@ -97,6 +99,7 @@ import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifes
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
+import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -9280,6 +9283,72 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llmInputManifest_validationFailureLeavesNoPartialMaterialOrRunRows() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val invocationId = "standard-snapshot-validation-atomicity"
+        val material = identityManifest(invocationId).copy(
+            missingSources = listOf(MaterialMissingSource("UNEXPECTED_SOURCE", "INVALID")),
+        )
+        val runManifest = testRunManifest(material)
+        val repository = ExposedLlmInputManifestRepository(database, emptySet())
+
+        repository.appendRoot(
+            LlmInvocationAuditRoot(invocationId, LlmAuditRootKind.DECISION_ATTEMPT, fixedInstant()),
+        ).getOrThrow()
+        val result = repository.appendRunWithMaterial(material, runManifest)
+        val failure = assertIs<StandardMaterialSnapshotException>(result.exceptionOrNull())
+
+        assertEquals(StandardMaterialSnapshotStage.VALIDATION, failure.stage)
+        assertEquals(0, selectManifestRowCount(database, "decision_material_state_manifests", invocationId))
+        assertEquals(0, selectManifestRowCount(database, "llm_run_input_manifests", invocationId))
+    }
+
+    @Test
+    fun llmInputManifest_hashPreparationFailureLeavesNoPartialMaterialOrRunRows() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val invocationId = "standard-snapshot-hash-atomicity"
+        val material = identityManifest(invocationId)
+        val runManifest = testRunManifest(material).copy(materialContentHash = "0".repeat(64))
+        val repository = ExposedLlmInputManifestRepository(database, emptySet())
+
+        repository.appendRoot(
+            LlmInvocationAuditRoot(invocationId, LlmAuditRootKind.DECISION_ATTEMPT, fixedInstant()),
+        ).getOrThrow()
+        val result = repository.appendRunWithMaterial(material, runManifest)
+        val failure = assertIs<StandardMaterialSnapshotException>(result.exceptionOrNull())
+
+        assertEquals(StandardMaterialSnapshotStage.HASH_SERIALIZATION, failure.stage)
+        assertEquals(0, selectManifestRowCount(database, "decision_material_state_manifests", invocationId))
+        assertEquals(0, selectManifestRowCount(database, "llm_run_input_manifests", invocationId))
+    }
+
+    @Test
+    fun llmInputManifest_statementFailureIsPersistenceAndRollsBackMaterialAndRun() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val invocationId = "standard-snapshot-persistence-atomicity"
+        val material = identityManifest(invocationId)
+        val runManifest = testRunManifest(material)
+        val repository = ExposedLlmInputManifestRepository(database, emptySet())
+
+        repository.appendRoot(
+            LlmInvocationAuditRoot(invocationId, LlmAuditRootKind.DECISION_ATTEMPT, fixedInstant()),
+        ).getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate(
+                "ALTER TABLE decision_material_state_manifests " +
+                    "ADD CONSTRAINT standard_snapshot_persistence_fixture CHECK (false)",
+            )
+        }
+
+        val result = repository.appendRunWithMaterial(material, runManifest)
+        val failure = assertIs<StandardMaterialSnapshotException>(result.exceptionOrNull())
+
+        assertEquals(StandardMaterialSnapshotStage.PERSISTENCE, failure.stage)
+        assertEquals(0, selectManifestRowCount(database, "decision_material_state_manifests", invocationId))
+        assertEquals(0, selectManifestRowCount(database, "llm_run_input_manifests", invocationId))
+    }
+
+    @Test
     fun ttlAloneKeepsEpisodeUntilNextChangedProposal() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val runtime = TradingRuntimeFactory.connectedPostgres(
@@ -9506,6 +9575,50 @@ private fun identityManifest(invocationId: String): DecisionMaterialStateManifes
         canonicalContentHash = "b".repeat(64),
         materialProjection = "risk=RUNNING\npriceMoveBand=0",
     )
+}
+
+private fun testRunManifest(material: DecisionMaterialStateManifest): LlmRunInputManifest {
+    val runWithoutHash = LlmRunInputManifest(
+        invocationId = material.invocationId,
+        rootId = material.invocationId,
+        trigger = LlmRunTriggerSnapshot(
+            kind = "TEST",
+            observedAt = material.capturedAt,
+            measurements = emptyList(),
+            entities = emptyList(),
+            notApplicableReason = null,
+        ),
+        runtimeConfigVersion = null,
+        runtimeConfigHash = null,
+        runtimeConfigSnapshot = "{}",
+        materialInvocationId = material.invocationId,
+        materialContentHash = material.persistedSnapshotHash(),
+        schemaVersion = material.schemaVersion,
+        capturedAt = material.capturedAt,
+        canonicalContentHash = "",
+    )
+
+    return runWithoutHash.copy(
+        canonicalContentHash = LlmManifestJsonCodec.contentHash(runWithoutHash),
+    )
+}
+
+private fun selectManifestRowCount(
+    database: ExposedDatabase,
+    table: String,
+    invocationId: String,
+): Int {
+    require(table in setOf("decision_material_state_manifests", "llm_run_input_manifests"))
+
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement("SELECT COUNT(*) FROM $table WHERE invocation_id=?").use { statement ->
+            statement.setString(1, invocationId)
+            statement.executeQuery().use { rows ->
+                check(rows.next())
+                rows.getInt(1)
+            }
+        }
+    }
 }
 
 private fun assertLedgerLineage(database: ExposedDatabase, path: String) {
