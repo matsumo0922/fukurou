@@ -1007,8 +1007,7 @@ class OneShotLlmRunner(
             runAuditRecorder.recordNoTrade(
                 context = context,
                 reason = "risk_reduction_only_missing_decision",
-                cause = audit.exceptionOrNull() ?: auditResult?.cleanupFailure ?: auditResult?.auditAppendFailure
-                    ?: standardFailure,
+                cause = audit.exceptionOrNull() ?: auditResult?.cleanupFailure ?: standardFailure,
             ).getOrThrow()
 
             return OneShotRunnerResult(
@@ -1047,7 +1046,7 @@ class OneShotLlmRunner(
                 failureContextUpdated = input.failureContextUpdated,
             ),
             decision = decision,
-            attributionIncomplete = audit.getOrNull()?.hasAttributionFailure == true,
+            attributionIncomplete = audit.getOrNull()?.observationAppendFailure != null,
         )
     }
 
@@ -1343,12 +1342,10 @@ class OneShotLlmRunner(
 
         return ProposerDecisionResult(
             decision = decision,
-            failure = proposerAudit.exceptionOrNull() ?: proposerAudit.getOrNull()?.cleanupFailure
-                ?: proposerAudit.getOrNull()?.auditAppendFailure,
+            failure = proposerAudit.exceptionOrNull() ?: proposerAudit.getOrNull()?.cleanupFailure,
             authFailureSuspected = proposerAudit.getOrNull()?.authFailureSuspected ?: false,
             cliErrorReported = proposerAudit.getOrNull()?.cliErrorReported ?: false,
             observationAppendFailure = proposerAudit.getOrNull()?.observationAppendFailure,
-            auditAppendFailure = proposerAudit.getOrNull()?.auditAppendFailure,
         )
     }
 
@@ -1527,7 +1524,7 @@ class OneShotLlmRunner(
             ),
         )
         val falsifierAudit = phaseInvoker.invokePhase("falsifier", falsifierContext, falsifierRequest)
-        val falsifierFailure = falsifierAudit.exceptionOrNull()
+        val falsifierFailure = falsifierAudit.exceptionOrNull() ?: falsifierAudit.getOrNull()?.cleanupFailure
         val falsification = tradingRuntime.decisionRepository
             .latestFalsification(intent.intentId)
             .getOrThrow()
@@ -2329,9 +2326,8 @@ private data class ProposerDecisionResult(
     val authFailureSuspected: Boolean,
     val cliErrorReported: Boolean,
     val observationAppendFailure: Throwable?,
-    val auditAppendFailure: Throwable?,
 ) {
-    val attributionIncomplete: Boolean get() = observationAppendFailure != null || auditAppendFailure != null
+    val attributionIncomplete: Boolean get() = observationAppendFailure != null
 }
 
 private suspend fun noDecisionAuditReason(
@@ -2601,9 +2597,6 @@ private fun LlmPhaseProcessFailure.toTerminalCause(): LlmRunTerminalCause = when
     LlmPhaseProcessFailureKind.NON_ZERO_EXIT,
     -> LlmRunTerminalCause.RUNNER_FAILED
 }
-
-private val LlmPhaseAuditResult.hasAttributionFailure: Boolean
-    get() = observationAppendFailure != null || auditAppendFailure != null
 
 private fun Throwable.toStandardMaterialPersistenceFailure(): StandardMaterialFailure {
     if (this is StandardMaterialFailure) return this

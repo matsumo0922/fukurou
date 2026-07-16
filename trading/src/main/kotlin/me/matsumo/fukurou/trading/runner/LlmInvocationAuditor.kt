@@ -193,7 +193,6 @@ class LlmInvocationAuditor(
                 cliErrorReported = auditSignals.cliErrorReported,
                 cleanupFailure = cleanupFailure,
                 observationAppendFailure = observationFailure,
-                auditAppendFailure = appendFailure,
             ),
         )
     }
@@ -471,7 +470,6 @@ data class LlmPhaseAuditResult(
     val cliErrorReported: Boolean,
     val cleanupFailure: Throwable? = null,
     val observationAppendFailure: Throwable? = null,
-    val auditAppendFailure: Throwable? = null,
 )
 
 /** LLM child process の hard gate に使う安定した失敗種別。 */

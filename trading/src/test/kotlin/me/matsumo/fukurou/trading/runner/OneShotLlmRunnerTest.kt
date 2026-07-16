@@ -1365,6 +1365,54 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun falsifierCleanupWithoutVerdict_keepsInfrastructureCause() = runBlocking {
+        val cleanupFailure = IllegalStateException("synthetic falsifier cleanup failure")
+        val fixture = runnerFixture(
+            llmInvokerTransform = { delegate ->
+                CleanupInjectingLlmInvoker(delegate, cleanupFailure)
+            },
+        ) { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
+
+                return@runnerFixture cleanExit()
+            }
+
+            cleanExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "falsifier-cleanup")).getOrThrow()
+        val noTradeEvent = fixture.eventLog.events().single { event ->
+            event.eventType == CommandEventType.NO_TRADE_EXIT && event.payload.contains("falsifier_missing_verdict")
+        }
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(
+            me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED,
+            result.terminalCause,
+        )
+        assertEquals(0, fixture.runtime.broker.getPositions().getOrThrow().size)
+        assertTrue(noTradeEvent.payload.contains("\"cause\":\"IllegalStateException\""))
+    }
+
+    @Test
+    fun falsifierRejectedWithCleanup_remainsNoTradeWithoutEntry() = runBlocking {
+        val fixture = runnerFixture(
+            llmInvokerTransform = { delegate ->
+                CleanupInjectingLlmInvoker(delegate, IllegalStateException("synthetic cleanup failure"))
+            },
+        ) { command ->
+            handleEnterAndRejectedFalsifier(fixtureRepository, command)
+        }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "falsifier-rejected-cleanup")).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(0, fixture.runtime.broker.getPositions().getOrThrow().size)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("falsifier_rejected"))
+    }
+
+    @Test
     fun falsifierTimeout_recordsNoTradeWithoutEntry() = runBlocking {
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {

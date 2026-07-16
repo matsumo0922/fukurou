@@ -253,6 +253,34 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
+    fun invokeAndAudit_appendFailureDoesNotReturnSuccessAuditResult() = runBlocking {
+        val appendFailure = IllegalStateException("synthetic audit append failure")
+        val commandEventLog = object : me.matsumo.fukurou.trading.audit.CommandEventLog by InMemoryCommandEventLog() {
+            override suspend fun append(event: me.matsumo.fukurou.trading.audit.CommandEvent): Result<Unit> {
+                return Result.failure(appendFailure)
+            }
+        }
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CLAUDE)
+
+        val result = runCatching {
+            auditor.invokeAndAudit(
+                phaseName = "falsifier",
+                context = request.decisionRunContext,
+                request = request,
+                llmInvoker = StaticAuditLlmInvoker("{}"),
+            ).getOrThrow()
+        }
+
+        assertTrue(result.isFailure)
+        assertSame(appendFailure, result.exceptionOrNull())
+    }
+
+    @Test
     fun invokeAndAudit_preservesClaudeStartFailureDetail() = runBlocking {
         val commandEventLog = InMemoryCommandEventLog()
         val auditor = LlmInvocationAuditor(
