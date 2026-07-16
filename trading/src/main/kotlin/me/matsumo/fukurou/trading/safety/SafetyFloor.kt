@@ -456,6 +456,7 @@ data class SafetyFloorPlaceOrderRiskDetails(
  * @param clock violation timestamp に使う clock
  * @param paperExecutionConfig paper 約定近似設定
  */
+@Suppress("LargeClass") // placement と fill が同じ rule authority を共有するため、rule set を分散させない。
 class SafetyFloor(
     private val config: SafetyFloorConfig = SafetyFloorConfig(),
     private val clock: Clock = Clock.systemUTC(),
@@ -471,6 +472,28 @@ class SafetyFloor(
         detectSoftHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateEconomicEventBlackout(command)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateFalsifierGate(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateNoAveragingDown(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validatePyramidingGates(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateSymbolFeeRates(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateGroupRisk(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateTotalExposure(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateBalanceAndCost(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateExpectedValue(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateExpectedMoveToCost(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+
+        return SafetyFloorVerdict.Accepted
+    }
+
+    /**
+     * resting entry の約定直前に、現在状態で変化し得る安全条件だけを再評価する。
+     *
+     * intent consumption と fresh falsification は placement 時だけの条件なので再評価しない。
+     */
+    internal fun evaluateRestingEntryFill(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyFloorVerdict {
+        detectHardHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        detectSoftHalt(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
+        validateEconomicEventBlackout(command)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateStopLoss(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validateNoAveragingDown(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
         validatePyramidingGates(command, context)?.let { violation -> return SafetyFloorVerdict.Rejected(violation) }
@@ -1150,6 +1173,20 @@ class SafetyFloor(
 
     private fun probabilityCapSuffix(cappedProbability: BigDecimal): String {
         return "データ鮮度劣化により p を ${cappedProbability.toPlainString()} に cap しました。"
+    }
+}
+
+/**
+ * resting entry fill 時に current invariant だけを評価する evaluator。
+ *
+ * @param safetyFloor placement と同じ active config を使う安全床
+ */
+class RestingEntryFillInvariantEvaluator(
+    private val safetyFloor: SafetyFloor,
+) {
+    /** current DB state から構築した context で fill 可否を返す。 */
+    fun evaluate(command: PlaceOrderCommand, context: SafetyFloorContext): SafetyFloorVerdict {
+        return safetyFloor.evaluateRestingEntryFill(command, context)
     }
 }
 

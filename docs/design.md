@@ -155,10 +155,12 @@ flowchart LR
 
 1. `ProtectionReconciler` は GMO Public WebSocket `trades/BTC` を接続単位で直列消費し、realtime trade event だけで resting entry と保護を前進させる。subscription acknowledgement とPing/Pongはtransport livenessを更新するが、約定、sequence、gap recoveryを前進させない。
 2. connection session と local sequence、exchange/received time、gap、recovery、約定 source evidence を PostgreSQL に保存し、event と ledger cursor を同一 transaction で確定する。
-3. RESTで5分・1時間・日足のOHLCVを補完する。
-4. `MarketDataSource` 実装が、ローソク足、板、約定、指標、マイクロストラクチャ要約を統一モデルへ変換する。
-5. 必要なスナップショットのみPostgreSQLへ保存する。高頻度の板フル履歴はv1では保存せず、要約特徴量を保存する。
-6. LLMは初期プロンプトで全データを受け取らず、MCP read系ツールで必要な粒度を取得する。
+3. resting entry の trigger 成立後は、候補 order を再検証し、current DB state から fill 時に変化し得る SafetyFloor rule だけを評価する。候補自身の予約 cash / exposure は一度だけ除外し、intent consumption と falsification freshness は placement 時だけの条件として再評価しない。違反時は execution / position / account の fill mutation を行わず、order を既知の外側理由で cancel し、`paper_order_cancellation_details` に `FILL_INVARIANT_VIOLATION` と `SafetyFloorRule` を保存する。
+4. paper ledger mutation は `risk_state → paper_account → positions(id昇順) → orders(id昇順) → child rows` の lock 順を共有する。DB deadlock、serialization、lock timeout は同じ causal event を再試行し、market-data gap や strategy outcome に変換しない。
+5. RESTで5分・1時間・日足のOHLCVを補完する。
+6. `MarketDataSource` 実装が、ローソク足、板、約定、指標、マイクロストラクチャ要約を統一モデルへ変換する。
+7. 必要なスナップショットのみPostgreSQLへ保存する。高頻度の板フル履歴はv1では保存せず、要約特徴量を保存する。
+8. LLMは初期プロンプトで全データを受け取らず、MCP read系ツールで必要な粒度を取得する。
 
 #### 2.3.2 発火から売買までの流れ
 

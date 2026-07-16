@@ -63,6 +63,7 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import java.math.BigDecimal
+import java.sql.SQLException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -840,6 +841,57 @@ class ProtectionReconcilerTest {
     }
 
     @Test
+    fun marketEventPersistenceContentionRetriesSameEventWithoutCreatingGap() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000187")
+        val event = PaperMarketTradeEvent(
+            symbol = TradingSymbol.BTC,
+            side = OrderSide.SELL,
+            priceJpy = BigDecimal("10000000"),
+            sizeBtc = BigDecimal("0.0010"),
+            exchangeAt = fixedInstant(),
+            receivedAt = fixedInstant(),
+            connectionSessionId = sessionId,
+            sequence = 1,
+        )
+        val delegate = PaperBroker(
+            ledgerRepository = InMemoryPaperLedgerRepository(),
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = InMemoryDecisionRepository(fixedClock()),
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val broker = ContentionThenRecordingBroker(delegate)
+        val integrity = RetryableMarketDataIntegrityRepository(0)
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            marketEventStream = SingleSessionMarketEventStream(
+                BurstThenIdleMarketEventSession(sessionId, fixedInstant(), listOf(event)),
+            ),
+            marketDataIntegrityRepository = integrity,
+            broker = broker,
+            clock = fixedClock(),
+        )
+        val job = launch {
+            reconciler.runLoop(Duration.ofMillis(10))
+        }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (broker.attemptCount < 2) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertEquals(2, broker.attemptCount)
+        assertEquals(listOf(event), broker.appliedEvents)
+        assertEquals(0, integrity.markDisconnectedCount)
+        assertEquals(0, integrity.applyGapImpactCount)
+    }
+
+    @Test
     fun market_event_invalid_message_is_recorded_with_invalid_message_reason() = runBlocking {
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000180")
         val integrity = RetryableMarketDataIntegrityRepository(0)
@@ -1142,6 +1194,26 @@ private class RecordingBroker(
     override suspend fun maintainProtections(tickSnapshot: TickSnapshot): Result<PaperReconcileResult> {
         return delegate.maintainProtections(tickSnapshot).also {
             maintenanceCount += 1
+        }
+    }
+}
+
+/** 初回だけ deadlock を返し、同じ event の再試行を記録する broker。 */
+private class ContentionThenRecordingBroker(
+    private val delegate: Broker,
+) : Broker by delegate {
+    val appliedEvents = mutableListOf<PaperMarketTradeEvent>()
+    var attemptCount = 0
+        private set
+
+    override suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<PaperReconcileResult> {
+        attemptCount += 1
+        if (attemptCount == 1) {
+            return Result.failure(SQLException("deadlock detected", "40P01"))
+        }
+
+        return delegate.applyMarketEvent(event).also { result ->
+            if (result.isSuccess) appliedEvents += event
         }
     }
 }

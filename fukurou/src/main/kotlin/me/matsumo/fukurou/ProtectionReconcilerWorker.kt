@@ -205,7 +205,12 @@ private fun ProtectionReconcilerWorkerInputs.createRepositories(): ProtectionRec
         evaluationRepository = ExposedEvaluationRepository(database),
         riskStateCommandService = ExposedRiskStateCommandService(database, clock),
         safetyViolationRepository = ExposedSafetyViolationRepository(database),
-        ledgerRepository = ExposedPaperLedgerRepository(database),
+        ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = clock,
+            safetyFloorConfig = tradingConfig.safetyFloor,
+            paperExecutionConfig = tradingConfig.paperExecution,
+        ),
         marketDataIntegrityRepository = ExposedMarketDataIntegrityRepository(database),
     )
 }

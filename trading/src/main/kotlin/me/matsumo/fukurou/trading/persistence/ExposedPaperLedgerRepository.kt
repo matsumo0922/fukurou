@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.OpenOrdersWithUpdatedAt
+import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PaperLedgerAccountRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerExecutionRepository
 import me.matsumo.fukurou.trading.broker.PaperLedgerHistoryRepository
@@ -38,6 +39,9 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
+import me.matsumo.fukurou.trading.safety.RestingEntryFillInvariantEvaluator
+import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -908,8 +912,21 @@ class ExposedPaperLedgerRepository private constructor(
         database: ExposedDatabase,
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
+        safetyFloorConfig: SafetyFloorConfig = SafetyFloorConfig(),
+        paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
     ) : this(
-        writer = ExposedPaperLedgerWriter(database, fallbackSymbolRules = fallbackSymbolRules, clock = clock),
+        writer = ExposedPaperLedgerWriter(
+            database = database,
+            fallbackSymbolRules = fallbackSymbolRules,
+            fillInvariantEvaluator = RestingEntryFillInvariantEvaluator(
+                SafetyFloor(
+                    config = safetyFloorConfig,
+                    clock = clock,
+                    paperExecutionConfig = paperExecutionConfig,
+                ),
+            ),
+            clock = clock,
+        ),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),
         orderRepository = ExposedPaperLedgerOrderReader(database),
@@ -1114,7 +1131,7 @@ private fun JdbcTransaction.selectOrdersByClientRequestId(clientRequestId: Strin
     }
 }
 
-private fun JdbcTransaction.selectOrdersByTradeGroupId(tradeGroupId: String): List<Order> {
+internal fun JdbcTransaction.selectOrdersByTradeGroupId(tradeGroupId: String): List<Order> {
     return jdbcConnection().prepareStatement(SELECT_ORDERS_BY_TRADE_GROUP_ID_SQL).use { statement ->
         statement.setObject(1, UUID.fromString(tradeGroupId))
         statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -1130,7 +1147,7 @@ private fun JdbcTransaction.selectPositionsByTradeGroupId(tradeGroupId: String):
     }
 }
 
-private fun JdbcTransaction.selectExecutionsByOrderIds(orderIds: List<String>): List<Execution> {
+internal fun JdbcTransaction.selectExecutionsByOrderIds(orderIds: List<String>): List<Execution> {
     if (orderIds.isEmpty()) {
         return emptyList()
     }

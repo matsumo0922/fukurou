@@ -667,6 +667,33 @@ object OrdersTable : Table("orders") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** paper order の詳細な取消理由を表す app-owned table。 */
+object PaperOrderCancellationDetailsTable : Table("paper_order_cancellation_details") {
+    /** detail ID。 */
+    val id = uuid("id")
+
+    /** 取消対象 order。1 order につき active semantic は1件だけ保持する。 */
+    val orderId = uuid("order_id").references(OrdersTable.id).uniqueIndex()
+
+    /** 対応する SafetyFloor violation。 */
+    val safetyViolationId = uuid("safety_violation_id").references(SafetyViolationsTable.id).uniqueIndex()
+
+    /** generic detail kind。 */
+    val kind = varchar("kind", length = 64)
+
+    /** kind 内の typed code。 */
+    val code = varchar("code", length = 128)
+
+    /** 作成時刻。epoch millis で保存する。 */
+    val createdAt = long("created_at")
+
+    init {
+        index(false, kind, code)
+    }
+
+    override val primaryKey = PrimaryKey(id)
+}
+
 /**
  * 約定 ledger を表す Exposed table。
  */

@@ -36,6 +36,7 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
+import java.sql.SQLException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -51,6 +52,11 @@ private const val RECONCILER_LOCK_OWNER = "protection-reconciler"
 
 /** market event 適用時の global lock owner 名。 */
 private const val MARKET_EVENT_LOCK_OWNER = "paper-market-event"
+
+/** DB lock contention 後に同じ causal event を再適用する待機時間。 */
+private val MARKET_EVENT_CONTENTION_RETRY_DELAY = Duration.ofMillis(100)
+
+private val RETRYABLE_PERSISTENCE_SQL_STATES = setOf("40001", "40P01", "55P03", "57014")
 
 /**
  * worker 起動 audit の payload。
@@ -278,7 +284,7 @@ class ProtectionReconciler(
         signal: MarketEventSessionSignal,
     ): Boolean {
         val result = when (signal) {
-            is MarketEventSessionSignal.Trade -> applyMarketEvent(signal.event)
+            is MarketEventSessionSignal.Trade -> applyMarketEventWithContentionRetry(signal.event)
             is MarketEventSessionSignal.TransportActivity -> marketDataIntegrityRepository.markTransportActivity(
                 sessionId = session.sessionId,
                 observedAt = signal.observedAt,
@@ -292,6 +298,20 @@ class ProtectionReconciler(
         recordMarketDataGap(session.sessionId, result.exceptionOrNull())
 
         return false
+    }
+
+    private suspend fun applyMarketEventWithContentionRetry(event: PaperMarketTradeEvent): Result<Unit> {
+        while (currentCoroutineContext().isActive) {
+            val result = applyMarketEvent(event)
+
+            if (result.isSuccess || result.exceptionOrNull()?.isRetryablePersistenceContention() != true) {
+                return result
+            }
+
+            delay(MARKET_EVENT_CONTENTION_RETRY_DELAY.toMillis())
+        }
+
+        throw CancellationException("market event contention retry was cancelled.")
     }
 
     /** realtime event の量によらず periodic maintenance を rate limit する次回期限を返す。 */
@@ -765,4 +785,11 @@ private fun Throwable?.toMarketDataGapDetail(): String? {
 
         else -> javaClass.simpleName
     }
+}
+
+private fun Throwable.isRetryablePersistenceContention(): Boolean {
+    return generateSequence(this) { throwable -> throwable.cause }
+        .filterIsInstance<SQLException>()
+        .mapNotNull(SQLException::getSQLState)
+        .any(RETRYABLE_PERSISTENCE_SQL_STATES::contains)
 }

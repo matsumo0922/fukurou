@@ -1087,6 +1087,19 @@ private const val VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL = """
     LIMIT 0
 """
 
+/** cancellation detail schema の存在を確認する SQL。 */
+private const val VERIFY_PAPER_ORDER_CANCELLATION_DETAILS_SCHEMA_SQL = """
+    SELECT
+        id,
+        order_id,
+        safety_violation_id,
+        kind,
+        code,
+        created_at
+    FROM paper_order_cancellation_details
+    LIMIT 0
+"""
+
 /**
  * decisions schema の存在を確認する SQL。
  */
@@ -1254,6 +1267,7 @@ class TradingPersistenceBootstrap(
                     CommandEventLogTable,
                     LlmLaunchReservationsTable,
                     SafetyViolationsTable,
+                    PaperOrderCancellationDetailsTable,
                     DecisionMaterialStateManifestsTable,
                     LlmInvocationAuditRootsTable,
                     LlmRunInputManifestsTable,
@@ -1782,6 +1796,10 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_SAFETY_VIOLATIONS_SCHEMA_SQL,
         missingMessage = "safety_violations schema was not initialized.",
+    )
+    verifySchemaBySql(
+        sql = VERIFY_PAPER_ORDER_CANCELLATION_DETAILS_SCHEMA_SQL,
+        missingMessage = "paper_order_cancellation_details schema was not initialized.",
     )
 }
 
