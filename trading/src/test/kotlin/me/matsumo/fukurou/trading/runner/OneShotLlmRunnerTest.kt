@@ -28,6 +28,8 @@ import me.matsumo.fukurou.trading.audit.LlmInputManifestRepository
 import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
 import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
 import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotException
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotStage
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
 import me.matsumo.fukurou.trading.broker.PaperBroker
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
@@ -94,6 +96,7 @@ import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_CANCELLED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunRecord
 import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
@@ -287,6 +290,36 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun standardSnapshotTerminalPriorityPreservesSafetyAndExecutionBeforeRunnerFailure() {
+        val noTrade = OneShotRunnerResult(
+            invocationId = "no-trade",
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            decision = null,
+            intent = null,
+            tradeResult = null,
+            terminalCause = LlmRunTerminalCause.NO_TRADE,
+        )
+        val safetyDenied = noTrade.copy(terminalCause = LlmRunTerminalCause.SAFETY_DENIED)
+        val executed = noTrade.copy(
+            status = OneShotRunnerStatus.PAPER_EXIT_EXECUTED,
+            terminalCause = LlmRunTerminalCause.NORMAL_COMPLETION,
+        )
+
+        assertEquals(
+            LlmRunTerminalCause.RUNNER_FAILED,
+            noTrade.withStandardSnapshotFailureTerminalCause().terminalCause,
+        )
+        assertEquals(
+            LlmRunTerminalCause.SAFETY_DENIED,
+            safetyDenied.withStandardSnapshotFailureTerminalCause().terminalCause,
+        )
+        assertEquals(
+            LlmRunTerminalCause.NORMAL_COMPLETION,
+            executed.withStandardSnapshotFailureTerminalCause().terminalCause,
+        )
+    }
+
+    @Test
     fun manualRun_recordsRunningThenFinalLlmRunWithoutTriggerKind() = runBlocking {
         val fixture = runnerFixture { command ->
             if (command.isProposerLaunch()) {
@@ -331,7 +364,11 @@ class OneShotLlmRunnerTest {
         assertNotNull(manifest.sourceTimestamp)
         assertNotNull(manifest.atr14FiveMinutesJpy)
         assertEquals(2, manifest.schemaVersion)
-        assertNotNull(manifest.marketFeatureBundle)
+        val marketFeatureBundle = assertNotNull(manifest.marketFeatureBundle)
+        assertEquals(
+            "GMO_PUBLIC_ORDERBOOK_TOP10",
+            marketFeatureBundle.orderbookSummary?.metadata?.provenance,
+        )
         assertTrue(manifest.canonicalContentHash.matches(Regex("[0-9a-f]{64}")))
         assertTrue(manifest.snapshotContentHash.matches(Regex("[0-9a-f]{64}")))
         assertNotEquals(manifest.canonicalContentHash, manifest.snapshotContentHash)
@@ -389,7 +426,12 @@ class OneShotLlmRunnerTest {
                             materialManifest: DecisionMaterialStateManifest,
                             runManifest: LlmRunInputManifest,
                         ): Result<Unit> {
-                            return Result.failure(IllegalStateException("manifest unavailable"))
+                            return Result.failure(
+                                StandardMaterialSnapshotException(
+                                    StandardMaterialSnapshotStage.PERSISTENCE,
+                                    IllegalStateException("manifest unavailable"),
+                                ),
+                            )
                         }
                     },
                 )
@@ -404,6 +446,37 @@ class OneShotLlmRunnerTest {
         val result = fixture.runOneShot(defaultRequest()).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+        assertStandardSnapshotFailureEvent(fixture, StandardMaterialSnapshotStage.PERSISTENCE)
+    }
+
+    @Test
+    fun repositoryHashFailureKeepsHashSerializationAttribution() = runBlocking {
+        val fixture = runnerFixture(
+            marketDataSource = MaterialManifestMarketDataSource,
+            runtimeTransform = { runtime ->
+                val delegate = runtime.llmInputManifestRepository
+                runtime.copy(
+                    llmInputManifestRepository = object : LlmInputManifestRepository by delegate {
+                        override suspend fun appendRunWithMaterial(
+                            materialManifest: DecisionMaterialStateManifest,
+                            runManifest: LlmRunInputManifest,
+                        ): Result<Unit> = Result.failure(
+                            StandardMaterialSnapshotException(
+                                StandardMaterialSnapshotStage.HASH_SERIALIZATION,
+                                IllegalArgumentException("hash fixture detail"),
+                            ),
+                        )
+                    },
+                )
+            },
+        ) { cleanExit() }
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+        assertStandardSnapshotFailureEvent(fixture, StandardMaterialSnapshotStage.HASH_SERIALIZATION)
+        assertFalse(fixture.eventLog.events().any { event -> event.payload.contains("hash fixture detail") })
     }
 
     @Test
@@ -426,6 +499,8 @@ class OneShotLlmRunnerTest {
         assertTrue(manifest.contains("submit_decision"))
         assertFalse(manifest.contains("get_ticker"))
         assertFalse(manifest.contains("preview_order"))
+        assertEquals(LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+        assertStandardSnapshotFailureEvent(fixture, StandardMaterialSnapshotStage.CAPTURE)
     }
 
     @Test
@@ -611,6 +686,8 @@ class OneShotLlmRunnerTest {
 
             assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
             assertTrue(fixture.processRunner.launches.single().mcpManifestContent().contains("RISK_REDUCTION_ONLY"))
+            assertEquals(LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+            assertStandardSnapshotFailureEvent(fixture, StandardMaterialSnapshotStage.VALIDATION)
         }
     }
 
@@ -3583,6 +3660,19 @@ private fun assertPaperEntryAccepted(result: PaperTradeResult) {
     assertEquals(1, result.executionIds.size)
 }
 
+private suspend fun assertStandardSnapshotFailureEvent(fixture: RunnerFixture, stage: StandardMaterialSnapshotStage) {
+    val event = fixture.eventLog.events().single { event ->
+        event.isRunnerPhaseCompleted("standard_material_snapshot")
+    }
+    val details = event.payloadJsonObject().getValue("details").jsonObject
+
+    assertEquals("failed", details.stringValue("outcome"))
+    assertEquals(stage.name, details.stringValue("failureStage"))
+    assertEquals("STANDARD_SNAPSHOT_${stage.name}_FAILED", details.stringValue("failureCode"))
+    assertFalse(event.payload.contains("manifest unavailable"))
+    assertFalse(event.payload.contains("fixture market failure"))
+}
+
 private fun List<CommandEvent>.containsNoTradeReason(reason: String): Boolean {
     return any { event ->
         val noTradeExit = event.eventType == CommandEventType.NO_TRADE_EXIT
@@ -3751,6 +3841,16 @@ private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarket
                     volume = "1",
                 )
             },
+        )
+    }
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return Result.success(
+            Orderbook(
+                symbol = symbol.apiSymbol,
+                bids = listOf(OrderbookLevel(price = "9990000", size = "0.1")),
+                asks = listOf(OrderbookLevel(price = "10000000", size = "0.2")),
+            ),
         )
     }
 }

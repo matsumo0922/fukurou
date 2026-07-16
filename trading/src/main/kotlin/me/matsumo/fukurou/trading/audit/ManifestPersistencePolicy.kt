@@ -77,6 +77,12 @@ object ManifestPersistencePolicy {
 
     fun validateMaterial(manifest: DecisionMaterialStateManifest, knownSecretValues: Set<String> = emptySet()) {
         val bundle = manifest.marketFeatureBundle
+        val missingSources = manifest.missingSources + bundle?.missingSources.orEmpty()
+        missingSources.forEach { source ->
+            require(MATERIAL_MISSING_SOURCE_CODES[source.source]?.contains(source.reason) == true) {
+                "material missing source code is not recognized."
+            }
+        }
         val values = sequenceOf(
             manifest.invocationId,
             manifest.symbol,
@@ -92,10 +98,21 @@ object ManifestPersistencePolicy {
             (
                 bundle?.missingSources?.asSequence()?.flatMap { source -> sequenceOf(source.source, source.reason) }
                     ?: emptySequence()
-                ) +
-            bundle.accountStrings()
+                ) + bundle.accountStringsWithoutProvenance()
         validateStrings(values, knownSecretValues)
-        val totalBytes = values.filterNotNull().sumOf { value -> value.toByteArray(StandardCharsets.UTF_8).size.toLong() }
+        bundle.materialProvenanceStrings().filterNotNull().forEach { provenance ->
+            validateBounded("material provenance", provenance, MAX_MANIFEST_BYTES)
+            validateSecretFree(
+                value = provenance,
+                knownSecretValues = knownSecretValues,
+                highEntropyExempt = provenance in CODE_OWNED_MATERIAL_PROVENANCE,
+            )
+        }
+        val valueBytes = values.filterNotNull()
+            .sumOf { value -> value.toByteArray(StandardCharsets.UTF_8).size.toLong() }
+        val provenanceBytes = bundle.materialProvenanceStrings().filterNotNull()
+            .sumOf { value -> value.toByteArray(StandardCharsets.UTF_8).size.toLong() }
+        val totalBytes = valueBytes + provenanceBytes
         require(totalBytes <= MAX_MANIFEST_BYTES) { "material manifest exceeds persistence limit." }
     }
 
@@ -333,17 +350,45 @@ private val SAFE_SYSTEM_PROMPT_VERSION = Regex(
 )
 private val SAFE_REFLECTION_SNAPSHOT_ID = Regex("reflection-[0-9]{4}-W[0-9]{2}")
 private val SAFE_PHASE_RUN_ID = Regex("run-[A-Za-z][A-Za-z0-9_]{0,31}-[0-9]{10,17}")
+private val CODE_OWNED_MATERIAL_PROVENANCE = setOf(
+    "GMO_PUBLIC_TICKER",
+    "GMO_PUBLIC_ORDERBOOK_TOP10",
+    "IN_MEMORY_LEDGER_MUTEX",
+    "POSTGRES_REPEATABLE_READ_READ_ONLY",
+)
+private val MATERIAL_MISSING_SOURCE_CODES = mapOf(
+    "SOURCE_TIMESTAMP" to setOf("MISSING_OR_INVALID"),
+    "ATR14" to setOf("INSUFFICIENT_VALID_SAMPLES"),
+    "ORDERBOOK" to setOf("SOURCE_NOT_IMPLEMENTED"),
+    "STANDARD_CONTEXT" to setOf(
+        "MARKET_DATA_UNAVAILABLE",
+        "CLI_VERSION_UNAVAILABLE",
+        "CANONICALIZATION_UNAVAILABLE",
+        "STANDARD_SNAPSHOT_UNAVAILABLE",
+        "STANDARD_SNAPSHOT_CAPTURE_FAILED",
+        "STANDARD_SNAPSHOT_VALIDATION_FAILED",
+        "STANDARD_SNAPSHOT_HASH_SERIALIZATION_FAILED",
+        "STANDARD_SNAPSHOT_PERSISTENCE_FAILED",
+    ),
+)
 
-private fun me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle?.accountStrings(): Sequence<String?> {
+private fun me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle?.accountStringsWithoutProvenance(): Sequence<String?> {
     val account = this?.account ?: return emptySequence()
 
-    return account.strings() + sequenceOf(
-        ticker?.metadata?.provenance,
-        orderbookSummary?.metadata?.provenance,
+    return account.stringsWithoutProvenance()
+}
+
+private fun me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle?.materialProvenanceStrings(): Sequence<String?> {
+    val account = this?.account
+
+    return sequenceOf(
+        this?.ticker?.metadata?.provenance,
+        this?.orderbookSummary?.metadata?.provenance,
+        account?.positionMetadata?.provenance,
+        account?.orderMetadata?.provenance,
     )
 }
 
-private fun MaterialAccountSnapshot.strings(): Sequence<String?> = sequenceOf(riskState) +
+private fun MaterialAccountSnapshot.stringsWithoutProvenance(): Sequence<String?> = sequenceOf(riskState) +
     positions.asSequence().flatMap { fact -> sequenceOf(fact.id, fact.status, fact.side, fact.type) } +
-    openOrders.asSequence().flatMap { fact -> sequenceOf(fact.id, fact.status, fact.side, fact.type) } +
-    sequenceOf(positionMetadata.provenance, orderMetadata.provenance)
+    openOrders.asSequence().flatMap { fact -> sequenceOf(fact.id, fact.status, fact.side, fact.type) }

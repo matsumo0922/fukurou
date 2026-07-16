@@ -35,6 +35,8 @@ import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
 import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
 import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
 import me.matsumo.fukurou.trading.audit.LlmPhaseInputCaptureException
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotException
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotStage
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -64,6 +66,7 @@ import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
+import me.matsumo.fukurou.trading.decision.identity.MaterialAccountSnapshot
 import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
 import me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle
 import me.matsumo.fukurou.trading.decision.identity.MaterialCandleSummary
@@ -101,7 +104,9 @@ import me.matsumo.fukurou.trading.invoker.isCodexProvider
 import me.matsumo.fukurou.trading.invoker.readOptionalEnv
 import me.matsumo.fukurou.trading.invoker.splitCommandTemplate
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.Orderbook
+import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
 import me.matsumo.fukurou.trading.market.IndicatorParams
 import me.matsumo.fukurou.trading.market.IndicatorType
@@ -634,10 +639,9 @@ class OneShotLlmRunner(
     }
 
     private suspend fun requireLiveClaim(invocationId: String, claimantToken: String) {
-        check(
-            tradingRuntime.launchReservationRepository.validateExecutionAdmission(invocationId, claimantToken)
-                .getOrThrow(),
-        ) { "LLM execution claim is no longer admitted." }
+        val admitted = tradingRuntime.launchReservationRepository.validateExecutionAdmission(invocationId, claimantToken)
+            .getOrThrow()
+        if (!admitted) throw LlmExecutionClaimLostException()
     }
 
     private suspend fun requireTerminalLlmRun(invocationId: String) {
@@ -861,19 +865,17 @@ class OneShotLlmRunner(
             return recordTtlSweepFailure(input.invocationId, proposerContext, ttlSweepResult.exceptionOrNull())
         }
 
-        val materialResult = runCatching {
-            val manifest = captureMaterialManifest(input)
-            appendRunInputManifest(input, triggerSnapshot, manifest).getOrThrow()
-
-            manifest
-        }
+        val materialResult = captureStandardMaterialSnapshot(input, triggerSnapshot)
         if (materialResult.isFailure) {
+            val standardFailure = requireNotNull(materialResult.exceptionOrNull())
+            recordStandardSnapshotFailure(proposerContext, standardFailure)
+
             return runRiskReductionOnly(
                 input = input,
                 triggerSnapshot = triggerSnapshot,
-                standardFailure = requireNotNull(materialResult.exceptionOrNull()),
+                standardFailure = standardFailure,
                 persistedStandardMaterial = null,
-            )
+            ).withStandardSnapshotFailureTerminalCause()
         }
         val materialManifest = materialResult.getOrThrow()
 
@@ -918,6 +920,68 @@ class OneShotLlmRunner(
             canonicalContentHash = LlmManifestJsonCodec.contentHash(runManifestWithoutHash),
         )
         return tradingRuntime.llmInputManifestRepository.appendRunWithMaterial(materialManifest, runManifest)
+    }
+
+    private suspend fun captureStandardMaterialSnapshot(
+        input: OneShotRunBodyInput,
+        triggerSnapshot: LlmRunTriggerSnapshot,
+    ): Result<DecisionMaterialStateManifest> {
+        requireLiveClaimForInvocation(input.invocationId)
+        val captured = runStandardSnapshotStage(StandardMaterialSnapshotStage.CAPTURE) {
+            captureMaterialInputs(input)
+        }.getOrElse { return Result.failure(it) }
+
+        requireLiveClaimForInvocation(input.invocationId)
+        val validated = runStandardSnapshotStage(StandardMaterialSnapshotStage.VALIDATION) {
+            validateMaterialManifest(input, captured)
+        }.getOrElse { return Result.failure(it) }
+
+        requireLiveClaimForInvocation(input.invocationId)
+        return runStandardSnapshotStage(StandardMaterialSnapshotStage.HASH_SERIALIZATION) {
+            val hashed = validated.withSnapshotContentHash()
+            appendRunInputManifest(input, triggerSnapshot, hashed).getOrThrow()
+            hashed
+        }
+    }
+
+    private suspend fun <T> runStandardSnapshotStage(
+        stage: StandardMaterialSnapshotStage,
+        block: suspend () -> T,
+    ): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: LlmExecutionClaimLostException) {
+            throw throwable
+        } catch (throwable: StandardMaterialSnapshotException) {
+            Result.failure(throwable)
+        } catch (throwable: Throwable) {
+            Result.failure(StandardMaterialSnapshotException(stage, throwable))
+        }
+    }
+
+    private suspend fun recordStandardSnapshotFailure(context: DecisionRunContext, standardFailure: Throwable) {
+        val failure = standardFailure as? StandardMaterialSnapshotException ?: return
+        val rootCauseClass = failure.cause.safeSnapshotFailureClass()
+        val auditFailure = try {
+            runAuditRecorder.appendRunnerPhase(
+                context = context,
+                phase = STANDARD_MATERIAL_SNAPSHOT_PHASE,
+                duration = Duration.ZERO,
+                details = buildJsonObject {
+                    put("outcome", "failed")
+                    put("failureStage", failure.stage.name)
+                    put("failureCode", failure.failureCode())
+                    put("rootCauseClass", rootCauseClass)
+                },
+            ).exceptionOrNull()
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            throwable
+        }
+        auditFailure?.let(standardFailure::addSuppressed)
     }
 
     @Suppress("LongMethod")
@@ -1063,10 +1127,8 @@ class OneShotLlmRunner(
         ).withSnapshotContentHash()
     }
 
-    @Suppress("CyclomaticComplexMethod", "LongMethod")
-    private suspend fun captureMaterialManifest(input: OneShotRunBodyInput): DecisionMaterialStateManifest {
+    private suspend fun captureMaterialInputs(input: OneShotRunBodyInput): CapturedMaterialInputs {
         val capturedAt = clock.instant()
-        requireLiveClaimForInvocation(input.invocationId)
         val account = tradingRuntime.decisionAccountSnapshotReader.read().getOrThrow()
         requireLiveClaimForInvocation(input.invocationId)
         val marketDataSource = requireNotNull(materialMarketDataSource) { "material market data source is required." }
@@ -1078,6 +1140,38 @@ class OneShotLlmRunner(
             limit = 64,
         ).getOrThrow()
         requireLiveClaimForInvocation(input.invocationId)
+        val orderbookResult = withGmoPublicRequestCorrelation(
+            GmoPublicRequestCorrelation(
+                decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = input.invocationId),
+                toolCallId = idGenerator().toString(),
+                clientRole = GmoPublicClientRole.RUNNER,
+            ),
+        ) {
+            marketDataSource.getOrderbook(tradingConfig.symbol, MATERIAL_ORDERBOOK_LEVEL_LIMIT)
+        }
+        val orderbook = orderbookResult.getOrElse { throwable ->
+            if (throwable is UnsupportedOperationException) null else throw throwable
+        }
+
+        return CapturedMaterialInputs(
+            capturedAt = capturedAt,
+            account = account,
+            ticker = ticker,
+            candles = candles,
+            orderbook = orderbook,
+        )
+    }
+
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
+    private fun validateMaterialManifest(
+        input: OneShotRunBodyInput,
+        captured: CapturedMaterialInputs,
+    ): DecisionMaterialStateManifest {
+        val capturedAt = captured.capturedAt
+        val account = captured.account
+        val ticker = captured.ticker
+        val candles = captured.candles
+        val orderbook = captured.orderbook
         val candleSummaries = candles.sortedBy { candle -> candle.openTime }.map { candle ->
             MaterialCandleSummary(
                 openTime = runCatching { Instant.parse(candle.openTime) }
@@ -1090,18 +1184,6 @@ class OneShotLlmRunner(
             ).also { summary ->
                 require(summary.highJpy >= summary.lowJpy) { "Required candle range is malformed." }
             }
-        }
-        val orderbookResult = withGmoPublicRequestCorrelation(
-            GmoPublicRequestCorrelation(
-                decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = input.invocationId),
-                toolCallId = idGenerator().toString(),
-                clientRole = GmoPublicClientRole.RUNNER,
-            ),
-        ) {
-            marketDataSource.getOrderbook(tradingConfig.symbol, MATERIAL_ORDERBOOK_LEVEL_LIMIT)
-        }
-        val orderbook = orderbookResult.getOrElse { throwable ->
-            if (throwable is UnsupportedOperationException) null else throw throwable
         }
         val latestCandle = candleSummaries.maxByOrNull { candle -> candle.openTime }
         val atr = IndicatorCalculator.calculate(
@@ -1153,7 +1235,7 @@ class OneShotLlmRunner(
             "missing=${missingSources.joinToString(",") { "${it.source}:${it.reason}" }}",
         ).joinToString("\n")
         val thresholdRatio = tradingConfig.daemon.priceMoveThresholdRatio
-        val manifest = DecisionMaterialStateManifest(
+        return DecisionMaterialStateManifest(
             invocationId = input.invocationId,
             capturedAt = capturedAt,
             triggerKind = if (input.request.triggerKind == null) DecisionTriggerKind.MANUAL else DecisionTriggerKind.DAEMON,
@@ -1179,9 +1261,7 @@ class OneShotLlmRunner(
             canonicalContentHash = DecisionIdentityGenerator.contentHash(canonical),
             materialProjection = "",
             marketFeatureBundle = bundle,
-        ).withSnapshotContentHash()
-
-        return manifest
+        )
     }
 
     private suspend fun recordTtlSweepFailure(
@@ -2182,6 +2262,18 @@ private data class OneShotRunBodyInput(
     val failureContextUpdated: (DecisionRunContext) -> Unit,
 )
 
+/** standard material snapshot の capture 済み入力。 */
+private data class CapturedMaterialInputs(
+    val capturedAt: Instant,
+    val account: MaterialAccountSnapshot,
+    val ticker: Ticker,
+    val candles: List<Candle>,
+    val orderbook: Orderbook?,
+)
+
+/** claim 失効を snapshot failure から分離する terminal exception。 */
+private class LlmExecutionClaimLostException : IllegalStateException()
+
 /**
  * preflight 後の one-shot 実行入力。
  *
@@ -2594,6 +2686,8 @@ private val RISK_REDUCTION_ONLY_ACTIONS = setOf(
     DecisionAction.NO_TRADE,
 )
 
+private const val STANDARD_MATERIAL_SNAPSHOT_PHASE = "standard_material_snapshot"
+
 private val ATTRIBUTION_PHASES = setOf(
     LlmInvocationPhase.PRE_FILTER,
     LlmInvocationPhase.PROPOSER,
@@ -2608,6 +2702,8 @@ private val RISK_REDUCTION_ONLY_PROMPT = """
 """.trimMargin()
 
 private fun Throwable.toStandardContextFailureCode(): String {
+    if (this is StandardMaterialSnapshotException) return failureCode()
+
     val simpleName = javaClass.simpleName.uppercase()
 
     return when {
@@ -2618,6 +2714,20 @@ private fun Throwable.toStandardContextFailureCode(): String {
     }
 }
 
+private fun StandardMaterialSnapshotException.failureCode(): String = "STANDARD_SNAPSHOT_${stage.name}_FAILED"
+
+private fun Throwable?.safeSnapshotFailureClass(): String {
+    val candidate = this?.javaClass?.simpleName.orEmpty()
+
+    return candidate.takeIf { value -> value.matches(Regex("[A-Za-z][A-Za-z0-9]{0,63}")) } ?: "Throwable"
+}
+
+internal fun OneShotRunnerResult.withStandardSnapshotFailureTerminalCause(): OneShotRunnerResult {
+    if (terminalCause != LlmRunTerminalCause.NO_TRADE) return this
+
+    return copy(terminalCause = LlmRunTerminalCause.RUNNER_FAILED)
+}
+
 private fun String.requiredPositiveMarketDecimal(label: String): BigDecimal {
     val value = toBigDecimalOrNull()
     require(value != null && value.signum() > 0) { "Required $label is malformed." }
@@ -2626,28 +2736,22 @@ private fun String.requiredPositiveMarketDecimal(label: String): BigDecimal {
 }
 
 private fun Orderbook.toMaterialSummary(sourceTimestamp: Instant?, capturedAt: Instant): MaterialOrderbookSummary {
-    val bids = bids.take(MATERIAL_ORDERBOOK_LEVEL_LIMIT).mapNotNull { level ->
-        val price = level.price.toBigDecimalOrNull() ?: return@mapNotNull null
-        val size = level.size.toBigDecimalOrNull() ?: return@mapNotNull null
+    val bids = bids.take(MATERIAL_ORDERBOOK_LEVEL_LIMIT).map { level ->
+        val price = level.price.requiredPositiveMarketDecimal("orderbook bid price")
+        val size = level.size.requiredPositiveMarketDecimal("orderbook bid size")
         price to size
     }
-    val asks = asks.take(MATERIAL_ORDERBOOK_LEVEL_LIMIT).mapNotNull { level ->
-        val price = level.price.toBigDecimalOrNull() ?: return@mapNotNull null
-        val size = level.size.toBigDecimalOrNull() ?: return@mapNotNull null
+    val asks = asks.take(MATERIAL_ORDERBOOK_LEVEL_LIMIT).map { level ->
+        val price = level.price.requiredPositiveMarketDecimal("orderbook ask price")
+        val size = level.size.requiredPositiveMarketDecimal("orderbook ask size")
         price to size
     }
-    val bestBid = bids.maxOfOrNull { it.first }
-    val bestAsk = asks.minOfOrNull { it.first }
-    val mid = if (bestBid != null && bestAsk != null) {
-        bestBid.add(bestAsk).divide(BigDecimal(2))
-    } else {
-        null
-    }
-    val spreadBps = if (mid != null && mid.signum() > 0) {
-        bestAsk?.subtract(bestBid)?.multiply(BigDecimal(10_000))?.divide(mid, 8, RoundingMode.HALF_UP)
-    } else {
-        null
-    }
+    require(bids.isNotEmpty() && asks.isNotEmpty()) { "Required orderbook sides are missing." }
+    val bestBid = bids.maxOf { it.first }
+    val bestAsk = asks.minOf { it.first }
+    require(bestAsk >= bestBid) { "Required orderbook spread is malformed." }
+    val mid = bestBid.add(bestAsk).divide(BigDecimal(2))
+    val spreadBps = bestAsk.subtract(bestBid).multiply(BigDecimal(10_000)).divide(mid, 8, RoundingMode.HALF_UP)
     val bidQuantity = bids.fold(BigDecimal.ZERO) { total, level -> total.add(level.second) }
     val askQuantity = asks.fold(BigDecimal.ZERO) { total, level -> total.add(level.second) }
     val totalQuantity = bidQuantity.add(askQuantity)

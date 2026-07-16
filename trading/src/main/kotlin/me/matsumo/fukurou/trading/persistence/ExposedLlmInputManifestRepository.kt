@@ -10,6 +10,8 @@ import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
 import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
 import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotStage
+import me.matsumo.fukurou.trading.audit.standardMaterialSnapshotResult
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import org.jetbrains.exposed.v1.jdbc.Database
@@ -38,39 +40,55 @@ class ExposedLlmInputManifestRepository(
     override suspend fun appendRunWithMaterial(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
-    ): Result<Unit> = write {
-        materialManifest.requireValidSnapshotHash()
-        ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-        require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-        require(materialManifest.invocationId == runManifest.invocationId) {
-            "run manifest material scope mismatch."
-        }
-        require(runManifest.materialInvocationId == materialManifest.invocationId) {
-            "run manifest material reference mismatch."
-        }
-        require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
-            "run manifest material hash mismatch."
-        }
-        ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-        require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-            "run manifest canonical hash mismatch."
-        }
-        requireReferenced(SELECT_ROOT_EXISTS_SQL, runManifest.rootId)
-        appendMaterial(materialManifest)
-        appendImmutable(
-            INSERT_RUN_SQL,
-            runManifest.invocationId,
-            runManifest.canonicalContentHash,
-            SELECT_RUN_HASH_SQL,
-        ) { statement ->
-            statement.setString(1, runManifest.invocationId)
-            statement.setString(2, runManifest.rootId)
-            statement.setString(3, runManifest.materialInvocationId)
-            statement.setString(4, runManifest.materialContentHash)
-            statement.setInt(5, runManifest.schemaVersion)
-            statement.setString(6, runManifest.canonicalContentHash)
-            statement.setLong(7, runManifest.capturedAt.toEpochMilli())
-            statement.setString(8, LlmManifestJsonCodec.encode(runManifest))
+    ): Result<Unit> {
+        standardMaterialSnapshotResult(StandardMaterialSnapshotStage.VALIDATION) {
+            ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
+            require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
+            require(materialManifest.invocationId == runManifest.invocationId) {
+                "run manifest material scope mismatch."
+            }
+            require(runManifest.materialInvocationId == materialManifest.invocationId) {
+                "run manifest material reference mismatch."
+            }
+            ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
+        }.getOrElse { return Result.failure(it) }
+
+        val prepared = standardMaterialSnapshotResult(StandardMaterialSnapshotStage.HASH_SERIALIZATION) {
+            materialManifest.requireValidSnapshotHash()
+            val materialHash = materialManifest.persistedSnapshotHash()
+            require(runManifest.materialContentHash == materialHash) { "run manifest material hash mismatch." }
+            require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
+                "run manifest canonical hash mismatch."
+            }
+            PreparedRunBundle(
+                materialJson = materialManifest.toJson(),
+                materialHash = materialHash,
+                runJson = LlmManifestJsonCodec.encode(runManifest),
+            )
+        }.getOrElse { return Result.failure(it) }
+
+        return standardMaterialSnapshotResult(StandardMaterialSnapshotStage.PERSISTENCE) {
+            withContext(Dispatchers.IO) {
+                transaction(database) {
+                    requireReferenced(SELECT_ROOT_EXISTS_SQL, runManifest.rootId)
+                    appendMaterial(materialManifest, prepared.materialHash, prepared.materialJson)
+                    appendImmutable(
+                        INSERT_RUN_SQL,
+                        runManifest.invocationId,
+                        runManifest.canonicalContentHash,
+                        SELECT_RUN_HASH_SQL,
+                    ) { statement ->
+                        statement.setString(1, runManifest.invocationId)
+                        statement.setString(2, runManifest.rootId)
+                        statement.setString(3, runManifest.materialInvocationId)
+                        statement.setString(4, runManifest.materialContentHash)
+                        statement.setInt(5, runManifest.schemaVersion)
+                        statement.setString(6, runManifest.canonicalContentHash)
+                        statement.setLong(7, runManifest.capturedAt.toEpochMilli())
+                        statement.setString(8, prepared.runJson)
+                    }
+                }
+            }
         }
     }
 
@@ -263,14 +281,18 @@ class ExposedLlmInputManifestRepository(
         }
     }
 
-    private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.appendMaterial(manifest: DecisionMaterialStateManifest) {
+    private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.appendMaterial(
+        manifest: DecisionMaterialStateManifest,
+        materialHash: String,
+        materialJson: String,
+    ) {
         val inserted = jdbcConnection().prepareStatement(INSERT_MATERIAL_SQL).use { statement ->
             statement.setString(1, manifest.invocationId)
             statement.setLong(2, manifest.capturedAt.toEpochMilli())
             statement.setInt(3, manifest.schemaVersion)
-            statement.setString(4, manifest.persistedSnapshotHash())
+            statement.setString(4, materialHash)
             statement.setString(5, manifest.materialProjection)
-            statement.setString(6, manifest.toJson())
+            statement.setString(6, materialJson)
             statement.executeUpdate()
         }
         if (inserted == 1) return
@@ -278,10 +300,16 @@ class ExposedLlmInputManifestRepository(
         requireReferencedHash(
             selectSql = SELECT_MATERIAL_HASH_SQL,
             key = manifest.invocationId,
-            expectedHash = manifest.persistedSnapshotHash(),
+            expectedHash = materialHash,
         )
     }
 }
+
+private data class PreparedRunBundle(
+    val materialJson: String,
+    val materialHash: String,
+    val runJson: String,
+)
 
 private const val INSERT_ROOT_SQL = "INSERT INTO llm_invocation_audit_roots(root_id,root_kind,captured_at) " +
     "VALUES(?,?,?) ON CONFLICT(root_id) DO NOTHING"

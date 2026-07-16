@@ -3,7 +3,12 @@ package me.matsumo.fukurou.trading.audit
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
+import me.matsumo.fukurou.trading.decision.identity.MarketFeatureBundle
+import me.matsumo.fukurou.trading.decision.identity.MaterialAccountSnapshot
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
+import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
+import me.matsumo.fukurou.trading.decision.identity.MaterialSourceMetadata
+import me.matsumo.fukurou.trading.decision.identity.MaterialTickerSnapshot
 import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -87,6 +92,65 @@ class LlmInputManifestTest {
             assertFailsWith<IllegalArgumentException>(value) {
                 ManifestPersistencePolicy.validatePhase(phaseManifest(prompt = value))
             }
+        }
+    }
+
+    @Test
+    fun materialProvenance_allowsOnlyExactCodeOwnedEntropyValues() {
+        val allowed = listOf(
+            "GMO_PUBLIC_TICKER",
+            "GMO_PUBLIC_ORDERBOOK_TOP10",
+            "IN_MEMORY_LEDGER_MUTEX",
+            "POSTGRES_REPEATABLE_READ_READ_ONLY",
+        )
+        allowed.forEach { provenance ->
+            ManifestPersistencePolicy.validateMaterial(materialManifestWithProvenance(provenance))
+        }
+
+        val unsafeValues = listOf(
+            highEntropyDetectorFixture(),
+            apiKeyDetectorFixture(),
+        )
+        unsafeValues.forEach { provenance ->
+            assertFailsWith<IllegalArgumentException> {
+                ManifestPersistencePolicy.validateMaterial(materialManifestWithProvenance(provenance))
+            }
+        }
+
+        val knownSecret = runtimeFixture("KnownCre", "dential_", "7kN2pQ9x", "V4mZ8rT6")
+        assertFailsWith<IllegalArgumentException> {
+            ManifestPersistencePolicy.validateMaterial(
+                materialManifestWithProvenance(knownSecret),
+                setOf(knownSecret),
+            )
+        }
+    }
+
+    @Test
+    fun standardSnapshotStageCodesPassMaterialPolicyAndUnknownCodeIsRejected() {
+        val reasons = listOf(
+            "STANDARD_SNAPSHOT_CAPTURE_FAILED",
+            "STANDARD_SNAPSHOT_VALIDATION_FAILED",
+            "STANDARD_SNAPSHOT_HASH_SERIALIZATION_FAILED",
+            "STANDARD_SNAPSHOT_PERSISTENCE_FAILED",
+        )
+        reasons.forEach { reason ->
+            val missing = MaterialMissingSource("STANDARD_CONTEXT", reason)
+            val manifest = materialManifestWithProvenance("GMO_PUBLIC_TICKER").copy(
+                missingSources = listOf(missing),
+                marketFeatureBundle = materialManifestWithProvenance("GMO_PUBLIC_TICKER")
+                    .marketFeatureBundle
+                    ?.copy(missingSources = listOf(missing)),
+            )
+
+            ManifestPersistencePolicy.validateMaterial(manifest)
+        }
+
+        val unknown = MaterialMissingSource("STANDARD_CONTEXT", "STANDARD_SNAPSHOT_UNKNOWN_FAILED")
+        assertFailsWith<IllegalArgumentException> {
+            ManifestPersistencePolicy.validateMaterial(
+                materialManifestWithProvenance("GMO_PUBLIC_TICKER").copy(missingSources = listOf(unknown)),
+            )
         }
     }
 
@@ -331,6 +395,36 @@ class LlmInputManifestTest {
             missingSources = emptyList(),
             canonicalContentHash = "b".repeat(64),
             materialProjection = materialProjection,
+        )
+    }
+
+    private fun materialManifestWithProvenance(provenance: String): DecisionMaterialStateManifest {
+        val metadata = MaterialSourceMetadata(
+            observedAt = Instant.EPOCH,
+            provenance = provenance,
+            truncated = false,
+            totalCount = 1,
+        )
+        val account = MaterialAccountSnapshot(
+            riskState = "RUNNING",
+            availableJpy = BigDecimal.ONE,
+            equityJpy = BigDecimal.ONE,
+            positions = emptyList(),
+            openOrders = emptyList(),
+            positionMetadata = metadata.copy(provenance = "IN_MEMORY_LEDGER_MUTEX"),
+            orderMetadata = metadata.copy(provenance = "IN_MEMORY_LEDGER_MUTEX"),
+        )
+
+        return materialManifest("").copy(
+            schemaVersion = 2,
+            marketFeatureBundle = MarketFeatureBundle(
+                ticker = MaterialTickerSnapshot(BigDecimal.ONE, BigDecimal.ONE, BigDecimal.ONE, metadata),
+                candleSummaries = emptyList(),
+                indicators = emptyList(),
+                orderbookSummary = null,
+                account = account,
+                missingSources = emptyList(),
+            ),
         )
     }
 }
