@@ -7,12 +7,22 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 #### Scenario: Every test consumer receives bounded JDBC settings
 
 - **WHEN** Testcontainers PostgreSQL fixture が HikariCP、Exposed、`DriverManager`、または production composition test へ JDBC URL を渡す
-- **THEN** URL は `connectTimeout=10` と `socketTimeout=30` を含む
+- **THEN** URL は `connectTimeout` が 10 秒以下、`socketTimeout` が 30 秒以下の正の整数値をそれぞれちょうど 1 個含む
+
+#### Scenario: Consumer uses a stricter timeout
+
+- **WHEN** 接続失敗を検証する consumer が既定値より短い timeout を必要とする
+- **THEN** URL helper は既存 query parameter を key 単位で上書きし、重複 key や複数の `?` を生成しない
 
 #### Scenario: Authentication response stops arriving
 
 - **WHEN** PostgreSQL JDBC connection が socket を確立した後、authentication response を受信できない
 - **THEN** driver は設定した socket timeout 以内に例外を返し、test worker は無期限に停止しない
+
+#### Scenario: Wrong-password assertion rejects URL configuration failures
+
+- **WHEN** MCP integration test が誤った password で PostgreSQL 接続失敗を検証する
+- **THEN** test は任意の例外ではなく invalid-password SQLSTATE `28P01` を確認する
 
 ### Requirement: Production connection semantics remain unchanged
 
