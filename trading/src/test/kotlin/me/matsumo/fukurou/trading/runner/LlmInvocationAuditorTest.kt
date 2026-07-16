@@ -199,7 +199,7 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
-    fun invokeAndAudit_recordsCompletedUsageBeforeFailingOnCleanup() = runBlocking {
+    fun invokeAndAudit_recordsCompletedUsageAndReportsCleanupSignal() = runBlocking {
         val commandEventLog = InMemoryCommandEventLog()
         val humanLogs = mutableListOf<String>()
         val auditor = LlmInvocationAuditor(
