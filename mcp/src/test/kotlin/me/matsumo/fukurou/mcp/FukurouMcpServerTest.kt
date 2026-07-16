@@ -134,6 +134,7 @@ import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.DriverManager
+import java.sql.SQLException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -1173,7 +1174,7 @@ class FukurouMcpServerTest {
     fun knowledgeRecentLessonsTool_readsSafetyDenialThroughPostgresRuntime() = runBlocking {
         if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
 
-        val container = PostgreSQLContainer("postgres:16-alpine")
+        val container = McpPostgresContainer()
         var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
         container.start()
 
@@ -2077,7 +2078,7 @@ class McpDatabaseRoleIntegrationTest {
     fun leastPrivilegeRole_supportsRequiredMatrixAndRejectsForbiddenWrites() = runBlocking {
         if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
 
-        val container = PostgreSQLContainer("postgres:16-alpine")
+        val container = McpPostgresContainer()
         container.start()
         val marketFixture = GmoRequiredMatrixFixture.start()
         var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
@@ -2613,18 +2614,41 @@ private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
 }
 
 private fun assertNoFallback(container: PostgreSQLContainer<*>, clock: Clock) {
-    assertNotNull(
-        runCatching {
-            TradingRuntimeFactory.postgresForMcp(
-                TradingDatabaseConfig("${container.jdbcUrl}?connectTimeout=2&socketTimeout=2", MCP_TEST_ROLE, "wrong-dummy-password"),
-                clock = clock,
-            )
-        }.exceptionOrNull(),
+    val jdbcUrl = container.jdbcUrl.withJdbcQueryParameters(
+        mapOf(
+            TEST_POSTGRES_CONNECT_TIMEOUT_KEY to MCP_WRONG_PASSWORD_TIMEOUT_SECONDS.toString(),
+            TEST_POSTGRES_SOCKET_TIMEOUT_KEY to MCP_WRONG_PASSWORD_TIMEOUT_SECONDS.toString(),
+        ),
     )
+    val failure = runCatching {
+        TradingRuntimeFactory.postgresForMcp(
+            TradingDatabaseConfig(jdbcUrl, MCP_TEST_ROLE, "wrong-dummy-password"),
+            clock = clock,
+        )
+    }.exceptionOrNull()
+
+    assertEquals(POSTGRES_INVALID_PASSWORD_SQL_STATE, failure?.firstSqlState())
+}
+
+private fun Throwable.firstSqlState(): String? {
+    return generateSequence(this) { throwable -> throwable.cause }
+        .filterIsInstance<SQLException>()
+        .mapNotNull(SQLException::getSQLState)
+        .firstOrNull()
+}
+
+/** MCP integration test 用 PostgreSQL container。 */
+private class McpPostgresContainer : PostgreSQLContainer<McpPostgresContainer>("postgres:16-alpine") {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
 }
 
 private fun mcpTestConnection(container: PostgreSQLContainer<*>) =
     DriverManager.getConnection(container.jdbcUrl, MCP_TEST_ROLE, MCP_TEST_PASSWORD)
+
+private const val MCP_WRONG_PASSWORD_TIMEOUT_SECONDS = 2
+private const val POSTGRES_INVALID_PASSWORD_SQL_STATE = "28P01"
 
 private fun assertSqlCount(
     statement: java.sql.Statement,

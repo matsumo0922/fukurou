@@ -282,7 +282,11 @@ private fun countBackfilledAttemptKeys(database: ExposedDatabase): Int {
 
 /** application migration failure test 用 PostgreSQL container。 */
 private class ApplicationMigrationPostgresContainer :
-    PostgreSQLContainer<ApplicationMigrationPostgresContainer>("postgres:16-alpine")
+    PostgreSQLContainer<ApplicationMigrationPostgresContainer>("postgres:16-alpine") {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 private fun applicationMigrationDockerAvailable(): Boolean {
     return runCatching {

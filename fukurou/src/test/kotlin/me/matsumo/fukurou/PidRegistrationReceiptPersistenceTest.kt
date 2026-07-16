@@ -106,7 +106,11 @@ class PidRegistrationReceiptPersistenceTest {
     }
 }
 
-private class ReceiptPostgresContainer : PostgreSQLContainer<ReceiptPostgresContainer>("postgres:16-alpine")
+private class ReceiptPostgresContainer : PostgreSQLContainer<ReceiptPostgresContainer>("postgres:16-alpine") {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 private fun JdbcTransaction.jdbcConnection(): java.sql.Connection {
     return connection.connection as java.sql.Connection

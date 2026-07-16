@@ -56,6 +56,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
+import me.matsumo.fukurou.trading.configureBoundedTestJdbcConnections
 import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
@@ -143,6 +144,7 @@ import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
+import me.matsumo.fukurou.trading.retryTransientTestPostgresConnection
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -10863,7 +10865,11 @@ private fun applyRecoveryStatementFault(
 /** recovery fault proxyが識別するJDBC statement種別。 */
 private enum class RecoveryFaultStatementKind { MUTATION, READBACK, SCAN, OTHER }
 
-private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
+private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE) {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 /**
  * Docker が利用できる場合だけ Postgres integration test を実行する。
@@ -10878,7 +10884,7 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
     container.start()
 
     try {
-        createDataSource(container).use { dataSource ->
+        retryTransientTestPostgresConnection { createDataSource(container) }.use { dataSource ->
             val database = ExposedDatabase.connect(dataSource)
             val context = PostgresTestContext(
                 container = container,

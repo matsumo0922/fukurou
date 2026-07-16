@@ -114,7 +114,11 @@ private fun testJob(jobId: String) = EvaluationReportJobResponse(
     stage = "ADMITTED",
 )
 
-private class ReportPostgresContainer : PostgreSQLContainer<ReportPostgresContainer>("postgres:16-alpine")
+private class ReportPostgresContainer : PostgreSQLContainer<ReportPostgresContainer>("postgres:16-alpine") {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 private fun reportDockerAvailable(): Boolean = runCatching {
     DockerClientFactory.instance().client().pingCmd().exec()

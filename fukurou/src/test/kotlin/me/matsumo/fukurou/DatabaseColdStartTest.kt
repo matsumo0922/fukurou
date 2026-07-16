@@ -153,7 +153,11 @@ private fun String.withSocketFactory(factoryName: String): String {
     return "$this${separator}socketFactory=$factoryName"
 }
 
-private class ColdStartPostgresContainer : PostgreSQLContainer<ColdStartPostgresContainer>("postgres:16-alpine")
+private class ColdStartPostgresContainer : PostgreSQLContainer<ColdStartPostgresContainer>("postgres:16-alpine") {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 private const val COLD_START_REVISION = "cold-start-composition"
 private const val COLD_CONNECT_DELAY_MILLIS = 750L

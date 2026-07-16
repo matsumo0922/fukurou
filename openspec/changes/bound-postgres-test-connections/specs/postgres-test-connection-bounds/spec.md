@@ -19,6 +19,16 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 - **WHEN** PostgreSQL JDBC connection が socket を確立した後、authentication response を受信できない
 - **THEN** driver は設定した socket timeout 以内に例外を返し、test worker は無期限に停止しない
 
+#### Scenario: First pool initialization hits a transient socket failure
+
+- **WHEN** `runPostgresTest` の test body 開始前に最初の DataSource construction が socket timeout または connect failure で失敗する
+- **THEN** fixture は接続を 1 回だけ再試行し、成功すれば test body を 1 回だけ実行する
+
+#### Scenario: Retry does not mask a persistent or non-network failure
+
+- **WHEN** 2 回目の DataSource construction が失敗する、または最初の失敗が retryable socket/connect cause を持たない
+- **THEN** fixture は失敗を呼び出し元へ伝播し、test body を実行しない
+
 #### Scenario: Wrong-password assertion rejects URL configuration failures
 
 - **WHEN** MCP integration test が誤った password で PostgreSQL 接続失敗を検証する

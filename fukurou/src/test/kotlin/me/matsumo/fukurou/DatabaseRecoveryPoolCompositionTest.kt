@@ -100,6 +100,10 @@ private fun isDockerAvailable(): Boolean {
 
 private class ProductionPoolPostgresContainer : PostgreSQLContainer<ProductionPoolPostgresContainer>(
     "postgres:16-alpine",
-)
+) {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 private const val RECOVERY_INVOCATION_ID = "production-pool-recovery"

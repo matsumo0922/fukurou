@@ -2244,7 +2244,11 @@ private const val POSTGRES_IMAGE = "postgres:16-alpine"
 /**
  * fukurou module test 用 Postgres container。
  */
-private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
+private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE) {
+    init {
+        configureBoundedTestJdbcConnections()
+    }
+}
 
 private fun isDockerAvailable(): Boolean {
     return runCatching {
