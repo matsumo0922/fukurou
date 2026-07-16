@@ -1412,7 +1412,7 @@ suspend fun handleTrigger(
     repository.saveTrigger(triggerEvent).getOrThrow()
 
     val runtimeState = runtimeStateLoader.load().getOrThrow()
-    val globalHaltEnabled = runtimeState.equity.drawdownRatio <= config.risk.maxDrawdownRatio
+    val globalHaltEnabled = maxDrawdownPolicy.isHardHalt(runtimeState.equity.drawdownRatio)
     if (globalHaltEnabled) {
         killSwitch.haltAll("最大DDに到達したため全停止", triggerEvent).getOrThrow()
         return@runCatching
@@ -2545,7 +2545,7 @@ fun evaluateOrder(
     val now = clock.now()
 
     val globalHaltReached = context.globalHalt ||
-        context.equity.drawdownRatio <= config.risk.maxDrawdownRatio
+        maxDrawdownPolicy.isHardHalt(context.equity.drawdownRatio)
     val requestReducesRisk = request.action == DecisionAction.EXIT ||
         request.action == DecisionAction.REDUCE ||
         request.side == OrderSide.SELL
@@ -2555,7 +2555,7 @@ fun evaluateOrder(
             rule = SafetyFloorRule.MAX_DRAWDOWN_HALT,
             messageJa = "最大DD -15% 到達中のため、新規・買い増し注文は拒否します。",
             measuredValue = context.equity.drawdownRatio.toPlainString(),
-            limitValue = config.risk.maxDrawdownRatio.toPlainString(),
+            limitValue = maxDrawdownPolicy.thresholdRatio.toPlainString(),
             now = now,
         )
     }
@@ -3661,7 +3661,7 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 | `SOFT_HALT` | 新規停止 | close/reduce/stop tightenのみ     |
 | `HARD_HALT` | 全停止  | 全open order取消 + 全建玉close、手動確認のみ |
 
-DD -15% は `HARD_HALT`。発動時はDB上の `risk_state.hard_halt=true` をstickyにし、全open orderを取消して全建玉をcloseする。自動再開はせず、手動再開にはreason付きのaudit記録を必須とする。CLI失敗連発やデータstale長期化は `SOFT_HALT`。
+最大 drawdown 閾値は active runtime config から composition root ごとに1回生成する `MaxDrawdownPolicy` が正本である。SafetyFloor、PaperBroker、ProtectionReconciler、in-memory / PostgreSQL ledger は同じpolicy instanceと `BigDecimal.compareTo` 境界を使う。閾値到達passではresting entryを約定させず、protective STOP / take-profitを同じ市場入力で継続し、sticky `HARD_HALT` の設定と残存risk sweepを同じpassで完了する。自動再開はせず、手動再開にはreason付きのaudit記録を必須とする。CLI失敗連発やデータstale長期化は `SOFT_HALT`。
 
 ---
 

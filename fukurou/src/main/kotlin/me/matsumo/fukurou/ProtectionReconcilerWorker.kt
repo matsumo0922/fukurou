@@ -39,6 +39,7 @@ import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import java.time.Clock
 import java.time.Duration
@@ -134,6 +135,7 @@ internal fun startProtectionReconcilerWorker(
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
     latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
 ): ProtectionReconcilerWorker {
+    val maxDrawdownPolicy = MaxDrawdownPolicy(tradingConfig.safetyFloor.maxDrawdownRatio)
     val inputs = ProtectionReconcilerWorkerInputs(
         dataSource = dataSource,
         database = database,
@@ -141,6 +143,7 @@ internal fun startProtectionReconcilerWorker(
         clock = clock,
         tradingConfig = tradingConfig,
         latestMarketQuoteStore = latestMarketQuoteStore,
+        maxDrawdownPolicy = maxDrawdownPolicy,
     )
     val runtimeComponents = inputs.createRuntimeComponents()
     val reconciler = runtimeComponents.createReconciler()
@@ -219,6 +222,7 @@ private fun ProtectionReconcilerWorkerInputs.createRepositories(): ProtectionRec
             clock = clock,
             safetyFloorConfig = tradingConfig.safetyFloor,
             paperExecutionConfig = tradingConfig.paperExecution,
+            maxDrawdownPolicy = maxDrawdownPolicy,
         ),
         marketDataIntegrityRepository = ExposedMarketDataIntegrityRepository(database),
         marketEventReceiptRepository = ExposedPaperMarketEventReceiptRepository(database),
@@ -235,7 +239,12 @@ private fun ProtectionReconcilerWorkerInputs.createBroker(
         riskStateCommandService = repositories.riskStateCommandService,
         safetyViolationRepository = repositories.safetyViolationRepository,
         restingEntryOrderTtl = tradingConfig.decisionProtocol.restingEntryOrderTtl,
-        safetyFloor = SafetyFloor(tradingConfig.safetyFloor, clock),
+        safetyFloor = SafetyFloor(
+            config = tradingConfig.safetyFloor,
+            clock = clock,
+            maxDrawdownPolicy = maxDrawdownPolicy,
+        ),
+        maxDrawdownPolicy = maxDrawdownPolicy,
         marketDataSource = marketDataSource,
         fillSimulator = FillSimulator(tradingConfig.paperExecution, clock),
         reconcilerStatusProvider = status,
@@ -274,6 +283,7 @@ private fun ProtectionReconcilerRuntimeComponents.createReconciler(): Protection
         ),
         status = inputs.status,
         clock = inputs.clock,
+        maxDrawdownPolicy = inputs.maxDrawdownPolicy,
     )
 }
 
@@ -286,6 +296,7 @@ private fun ProtectionReconcilerRuntimeComponents.createReconciler(): Protection
  * @param clock worker と repository に渡す clock
  * @param tradingConfig 取引 bot 全体の typed config
  * @param latestMarketQuoteStore Activity API と共有する最新気配値 store
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 private data class ProtectionReconcilerWorkerInputs(
     val dataSource: HikariDataSource,
@@ -294,6 +305,7 @@ private data class ProtectionReconcilerWorkerInputs(
     val clock: Clock,
     val tradingConfig: TradingBotConfig,
     val latestMarketQuoteStore: LatestMarketQuoteStore,
+    val maxDrawdownPolicy: MaxDrawdownPolicy,
 )
 
 /**

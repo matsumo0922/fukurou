@@ -40,9 +40,9 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorContext
-import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
 import me.matsumo.fukurou.trading.safety.SafetyFloorVerdict
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
@@ -105,6 +105,7 @@ class PaperBroker private constructor(
         restingEntryOrderTtl: Duration = DecisionProtocolConfig().restingEntryOrderTtl,
         safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
         safetyFloor: SafetyFloor? = null,
+        maxDrawdownPolicy: MaxDrawdownPolicy = safetyFloor?.maxDrawdownPolicy ?: MaxDrawdownPolicy(),
         marketDataSource: MarketDataSource? = null,
         paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
         fillSimulator: PaperExecutionSimulator? = null,
@@ -129,7 +130,9 @@ class PaperBroker private constructor(
                 safetyFloor = safetyFloor ?: SafetyFloor(
                     clock = clock,
                     paperExecutionConfig = paperExecutionConfig,
+                    maxDrawdownPolicy = maxDrawdownPolicy,
                 ),
+                maxDrawdownPolicy = maxDrawdownPolicy,
             ),
             market = PaperBrokerMarketServices(
                 marketDataSource = marketDataSource,
@@ -173,12 +176,20 @@ private data class PaperBrokerStores(
  * @param riskStateCommandService risk_state 更新と audit をまとめる service
  * @param safetyViolationRepository SafetyFloor violation repository
  * @param safetyFloor Broker 副作用前に実行する SafetyFloor
+ * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  */
 private data class PaperBrokerSafetyServices(
     val riskStateCommandService: RiskStateCommandService?,
     val safetyViolationRepository: SafetyViolationRepository,
     val safetyFloor: SafetyFloor,
-)
+    val maxDrawdownPolicy: MaxDrawdownPolicy,
+) {
+    init {
+        require(safetyFloor.maxDrawdownPolicy === maxDrawdownPolicy) {
+            "PaperBroker requires one MaxDrawdownPolicy instance."
+        }
+    }
+}
 
 /**
  * PaperBroker delegate 群で共有する market execution service。
@@ -1086,7 +1097,7 @@ private class PaperBrokerSafetyGate(
         val accountSnapshot = runtime.stores.ledgerRepository.getAccountSnapshot().getOrThrow()
         val drawdownRatio = accountSnapshot.drawdownRatio.toBigDecimal()
 
-        if (drawdownRatio > SafetyFloorDefaults.maxDrawdownRatio) {
+        if (!runtime.safety.maxDrawdownPolicy.isHardHalt(drawdownRatio)) {
             return
         }
 

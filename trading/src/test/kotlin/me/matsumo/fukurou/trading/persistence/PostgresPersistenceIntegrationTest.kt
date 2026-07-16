@@ -154,6 +154,8 @@ import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
+import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
+import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
@@ -8575,6 +8577,150 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun postgres_reconcile_and_event_use_non_default_policy_for_entry_gate() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000182")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = fixedClock(),
+            maxDrawdownPolicy = policy,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            safetyFloor = SafetyFloor(
+                config = SafetyFloorConfig(maxDrawdownRatio = BigDecimal("-0.10")),
+                clock = fixedClock(),
+                maxDrawdownPolicy = policy,
+            ),
+            maxDrawdownPolicy = policy,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        broker.placeOrder(
+            approvedPostgresEntryCommand(
+                decisionRepository,
+                postgresEntryCommand(
+                    orderType = OrderType.LIMIT,
+                    priceJpy = BigDecimal("9900000"),
+                    sizeBtc = BigDecimal("0.0010"),
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                ),
+            ),
+        ).getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate(
+                """
+                    UPDATE paper_account
+                    SET cash_jpy=880000,
+                        btc_quantity=0,
+                        btc_mark_price_jpy=0,
+                        total_equity_jpy=880000,
+                        equity_peak_jpy=1000000,
+                        drawdown_ratio=-0.12
+                    WHERE id=$PAPER_ACCOUNT_SINGLE_ROW_ID
+                """.trimIndent(),
+            )
+        }
+
+        ledgerRepository.reconcile(
+            tickSnapshot = watermarkTickSnapshot("9800000"),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+        ledgerRepository.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 1,
+                sizeBtc = "0.0010",
+                priceJpy = "9800000",
+            ),
+            FillSimulator(),
+        ).getOrThrow()
+
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        assertEquals(1, ledgerRepository.getOpenOrders().getOrThrow().size)
+    }
+
+    @Test
+    fun postgres_reconcile_executes_protection_after_non_default_threshold() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = fixedClock(),
+            maxDrawdownPolicy = policy,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = postgresPolicyBroker(database, ledgerRepository, decisionRepository, policy)
+        broker.placeOrder(
+            approvedPostgresEntryCommand(
+                decisionRepository,
+                postgresEntryCommand(
+                    sizeBtc = BigDecimal("0.0010"),
+                    protectiveStopPriceJpy = BigDecimal("9700000"),
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                ),
+            ),
+        ).getOrThrow()
+        forcePaperAccountBelowNonDefaultThreshold(database)
+
+        ledgerRepository.reconcile(
+            tickSnapshot = watermarkTickSnapshot("9600000"),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        val executions = ledgerRepository.getExecutions().getOrThrow()
+        assertEquals(2, executions.size)
+        assertEquals(OrderSide.SELL, executions.last().side)
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+    }
+
+    @Test
+    fun postgres_market_event_executes_protection_after_non_default_threshold() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000185")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = fixedClock(),
+            maxDrawdownPolicy = policy,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = postgresPolicyBroker(database, ledgerRepository, decisionRepository, policy)
+        broker.placeOrder(
+            approvedPostgresEntryCommand(
+                decisionRepository,
+                postgresEntryCommand(
+                    sizeBtc = BigDecimal("0.0010"),
+                    protectiveStopPriceJpy = BigDecimal("9700000"),
+                    takeProfitPriceJpy = BigDecimal("10500000"),
+                ),
+            ),
+        ).getOrThrow()
+        forcePaperAccountBelowNonDefaultThreshold(database)
+
+        ledgerRepository.applyMarketEvent(
+            event = paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 1,
+                sizeBtc = "0.0010",
+                priceJpy = "9600000",
+            ),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        val executions = ledgerRepository.getExecutions().getOrThrow()
+        assertEquals(2, executions.size)
+        assertEquals(OrderSide.SELL, executions.last().side)
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+    }
+
+    @Test
     fun paper_market_events_trigger_buy_stop_then_virtual_take_profit_on_later_events() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000164")
@@ -9715,6 +9861,40 @@ private fun insertInfrastructureGap(
                 statement.executeUpdate()
             }
         }
+    }
+}
+
+private fun postgresPolicyBroker(
+    database: ExposedDatabase,
+    ledgerRepository: ExposedPaperLedgerRepository,
+    decisionRepository: DecisionRepository,
+    policy: MaxDrawdownPolicy,
+): PaperBroker {
+    return PaperBroker(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = ExposedRiskStateRepository(database),
+        decisionRepository = decisionRepository,
+        safetyFloor = SafetyFloor(
+            config = SafetyFloorConfig(maxDrawdownRatio = policy.thresholdRatio),
+            clock = fixedClock(),
+            maxDrawdownPolicy = policy,
+        ),
+        maxDrawdownPolicy = policy,
+        marketDataSource = PostgresFakeMarketDataSource,
+        clock = fixedClock(),
+    )
+}
+
+private fun forcePaperAccountBelowNonDefaultThreshold(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        executeUpdate(
+            """
+                UPDATE paper_account
+                SET equity_peak_jpy=1200000,
+                    drawdown_ratio=-0.12
+                WHERE id=$PAPER_ACCOUNT_SINGLE_ROW_ID
+            """.trimIndent(),
+        )
     }
 }
 
