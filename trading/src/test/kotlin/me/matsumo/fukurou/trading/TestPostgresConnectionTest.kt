@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading
 
 import org.testcontainers.containers.PostgreSQLContainer
+import java.net.ConnectException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
@@ -22,6 +23,7 @@ class TestPostgresConnectionTest {
         val parameters = InspectablePostgresContainer().configuredUrlParameters()
 
         assertEquals(TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_CONNECT_TIMEOUT_KEY])
+        assertEquals(TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_LOGIN_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_SOCKET_TIMEOUT_KEY])
     }
 
@@ -35,7 +37,8 @@ class TestPostgresConnectionTest {
                 }
             }
             val jdbcUrl = "jdbc:postgresql://${serverSocket.inetAddress.hostAddress}:${serverSocket.localPort}/test" +
-                "?connectTimeout=$DRIVER_CONTRACT_TIMEOUT_SECONDS&socketTimeout=$DRIVER_CONTRACT_TIMEOUT_SECONDS"
+                "?connectTimeout=$DRIVER_CONTRACT_TIMEOUT_SECONDS&loginTimeout=$DRIVER_CONTRACT_TIMEOUT_SECONDS" +
+                "&socketTimeout=$TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS"
             val startedAt = System.nanoTime()
 
             val failure = try {
@@ -47,18 +50,20 @@ class TestPostgresConnectionTest {
             }
             val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
 
-            assertTrue(failure.hasCause<SocketTimeoutException>())
+            assertEquals(POSTGRES_CONNECTION_UNABLE_SQL_STATE, failure.sqlState)
             assertTrue(elapsed < Duration.ofSeconds(DRIVER_CONTRACT_MAX_ELAPSED_SECONDS), "elapsed=$elapsed")
         }
     }
 
     @Test
-    fun transientSocketFailureRetriesOnceBeforeReturningConnection() {
+    fun transientSocketFailureRetriesWithinMaximumBeforeReturningConnection() {
         var attempts = 0
 
         val connection = retryTransientTestPostgresConnection {
             attempts += 1
-            if (attempts == 1) throw SQLException("transient", SocketTimeoutException("stale socket"))
+            if (attempts < TEST_POSTGRES_CONNECTION_MAX_ATTEMPTS) {
+                throw SQLException("transient", SocketTimeoutException("stale socket"))
+            }
             "connected"
         }
 
@@ -79,10 +84,38 @@ class TestPostgresConnectionTest {
 
         assertEquals(1, attempts)
     }
-}
 
-private inline fun <reified T : Throwable> Throwable.hasCause(): Boolean {
-    return generateSequence(this) { throwable -> throwable.cause }.any { throwable -> throwable is T }
+    @Test
+    fun connectionSqlStateFailureIsRetried() {
+        var attempts = 0
+
+        val connection = retryTransientTestPostgresConnection {
+            attempts += 1
+            if (attempts == 1) throw SQLException("connection unavailable", POSTGRES_CONNECTION_UNABLE_SQL_STATE)
+            "connected"
+        }
+
+        assertEquals("connected", connection)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun connectionRejectedSqlStateIsNotRetried() {
+        var attempts = 0
+
+        assertFailsWith<SQLException> {
+            retryTransientTestPostgresConnection {
+                attempts += 1
+                throw SQLException(
+                    "connection rejected",
+                    POSTGRES_CONNECTION_REJECTED_SQL_STATE,
+                    ConnectException("nested transport detail"),
+                )
+            }
+        }
+
+        assertEquals(1, attempts)
+    }
 }
 
 /** URL parameter を container 起動なしで観測する test double。 */
@@ -97,3 +130,5 @@ private class InspectablePostgresContainer : PostgreSQLContainer<InspectablePost
 private const val DRIVER_CONTRACT_TIMEOUT_SECONDS = 1
 private const val DRIVER_CONTRACT_MAX_ELAPSED_SECONDS = 5L
 private const val SILENT_SERVER_RELEASE_SECONDS = 5L
+private const val POSTGRES_CONNECTION_UNABLE_SQL_STATE = "08001"
+private const val POSTGRES_CONNECTION_REJECTED_SQL_STATE = "08004"

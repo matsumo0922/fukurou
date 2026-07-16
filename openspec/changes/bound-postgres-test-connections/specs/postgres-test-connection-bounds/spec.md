@@ -7,7 +7,7 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 #### Scenario: Every test consumer receives bounded JDBC settings
 
 - **WHEN** Testcontainers PostgreSQL fixture が HikariCP、Exposed、`DriverManager`、または production composition test へ JDBC URL を渡す
-- **THEN** URL は `connectTimeout` が 10 秒以下、`socketTimeout` が 30 秒以下の正の整数値をそれぞれちょうど 1 個含む
+- **THEN** URL は `connectTimeout` が 10 秒以下、`loginTimeout` が 30 秒以下、`socketTimeout` が 300 秒以下の正の整数値をそれぞれちょうど 1 個含む
 
 #### Scenario: Consumer uses a stricter timeout
 
@@ -17,16 +17,16 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 #### Scenario: Authentication response stops arriving
 
 - **WHEN** PostgreSQL JDBC connection が socket を確立した後、authentication response を受信できない
-- **THEN** driver は設定した socket timeout 以内に例外を返し、test worker は無期限に停止しない
+- **THEN** driver は設定した login timeout 以内に connection failure を返し、test worker は無期限に停止しない
 
 #### Scenario: First pool initialization hits a transient socket failure
 
-- **WHEN** `runPostgresTest` の test body 開始前に最初の DataSource construction が socket timeout または connect failure で失敗する
-- **THEN** fixture は接続を 1 回だけ再試行し、成功すれば test body を 1 回だけ実行する
+- **WHEN** `runPostgresTest` の test body 開始前に最初の DataSource construction が socket/connect cause または SQLSTATE `08001` の connection attempt failure で失敗する
+- **THEN** fixture は接続を最大 2 回再試行し、成功すれば test body を 1 回だけ実行する
 
 #### Scenario: Retry does not mask a persistent or non-network failure
 
-- **WHEN** 2 回目の DataSource construction が失敗する、または最初の失敗が retryable socket/connect cause を持たない
+- **WHEN** 3 回目の DataSource construction が失敗する、または最初の失敗が retryable SQLSTATE `08001` を持たない（SQLSTATE がない場合は socket/connect cause を持たない）
 - **THEN** fixture は失敗を呼び出し元へ伝播し、test body を実行しない
 
 #### Scenario: Wrong-password assertion rejects URL configuration failures
