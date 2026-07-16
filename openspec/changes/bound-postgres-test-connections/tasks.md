@@ -14,5 +14,5 @@
 ## 3. Verification and documentation
 
 - [x] 3.1 Verify the PostgreSQL container inventory has no unbounded construction path and run targeted tests
-- [ ] 3.2 Run full test, detekt, and build validation under the validation lease
+- [x] 3.2 Run full test, detekt, and build validation under the validation lease
 - [x] 3.3 Search README and docs for affected fixture and timeout descriptions and update only stale current-state documentation
