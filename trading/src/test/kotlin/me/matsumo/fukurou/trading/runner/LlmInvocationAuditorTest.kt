@@ -182,6 +182,10 @@ class LlmInvocationAuditorTest {
         val auditUsage = requireNotNull(details["usage"]).jsonObject
 
         assertTrue(result.isFailure)
+        assertEquals(
+            LlmPhaseProcessFailureKind.NON_ZERO_EXIT,
+            (result.exceptionOrNull() as LlmPhaseProcessFailure).kind,
+        )
         assertEquals("1", details["exitCode"]?.jsonPrimitive?.content)
         assertEquals("2", auditUsage["usage"]?.jsonObject?.get("reasoningOutputTokens")?.jsonPrimitive?.content)
         assertEquals("true", details["rawOutputOmitted"]?.jsonPrimitive?.content)
@@ -195,7 +199,7 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
-    fun invokeAndAudit_recordsCompletedUsageBeforeFailingOnCleanup() = runBlocking {
+    fun invokeAndAudit_recordsCompletedUsageAndReportsCleanupSignal() = runBlocking {
         val commandEventLog = InMemoryCommandEventLog()
         val humanLogs = mutableListOf<String>()
         val auditor = LlmInvocationAuditor(
@@ -236,7 +240,8 @@ class LlmInvocationAuditorTest {
         val details = requireNotNull(payload["details"]).jsonObject
         val auditUsage = requireNotNull(details["usage"]).jsonObject
 
-        assertTrue(result.isFailure)
+        assertTrue(result.isSuccess)
+        assertSame(cleanupFailure, result.getOrThrow().cleanupFailure)
         assertEquals("EXITED", details["status"]?.jsonPrimitive?.content)
         assertEquals("0", details["exitCode"]?.jsonPrimitive?.content)
         assertEquals("true", details["cleanupFailed"]?.jsonPrimitive?.content)
@@ -244,7 +249,38 @@ class LlmInvocationAuditorTest {
         assertEquals("12", auditUsage["usage"]?.jsonObject?.get("inputTokens")?.jsonPrimitive?.content)
         assertFalse(commandEventLog.events().single().payload.contains("path-marker"))
         assertFalse(commandEventLog.events().single().payload.contains("path-message-marker"))
-        assertEquals(emptyList(), humanLogs)
+        assertEquals(1, humanLogs.size)
+        assertTrue(humanLogs.single().startsWith("falsifier completed with cleanup failure invocation="))
+        assertFalse(humanLogs.single().contains("path-marker"))
+        assertFalse(humanLogs.single().contains("path-message-marker"))
+    }
+
+    @Test
+    fun invokeAndAudit_appendFailureDoesNotReturnSuccessAuditResult() = runBlocking {
+        val appendFailure = IllegalStateException("synthetic audit append failure")
+        val commandEventLog = object : me.matsumo.fukurou.trading.audit.CommandEventLog by InMemoryCommandEventLog() {
+            override suspend fun append(event: me.matsumo.fukurou.trading.audit.CommandEvent): Result<Unit> {
+                return Result.failure(appendFailure)
+            }
+        }
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CLAUDE)
+
+        val result = runCatching {
+            auditor.invokeAndAudit(
+                phaseName = "falsifier",
+                context = request.decisionRunContext,
+                request = request,
+                llmInvoker = StaticAuditLlmInvoker("{}"),
+            ).getOrThrow()
+        }
+
+        assertTrue(result.isFailure)
+        assertSame(appendFailure, result.exceptionOrNull())
     }
 
     @Test
@@ -268,7 +304,12 @@ class LlmInvocationAuditorTest {
         val details = requireNotNull(payload["details"]).jsonObject
 
         assertTrue(result.isFailure)
+        assertEquals(
+            LlmPhaseProcessFailureKind.START_FAILURE,
+            (result.exceptionOrNull() as LlmPhaseProcessFailure).kind,
+        )
         assertEquals("FAILED_TO_START", details["status"]?.jsonPrimitive?.content)
+        assertEquals("START_FAILURE", details["processFailureKind"]?.jsonPrimitive?.content)
         assertTrue(details["error"]?.jsonPrimitive?.content.orEmpty().contains("synthetic claude failure"))
         assertFalse(details.containsKey("failureCategory"))
     }
@@ -536,7 +577,7 @@ class LlmInvocationAuditorTest {
             invoker,
         ).exceptionOrNull()
 
-        val terminalFailure = requireNotNull(failure)
+        val terminalFailure = requireNotNull((requireNotNull(failure) as LlmPhaseProcessFailure).cause)
         assertTrue(terminalFailure.suppressed.contains(cleanupFailure))
         assertTrue(terminalFailure.suppressed.contains(observationFailure))
         assertTrue(terminalFailure.suppressed.contains(appendFailure))
@@ -659,7 +700,14 @@ class LlmInvocationAuditorTest {
         }
         val observation = repository.findObservation("audit-run:PRE_FILTER").getOrThrow()
 
-        assertSame(failure, result.exceptionOrNull())
+        val actualFailure = result.exceptionOrNull()
+        if (failure is CancellationException) {
+            assertSame(failure, actualFailure)
+        } else {
+            val processFailure = actualFailure as LlmPhaseProcessFailure
+            assertEquals(LlmPhaseProcessFailureKind.START_FAILURE, processFailure.kind)
+            assertSame(failure, processFailure.cause)
+        }
         assertEquals(expectedCoverage, observation?.modelCoverageStatus)
     }
 
