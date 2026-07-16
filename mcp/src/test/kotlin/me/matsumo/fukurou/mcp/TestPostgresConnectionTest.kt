@@ -1,6 +1,5 @@
 package me.matsumo.fukurou.mcp
 
-import org.testcontainers.containers.PostgreSQLContainer
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -36,10 +35,7 @@ class TestPostgresConnectionTest {
 }
 
 /** URL parameter を container 起動なしで観測する test double。 */
-private class InspectablePostgresContainer : PostgreSQLContainer<InspectablePostgresContainer>("postgres:16-alpine") {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-
+private class InspectablePostgresContainer :
+    BoundedTestPostgresContainer<InspectablePostgresContainer>("postgres:16-alpine") {
     fun configuredUrlParameters(): Map<String, String> = urlParameters.toMap()
 }

@@ -1,6 +1,5 @@
 package me.matsumo.fukurou.trading
 
-import org.testcontainers.containers.PostgreSQLContainer
 import java.net.ConnectException
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -119,11 +118,8 @@ class TestPostgresConnectionTest {
 }
 
 /** URL parameter を container 起動なしで観測する test double。 */
-private class InspectablePostgresContainer : PostgreSQLContainer<InspectablePostgresContainer>("postgres:16-alpine") {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-
+private class InspectablePostgresContainer :
+    BoundedTestPostgresContainer<InspectablePostgresContainer>("postgres:16-alpine") {
     fun configuredUrlParameters(): Map<String, String> = urlParameters.toMap()
 }
 

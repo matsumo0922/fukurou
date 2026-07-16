@@ -2638,11 +2638,8 @@ private fun Throwable.firstSqlState(): String? {
 }
 
 /** MCP integration test 用 PostgreSQL container。 */
-private class McpPostgresContainer : PostgreSQLContainer<McpPostgresContainer>("postgres:16-alpine") {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-}
+private class McpPostgresContainer :
+    BoundedTestPostgresContainer<McpPostgresContainer>("postgres:16-alpine")
 
 private fun mcpTestConnection(container: PostgreSQLContainer<*>) =
     DriverManager.getConnection(container.jdbcUrl, MCP_TEST_ROLE, MCP_TEST_PASSWORD)

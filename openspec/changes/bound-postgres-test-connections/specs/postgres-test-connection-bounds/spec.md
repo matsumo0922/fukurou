@@ -2,7 +2,12 @@
 
 ### Requirement: Testcontainers PostgreSQL connections are time bounded
 
-Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture が生成する全 JDBC URL は、connection establishment と socket read の有限 timeout を MUST 設定する。
+Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture は module-local な bounded base container を MUST 継承し、生成する全 JDBC URL に connection establishment と socket read の有限 timeout を設定する。
+
+#### Scenario: Every fixture inherits bounded connection settings
+
+- **WHEN** test source に Testcontainers PostgreSQL fixture を定義する
+- **THEN** fixture は module-local な bounded base container を継承し、fixture ごとの timeout helper 呼び出しを必要としない
 
 #### Scenario: Every test consumer receives bounded JDBC settings
 

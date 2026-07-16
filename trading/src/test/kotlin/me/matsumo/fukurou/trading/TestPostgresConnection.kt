@@ -5,11 +5,15 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.sql.SQLException
 
-/** Testcontainers PostgreSQL の JDBC 接続を有限時間に制限する。 */
-internal fun PostgreSQLContainer<*>.configureBoundedTestJdbcConnections() {
-    withUrlParam(TEST_POSTGRES_CONNECT_TIMEOUT_KEY, TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString())
-    withUrlParam(TEST_POSTGRES_LOGIN_TIMEOUT_KEY, TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString())
-    withUrlParam(TEST_POSTGRES_SOCKET_TIMEOUT_KEY, TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString())
+/** JDBC 接続が有限時間に制限された test 用 PostgreSQL container。 */
+internal abstract class BoundedTestPostgresContainer<SELF : BoundedTestPostgresContainer<SELF>>(
+    dockerImageName: String,
+) : PostgreSQLContainer<SELF>(dockerImageName) {
+    init {
+        withUrlParam(TEST_POSTGRES_CONNECT_TIMEOUT_KEY, TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString())
+        withUrlParam(TEST_POSTGRES_LOGIN_TIMEOUT_KEY, TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString())
+        withUrlParam(TEST_POSTGRES_SOCKET_TIMEOUT_KEY, TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString())
+    }
 }
 
 /** test body 開始前の一時的な PostgreSQL 接続失敗だけを最大 2 回再試行する。 */

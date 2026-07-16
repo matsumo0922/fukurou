@@ -81,7 +81,6 @@ import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.io.File
 import java.math.BigDecimal
 import java.nio.file.FileSystemException
@@ -2244,11 +2243,8 @@ private const val POSTGRES_IMAGE = "postgres:16-alpine"
 /**
  * fukurou module test 用 Postgres container。
  */
-private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE) {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-}
+private class FukurouPostgresContainer :
+    BoundedTestPostgresContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 private fun isDockerAvailable(): Boolean {
     return runCatching {

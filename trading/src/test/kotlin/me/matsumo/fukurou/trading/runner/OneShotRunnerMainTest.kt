@@ -2,8 +2,8 @@ package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.config.TradingBotConfig
-import me.matsumo.fukurou.trading.configureBoundedTestJdbcConnections
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
@@ -22,7 +22,6 @@ import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketAddress
@@ -304,11 +303,7 @@ private fun String.withSocketFactory(factoryName: String): String {
 
 /** runner cold-start test 用 PostgreSQL container。 */
 private class RunnerColdStartPostgresContainer :
-    PostgreSQLContainer<RunnerColdStartPostgresContainer>("postgres:16-alpine") {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-}
+    BoundedTestPostgresContainer<RunnerColdStartPostgresContainer>("postgres:16-alpine")
 
 private const val RUNNER_COLD_CONNECT_DELAY_MILLIS = 750L
 

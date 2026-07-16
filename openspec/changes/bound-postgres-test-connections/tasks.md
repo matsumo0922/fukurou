@@ -1,13 +1,13 @@
 ## 1. Test connection contract
 
-- [x] 1.1 Add module-local Testcontainers PostgreSQL timeout helpers with 10-second connect, 30-second login, and 300-second socket read bounds
+- [x] 1.1 Add module-local bounded PostgreSQL base containers with 10-second connect, 30-second login, and 300-second socket read bounds
 - [x] 1.2 Add Docker-independent contract tests for URL parameters, structural overrides, and an unresponsive authentication socket
 
 ## 2. Fixture migration
 
-- [x] 2.1 Apply the timeout helper to the finite `:trading` PostgreSQL container inventory
-- [x] 2.2 Apply the timeout helper to the finite `:fukurou` PostgreSQL container inventory
-- [x] 2.3 Apply the timeout helper to the finite `:mcp` PostgreSQL container inventory
+- [x] 2.1 Migrate the finite `:trading` PostgreSQL fixture inventory to the bounded base container
+- [x] 2.2 Migrate the finite `:fukurou` PostgreSQL fixture inventory to the bounded base container
+- [x] 2.3 Migrate the finite `:mcp` PostgreSQL fixture inventory to the bounded base container
 - [x] 2.4 Make the MCP wrong-password test assert SQLSTATE `28P01` without malformed or duplicate URL parameters
 - [x] 2.5 Retry transient `runPostgresTest` DataSource initialization at most twice before the test body starts
 

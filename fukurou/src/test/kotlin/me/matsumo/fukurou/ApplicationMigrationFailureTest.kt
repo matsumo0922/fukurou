@@ -17,7 +17,6 @@ import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
@@ -282,11 +281,7 @@ private fun countBackfilledAttemptKeys(database: ExposedDatabase): Int {
 
 /** application migration failure test 用 PostgreSQL container。 */
 private class ApplicationMigrationPostgresContainer :
-    PostgreSQLContainer<ApplicationMigrationPostgresContainer>("postgres:16-alpine") {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-}
+    BoundedTestPostgresContainer<ApplicationMigrationPostgresContainer>("postgres:16-alpine")
 
 private fun applicationMigrationDockerAvailable(): Boolean {
     return runCatching {

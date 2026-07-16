@@ -8,6 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
@@ -56,7 +57,6 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigDraftCreation
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
-import me.matsumo.fukurou.trading.configureBoundedTestJdbcConnections
 import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
@@ -167,7 +167,6 @@ import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.math.BigDecimal
@@ -10865,11 +10864,8 @@ private fun applyRecoveryStatementFault(
 /** recovery fault proxyが識別するJDBC statement種別。 */
 private enum class RecoveryFaultStatementKind { MUTATION, READBACK, SCAN, OTHER }
 
-private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE) {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-}
+private class FukurouPostgresContainer :
+    BoundedTestPostgresContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 /**
  * Docker が利用できる場合だけ Postgres integration test を実行する。

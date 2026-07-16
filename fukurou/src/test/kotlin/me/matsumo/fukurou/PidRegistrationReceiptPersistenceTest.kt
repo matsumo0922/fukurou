@@ -9,7 +9,6 @@ import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.sql.DriverManager
 import java.time.Clock
 import java.time.Instant
@@ -106,11 +105,8 @@ class PidRegistrationReceiptPersistenceTest {
     }
 }
 
-private class ReceiptPostgresContainer : PostgreSQLContainer<ReceiptPostgresContainer>("postgres:16-alpine") {
-    init {
-        configureBoundedTestJdbcConnections()
-    }
-}
+private class ReceiptPostgresContainer :
+    BoundedTestPostgresContainer<ReceiptPostgresContainer>("postgres:16-alpine")
 
 private fun JdbcTransaction.jdbcConnection(): java.sql.Connection {
     return connection.connection as java.sql.Connection
