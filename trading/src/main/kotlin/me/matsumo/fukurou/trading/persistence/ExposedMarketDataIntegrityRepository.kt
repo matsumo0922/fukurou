@@ -3,13 +3,23 @@
 package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
+import me.matsumo.fukurou.trading.market.MarketEventReceiptIntegrityConflictException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptCommit
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptRepository
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
@@ -165,6 +175,196 @@ class ExposedMarketDataIntegrityRepository(
         }
     }
 }
+
+/** PostgreSQL の独立 transaction で durable market-event receipt を保存する repository。 */
+class ExposedPaperMarketEventReceiptRepository(
+    private val database: ExposedDatabase,
+    private val nanoTime: () -> Long = System::nanoTime,
+) : PaperMarketEventReceiptRepository {
+
+    override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
+        val transactionStartedAtNanos = nanoTime()
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val commit = exposedTransaction(database) {
+                    insertPaperMarketEventReceipt(event, nanoTime)
+                }
+                Result.success(
+                    commit.copy(
+                        transactionDurationNanos = elapsedNanos(transactionStartedAtNanos, nanoTime()),
+                    ),
+                )
+            } catch (throwable: CancellationException) {
+                throw throwable
+            } catch (throwable: MarketEventReceiptIntegrityConflictException) {
+                Result.failure(throwable)
+            } catch (throwable: Throwable) {
+                Result.failure(MarketEventReceiptPersistenceException(throwable))
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.insertPaperMarketEventReceipt(
+    event: PaperMarketTradeEvent,
+    nanoTime: () -> Long,
+): PaperMarketEventReceiptCommit {
+    val normalizedPayload = event.normalizedReceiptPayload()
+    val payloadHash = normalizedPayload.sha256()
+    val advisoryWaitStartedAtNanos = nanoTime()
+
+    acquireSharedPaperMarketSessionLock(event.connectionSessionId)
+    val advisoryWaitNanos = elapsedNanos(advisoryWaitStartedAtNanos, nanoTime())
+    acquirePaperMarketSourceIdentityLock(event.connectionSessionId, event.sequence)
+
+    selectPaperMarketEventReceipt(event.connectionSessionId, event.sequence)?.let { existing ->
+        if (existing.payloadHash != payloadHash) throw MarketEventReceiptIntegrityConflictException()
+
+        return existing.toCommit(
+            duplicate = true,
+            advisoryWaitNanos = advisoryWaitNanos,
+        )
+    }
+
+    val receiptId = UUID.randomUUID()
+    val admissionOrdinal = nextPaperMarketAdmissionOrdinal()
+    prepare(
+        """
+            INSERT INTO paper_market_event_receipts (
+                id, session_id, source_sequence, source_timestamp, socket_observed_at,
+                normalized_payload, payload_hash, admission_ordinal, advisory_wait_nanos, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+        """,
+    ).use { statement ->
+        statement.setObject(1, receiptId)
+        statement.setObject(2, event.connectionSessionId)
+        statement.setLong(3, event.sequence)
+        statement.setLong(4, event.exchangeAt.toEpochMilli())
+        statement.setLong(5, event.receivedAt.toEpochMilli())
+        statement.setString(6, normalizedPayload)
+        statement.setString(7, payloadHash)
+        statement.setLong(8, admissionOrdinal)
+        statement.setLong(9, advisoryWaitNanos)
+        check(statement.executeUpdate() == 1) { "paper market-event receipt insert did not affect one row." }
+    }
+
+    return PaperMarketEventReceiptCommit(
+        receiptId = receiptId,
+        admissionOrdinal = admissionOrdinal,
+        payloadHash = payloadHash,
+        duplicate = false,
+        transactionDurationNanos = 0,
+        advisoryWaitNanos = advisoryWaitNanos,
+    )
+}
+
+private fun JdbcTransaction.acquireSharedPaperMarketSessionLock(sessionId: UUID) {
+    prepare("SELECT pg_advisory_xact_lock_shared(?)").use { statement ->
+        statement.setLong(1, paperMarketSessionAdvisoryLockKey(sessionId))
+        statement.executeQuery().use { rows -> check(rows.next()) }
+    }
+}
+
+private fun JdbcTransaction.acquirePaperMarketSourceIdentityLock(sessionId: UUID, sourceSequence: Long) {
+    prepare("SELECT pg_advisory_xact_lock(?)").use { statement ->
+        statement.setLong(1, paperMarketSourceIdentityLockKey(sessionId, sourceSequence))
+        statement.executeQuery().use { rows -> check(rows.next()) }
+    }
+}
+
+private fun JdbcTransaction.selectPaperMarketEventReceipt(
+    sessionId: UUID,
+    sourceSequence: Long,
+): StoredPaperMarketEventReceipt? {
+    return prepare(
+        """
+            SELECT id, admission_ordinal, payload_hash
+            FROM paper_market_event_receipts
+            WHERE session_id = ? AND source_sequence = ?
+            FOR UPDATE
+        """,
+    ).use { statement ->
+        statement.setObject(1, sessionId)
+        statement.setLong(2, sourceSequence)
+        statement.executeQuery().use { rows ->
+            if (!rows.next()) return@use null
+
+            StoredPaperMarketEventReceipt(
+                receiptId = rows.getObject("id", UUID::class.java),
+                admissionOrdinal = rows.getLong("admission_ordinal"),
+                payloadHash = rows.getString("payload_hash"),
+            )
+        }
+    }
+}
+
+private fun JdbcTransaction.nextPaperMarketAdmissionOrdinal(): Long {
+    return prepare("SELECT nextval('paper_market_admission_ordinal_seq')").use { statement ->
+        statement.executeQuery().use { rows ->
+            check(rows.next()) { "paper market admission ordinal was not returned." }
+            rows.getLong(1)
+        }
+    }
+}
+
+private fun PaperMarketTradeEvent.normalizedReceiptPayload(): String {
+    val payload = buildJsonObject {
+        put("exchangeAt", exchangeAt.toString())
+        put("priceJpy", priceJpy.stripTrailingZeros().toPlainString())
+        put("side", side.name)
+        put("sizeBtc", sizeBtc.stripTrailingZeros().toPlainString())
+        put("symbol", symbol.apiSymbol)
+    }.toString()
+    check(payload.length <= MAX_NORMALIZED_RECEIPT_PAYLOAD_LENGTH) {
+        "normalized paper market-event receipt payload exceeded its bound."
+    }
+
+    return payload
+}
+
+internal fun paperMarketSessionAdvisoryLockKey(sessionId: UUID): Long {
+    return "paper-market-session:$sessionId".stableAdvisoryLockKey()
+}
+
+private fun paperMarketSourceIdentityLockKey(sessionId: UUID, sourceSequence: Long): Long {
+    return "paper-market-source:$sessionId:$sourceSequence".stableAdvisoryLockKey()
+}
+
+private fun String.stableAdvisoryLockKey(): Long {
+    val digest = MessageDigest.getInstance("SHA-256").digest(toByteArray(Charsets.UTF_8))
+
+    return ByteBuffer.wrap(digest, 0, Long.SIZE_BYTES).long
+}
+
+private fun String.sha256(): String {
+    return MessageDigest.getInstance("SHA-256")
+        .digest(toByteArray(Charsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
+
+private fun elapsedNanos(startedAtNanos: Long, finishedAtNanos: Long): Long {
+    return (finishedAtNanos - startedAtNanos).coerceAtLeast(0)
+}
+
+private data class StoredPaperMarketEventReceipt(
+    val receiptId: UUID,
+    val admissionOrdinal: Long,
+    val payloadHash: String,
+) {
+    fun toCommit(duplicate: Boolean, advisoryWaitNanos: Long): PaperMarketEventReceiptCommit {
+        return PaperMarketEventReceiptCommit(
+            receiptId = receiptId,
+            admissionOrdinal = admissionOrdinal,
+            payloadHash = payloadHash,
+            duplicate = duplicate,
+            transactionDurationNanos = 0,
+            advisoryWaitNanos = advisoryWaitNanos,
+        )
+    }
+}
+
+private const val MAX_NORMALIZED_RECEIPT_PAYLOAD_LENGTH = 512
 
 private data class UnappliedMarketDataGap(
     val id: UUID,

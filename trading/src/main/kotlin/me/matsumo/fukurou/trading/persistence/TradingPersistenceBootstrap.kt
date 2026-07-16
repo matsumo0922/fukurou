@@ -479,6 +479,23 @@ private const val ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE state = 'CONNECTED'
 """
 
+/** paper market-event receipt の admission ordinal sequence を作る SQL。 */
+private const val ENSURE_PAPER_MARKET_ADMISSION_ORDINAL_SEQUENCE_SQL = """
+    CREATE SEQUENCE IF NOT EXISTS paper_market_admission_ordinal_seq AS BIGINT
+"""
+
+/** session 内 source identity の重複 receipt を防ぐ unique index を作る SQL。 */
+private const val ENSURE_PAPER_MARKET_RECEIPT_SOURCE_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_market_receipts_session_source_unique
+    ON paper_market_event_receipts (session_id, source_sequence)
+"""
+
+/** admission ordinal を一意にする index を作る SQL。 */
+private const val ENSURE_PAPER_MARKET_RECEIPT_ORDINAL_UNIQUE_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_market_receipts_admission_ordinal_unique
+    ON paper_market_event_receipts (admission_ordinal)
+"""
+
 /** symbol ごとの open opportunity episode を一意にする partial unique index。 */
 private const val ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_episodes_symbol_open_unique
@@ -746,6 +763,27 @@ private const val VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL = """
     WHERE schemaname = current_schema()
         AND tablename = 'market_data_sessions'
         AND indexname = 'idx_market_data_sessions_connected_unique'
+"""
+
+/** paper market-event receipt sequence の存在を確認する SQL。 */
+private const val VERIFY_PAPER_MARKET_ADMISSION_ORDINAL_SEQUENCE_SQL = """
+    SELECT 1
+    FROM pg_class
+    WHERE oid = to_regclass('paper_market_admission_ordinal_seq')
+        AND relkind = 'S'
+"""
+
+/** paper market-event receipt index の存在を確認する SQL。 */
+private const val VERIFY_PAPER_MARKET_RECEIPT_INDEX_COUNT_SQL = """
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+        AND indexname IN (
+            'idx_paper_market_receipts_session_source_unique',
+            'idx_paper_market_receipts_admission_ordinal_unique'
+        )
+    GROUP BY schemaname
+    HAVING COUNT(*) = 2
 """
 
 /** market-data integrity 補助indexの存在を確認するSQL。 */
@@ -1064,6 +1102,23 @@ private const val VERIFY_MARKET_DATA_INTEGRITY_SCHEMA_SQL = """
     LIMIT 0
 """
 
+/** paper market-event receipt journal schema の存在を確認する SQL。 */
+private const val VERIFY_PAPER_MARKET_EVENT_RECEIPT_SCHEMA_SQL = """
+    SELECT
+        id,
+        session_id,
+        source_sequence,
+        source_timestamp,
+        socket_observed_at,
+        normalized_payload,
+        payload_hash,
+        admission_ordinal,
+        advisory_wait_nanos,
+        recorded_at
+    FROM paper_market_event_receipts
+    LIMIT 0
+"""
+
 /**
  * safety_violations schema の存在を確認する SQL。
  */
@@ -1262,6 +1317,7 @@ class TradingPersistenceBootstrap(
                     OrdersTable,
                     ExecutionsTable,
                     MarketDataSessionsTable,
+                    PaperMarketEventReceiptsTable,
                     MarketDataGapsTable,
                     EvaluationExclusionsTable,
                     CommandEventLogTable,
@@ -1603,6 +1659,9 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
     executeUpdate(ENSURE_EVALUATION_EXECUTION_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_EVALUATION_ORDER_POSITION_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_PAPER_MARKET_ADMISSION_ORDINAL_SEQUENCE_SQL)
+    executeUpdate(ENSURE_PAPER_MARKET_RECEIPT_SOURCE_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_PAPER_MARKET_RECEIPT_ORDINAL_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
@@ -1789,6 +1848,7 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
         sql = VERIFY_MARKET_DATA_CONNECTED_SESSION_UNIQUE_INDEX_SQL,
         missingMessage = "market-data connected session unique index was not initialized.",
     )
+    verifyPaperMarketReceiptSchemaObjects()
     verifyExistsBySql(
         sql = VERIFY_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL,
         missingMessage = "market-data integrity indexes were not initialized.",
@@ -1800,6 +1860,21 @@ private fun JdbcTransaction.verifyLedgerRuntimeSchemaObjects() {
     verifySchemaBySql(
         sql = VERIFY_PAPER_ORDER_CANCELLATION_DETAILS_SCHEMA_SQL,
         missingMessage = "paper_order_cancellation_details schema was not initialized.",
+    )
+}
+
+private fun JdbcTransaction.verifyPaperMarketReceiptSchemaObjects() {
+    verifySchemaBySql(
+        sql = VERIFY_PAPER_MARKET_EVENT_RECEIPT_SCHEMA_SQL,
+        missingMessage = "paper market-event receipt schema was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_PAPER_MARKET_ADMISSION_ORDINAL_SEQUENCE_SQL,
+        missingMessage = "paper market admission ordinal sequence was not initialized.",
+    )
+    verifyExistsBySql(
+        sql = VERIFY_PAPER_MARKET_RECEIPT_INDEX_COUNT_SQL,
+        missingMessage = "paper market-event receipt indexes were not initialized.",
     )
 }
 

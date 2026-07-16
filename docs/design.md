@@ -3686,6 +3686,20 @@ DD -15% は `HARD_HALT`。発動時はDB上の `risk_state.hard_halt=true` をst
 
 [確定] paper `ProtectionReconciler` は WebSocket で受信した trade event の price をもとに STOP / virtual TP 到達を判定する。受信していない期間、注文作成前、期限外、retry event は約定根拠にしない。接続断や sequence gap は未監査の欠損にせず、影響 entity を評価除外して復旧後最初の realtime event から管理を再開する。
 
+[確定] WebSocket listener は complete trade message の process clock observation を先に固定し、`paper_market_event_receipts` へ durable receipt を commit してから既存の application queue へ event を渡す。receipt transaction は session-scoped shared advisory lockと同一source identityのduplicateを直列化する短いadvisory lock、`paper_market_admission_ordinal_seq`、receipt 1 rowだけを使い、`market_data_sessions` row、global trading lock、ledger transactionをlockしない。同一 `(session_id, source_sequence)` と同じ normalized payload hash は同じ receipt を返し、rowとordinalを増やさない。payloadが異なるduplicateとreceipt persistence failureはtyped infrastructure gapとしてqueue/fillへ渡さない。receiptはdark writeであり、正常時のfill/eligibility predicate、`last_processed_sequence`、legacy `last_received_at`を変更しない。既存historyのbackfill/dedupeとreceipt pruningは行わず、receiptは最低365日保持できるschemaとする。
+
+receipt hot path はeventごとに1 transaction/commit、shared session advisory lock 1回、source identity advisory lock 1回、sequence採番1回、row/index更新1回を追加する。commit logの `transactionNanos` と `advisoryWaitNanos` はpayload、session ID、source sequenceを含まない。運用観測は一定窓のreceipt row count、`pg_total_relation_size('paper_market_event_receipts')`、`pg_stat_wal.wal_bytes` の差分を同じ窓で採取し、次で投影する。
+
+```text
+eventsPerSecond = receiptRowsDelta / observationSeconds
+rowsPerDay = eventsPerSecond * 86400
+storage30Days = relationBytesPerRow * rowsPerDay * 30
+storage365Days = relationBytesPerRow * rowsPerDay * 365
+walPerDay = walBytesDelta / observationSeconds * 86400
+```
+
+`transactionNanos` はp95/p99、`advisoryWaitNanos` はp99を集計する。30日/365日の値は実測窓からのprojectionとして記録し、未測定値をproduction事実として扱わない。
+
 ### 15.2 手数料モデル
 
 [設計提案] 手数料率は毎起動または定期的に `get_symbol_rules` から取得する。取得できない場合のみconfig fallbackを使う。

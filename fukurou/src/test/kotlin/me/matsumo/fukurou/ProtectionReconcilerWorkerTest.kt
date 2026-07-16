@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataIntegritySnapshot
+import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
 import me.matsumo.fukurou.trading.market.MarketEventSession
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
@@ -343,6 +344,52 @@ class ProtectionReconcilerWorkerTest {
 
         assertEquals(MarketDataGapReason.TRANSPORT_LIVENESS_LOST, integrityRepository.snapshot().getOrThrow().gapReason)
         assertTrue(stream.connectCount >= 2)
+    }
+
+    @Test
+    fun worker_converges_receipt_persistence_failure_to_typed_gap_without_applying_trade() = runBlocking {
+        val clock = Clock.fixed(Instant.parse("2026-07-02T00:00:00Z"), ZoneOffset.UTC)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000182")
+        val signals = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val integrityRepository = WorkerTestMarketDataIntegrityRepository()
+        val broker = EpisodicMaintenanceFailureBroker(
+            PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(clock = clock),
+                riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+                decisionRepository = InMemoryDecisionRepository(clock),
+                clock = clock,
+            ),
+        )
+        val stream = WorkerTestMarketEventStream(
+            session = WorkerSignalMarketEventSession(sessionId, clock.instant(), signals),
+        )
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = InMemoryRiskStateRepository(clock = clock),
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = InMemoryTradingLock(clock),
+            marketEventStream = stream,
+            marketDataIntegrityRepository = integrityRepository,
+            broker = broker,
+            clock = clock,
+        )
+        val worker = ProtectionReconcilerWorker(reconciler, interval = Duration.ofMillis(10))
+
+        worker.use {
+            worker.start()
+            signals.send(Result.failure(MarketEventReceiptPersistenceException()))
+
+            withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+                while (integrityRepository.snapshot().getOrThrow().gapReason == null) {
+                    delay(1.toDuration(DurationUnit.MILLISECONDS))
+                }
+            }
+        }
+
+        assertEquals(0, broker.appliedEventCount.get())
+        assertEquals(
+            MarketDataGapReason.DATABASE_FAILURE,
+            integrityRepository.snapshot().getOrThrow().gapReason,
+        )
     }
 }
 

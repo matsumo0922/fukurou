@@ -7,7 +7,11 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptCommit
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptRepository
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.market.TransportActivityKind
 import java.net.Authenticator
 import java.net.CookieHandler
@@ -40,6 +44,7 @@ import kotlin.test.assertTrue
 class GmoPublicWebSocketMarketEventStreamTest {
     private val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000163")
     private val decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId)
+    private val directExecutor = Executor { command -> command.run() }
 
     @Test
     fun `同値 payload も別 market event として連番を付ける`() {
@@ -135,6 +140,8 @@ class GmoPublicWebSocketMarketEventStreamTest {
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = clock,
+            receiptRepository = SuccessfulReceiptRepository,
+            receiptExecutor = directExecutor,
         )
 
         listener.onText(NoOpWebSocket, tradePayload(), true)
@@ -151,6 +158,58 @@ class GmoPublicWebSocketMarketEventStreamTest {
     }
 
     @Test
+    fun `listener は socket observation 後の receipt commit 完了まで trade を queue に渡さない`() = runBlocking {
+        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val observedAt = Instant.parse("2026-07-10T00:00:01Z")
+        val repository = BlockingReceiptRepository()
+        val listener = GmoWebSocketListener(
+            messages = messages,
+            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
+            clock = Clock.fixed(observedAt, ZoneOffset.UTC),
+            receiptRepository = repository,
+        )
+
+        val dispatch = requireNotNull(listener.onText(NoOpWebSocket, tradePayload(), true))
+        assertTrue(repository.entered.await(1, TimeUnit.SECONDS))
+        assertEquals(observedAt, repository.event?.receivedAt)
+        assertTrue(messages.tryReceive().isFailure)
+
+        repository.release.countDown()
+        dispatch.toCompletableFuture().join()
+
+        val queued = messages.receive().getOrThrow() as MarketEventSessionSignal.Trade
+        assertEquals(observedAt, queued.event.receivedAt)
+    }
+
+    @Test
+    fun `listener は receipt persistence failure で trade を queue に渡さず terminal failure を1件返す`() = runBlocking {
+        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val listener = GmoWebSocketListener(
+            messages = messages,
+            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
+            clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            receiptRepository = FailingReceiptRepository,
+            receiptExecutor = directExecutor,
+        )
+
+        listener.onText(NoOpWebSocket, tradePayload(), true)
+
+        assertTrue(messages.receive().exceptionOrNull() is MarketEventReceiptPersistenceException)
+        assertTrue(messages.tryReceive().isFailure)
+    }
+
+    @Test
+    fun `receipt commit log は latency 入力だけを含み payload と source identity を含まない`() {
+        val message = paperMarketReceiptCommitLogMessage(receiptCommit())
+
+        assertTrue(message.contains("transactionNanos=1"))
+        assertTrue(message.contains("advisoryWaitNanos=1"))
+        assertTrue(!message.contains(sessionId.toString()))
+        assertTrue(!message.contains("10000000"))
+        assertTrue(!message.contains("SELL"))
+    }
+
+    @Test
     fun `listener buffer overflowはqueued tradeの後にterminal failureにする`() = runBlocking {
         val messages = Channel<Result<MarketEventSessionSignal>>(capacity = 1)
         val session = GmoMarketEventSession(sessionId, Instant.EPOCH, NoOpWebSocket, messages)
@@ -158,6 +217,8 @@ class GmoPublicWebSocketMarketEventStreamTest {
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            receiptRepository = SuccessfulReceiptRepository,
+            receiptExecutor = directExecutor,
         )
 
         listener.onText(NoOpWebSocket, tradePayload(), true)
@@ -175,6 +236,8 @@ class GmoPublicWebSocketMarketEventStreamTest {
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = Clock.fixed(observedAt, ZoneOffset.UTC),
+            receiptRepository = SuccessfulReceiptRepository,
+            receiptExecutor = directExecutor,
         )
 
         listener.onText(NoOpWebSocket, """{"status":0}""", true)
@@ -196,6 +259,8 @@ class GmoPublicWebSocketMarketEventStreamTest {
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            receiptRepository = SuccessfulReceiptRepository,
+            receiptExecutor = directExecutor,
         )
 
         listener.onText(NoOpWebSocket, tradePayload(), true)
@@ -218,6 +283,8 @@ class GmoPublicWebSocketMarketEventStreamTest {
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            receiptRepository = SuccessfulReceiptRepository,
+            receiptExecutor = directExecutor,
         )
         val error = IllegalStateException("network error")
 
@@ -244,6 +311,8 @@ class GmoPublicWebSocketMarketEventStreamTest {
             messages = messages,
             decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
             clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            receiptRepository = SuccessfulReceiptRepository,
+            receiptExecutor = directExecutor,
             afterTerminalClaim = {
                 terminalClaimed.countDown()
                 check(allowTerminalDispatch.await(1, TimeUnit.SECONDS))
@@ -278,6 +347,44 @@ class GmoPublicWebSocketMarketEventStreamTest {
             }
         """.trimIndent()
     }
+}
+
+private object SuccessfulReceiptRepository : PaperMarketEventReceiptRepository {
+    override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
+        return Result.success(receiptCommit())
+    }
+}
+
+private object FailingReceiptRepository : PaperMarketEventReceiptRepository {
+    override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
+        return Result.failure(MarketEventReceiptPersistenceException())
+    }
+}
+
+private class BlockingReceiptRepository : PaperMarketEventReceiptRepository {
+    val entered = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    var event: PaperMarketTradeEvent? = null
+        private set
+
+    override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
+        this.event = event
+        entered.countDown()
+        check(release.await(1, TimeUnit.SECONDS))
+
+        return Result.success(receiptCommit())
+    }
+}
+
+private fun receiptCommit(): PaperMarketEventReceiptCommit {
+    return PaperMarketEventReceiptCommit(
+        receiptId = UUID.fromString("00000000-0000-0000-0000-000000000164"),
+        admissionOrdinal = 1,
+        payloadHash = "a".repeat(64),
+        duplicate = false,
+        transactionDurationNanos = 1,
+        advisoryWaitNanos = 1,
+    )
 }
 
 private class MutableWebSocketTestClock(

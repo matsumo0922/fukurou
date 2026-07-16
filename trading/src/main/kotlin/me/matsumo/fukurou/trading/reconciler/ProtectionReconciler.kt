@@ -26,6 +26,8 @@ import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
 import me.matsumo.fukurou.trading.market.MarketDataTransportLivenessException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptIntegrityConflictException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
 import me.matsumo.fukurou.trading.market.MarketEventSession
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
@@ -767,6 +769,8 @@ private fun Throwable?.toGapReason(): MarketDataGapReason {
     return when {
         this is MarketDataTransportLivenessException -> MarketDataGapReason.TRANSPORT_LIVENESS_LOST
         this is InvalidMarketDataMessageException -> MarketDataGapReason.INVALID_MESSAGE
+        this is MarketEventReceiptIntegrityConflictException -> MarketDataGapReason.DATABASE_FAILURE
+        this is MarketEventReceiptPersistenceException -> MarketDataGapReason.DATABASE_FAILURE
         this?.message.orEmpty().contains("sequence gap", ignoreCase = true) -> MarketDataGapReason.SEQUENCE_GAP
         this is java.sql.SQLException -> MarketDataGapReason.DATABASE_FAILURE
         else -> MarketDataGapReason.DISCONNECTED
@@ -781,6 +785,8 @@ private fun Throwable?.toMarketDataGapDetail(): String? {
         is MarketDataBackpressureException,
         is MarketDataSubscriptionException,
         is MarketDataTransportLivenessException,
+        is MarketEventReceiptIntegrityConflictException,
+        is MarketEventReceiptPersistenceException,
         -> "${javaClass.simpleName}: ${message.orEmpty()}"
 
         else -> javaClass.simpleName
