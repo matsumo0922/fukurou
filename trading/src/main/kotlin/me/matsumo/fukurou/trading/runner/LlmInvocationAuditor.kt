@@ -183,6 +183,11 @@ class LlmInvocationAuditor(
         val completedInvocation = requireNotNull(invocationResult)
         if (cleanupFailure == null) {
             humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        } else {
+            humanLogger(
+                "$phaseName completed with cleanup failure " +
+                    "invocation=${request.invocationId} duration=${duration.toMillis()}ms",
+            )
         }
 
         return Result.success(

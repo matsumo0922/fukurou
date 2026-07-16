@@ -249,7 +249,10 @@ class LlmInvocationAuditorTest {
         assertEquals("12", auditUsage["usage"]?.jsonObject?.get("inputTokens")?.jsonPrimitive?.content)
         assertFalse(commandEventLog.events().single().payload.contains("path-marker"))
         assertFalse(commandEventLog.events().single().payload.contains("path-message-marker"))
-        assertEquals(emptyList(), humanLogs)
+        assertEquals(1, humanLogs.size)
+        assertTrue(humanLogs.single().startsWith("falsifier completed with cleanup failure invocation="))
+        assertFalse(humanLogs.single().contains("path-marker"))
+        assertFalse(humanLogs.single().contains("path-message-marker"))
     }
 
     @Test

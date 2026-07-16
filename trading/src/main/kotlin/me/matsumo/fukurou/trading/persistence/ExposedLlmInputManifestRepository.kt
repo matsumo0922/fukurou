@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.persistence
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.LlmAuditRootKind
@@ -12,6 +13,7 @@ import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
 import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
 import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.audit.withLlmInputPersistenceValueStage
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import org.jetbrains.exposed.v1.jdbc.Database
@@ -41,44 +43,47 @@ class ExposedLlmInputManifestRepository(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
     ): Result<Unit> {
-        var stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE
-
         val result = write {
-            materialManifest.requireValidSnapshotHash()
-            ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-            stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE
-            require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-            require(materialManifest.invocationId == runManifest.invocationId) {
-                "run manifest material scope mismatch."
+            withLlmInputPersistenceValueStage(LlmInputPersistenceStage.MATERIAL_PERSISTENCE) {
+                materialManifest.requireValidSnapshotHash()
+                ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
             }
-            require(runManifest.materialInvocationId == materialManifest.invocationId) {
-                "run manifest material reference mismatch."
+            withLlmInputPersistenceValueStage(LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE) {
+                require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
+                require(materialManifest.invocationId == runManifest.invocationId) {
+                    "run manifest material scope mismatch."
+                }
+                require(runManifest.materialInvocationId == materialManifest.invocationId) {
+                    "run manifest material reference mismatch."
+                }
+                require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
+                    "run manifest material hash mismatch."
+                }
+                ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
+                require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
+                    "run manifest canonical hash mismatch."
+                }
+                requireReferenced(SELECT_ROOT_EXISTS_SQL, runManifest.rootId)
             }
-            require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
-                "run manifest material hash mismatch."
+            withLlmInputPersistenceValueStage(LlmInputPersistenceStage.MATERIAL_PERSISTENCE) {
+                appendMaterial(materialManifest)
             }
-            ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-            require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-                "run manifest canonical hash mismatch."
-            }
-            requireReferenced(SELECT_ROOT_EXISTS_SQL, runManifest.rootId)
-            stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE
-            appendMaterial(materialManifest)
-            stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE
-            appendImmutable(
-                INSERT_RUN_SQL,
-                runManifest.invocationId,
-                runManifest.canonicalContentHash,
-                SELECT_RUN_HASH_SQL,
-            ) { statement ->
-                statement.setString(1, runManifest.invocationId)
-                statement.setString(2, runManifest.rootId)
-                statement.setString(3, runManifest.materialInvocationId)
-                statement.setString(4, runManifest.materialContentHash)
-                statement.setInt(5, runManifest.schemaVersion)
-                statement.setString(6, runManifest.canonicalContentHash)
-                statement.setLong(7, runManifest.capturedAt.toEpochMilli())
-                statement.setString(8, LlmManifestJsonCodec.encode(runManifest))
+            withLlmInputPersistenceValueStage(LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE) {
+                appendImmutable(
+                    INSERT_RUN_SQL,
+                    runManifest.invocationId,
+                    runManifest.canonicalContentHash,
+                    SELECT_RUN_HASH_SQL,
+                ) { statement ->
+                    statement.setString(1, runManifest.invocationId)
+                    statement.setString(2, runManifest.rootId)
+                    statement.setString(3, runManifest.materialInvocationId)
+                    statement.setString(4, runManifest.materialContentHash)
+                    statement.setInt(5, runManifest.schemaVersion)
+                    statement.setString(6, runManifest.canonicalContentHash)
+                    statement.setLong(7, runManifest.capturedAt.toEpochMilli())
+                    statement.setString(8, LlmManifestJsonCodec.encode(runManifest))
+                }
             }
         }
 
@@ -89,7 +94,8 @@ class ExposedLlmInputManifestRepository(
                     if (throwable is LlmInputPersistenceException) {
                         throwable
                     } else {
-                        LlmInputPersistenceException(stage, throwable)
+                        // stage 内処理後の untyped transaction / commit failure は run manifest 境界として扱う。
+                        LlmInputPersistenceException(LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE, throwable)
                     },
                 )
             },
@@ -188,10 +194,20 @@ class ExposedLlmInputManifestRepository(
     }
 
     private suspend fun write(block: org.jetbrains.exposed.v1.jdbc.JdbcTransaction.() -> Unit): Result<Unit> =
-        withContext(Dispatchers.IO) { runCatching { transaction(database) { block() } } }
+        withContext(Dispatchers.IO) { runTransactionCatchingCancellation { transaction(database) { block() } } }
 
     private suspend fun <T> read(block: org.jetbrains.exposed.v1.jdbc.JdbcTransaction.() -> T): Result<T> =
-        withContext(Dispatchers.IO) { runCatching { transaction(database) { block() } } }
+        withContext(Dispatchers.IO) { runTransactionCatchingCancellation { transaction(database) { block() } } }
+
+    private fun <T> runTransactionCatchingCancellation(block: () -> T): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
+        }
+    }
 
     private fun org.jetbrains.exposed.v1.jdbc.JdbcTransaction.appendImmutable(
         insertSql: String,

@@ -37,6 +37,7 @@ import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
 import me.matsumo.fukurou.trading.audit.LlmRunTriggerSnapshot
 import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
 import me.matsumo.fukurou.trading.audit.LlmPhaseInputCaptureException
+import me.matsumo.fukurou.trading.audit.runCatchingPreservingCancellation
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PaperTradeResult
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
@@ -303,7 +304,7 @@ enum class OneShotRunnerStatus {
  *
  * @param invocationId runner 起動 ID
  * @param status 最終状態
- * @param decision 提出済み decision
+ * @param decision runner が最終結果として採用した decision。process failure では保存済みでも返さない
  * @param intent entry intent
  * @param tradeResult paper trade result
  */
@@ -863,7 +864,7 @@ class OneShotLlmRunner(
             return recordTtlSweepFailure(input.invocationId, proposerContext, ttlSweepResult.exceptionOrNull())
         }
 
-        val materialResult = runCatching {
+        val materialResult = runCatchingPreservingCancellation {
             val manifest = captureMaterialManifest(input)
             appendRunInputManifest(input, triggerSnapshot, manifest).getOrThrow()
 
@@ -899,7 +900,7 @@ class OneShotLlmRunner(
         input: OneShotRunBodyInput,
         triggerSnapshot: LlmRunTriggerSnapshot,
         materialManifest: DecisionMaterialStateManifest,
-    ): Result<Unit> = runCatching {
+    ): Result<Unit> = runCatchingPreservingCancellation {
         val runManifestWithoutHash = withStandardMaterialValueStage(
             stage = StandardMaterialFailureStage.CANONICAL_HASH,
         ) {
@@ -939,11 +940,12 @@ class OneShotLlmRunner(
         persistedStandardMaterial: DecisionMaterialStateManifest?,
     ): OneShotRunnerResult {
         val manifestResult = if (persistedStandardMaterial == null) {
-            createRiskReductionMaterialManifest(input, standardFailure)
-                .mapCatching { manifest ->
-                    appendRunInputManifest(input, triggerSnapshot, manifest).getOrThrow()
-                    manifest
-                }
+            runCatchingPreservingCancellation {
+                val manifest = createRiskReductionMaterialManifest(input, standardFailure).getOrThrow()
+                appendRunInputManifest(input, triggerSnapshot, manifest).getOrThrow()
+
+                manifest
+            }
         } else {
             Result.success(persistedStandardMaterial)
         }
@@ -996,7 +998,7 @@ class OneShotLlmRunner(
             return OneShotRunnerResult(
                 invocationId = input.invocationId,
                 status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                decision = decision,
+                decision = null,
                 intent = null,
                 tradeResult = null,
                 terminalCause = processFailure.toTerminalCause(),
@@ -1053,7 +1055,7 @@ class OneShotLlmRunner(
     private suspend fun createRiskReductionMaterialManifest(
         input: OneShotRunBodyInput,
         standardFailure: Throwable,
-    ): Result<DecisionMaterialStateManifest> = runCatching {
+    ): Result<DecisionMaterialStateManifest> = runCatchingPreservingCancellation {
         val account = tradingRuntime.decisionAccountSnapshotReader.read().getOrElse { throwable ->
             standardFailure.addSuppressed(throwable)
             throw standardFailure
@@ -1102,7 +1104,7 @@ class OneShotLlmRunner(
             tradingRuntime.decisionAccountSnapshotReader.read().getOrThrow()
         }
         requireLiveClaimForInvocation(input.invocationId)
-        val marketDataSource = withStandardMaterialValueStage(StandardMaterialFailureStage.TICKER) {
+        val marketDataSource = withStandardMaterialValueStage(StandardMaterialFailureStage.MARKET_DATA_SOURCE) {
             requireNotNull(materialMarketDataSource) { "material market data source is required." }
         }
         val ticker = withStandardMaterialStage(StandardMaterialFailureStage.TICKER) {
@@ -2599,11 +2601,13 @@ private fun LlmPhaseProcessFailure.toTerminalCause(): LlmRunTerminalCause = when
 }
 
 private fun Throwable.toStandardMaterialPersistenceFailure(): StandardMaterialFailure {
+    if (this is CancellationException) throw this
     if (this is StandardMaterialFailure) return this
     val persistenceFailure = this as? LlmInputPersistenceException
     val stage = when (persistenceFailure?.stage) {
         LlmInputPersistenceStage.MATERIAL_PERSISTENCE -> StandardMaterialFailureStage.MATERIAL_PERSISTENCE
         LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE -> StandardMaterialFailureStage.RUN_MANIFEST_PERSISTENCE
+        // appendRunWithMaterial 後の untyped failure は transaction / commit 境界として扱う。
         null -> StandardMaterialFailureStage.RUN_MANIFEST_PERSISTENCE
     }
 

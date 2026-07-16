@@ -626,6 +626,37 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun missingMaterialMarketDataSource_failClosedAtConfigurationStage() = runBlocking {
+        val fixture = runnerFixture(
+            materialMarketDataSource = null,
+        ) { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "missing-material-source")).getOrThrow()
+        val manifest = assertNotNull(
+            fixture.runtime.decisionMaterialStateRepository.find("missing-material-source").getOrThrow(),
+        )
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+        assertEquals("MARKET_DATA_SOURCE", manifest.missingSources.single().reason)
+    }
+
+    @Test
+    fun standardMaterialCapture_rethrowsCancellationWithoutTypedStage() = runBlocking {
+        val fixture = runnerFixture(marketDataSource = CancellingMaterialMarketDataSource) { cleanExit() }
+
+        val failure = assertFailsWith<CancellationException> {
+            fixture.runOneShot(defaultRequest().copy(invocationId = "cancelled-material")).getOrThrow()
+        }
+
+        assertEquals("material capture cancelled", failure.message)
+        assertTrue(fixture.processRunner.launches.isEmpty())
+        assertNull(fixture.runtime.decisionMaterialStateRepository.find("cancelled-material").getOrThrow())
+    }
+
+    @Test
     fun riskReductionOnly_processFailureWinsOverPersistedDecision() = runBlocking {
         val fixture = runnerFixture(marketDataSource = FailingMaterialMarketDataSource) { command ->
             submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
@@ -635,6 +666,7 @@ class OneShotLlmRunnerTest {
         val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-process-failure")).getOrThrow()
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.decision)
         assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
         assertTrue(fixture.eventLog.events().containsNoTradeReason("risk_reduction_only_process_failed"))
         val details = fixture.eventLog.events().singleRunnerPhaseDetails("risk_reduction_only")
@@ -2735,6 +2767,7 @@ private fun runnerFixture(
     logger: (String) -> Unit = {},
     clock: Clock = fixedClock(),
     marketDataSource: MarketDataSource = FakeMarketDataSource,
+    materialMarketDataSource: MarketDataSource? = marketDataSource,
     cliVersionProbe: LlmCliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
     llmInvokerTransform: (LlmInvoker) -> LlmInvoker = { invoker -> invoker },
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
@@ -2751,7 +2784,7 @@ private fun runnerFixture(
     val runner = OneShotLlmRunner(
         tradingRuntime = runtime,
         tradingConfig = config,
-        materialMarketDataSource = marketDataSource,
+        materialMarketDataSource = materialMarketDataSource,
         llmInvoker = llmInvokerTransform(
             ShellLlmInvoker(
                 commandRenderer = DefaultLlmCommandRenderer(),
@@ -3893,6 +3926,12 @@ private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarket
 private object FailingMaterialMarketDataSource : MarketDataSource by FakeMarketDataSource {
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
         return Result.failure(GmoRateLimitException("fixture market failure"))
+    }
+}
+
+private object CancellingMaterialMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        throw CancellationException("material capture cancelled")
     }
 }
 

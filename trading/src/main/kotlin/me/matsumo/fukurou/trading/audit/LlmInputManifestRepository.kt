@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.audit
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
@@ -59,14 +60,14 @@ class InMemoryLlmInputManifestRepository(
     override suspend fun appendRunWithMaterial(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
-    ): Result<Unit> = runCatching {
-        persistenceStage(
+    ): Result<Unit> = runCatchingPreservingCancellation {
+        withLlmInputPersistenceSuspendStage(
             stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE,
         ) {
             materialManifest.requireValidSnapshotHash()
             ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
         }
-        persistenceStage(
+        withLlmInputPersistenceSuspendStage(
             stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE,
         ) {
             require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
@@ -85,12 +86,12 @@ class InMemoryLlmInputManifestRepository(
             }
             require(findRoot(runManifest.rootId).getOrThrow() != null) { "run manifest audit root is missing." }
         }
-        persistenceStage(
+        withLlmInputPersistenceSuspendStage(
             stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE,
         ) {
             materialRepository.append(materialManifest).getOrThrow()
         }
-        persistenceStage(
+        withLlmInputPersistenceSuspendStage(
             stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE,
         ) {
             appendImmutable(runs, runManifest.invocationId, runManifest, "run manifest").getOrThrow()
@@ -98,7 +99,7 @@ class InMemoryLlmInputManifestRepository(
     }
 
     override suspend fun appendPhase(manifest: LlmPhaseInputManifest): Result<Unit> {
-        return runCatching {
+        return runCatchingPreservingCancellation {
             ManifestPersistencePolicy.validatePhase(manifest, knownSecretValues)
             require(manifest.rootId == manifest.invocationId) { "phase manifest root/invocation mismatch." }
             require(findRoot(manifest.rootId).getOrThrow() != null) { "phase manifest audit root is missing." }
@@ -119,7 +120,7 @@ class InMemoryLlmInputManifestRepository(
     }
 
     override suspend fun appendObservation(observation: LlmPhaseObservation): Result<Unit> {
-        return runCatching {
+        return runCatchingPreservingCancellation {
             ManifestPersistencePolicy.validateObservation(observation, knownSecretValues)
         }.fold(
             onSuccess = { appendImmutable(observations, observation.phaseManifestId, observation, "phase observation") },
@@ -128,23 +129,23 @@ class InMemoryLlmInputManifestRepository(
     }
 
     override suspend fun findRoot(rootId: String): Result<LlmInvocationAuditRoot?> =
-        runCatching { mutex.withLock { roots[rootId] } }
+        runCatchingPreservingCancellation { mutex.withLock { roots[rootId] } }
 
     override suspend fun findRun(invocationId: String): Result<LlmRunInputManifest?> =
-        runCatching { mutex.withLock { runs[invocationId] } }
+        runCatchingPreservingCancellation { mutex.withLock { runs[invocationId] } }
 
     override suspend fun findPhase(phaseManifestId: String): Result<LlmPhaseInputManifest?> =
-        runCatching { mutex.withLock { phases[phaseManifestId] } }
+        runCatchingPreservingCancellation { mutex.withLock { phases[phaseManifestId] } }
 
     override suspend fun findObservation(phaseManifestId: String): Result<LlmPhaseObservation?> =
-        runCatching { mutex.withLock { observations[phaseManifestId] } }
+        runCatchingPreservingCancellation { mutex.withLock { observations[phaseManifestId] } }
 
     private suspend fun <T> appendImmutable(
         values: MutableMap<String, T>,
         key: String,
         value: T,
         label: String,
-    ): Result<Unit> = runCatching {
+    ): Result<Unit> = runCatchingPreservingCancellation {
         mutex.withLock {
             val existing = values[key]
             require(existing == null || existing == value) { "$label content mismatch." }
@@ -153,13 +154,40 @@ class InMemoryLlmInputManifestRepository(
     }
 }
 
-private suspend fun <T> persistenceStage(stage: LlmInputPersistenceStage, block: suspend () -> T): T {
+internal suspend fun <T> withLlmInputPersistenceSuspendStage(
+    stage: LlmInputPersistenceStage,
+    block: suspend () -> T,
+): T {
     return try {
         block()
+    } catch (throwable: CancellationException) {
+        throw throwable
     } catch (failure: LlmInputPersistenceException) {
         throw failure
     } catch (throwable: Throwable) {
         throw LlmInputPersistenceException(stage, throwable)
+    }
+}
+
+internal fun <T> withLlmInputPersistenceValueStage(stage: LlmInputPersistenceStage, block: () -> T): T {
+    return try {
+        block()
+    } catch (throwable: CancellationException) {
+        throw throwable
+    } catch (failure: LlmInputPersistenceException) {
+        throw failure
+    } catch (throwable: Throwable) {
+        throw LlmInputPersistenceException(stage, throwable)
+    }
+}
+
+internal suspend fun <T> runCatchingPreservingCancellation(block: suspend () -> T): Result<T> {
+    return try {
+        Result.success(block())
+    } catch (throwable: CancellationException) {
+        throw throwable
+    } catch (throwable: Throwable) {
+        Result.failure(throwable)
     }
 }
 

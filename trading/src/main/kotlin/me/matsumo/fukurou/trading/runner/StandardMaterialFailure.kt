@@ -1,8 +1,11 @@
 package me.matsumo.fukurou.trading.runner
 
+import kotlinx.coroutines.CancellationException
+
 /** Standard material 構築に失敗した境界を表す安定した stage。 */
 enum class StandardMaterialFailureStage {
     ACCOUNT_SNAPSHOT,
+    MARKET_DATA_SOURCE,
     TICKER,
     CANDLES,
     ORDERBOOK,
@@ -21,6 +24,8 @@ class StandardMaterialFailure(
 internal suspend fun <T> withStandardMaterialStage(stage: StandardMaterialFailureStage, block: suspend () -> T): T {
     return try {
         block()
+    } catch (throwable: CancellationException) {
+        throw throwable
     } catch (failure: StandardMaterialFailure) {
         throw failure
     } catch (throwable: Throwable) {
@@ -31,6 +36,8 @@ internal suspend fun <T> withStandardMaterialStage(stage: StandardMaterialFailur
 internal fun <T> withStandardMaterialValueStage(stage: StandardMaterialFailureStage, block: () -> T): T {
     return try {
         block()
+    } catch (throwable: CancellationException) {
+        throw throwable
     } catch (failure: StandardMaterialFailure) {
         throw failure
     } catch (throwable: Throwable) {

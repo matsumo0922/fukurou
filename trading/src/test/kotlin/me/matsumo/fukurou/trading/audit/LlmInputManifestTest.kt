@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.audit
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
@@ -26,6 +27,29 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class LlmInputManifestTest {
+    @Test
+    fun persistenceStages_rethrowCancellation() = runBlocking {
+        val cancellation = CancellationException("repository cancellation")
+
+        val suspendFailure = assertFailsWith<CancellationException> {
+            withLlmInputPersistenceSuspendStage<Unit>(LlmInputPersistenceStage.MATERIAL_PERSISTENCE) {
+                throw cancellation
+            }
+        }
+        val valueFailure = assertFailsWith<CancellationException> {
+            withLlmInputPersistenceValueStage<Unit>(LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE) {
+                throw cancellation
+            }
+        }
+        val resultFailure = assertFailsWith<CancellationException> {
+            runCatchingPreservingCancellation<Unit> { throw cancellation }
+        }
+
+        assertTrue(suspendFailure === cancellation)
+        assertTrue(valueFailure === cancellation)
+        assertTrue(resultFailure === cancellation)
+    }
+
     @Test
     fun append_isIdempotentForSameContentAndRejectsMismatch() = runBlocking {
         val repository = InMemoryLlmInputManifestRepository()
