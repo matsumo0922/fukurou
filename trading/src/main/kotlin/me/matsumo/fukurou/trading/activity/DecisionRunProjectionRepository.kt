@@ -69,7 +69,7 @@ fun classifyDecisionRunOutcome(evidence: DecisionRunOutcomeEvidence): DecisionRu
 }
 
 private fun DecisionRunOutcomeEvidence.safetyOutcome(): DecisionRunOutcome? {
-    val denied = terminalCause == LlmRunTerminalCause.SAFETY_DENIED || safetyRule != null
+    val denied = terminalCause == LlmRunTerminalCause.SAFETY_DENIED
 
     return if (denied) DecisionRunOutcome.DENIED else null
 }
@@ -97,6 +97,7 @@ private fun DecisionRunOutcomeEvidence.processOutcome(): DecisionRunOutcome {
             LlmRunTerminalCause.TIMED_OUT,
             LlmRunTerminalCause.RUNNER_FAILED,
         ) -> DecisionRunOutcome.FAILED
+        safetyRule != null -> DecisionRunOutcome.DENIED
         hasNoEntryEvidence() -> DecisionRunOutcome.NO_ENTRY
         status == LLM_RUN_STATUS_FAILED || status == LLM_RUN_STATUS_CANCELLED -> DecisionRunOutcome.FAILED
         else -> DecisionRunOutcome.FAILED

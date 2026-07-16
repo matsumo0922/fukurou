@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.OpportunityEpisodeLifecycleObserver
@@ -86,6 +87,21 @@ class LlmDaemonSchedulerCompositionTest {
 
     @Test
     fun productionRunnerFactoryUsesOrderbookSnapshotForStandardProposer() = runBlocking {
+        restoreAdmissionHealthFlags()
+
+        try {
+            assertProductionRunnerFactoryUsesOrderbookSnapshot()
+        } finally {
+            restoreAdmissionHealthFlags()
+        }
+    }
+
+    private fun restoreAdmissionHealthFlags() {
+        LlmExecutionAdmissionHealth.setHeartbeatHealthy(true)
+        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(true)
+    }
+
+    private suspend fun assertProductionRunnerFactoryUsesOrderbookSnapshot() {
         val config = TradingBotConfig.fromEnvironment(emptyMap())
         val clock = Clock.fixed(Instant.parse("2026-07-16T00:00:00Z"), ZoneOffset.UTC)
         val runtime = TradingRuntimeFactory.inMemory(
