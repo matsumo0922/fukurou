@@ -4,6 +4,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.LlmAuditRootKind
 import me.matsumo.fukurou.trading.audit.LlmInputManifestRepository
+import me.matsumo.fukurou.trading.audit.LlmInputPersistenceException
+import me.matsumo.fukurou.trading.audit.LlmInputPersistenceStage
 import me.matsumo.fukurou.trading.audit.LlmInvocationAuditRoot
 import me.matsumo.fukurou.trading.audit.LlmManifestJsonCodec
 import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
@@ -38,40 +40,60 @@ class ExposedLlmInputManifestRepository(
     override suspend fun appendRunWithMaterial(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
-    ): Result<Unit> = write {
-        materialManifest.requireValidSnapshotHash()
-        ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-        require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-        require(materialManifest.invocationId == runManifest.invocationId) {
-            "run manifest material scope mismatch."
+    ): Result<Unit> {
+        var stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE
+
+        val result = write {
+            materialManifest.requireValidSnapshotHash()
+            ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
+            stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE
+            require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
+            require(materialManifest.invocationId == runManifest.invocationId) {
+                "run manifest material scope mismatch."
+            }
+            require(runManifest.materialInvocationId == materialManifest.invocationId) {
+                "run manifest material reference mismatch."
+            }
+            require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
+                "run manifest material hash mismatch."
+            }
+            ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
+            require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
+                "run manifest canonical hash mismatch."
+            }
+            requireReferenced(SELECT_ROOT_EXISTS_SQL, runManifest.rootId)
+            stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE
+            appendMaterial(materialManifest)
+            stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE
+            appendImmutable(
+                INSERT_RUN_SQL,
+                runManifest.invocationId,
+                runManifest.canonicalContentHash,
+                SELECT_RUN_HASH_SQL,
+            ) { statement ->
+                statement.setString(1, runManifest.invocationId)
+                statement.setString(2, runManifest.rootId)
+                statement.setString(3, runManifest.materialInvocationId)
+                statement.setString(4, runManifest.materialContentHash)
+                statement.setInt(5, runManifest.schemaVersion)
+                statement.setString(6, runManifest.canonicalContentHash)
+                statement.setLong(7, runManifest.capturedAt.toEpochMilli())
+                statement.setString(8, LlmManifestJsonCodec.encode(runManifest))
+            }
         }
-        require(runManifest.materialInvocationId == materialManifest.invocationId) {
-            "run manifest material reference mismatch."
-        }
-        require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
-            "run manifest material hash mismatch."
-        }
-        ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-        require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-            "run manifest canonical hash mismatch."
-        }
-        requireReferenced(SELECT_ROOT_EXISTS_SQL, runManifest.rootId)
-        appendMaterial(materialManifest)
-        appendImmutable(
-            INSERT_RUN_SQL,
-            runManifest.invocationId,
-            runManifest.canonicalContentHash,
-            SELECT_RUN_HASH_SQL,
-        ) { statement ->
-            statement.setString(1, runManifest.invocationId)
-            statement.setString(2, runManifest.rootId)
-            statement.setString(3, runManifest.materialInvocationId)
-            statement.setString(4, runManifest.materialContentHash)
-            statement.setInt(5, runManifest.schemaVersion)
-            statement.setString(6, runManifest.canonicalContentHash)
-            statement.setLong(7, runManifest.capturedAt.toEpochMilli())
-            statement.setString(8, LlmManifestJsonCodec.encode(runManifest))
-        }
+
+        return result.fold(
+            onSuccess = { Result.success(Unit) },
+            onFailure = { throwable ->
+                Result.failure(
+                    if (throwable is LlmInputPersistenceException) {
+                        throwable
+                    } else {
+                        LlmInputPersistenceException(stage, throwable)
+                    },
+                )
+            },
+        )
     }
 
     override suspend fun appendPhase(manifest: LlmPhaseInputManifest): Result<Unit> = write {

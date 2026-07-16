@@ -19,6 +19,8 @@ import me.matsumo.fukurou.trading.audit.LlmAuditRootKind
 import me.matsumo.fukurou.trading.audit.LlmDecisionReconstructionClassification
 import me.matsumo.fukurou.trading.audit.LlmDecisionReconstructionReason
 import me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus
+import me.matsumo.fukurou.trading.audit.LlmInputPersistenceException
+import me.matsumo.fukurou.trading.audit.LlmInputPersistenceStage
 import me.matsumo.fukurou.trading.audit.LlmInvocationAuditRoot
 import me.matsumo.fukurou.trading.audit.LlmManifestJsonCodec
 import me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest
@@ -125,6 +127,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunFinish
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
 import me.matsumo.fukurou.trading.evaluation.toEquitySnapshotRecord
+import me.matsumo.fukurou.trading.exchange.gmo.ProductionLikeStandardMaterialMarketDataSource
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.invoker.LlmEffort
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -5936,6 +5939,71 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_runner_persistsProductionLikeStandardBundleAndKeepsItImmutable() = runPostgresTest {
+        val invocationId = "production-like-standard"
+        val clock = fixedClock()
+        val config = TradingBotConfig()
+        TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+        ExposedLlmLaunchReservationRepository(database).tryReserve(
+            llmLaunchReservationRequest(invocationId, config.runner, fixedInstant()),
+        ).getOrThrow()
+        val fixture = postgresOneShotFixture(
+            config = config,
+            clock = clock,
+            marketDataSource = ProductionLikeStandardMaterialMarketDataSource,
+        )
+
+        try {
+            val result = fixture.runner.runOneShot(postgresOneShotRequest(invocationId)).getOrThrow()
+            val material = requireNotNull(
+                fixture.runtime.decisionMaterialStateRepository.find(invocationId).getOrThrow(),
+            )
+            val run = requireNotNull(fixture.runtime.llmInputManifestRepository.findRun(invocationId).getOrThrow())
+            val phase = fixture.runtime.llmInputManifestRepository.findPhase("$invocationId:PROPOSER").getOrThrow()
+            val originalMaterialHash = material.persistedSnapshotHash()
+            val originalRunHash = run.canonicalContentHash
+
+            assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+            assertEquals(
+                "GMO_PUBLIC_ORDERBOOK",
+                requireNotNull(material.marketFeatureBundle).orderbookSummary?.metadata?.provenance,
+            )
+            assertEquals(originalMaterialHash, run.materialContentHash)
+            assertNotNull(phase)
+            val manifestBytes = exposedTransaction(database) {
+                selectLongForTest(
+                    "SELECT octet_length(manifest_json) " +
+                        "FROM decision_material_state_manifests WHERE invocation_id='$invocationId'",
+                )
+            }
+            assertTrue(manifestBytes < 512 * 1024)
+
+            val changedMaterial = material.copy(
+                lastPriceJpy = requireNotNull(material.lastPriceJpy).add(BigDecimal.ONE),
+                snapshotContentHash = "",
+            ).withSnapshotContentHash()
+            val changedRunWithoutHash = run.copy(
+                materialContentHash = changedMaterial.persistedSnapshotHash(),
+                canonicalContentHash = "",
+            )
+            val changedRun = changedRunWithoutHash.copy(
+                canonicalContentHash = LlmManifestJsonCodec.contentHash(changedRunWithoutHash),
+            )
+            val failure = fixture.runtime.llmInputManifestRepository
+                .appendRunWithMaterial(changedMaterial, changedRun)
+                .exceptionOrNull() as LlmInputPersistenceException
+
+            assertEquals(LlmInputPersistenceStage.MATERIAL_PERSISTENCE, failure.stage)
+            val persistedMaterial = fixture.runtime.decisionMaterialStateRepository.find(invocationId).getOrThrow()
+            val persistedRun = fixture.runtime.llmInputManifestRepository.findRun(invocationId).getOrThrow()
+            assertEquals(originalMaterialHash, persistedMaterial?.persistedSnapshotHash())
+            assertEquals(originalRunHash, persistedRun?.canonicalContentHash)
+        } finally {
+            fixture.runtime.close()
+        }
+    }
+
+    @Test
     fun llm_runner_preflight_rejectsInWindowReservationWithExistingAuditReasonInPostgresPath() = runPostgresTest {
         val observedAt = fixedInstant().plus(Duration.ofHours(1))
         val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
@@ -10044,11 +10112,13 @@ private data class PostgresOneShotFixture(
 private fun PostgresTestContext.postgresOneShotFixture(
     config: TradingBotConfig,
     clock: Clock,
+    marketDataSource: MarketDataSource? = null,
 ): PostgresOneShotFixture {
     val runtime = TradingRuntimeFactory.connectedPostgres(
         dataSource = dataSource,
         database = database,
         clock = clock,
+        marketDataSource = marketDataSource,
         tradingConfig = config,
     )
     val invoker = RecordingFailureLlmInvoker()
@@ -10056,6 +10126,7 @@ private fun PostgresTestContext.postgresOneShotFixture(
         tradingRuntime = runtime,
         tradingConfig = config,
         llmInvoker = invoker,
+        materialMarketDataSource = marketDataSource,
         parentEnvironment = mapOf(
             "DB_URL" to tradingDatabaseConfig().url,
             "FUKUROU_MCP_DB_USER" to "fukurou_mcp",

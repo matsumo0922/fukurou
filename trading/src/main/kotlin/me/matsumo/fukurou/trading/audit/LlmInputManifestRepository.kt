@@ -30,6 +30,18 @@ interface LlmInputManifestRepository {
     suspend fun findObservation(phaseManifestId: String): Result<LlmPhaseObservation?>
 }
 
+/** material/run bundle 永続化に失敗した境界。 */
+enum class LlmInputPersistenceStage {
+    MATERIAL_PERSISTENCE,
+    RUN_MANIFEST_PERSISTENCE,
+}
+
+/** immutable input bundle の失敗を安定した stage で伝える例外。 */
+class LlmInputPersistenceException(
+    val stage: LlmInputPersistenceStage,
+    cause: Throwable,
+) : RuntimeException("LLM input persistence failed at ${stage.name}.", cause)
+
 /** DB 未構成 runtime 用 manifest repository。 */
 class InMemoryLlmInputManifestRepository(
     private val materialRepository: DecisionMaterialStateRepository = InMemoryDecisionMaterialStateRepository(),
@@ -48,25 +60,41 @@ class InMemoryLlmInputManifestRepository(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
     ): Result<Unit> = runCatching {
-        materialManifest.requireValidSnapshotHash()
-        ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-        require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-        require(materialManifest.invocationId == runManifest.invocationId) {
-            "run manifest material scope mismatch."
+        persistenceStage(
+            stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE,
+        ) {
+            materialManifest.requireValidSnapshotHash()
+            ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
         }
-        require(runManifest.materialInvocationId == materialManifest.invocationId) {
-            "run manifest material reference mismatch."
+        persistenceStage(
+            stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE,
+        ) {
+            require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
+            require(materialManifest.invocationId == runManifest.invocationId) {
+                "run manifest material scope mismatch."
+            }
+            require(runManifest.materialInvocationId == materialManifest.invocationId) {
+                "run manifest material reference mismatch."
+            }
+            require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
+                "run manifest material hash mismatch."
+            }
+            ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
+            require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
+                "run manifest canonical hash mismatch."
+            }
+            require(findRoot(runManifest.rootId).getOrThrow() != null) { "run manifest audit root is missing." }
         }
-        require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
-            "run manifest material hash mismatch."
+        persistenceStage(
+            stage = LlmInputPersistenceStage.MATERIAL_PERSISTENCE,
+        ) {
+            materialRepository.append(materialManifest).getOrThrow()
         }
-        ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-        require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-            "run manifest canonical hash mismatch."
+        persistenceStage(
+            stage = LlmInputPersistenceStage.RUN_MANIFEST_PERSISTENCE,
+        ) {
+            appendImmutable(runs, runManifest.invocationId, runManifest, "run manifest").getOrThrow()
         }
-        require(findRoot(runManifest.rootId).getOrThrow() != null) { "run manifest audit root is missing." }
-        materialRepository.append(materialManifest).getOrThrow()
-        appendImmutable(runs, runManifest.invocationId, runManifest, "run manifest").getOrThrow()
     }
 
     override suspend fun appendPhase(manifest: LlmPhaseInputManifest): Result<Unit> {
@@ -122,6 +150,16 @@ class InMemoryLlmInputManifestRepository(
             require(existing == null || existing == value) { "$label content mismatch." }
             if (existing == null) values[key] = value
         }
+    }
+}
+
+private suspend fun <T> persistenceStage(stage: LlmInputPersistenceStage, block: suspend () -> T): T {
+    return try {
+        block()
+    } catch (failure: LlmInputPersistenceException) {
+        throw failure
+    } catch (throwable: Throwable) {
+        throw LlmInputPersistenceException(stage, throwable)
     }
 }
 

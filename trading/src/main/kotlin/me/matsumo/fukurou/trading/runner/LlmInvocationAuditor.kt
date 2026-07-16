@@ -143,7 +143,12 @@ class LlmInvocationAuditor(
         }
         resultFailure?.let { failure ->
             failure.suppressInOrder(terminalFailures)
-            return Result.failure(failure.classifyLlmFailure(request.provider))
+            return Result.failure(
+                LlmPhaseProcessFailure(
+                    kind = LlmPhaseProcessFailureKind.START_FAILURE,
+                    cause = failure.classifyLlmFailure(request.provider),
+                ),
+            )
         }
         if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
@@ -155,34 +160,30 @@ class LlmInvocationAuditor(
             val failure = LlmInvocationTimedOutException(phaseName)
             failure.suppressInOrder(terminalFailures)
 
-            return Result.failure(failure)
+            return Result.failure(LlmPhaseProcessFailure(LlmPhaseProcessFailureKind.TIMEOUT, failure))
         }
 
         if (processFailed) {
             val failure = IllegalStateException("$phaseName process did not exit cleanly.")
             failure.suppressInOrder(terminalFailures)
 
-            return Result.failure(failure.classifyLlmFailure(request.provider))
+            return Result.failure(
+                LlmPhaseProcessFailure(
+                    kind = LlmPhaseProcessFailureKind.NON_ZERO_EXIT,
+                    cause = failure.classifyLlmFailure(request.provider),
+                ),
+            )
         }
 
         val cleanupFailure = cleanupFailures.filterNotNull().firstOrNull()
-        if (cleanupFailure != null) {
-            cleanupFailure.suppressInOrder(
-                cleanupFailures.dropWhile { failure -> failure !== cleanupFailure } + listOf(
-                    observationFailure,
-                    appendFailure,
-                ),
-            )
-            return Result.failure(cleanupFailure.classifyLlmFailure(request.provider))
-        }
-
         appendFailure?.let { failure ->
-            failure.suppressInOrder(listOf(observationFailure))
+            failure.suppressInOrder(listOf(cleanupFailure, observationFailure))
             throw failure.classifyLlmFailure(request.provider)
         }
-
         val completedInvocation = requireNotNull(invocationResult)
-        humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        if (cleanupFailure == null) {
+            humanLogger("$phaseName completed invocation=${request.invocationId} duration=${duration.toMillis()}ms")
+        }
 
         return Result.success(
             LlmPhaseAuditResult(
@@ -190,7 +191,9 @@ class LlmInvocationAuditor(
                 duration = duration,
                 authFailureSuspected = auditSignals.authFailureSuspected,
                 cliErrorReported = auditSignals.cliErrorReported,
+                cleanupFailure = cleanupFailure,
                 observationAppendFailure = observationFailure,
+                auditAppendFailure = appendFailure,
             ),
         )
     }
@@ -309,6 +312,7 @@ class LlmInvocationAuditor(
             putAssignmentAuditDetails(request, usage)
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
+            putProcessFailureKind(processResult, startFailure)
             if (auditSignals.cleanupFailed) {
                 put("cleanupFailed", "true")
             }
@@ -375,6 +379,13 @@ class LlmInvocationAuditor(
         put("modelObserved", observedModels.isNotEmpty().toString())
     }
 
+    private fun kotlinx.serialization.json.JsonObjectBuilder.putProcessFailureKind(
+        processResult: ProcessRunResult?,
+        startFailure: Throwable?,
+    ) {
+        processFailureKind(processResult, startFailure)?.let { kind -> put("processFailureKind", kind.name) }
+    }
+
     private fun ProcessRunResult.auditSignals(): LlmPhaseAuditSignals {
         val cliErrorReported = cliErrorReported()
 
@@ -382,6 +393,17 @@ class LlmInvocationAuditor(
             authFailureSuspected = authFailureSuspected(cliErrorReported),
             cliErrorReported = cliErrorReported,
         )
+    }
+
+    private fun processFailureKind(
+        processResult: ProcessRunResult?,
+        startFailure: Throwable?,
+    ): LlmPhaseProcessFailureKind? = when {
+        startFailure != null -> LlmPhaseProcessFailureKind.START_FAILURE
+        processResult?.status == ProcessRunStatus.TIMED_OUT -> LlmPhaseProcessFailureKind.TIMEOUT
+        processResult?.exitCode?.let { exitCode -> exitCode != 0 } == true ->
+            LlmPhaseProcessFailureKind.NON_ZERO_EXIT
+        else -> null
     }
 
     private fun ProcessRunResult.authFailureSuspected(cliErrorReported: Boolean): Boolean {
@@ -447,8 +469,23 @@ data class LlmPhaseAuditResult(
     val duration: Duration,
     val authFailureSuspected: Boolean,
     val cliErrorReported: Boolean,
+    val cleanupFailure: Throwable? = null,
     val observationAppendFailure: Throwable? = null,
+    val auditAppendFailure: Throwable? = null,
 )
+
+/** LLM child process の hard gate に使う安定した失敗種別。 */
+enum class LlmPhaseProcessFailureKind {
+    START_FAILURE,
+    TIMEOUT,
+    NON_ZERO_EXIT,
+}
+
+/** CLI 出力 heuristic や cleanup failure と区別できる process fact。 */
+class LlmPhaseProcessFailure(
+    val kind: LlmPhaseProcessFailureKind,
+    cause: Throwable,
+) : RuntimeException("LLM phase process failed: ${kind.name}.", cause)
 
 /**
  * LLM phase audit へ載せる CLI 出力由来の検出シグナル。

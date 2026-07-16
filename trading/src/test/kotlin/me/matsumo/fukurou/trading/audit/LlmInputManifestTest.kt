@@ -9,6 +9,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
+import me.matsumo.fukurou.trading.runner.StandardMaterialFailureStage
 import java.math.BigDecimal
 import java.nio.file.Path
 import java.time.Clock
@@ -102,6 +103,18 @@ class LlmInputManifestTest {
         )
 
         safeValues.forEach { value ->
+            ManifestPersistencePolicy.validatePhase(phaseManifest(prompt = value))
+        }
+    }
+
+    @Test
+    fun secretPolicy_acceptsCodeOwnedOrderbookProvenanceAndStandardFailureStages() {
+        val values = listOf("GMO_PUBLIC_ORDERBOOK") + StandardMaterialFailureStage.entries.map { stage -> stage.name }
+
+        assertFailsWith<IllegalArgumentException> {
+            ManifestPersistencePolicy.validatePhase(phaseManifest(prompt = "GMO_PUBLIC_ORDERBOOK_TOP10"))
+        }
+        values.forEach { value ->
             ManifestPersistencePolicy.validatePhase(phaseManifest(prompt = value))
         }
     }

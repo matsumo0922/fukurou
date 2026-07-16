@@ -100,6 +100,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientRole
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
+import me.matsumo.fukurou.trading.exchange.gmo.ProductionLikeStandardMaterialMarketDataSource
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.DefaultLlmOutputParser
@@ -312,7 +313,7 @@ class OneShotLlmRunnerTest {
 
     @Test
     fun materialManifestCapturesExactMarketFactsBeforeThesisScopedProjection() = runBlocking {
-        val fixture = runnerFixture(marketDataSource = MaterialManifestMarketDataSource) { command ->
+        val fixture = runnerFixture(marketDataSource = ProductionLikeStandardMaterialMarketDataSource) { command ->
             if (command.isProposerLaunch()) {
                 submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
             }
@@ -336,6 +337,11 @@ class OneShotLlmRunnerTest {
         assertTrue(manifest.snapshotContentHash.matches(Regex("[0-9a-f]{64}")))
         assertNotEquals(manifest.canonicalContentHash, manifest.snapshotContentHash)
         assertTrue(manifest.materialProjection.isEmpty())
+        assertEquals(
+            "GMO_PUBLIC_ORDERBOOK",
+            manifest.marketFeatureBundle.orderbookSummary?.metadata?.provenance,
+        )
+        assertEquals(10, manifest.marketFeatureBundle.orderbookSummary?.levelLimit)
         assertFalse(manifest.materialProjection.contains("sourceTimestamp"))
         val runManifest = assertNotNull(
             fixture.runtime.llmInputManifestRepository.findRun("material-facts-run").getOrThrow(),
@@ -611,7 +617,76 @@ class OneShotLlmRunnerTest {
 
             assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
             assertTrue(fixture.processRunner.launches.single().mcpManifestContent().contains("RISK_REDUCTION_ONLY"))
+            val manifest = assertNotNull(
+                fixture.runtime.decisionMaterialStateRepository.find("malformed-market-$index").getOrThrow(),
+            )
+            val expectedStage = if (index == 0) "TICKER" else "CANDLES"
+            assertEquals(expectedStage, manifest.missingSources.single().reason)
         }
+    }
+
+    @Test
+    fun riskReductionOnly_processFailureWinsOverPersistedDecision() = runBlocking {
+        val fixture = runnerFixture(marketDataSource = FailingMaterialMarketDataSource) { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            nonZeroExit()
+        }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-process-failure")).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("risk_reduction_only_process_failed"))
+        val details = fixture.eventLog.events().singleRunnerPhaseDetails("risk_reduction_only")
+        assertEquals("NON_ZERO_EXIT", details.stringValue("processFailureKind"))
+    }
+
+    @Test
+    fun riskReductionOnly_cleanExitWithoutDecisionIsInfrastructureNoTrade() = runBlocking {
+        val fixture = runnerFixture(marketDataSource = FailingMaterialMarketDataSource) { cleanExit() }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-missing-decision")).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("risk_reduction_only_missing_decision"))
+    }
+
+    @Test
+    fun riskReductionOnly_cleanupAndHeuristicSignalsDoNotBlockPersistedNoTradeDecision() = runBlocking {
+        val fixture = runnerFixture(
+            marketDataSource = FailingMaterialMarketDataSource,
+            llmInvokerTransform = { delegate ->
+                CleanupInjectingLlmInvoker(delegate, IllegalStateException("synthetic cleanup failure"))
+            },
+        ) { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit(stdout = """{"type":"result","is_error":true,"result":"Not logged in"}""")
+        }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "rro-audit-signals")).getOrThrow()
+        val details = fixture.eventLog.events().singleRunnerPhaseDetails("risk_reduction_only")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+        assertEquals("true", details.stringValue("cleanupFailed"))
+        assertEquals("true", details.stringValue("cliErrorReported"))
+        assertEquals("true", details.stringValue("authFailureSuspected"))
+        assertFalse(details.containsKey("processFailureKind"))
+    }
+
+    @Test
+    fun proposerCleanupWithoutDecisionKeepsInfrastructureCause() = runBlocking {
+        val fixture = runnerFixture(
+            llmInvokerTransform = { delegate ->
+                CleanupInjectingLlmInvoker(delegate, IllegalStateException("synthetic cleanup failure"))
+            },
+        ) { cleanExit() }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "proposer-cleanup")).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals(me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
     }
 
     @Test
@@ -2613,6 +2688,7 @@ private fun runnerFixture(
     clock: Clock = fixedClock(),
     marketDataSource: MarketDataSource = FakeMarketDataSource,
     cliVersionProbe: LlmCliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
+    llmInvokerTransform: (LlmInvoker) -> LlmInvoker = { invoker -> invoker },
     launchHandler: suspend (RenderedLlmCommand) -> ProcessRunResult,
 ): RunnerFixture {
     val baseRuntime = TradingRuntimeFactory.inMemory(
@@ -2628,9 +2704,11 @@ private fun runnerFixture(
         tradingRuntime = runtime,
         tradingConfig = config,
         materialMarketDataSource = marketDataSource,
-        llmInvoker = ShellLlmInvoker(
-            commandRenderer = DefaultLlmCommandRenderer(),
-            processRunner = processRunner,
+        llmInvoker = llmInvokerTransform(
+            ShellLlmInvoker(
+                commandRenderer = DefaultLlmCommandRenderer(),
+                processRunner = processRunner,
+            ),
         ),
         runtimeConfigSnapshot = runtimeConfigSnapshot,
         parentEnvironment = parentEnvironment,
@@ -2647,6 +2725,15 @@ private fun runnerFixture(
         processRunner = processRunner,
         runner = runner,
     )
+}
+
+private class CleanupInjectingLlmInvoker(
+    private val delegate: LlmInvoker,
+    private val cleanupFailure: Throwable,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return delegate.invoke(request).map { result -> result.copy(cleanupFailure = cleanupFailure) }
+    }
 }
 
 private fun processRecoveryFixture(
