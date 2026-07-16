@@ -11,7 +11,9 @@ import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
 import me.matsumo.fukurou.trading.audit.LlmRunInputManifest
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
 import me.matsumo.fukurou.trading.audit.StandardMaterialSnapshotStage
+import me.matsumo.fukurou.trading.audit.prepareStandardMaterialSnapshot
 import me.matsumo.fukurou.trading.audit.standardMaterialSnapshotResult
+import me.matsumo.fukurou.trading.audit.validateStandardMaterialSnapshot
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import org.jetbrains.exposed.v1.jdbc.Database
@@ -41,31 +43,19 @@ class ExposedLlmInputManifestRepository(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
     ): Result<Unit> {
-        standardMaterialSnapshotResult(StandardMaterialSnapshotStage.VALIDATION) {
-            ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-            require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-            require(materialManifest.invocationId == runManifest.invocationId) {
-                "run manifest material scope mismatch."
-            }
-            require(runManifest.materialInvocationId == materialManifest.invocationId) {
-                "run manifest material reference mismatch."
-            }
-            ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-        }.getOrElse { return Result.failure(it) }
+        validateStandardMaterialSnapshot(materialManifest, runManifest, knownSecretValues)
+            .getOrElse { return Result.failure(it) }
 
+        val snapshot = prepareStandardMaterialSnapshot(materialManifest, runManifest)
+            .getOrElse { return Result.failure(it) }
         val prepared = standardMaterialSnapshotResult(StandardMaterialSnapshotStage.HASH_SERIALIZATION) {
-            materialManifest.requireValidSnapshotHash()
-            val materialHash = materialManifest.persistedSnapshotHash()
-            require(runManifest.materialContentHash == materialHash) { "run manifest material hash mismatch." }
-            require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-                "run manifest canonical hash mismatch."
-            }
             PreparedRunBundle(
                 materialJson = materialManifest.toJson(),
-                materialHash = materialHash,
-                runJson = LlmManifestJsonCodec.encode(runManifest),
+                materialHash = snapshot.materialHash,
+                runJson = snapshot.runJson,
             )
-        }.getOrElse { return Result.failure(it) }
+        }
+            .getOrElse { return Result.failure(it) }
 
         return standardMaterialSnapshotResult(StandardMaterialSnapshotStage.PERSISTENCE) {
             withContext(Dispatchers.IO) {

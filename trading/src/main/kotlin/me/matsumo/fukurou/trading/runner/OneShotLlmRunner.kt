@@ -531,8 +531,8 @@ class OneShotLlmRunner(
             runAuditRecorder.recordLlmRunStarted(llmRunStart).getOrThrow()
             llmRunStarted = true
             val deadlineRemaining = java.time.Duration.between(clock.instant(), claimedAt.plus(executionPolicy.hardTimeout))
-            check(!deadlineRemaining.isNegative && !deadlineRemaining.isZero) { "LLM execution deadline expired." }
             val bodyResult = try {
+                check(!deadlineRemaining.isNegative && !deadlineRemaining.isZero) { "LLM execution deadline expired." }
                 withTimeout(deadlineRemaining.toMillis()) {
                     runCatching {
                         val preFilterDecision = request.preFilter?.let { preFilter ->
@@ -566,6 +566,8 @@ class OneShotLlmRunner(
                     }
                 }
             } catch (throwable: CancellationException) {
+                Result.failure(throwable)
+            } catch (throwable: Throwable) {
                 Result.failure(throwable)
             }
             val throwable = bodyResult.exceptionOrNull()
@@ -1130,16 +1132,13 @@ class OneShotLlmRunner(
     private suspend fun captureMaterialInputs(input: OneShotRunBodyInput): CapturedMaterialInputs {
         val capturedAt = clock.instant()
         val account = tradingRuntime.decisionAccountSnapshotReader.read().getOrThrow()
-        requireLiveClaimForInvocation(input.invocationId)
         val marketDataSource = requireNotNull(materialMarketDataSource) { "material market data source is required." }
         val ticker = marketDataSource.getTicker(tradingConfig.symbol).getOrThrow()
-        requireLiveClaimForInvocation(input.invocationId)
         val candles = marketDataSource.getCandles(
             symbol = tradingConfig.symbol,
             interval = CandleInterval.FIVE_MINUTES,
             limit = 64,
         ).getOrThrow()
-        requireLiveClaimForInvocation(input.invocationId)
         val orderbookResult = withGmoPublicRequestCorrelation(
             GmoPublicRequestCorrelation(
                 decisionRunContext = DecisionRunContext.EMPTY.copy(decisionRunId = input.invocationId),

@@ -54,6 +54,7 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
@@ -501,6 +502,190 @@ class OneShotLlmRunnerTest {
         assertFalse(manifest.contains("preview_order"))
         assertEquals(LlmRunTerminalCause.RUNNER_FAILED, result.terminalCause)
         assertStandardSnapshotFailureEvent(fixture, StandardMaterialSnapshotStage.CAPTURE)
+    }
+
+    @Test
+    fun standardSnapshotCancellation_doesNotCreateStageEvidenceOrMissingReason() = runBlocking {
+        val marketDataSource = BlockingSnapshotMarketDataSource()
+        val fixture = runnerFixture(marketDataSource = marketDataSource) { awaitCancellation() }
+        val runner = async {
+            fixture.runOneShot(defaultRequest().copy(invocationId = "snapshot-cancelled"))
+        }
+
+        marketDataSource.tickerEntered.await()
+        runner.cancel()
+
+        assertFailsWith<CancellationException> { runner.await() }
+        val events = fixture.eventLog.events()
+        assertFalse(events.any { event -> event.isRunnerPhaseCompleted("standard_material_snapshot") })
+        assertFalse(events.any { event -> event.payload.contains("STANDARD_CONTEXT") })
+        assertNull(fixture.runtime.decisionMaterialStateRepository.find("snapshot-cancelled").getOrThrow())
+    }
+
+    @Test
+    fun standardSnapshotClaimLoss_doesNotCreateStageEvidenceOrMissingReason() = runBlocking {
+        val marketDataSource = ClaimLossSnapshotMarketDataSource()
+        val fixture = runnerFixture(
+            marketDataSource = marketDataSource,
+            runtimeTransform = { runtime ->
+                runtime.copy(
+                    launchReservationRepository = SnapshotClaimLossRepository(
+                        delegate = runtime.launchReservationRepository,
+                        captureCompleted = { marketDataSource.captureCompleted },
+                    ),
+                )
+            },
+        ) { awaitCancellation() }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "snapshot-claim-lost"))
+
+        assertTrue(result.isFailure)
+        val events = fixture.eventLog.events()
+        assertFalse(events.any { event -> event.isRunnerPhaseCompleted("standard_material_snapshot") })
+        assertFalse(events.any { event -> event.payload.contains("STANDARD_CONTEXT") })
+        assertNull(fixture.runtime.decisionMaterialStateRepository.find("snapshot-claim-lost").getOrThrow())
+    }
+
+    @Test
+    fun standardSnapshotAdmissionQueryFailure_doesNotBecomeCaptureFailure() = runBlocking {
+        val marketDataSource = ClaimLossSnapshotMarketDataSource()
+        val fixture = runnerFixture(
+            marketDataSource = marketDataSource,
+            runtimeTransform = { runtime ->
+                runtime.copy(
+                    launchReservationRepository = SnapshotAdmissionQueryFailureRepository(
+                        delegate = runtime.launchReservationRepository,
+                        captureCompleted = { marketDataSource.captureCompleted },
+                    ),
+                )
+            },
+        ) { awaitCancellation() }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "snapshot-admission-query-failed"))
+
+        assertTrue(result.isFailure)
+        val events = fixture.eventLog.events()
+        assertFalse(events.any { event -> event.isRunnerPhaseCompleted("standard_material_snapshot") })
+        assertFalse(events.any { event -> event.payload.contains("STANDARD_CONTEXT") })
+        assertNull(
+            fixture.runtime.decisionMaterialStateRepository
+                .find("snapshot-admission-query-failed")
+                .getOrThrow(),
+        )
+    }
+
+    @Test
+    fun expiredSnapshotClaim_doesNotCreateStageEvidenceOrMissingReason() = runBlocking {
+        val config = TradingBotConfig(
+            runner = LlmRunnerConfig(
+                perRunTimeout = Duration.ofSeconds(1),
+                entryFillReservePerHour = 0,
+                entryFillReservePerDay = 0,
+                stopProximityReservePerHour = 0,
+                stopProximityReservePerDay = 0,
+            ),
+        )
+        val policy = OneShotExecutionPolicy.from(config.runner)
+        val fixture = runnerFixture(
+            config = config,
+            runtimeTransform = { runtime ->
+                runtime.copy(
+                    launchReservationRepository = ExpiredSnapshotClaimRepository(
+                        delegate = runtime.launchReservationRepository,
+                        hardTimeout = policy.hardTimeout,
+                    ),
+                )
+            },
+        ) { awaitCancellation() }
+
+        val result = fixture.runOneShot(defaultRequest().copy(invocationId = "snapshot-deadline"))
+
+        assertTrue(result.isFailure)
+        val events = fixture.eventLog.events()
+        assertFalse(events.any { event -> event.isRunnerPhaseCompleted("standard_material_snapshot") })
+        assertFalse(events.any { event -> event.payload.contains("STANDARD_CONTEXT") })
+        assertNull(fixture.runtime.decisionMaterialStateRepository.find("snapshot-deadline").getOrThrow())
+    }
+
+    @Test
+    fun standardSnapshotFailureDoesNotIncreaseHourlyOrDailyQuota() = runBlocking {
+        listOf(
+            Triple(
+                "hourly",
+                LlmRunnerConfig(
+                    maxInvocationsPerHour = 2,
+                    maxInvocationsPerDay = 3,
+                    entryFillReservePerHour = 0,
+                    entryFillReservePerDay = 0,
+                    stopProximityReservePerHour = 0,
+                    stopProximityReservePerDay = 0,
+                ),
+                LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR,
+            ),
+            Triple(
+                "daily",
+                LlmRunnerConfig(
+                    maxInvocationsPerHour = 3,
+                    maxInvocationsPerDay = 2,
+                    entryFillReservePerHour = 0,
+                    entryFillReservePerDay = 0,
+                    stopProximityReservePerHour = 0,
+                    stopProximityReservePerDay = 0,
+                ),
+                LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY,
+            ),
+        ).forEach { (quotaName, config, expectedRejection) ->
+            val fixture = runnerFixture(
+                config = TradingBotConfig(runner = config),
+                marketDataSource = FailingMaterialMarketDataSource,
+            ) { command ->
+                submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+                cleanExit()
+            }
+            val firstInvocationId = "snapshot-quota-$quotaName-1"
+            val reservationRequest = { invocationId: String ->
+                LlmLaunchReservationRequest(
+                    invocationId = invocationId,
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                    triggerKey = "test:$invocationId",
+                    reservedAt = fixedInstant(),
+                    runnerConfig = config,
+                    hourlyWindow = Duration.ofHours(1),
+                    dailyWindow = Duration.ofDays(1),
+                    activeReservationStaleAfter = Duration.ofMinutes(30),
+                )
+            }
+
+            assertIs<LlmLaunchReservationOutcome.Reserved>(
+                fixture.runtime.launchReservationRepository.tryReserve(reservationRequest(firstInvocationId)).getOrThrow(),
+            )
+            val result = fixture.runner.runOneShot(
+                defaultRequest().copy(
+                    invocationId = firstInvocationId,
+                    triggerKind = LlmDaemonTriggerKind.MANUAL,
+                ),
+            )
+            assertTrue(result.isSuccess, result.exceptionOrNull()?.stackTraceToString().orEmpty())
+            assertStandardSnapshotFailureEvent(fixture, StandardMaterialSnapshotStage.CAPTURE)
+
+            val secondInvocationId = "snapshot-quota-$quotaName-2"
+            assertIs<LlmLaunchReservationOutcome.Reserved>(
+                fixture.runtime.launchReservationRepository.tryReserve(reservationRequest(secondInvocationId)).getOrThrow(),
+            )
+            fixture.runtime.launchReservationRepository.finish(
+                LlmLaunchReservationFinish(
+                    invocationId = secondInvocationId,
+                    status = LlmLaunchReservationStatus.FINISHED,
+                    reason = "test",
+                    finishedAt = fixedInstant(),
+                ),
+            ).getOrThrow()
+
+            val third = fixture.runtime.launchReservationRepository.tryReserve(
+                reservationRequest("snapshot-quota-$quotaName-3"),
+            ).getOrThrow()
+            assertEquals(expectedRejection, assertIs<LlmLaunchReservationOutcome.Rejected>(third).reason)
+        }
     }
 
     @Test
@@ -2791,6 +2976,52 @@ private class ClaimBoundaryRepository(
     }
 }
 
+private class SnapshotClaimLossRepository(
+    private val delegate: LlmLaunchReservationRepository,
+    private val captureCompleted: () -> Boolean,
+) : LlmLaunchReservationRepository by delegate {
+    private var claimLost = false
+
+    override suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        if (!claimLost && captureCompleted()) {
+            claimLost = true
+            return Result.success(false)
+        }
+
+        return delegate.validateExecutionAdmission(invocationId, claimantToken)
+    }
+}
+
+private class SnapshotAdmissionQueryFailureRepository(
+    private val delegate: LlmLaunchReservationRepository,
+    private val captureCompleted: () -> Boolean,
+) : LlmLaunchReservationRepository by delegate {
+    private var failed = false
+
+    override suspend fun validateExecutionAdmission(invocationId: String, claimantToken: String?): Result<Boolean> {
+        if (!failed && captureCompleted()) {
+            failed = true
+            return Result.failure(IllegalStateException("snapshot admission query failed"))
+        }
+
+        return delegate.validateExecutionAdmission(invocationId, claimantToken)
+    }
+}
+
+private class ExpiredSnapshotClaimRepository(
+    private val delegate: LlmLaunchReservationRepository,
+    private val hardTimeout: Duration,
+) : LlmLaunchReservationRepository by delegate {
+    override suspend fun claimForExecution(request: LlmExecutionClaimRequest): LlmExecutionClaimOutcome {
+        return when (val outcome = delegate.claimForExecution(request)) {
+            is LlmExecutionClaimOutcome.Claimed -> outcome.copy(
+                claimedAt = request.claimedAt.minus(hardTimeout).minusMillis(1),
+            )
+            else -> outcome
+        }
+    }
+}
+
 private class FailFirstAppendCommandEventLog(
     private val delegate: CommandEventLog,
 ) : CommandEventLog by delegate {
@@ -3858,6 +4089,26 @@ private object MaterialManifestMarketDataSource : MarketDataSource by FakeMarket
 private object FailingMaterialMarketDataSource : MarketDataSource by FakeMarketDataSource {
     override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
         return Result.failure(GmoRateLimitException("fixture market failure"))
+    }
+}
+
+private class BlockingSnapshotMarketDataSource : MarketDataSource by FakeMarketDataSource {
+    val tickerEntered = CompletableDeferred<Unit>()
+
+    override suspend fun getTicker(symbol: TradingSymbol): Result<Ticker> {
+        tickerEntered.complete(Unit)
+        awaitCancellation()
+    }
+}
+
+private class ClaimLossSnapshotMarketDataSource : MarketDataSource by MaterialManifestMarketDataSource {
+    var captureCompleted: Boolean = false
+        private set
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        return MaterialManifestMarketDataSource.getOrderbook(symbol, depth).also {
+            captureCompleted = true
+        }
     }
 }
 

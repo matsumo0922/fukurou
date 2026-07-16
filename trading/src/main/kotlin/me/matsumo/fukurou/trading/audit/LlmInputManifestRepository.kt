@@ -45,6 +45,51 @@ class StandardMaterialSnapshotException(
     cause: Throwable,
 ) : RuntimeException(null, cause)
 
+/** standard material snapshot の validation/hash 準備結果。 */
+internal data class PreparedStandardMaterialSnapshot(
+    val materialHash: String,
+    val runJson: String,
+)
+
+/** repository 実装間で共有する standard material snapshot の validation。 */
+internal suspend fun validateStandardMaterialSnapshot(
+    materialManifest: DecisionMaterialStateManifest,
+    runManifest: LlmRunInputManifest,
+    knownSecretValues: Set<String>,
+): Result<Unit> = standardMaterialSnapshotResult(StandardMaterialSnapshotStage.VALIDATION) {
+    ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
+    require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
+    require(materialManifest.invocationId == runManifest.invocationId) {
+        "run manifest material scope mismatch."
+    }
+    require(runManifest.materialInvocationId == materialManifest.invocationId) {
+        "run manifest material reference mismatch."
+    }
+    ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
+}
+
+/** repository 実装間で共有する standard material snapshot の hash/serialization 準備。 */
+internal suspend fun prepareStandardMaterialSnapshot(
+    materialManifest: DecisionMaterialStateManifest,
+    runManifest: LlmRunInputManifest,
+): Result<PreparedStandardMaterialSnapshot> = standardMaterialSnapshotResult(
+    StandardMaterialSnapshotStage.HASH_SERIALIZATION,
+) {
+    materialManifest.requireValidSnapshotHash()
+    val materialHash = materialManifest.persistedSnapshotHash()
+    require(runManifest.materialContentHash == materialHash) {
+        "run manifest material hash mismatch."
+    }
+    val runJson = LlmManifestJsonCodec.encode(runManifest)
+    require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
+        "run manifest canonical hash mismatch."
+    }
+    PreparedStandardMaterialSnapshot(
+        materialHash = materialHash,
+        runJson = runJson,
+    )
+}
+
 internal suspend inline fun <T> standardMaterialSnapshotResult(
     stage: StandardMaterialSnapshotStage,
     crossinline block: suspend () -> T,
@@ -78,27 +123,11 @@ class InMemoryLlmInputManifestRepository(
         materialManifest: DecisionMaterialStateManifest,
         runManifest: LlmRunInputManifest,
     ): Result<Unit> {
-        standardMaterialSnapshotResult(StandardMaterialSnapshotStage.VALIDATION) {
-            ManifestPersistencePolicy.validateMaterial(materialManifest, knownSecretValues)
-            require(runManifest.rootId == runManifest.invocationId) { "run manifest root/invocation mismatch." }
-            require(materialManifest.invocationId == runManifest.invocationId) {
-                "run manifest material scope mismatch."
-            }
-            require(runManifest.materialInvocationId == materialManifest.invocationId) {
-                "run manifest material reference mismatch."
-            }
-            ManifestPersistencePolicy.validateRun(runManifest, knownSecretValues)
-        }.getOrElse { return Result.failure(it) }
+        validateStandardMaterialSnapshot(materialManifest, runManifest, knownSecretValues)
+            .getOrElse { return Result.failure(it) }
 
-        standardMaterialSnapshotResult(StandardMaterialSnapshotStage.HASH_SERIALIZATION) {
-            materialManifest.requireValidSnapshotHash()
-            require(runManifest.materialContentHash == materialManifest.persistedSnapshotHash()) {
-                "run manifest material hash mismatch."
-            }
-            require(LlmManifestJsonCodec.contentHash(runManifest) == runManifest.canonicalContentHash) {
-                "run manifest canonical hash mismatch."
-            }
-        }.getOrElse { return Result.failure(it) }
+        prepareStandardMaterialSnapshot(materialManifest, runManifest)
+            .getOrElse { return Result.failure(it) }
 
         return standardMaterialSnapshotResult(StandardMaterialSnapshotStage.PERSISTENCE) {
             require(findRoot(runManifest.rootId).getOrThrow() != null) { "run manifest audit root is missing." }
