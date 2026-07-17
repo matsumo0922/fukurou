@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
@@ -44,6 +45,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /** gateway construction のresource操作をfailure injection可能にする境界。 */
 internal data class LlmDecisionSubmissionGatewayStartHooks(
@@ -67,10 +69,14 @@ class LlmDecisionSubmissionGateway private constructor(
     private val server: ServerSocketChannel,
     private val executor: java.util.concurrent.ExecutorService,
     private val completion: java.util.concurrent.CountDownLatch,
+    private val submissionState: AtomicReference<LlmSemanticSubmissionState>,
 ) : AutoCloseable {
 
     /** canary 等の process boundary で1 requestの完了を待つ。 */
     fun awaitCompletion() = completion.await()
+
+    /** repository submission の確定済み phase-local state を返す。 */
+    fun semanticSubmissionState(): LlmSemanticSubmissionState = submissionState.get()
 
     override fun close() {
         var cleanupFailure = runCatching { server.close() }.exceptionOrNull()
@@ -132,37 +138,25 @@ class LlmDecisionSubmissionGateway private constructor(
                 val gatewayExecutor = hooks.createExecutor()
                 executor = gatewayExecutor
                 val completion = java.util.concurrent.CountDownLatch(1)
-                val gateway = LlmDecisionSubmissionGateway(socketPath, boundServer, gatewayExecutor, completion)
-                val task = Runnable {
-                    try {
-                        runCatching {
-                            boundServer.accept().use { channel ->
-                                val response = runCatching {
-                                    val request = LlmSubmissionGatewayCodec.readFrame(channel)
-                                    runBlocking {
-                                        handleRequest(
-                                            request = request,
-                                            repository = repository,
-                                            invocationId = invocationId,
-                                            phase = phase,
-                                            phaseManifestId = phaseManifestId,
-                                            effectiveInvocationHash = effectiveInvocationHash,
-                                            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
-                                        )
-                                    }
-                                }.getOrElse {
-                                    buildJsonObject {
-                                        put("accepted", false)
-                                        put("error", "SUBMISSION_REJECTED")
-                                    }
-                                }
-                                LlmSubmissionGatewayCodec.writeFrame(channel, response)
-                            }
-                        }
-                    } finally {
-                        completion.countDown()
-                    }
-                }
+                val submissionState = AtomicReference(LlmSemanticSubmissionState.NOT_ATTEMPTED)
+                val gateway = LlmDecisionSubmissionGateway(
+                    socketPath,
+                    boundServer,
+                    gatewayExecutor,
+                    completion,
+                    submissionState,
+                )
+                val task = submissionTask(
+                    server = boundServer,
+                    repository = repository,
+                    invocationId = invocationId,
+                    phase = phase,
+                    phaseManifestId = phaseManifestId,
+                    effectiveInvocationHash = effectiveInvocationHash,
+                    terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
+                    completion = completion,
+                    submissionState = submissionState,
+                )
                 hooks.execute(gatewayExecutor, task)
 
                 return gateway
@@ -170,6 +164,52 @@ class LlmDecisionSubmissionGateway private constructor(
                 cleanupFailedStart(socketPath, server, executor, hooks)
                     ?.let(throwable::addSuppressed)
                 throw throwable
+            }
+        }
+
+        @Suppress("LongParameterList")
+        private fun submissionTask(
+            server: ServerSocketChannel,
+            repository: DecisionRepository,
+            invocationId: String,
+            phase: LlmInvocationPhase,
+            phaseManifestId: String,
+            effectiveInvocationHash: String,
+            terminalEvidenceCaptureEnabled: Boolean,
+            completion: java.util.concurrent.CountDownLatch,
+            submissionState: AtomicReference<LlmSemanticSubmissionState>,
+        ) = Runnable {
+            try {
+                runCatching {
+                    server.accept().use { channel ->
+                        submissionState.set(LlmSemanticSubmissionState.IN_FLIGHT)
+                        val response = runCatching {
+                            val request = LlmSubmissionGatewayCodec.readFrame(channel)
+                            runBlocking {
+                                handleRequest(
+                                    request = request,
+                                    repository = repository,
+                                    invocationId = invocationId,
+                                    phase = phase,
+                                    phaseManifestId = phaseManifestId,
+                                    effectiveInvocationHash = effectiveInvocationHash,
+                                    terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
+                                )
+                            }
+                        }.onSuccess {
+                            submissionState.set(LlmSemanticSubmissionState.COMMITTED)
+                        }.getOrElse {
+                            submissionState.set(LlmSemanticSubmissionState.REJECTED)
+                            buildJsonObject {
+                                put("accepted", false)
+                                put("error", "SUBMISSION_REJECTED")
+                            }
+                        }
+                        LlmSubmissionGatewayCodec.writeFrame(channel, response)
+                    }
+                }
+            } finally {
+                completion.countDown()
             }
         }
 
