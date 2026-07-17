@@ -20,9 +20,41 @@
 - [x] 4.1 Cover same-thesis cancellation, unrelated-thesis preservation, order-only EXIT, and missing/null/multiple/stale linkage mutation-zero failures for Exposed and in-memory repositories
 - [x] 4.2 Replace the existing EXIT-plus-resting-order expectation and add deterministic PostgreSQL barrier races for EXIT-first and fill-first convergence with duplicate execution zero
 - [x] 4.3 Add HARD_HALT commit-before/commit-after-response-loss/retry tests, startup/connect-failure/periodic retry tests, flat-without-tick SAFE tests, SAFE evidence tests, old-writer stale-SAFE rollback tests, and UNKNOWN/open-risk resume rejection tests
-- [ ] 4.4 Run targeted production-entrypoint tests and record each OpenSpec Scenario's proving test at the validated HEAD
+- [x] 4.4 Run targeted production-entrypoint tests and record each OpenSpec Scenario's proving test at the validated HEAD
 
 ## 5. Documentation and validation
 
 - [x] 5.1 Update the system prompt, README, `docs/design.md`, and `docs/mcp-runtime.md` in current tense and grep affected feature/class/command names for stale descriptions
-- [ ] 5.2 Run `openspec validate issue-187-bf-atomic-exit`, `make test`, `make detekt`, and `make build` under the validation lease and record command, scope, result, and HEAD
+- [x] 5.2 Run `openspec validate issue-187-bf-atomic-exit`, `make test`, `make detekt`, and `make build` under the validation lease and record command, scope, result, and HEAD
+
+## Validation evidence
+
+- Implementation HEAD: `12a4104` (`test: align fixtures with atomic halt contract`). This evidence-only task update does not change production or test code.
+- Lease: `validation-lease.sh env GRADLE_USER_HOME=/tmp/fukurou-gradle-187-bf JAVA_TOOL_OPTIONS=-Duser.home=/tmp/fukurou-java-home-187 zsh -e -c '<commands below>'`; acquired immediately (`0s` external wait).
+- Targeted trading command: `./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process :trading:test` with the `InMemoryPaperLedgerRepositoryTest`, `RiskStateCommandServiceTest`, `OneShotLlmRunnerTest.exitDecision_*`, atomic-risk-exit / hard-halt-cleanup PostgreSQL barrier and failure patterns, and the startup / periodic / connect-failure `ProtectionReconcilerTest` patterns; `BUILD SUCCESSFUL in 17s`.
+- Targeted HTTP command: `./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process :fukurou:test --tests "me.matsumo.fukurou.OpsRouteTest"`; `BUILD SUCCESSFUL in 4s`.
+- Full validation commands: `openspec validate issue-187-bf-atomic-exit` (`valid`), `make test` (`BUILD SUCCESSFUL in 7m 31s`), `make detekt` (`BUILD SUCCESSFUL in 6s`), and `make build` (`BUILD SUCCESSFUL in 4s`).
+
+### Scenario ledger
+
+| OpenSpec Scenario | Proving test at `12a4104` |
+| --- | --- |
+| Position and same-thesis resting entry coexist | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitClosesPositionAndCancelsOnlyMatchingPendingBuy`; `PostgresPersistenceIntegrationTest.atomicRiskExitCancelsSameThesisAndPreservesUnrelatedThesisInPostgres`; `OneShotLlmRunnerTest.exitDecision_closesSingleOpenPositionWhenRestingEntryOrderAlsoExists` |
+| Unrelated thesis remains open | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitClosesPositionAndCancelsOnlyMatchingPendingBuy`; `PostgresPersistenceIntegrationTest.atomicRiskExitCancelsSameThesisAndPreservesUnrelatedThesisInPostgres` |
+| Resting entry is the only EXIT target | `OneShotLlmRunnerTest.exitDecision_cancelsSingleRestingEntryOrderDeterministically` |
+| Target position thesis cannot be resolved uniquely | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitFailsWithoutMutationForMissingNullOrMultipleLinkage`; `PostgresPersistenceIntegrationTest.atomicRiskExitLinkageFailuresAndStaleTargetLeavePostgresLedgerUnchanged` |
+| Pending BUY thesis cannot be classified | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitFailsWithoutMutationForMissingNullOrMultipleLinkage`; `PostgresPersistenceIntegrationTest.atomicRiskExitLinkageFailuresAndStaleTargetLeavePostgresLedgerUnchanged` |
+| Target changed before transaction lock | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitFailsWithoutMutationForContradictoryGroupOrStaleTarget`; `PostgresPersistenceIntegrationTest.atomicRiskExitLinkageFailuresAndStaleTargetLeavePostgresLedgerUnchanged` |
+| EXIT commits before an eligible fill | `PostgresPersistenceIntegrationTest.atomicRiskExitWinsBarrierBeforeRestingFillWithoutDuplicateExecution` |
+| Fill commits before EXIT | `PostgresPersistenceIntegrationTest.restingFillWinsBarrierBeforeAtomicRiskExitWithoutDuplicateExecution` |
+| HARD_HALT cleanup succeeds | `InMemoryPaperLedgerRepositoryTest.hardHaltCleanupKeepsUnknownWithoutTickThenConvergesAndRetriesIdempotently`; `PostgresPersistenceIntegrationTest.hardHaltCleanupPersistsUnknownRetriesToSafeAndResumesAtomicallyInPostgres` |
+| Failure occurs before cleanup commit | `PostgresPersistenceIntegrationTest.hardHaltCleanupRollsBackBeforeCommitAndConvergesAfterCommitResponseLossInPostgres` |
+| Result is lost after cleanup commit | `PostgresPersistenceIntegrationTest.hardHaltCleanupRollsBackBeforeCommitAndConvergesAfterCommitResponseLossInPostgres` |
+| Cleanup cannot obtain trustworthy execution input | `InMemoryPaperLedgerRepositoryTest.hardHaltCleanupKeepsUnknownWithoutTickThenConvergesAndRetriesIdempotently`; `PostgresPersistenceIntegrationTest.hardHaltCleanupPersistsUnknownRetriesToSafeAndResumesAtomicallyInPostgres` |
+| Flat halted account has no market input | `InMemoryPaperLedgerRepositoryTest.flatHardHaltCleanupStoresSafeWithoutTickAndStaleSafeReturnsToUnknown`; `PostgresPersistenceIntegrationTest.flatHardHaltCleanupPersistsSafeWithoutTickInPostgres` |
+| WebSocket connection remains unavailable | `ProtectionReconcilerTest.websocket_connect_failure_retries_hard_halt_cleanup_evenAfterSafeEvidence`; `ProtectionReconcilerTest.websocket_hard_halt_cleanup_retriesFromStartupDuringPeriodicMaintenance` |
+| Manual resume is requested before cleanup is safe | `RiskStateCommandServiceTest.resume_rejects_unknown_cleanup_without_changing_hard_halt`; `OpsRouteTest.opsRoutes_haltResumeAndReadRiskState` |
+| Stale SAFE survives an old-writer rollback epoch | `InMemoryPaperLedgerRepositoryTest.flatHardHaltCleanupStoresSafeWithoutTickAndStaleSafeReturnsToUnknown`; `RiskStateCommandServiceTest.resume_rejects_stale_safe_and_downgrades_evidence_to_unknown`; `PostgresPersistenceIntegrationTest.hardHaltCleanupPersistsUnknownRetriesToSafeAndResumesAtomicallyInPostgres` |
+| Entry races after HARD_HALT activation | `PostgresPersistenceIntegrationTest.hardHaltCleanupWinsBarrierBeforeRestingFillWithoutRiskIncrease`; `PostgresPersistenceIntegrationTest.restingFillWinsBarrierAfterHardHaltWithoutRiskIncrease` |
+| Protective order belongs to a closing position | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitClosesPositionAndCancelsOnlyMatchingPendingBuy`; `PostgresPersistenceIntegrationTest.atomicRiskExitCancelsSameThesisAndPreservesUnrelatedThesisInPostgres` |
+| Legacy thesis linkage blocks normal EXIT | `InMemoryPaperLedgerRepositoryTest.sameThesisRiskExitFailsWithoutMutationForMissingNullOrMultipleLinkage`; `PostgresPersistenceIntegrationTest.atomicRiskExitLinkageFailuresAndStaleTargetLeavePostgresLedgerUnchanged`; `PostgresPersistenceIntegrationTest.hardHaltCleanupPersistsUnknownRetriesToSafeAndResumesAtomicallyInPostgres` |
