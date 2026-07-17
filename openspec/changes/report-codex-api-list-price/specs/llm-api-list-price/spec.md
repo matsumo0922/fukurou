@@ -1,0 +1,50 @@
+## ADDED Requirements
+
+### Requirement: Exact Codex usage receives a static API list-price estimate
+Issue #189 Codex cost DoD: The evaluation service MUST calculate an API list-price estimate only when a Codex phase has an exact catalog model identity and complete internally consistent token usage.
+
+#### Scenario: Exact gpt-5.5 usage is priced
+- **WHEN** a Codex phase records configured model `gpt-5.5`, total input tokens, cached input tokens, and output tokens
+- **THEN** the estimate charges uncached input, cached input, and output at the versioned standard API rates
+
+#### Scenario: Reasoning output is reported separately
+- **WHEN** Codex output tokens include a non-zero reasoning output token count
+- **THEN** the estimate charges the total output token count once and does not add reasoning output tokens a second time
+
+#### Scenario: Provider-reported cost already exists
+- **WHEN** a phase contains provider-reported monetary cost and also matches a static catalog entry
+- **THEN** the API list-price equivalent uses the provider-reported cost and does not add a second catalog estimate
+
+### Requirement: Unprovable estimates remain unpriced
+The evaluation service MUST NOT invent a model, coerce incomplete usage to zero, or return a catalog estimate for inconsistent token facts.
+
+#### Scenario: Configured model is unavailable
+- **WHEN** a Codex phase records `CLI_DEFAULT` without an exact configured model name
+- **THEN** the phase remains unpriced even if the current pinned CLI is known to default to a cataloged model
+
+#### Scenario: Model is absent from the catalog
+- **WHEN** a phase records a model name that has no exact catalog entry
+- **THEN** the phase remains unpriced and the response preserves its token/model coverage facts
+
+#### Scenario: Cached input exceeds total input
+- **WHEN** cached input tokens exceed total input tokens or a required token count is negative or missing
+- **THEN** the phase remains unpriced rather than producing a negative or partial estimate
+
+### Requirement: Public cost sources remain distinct
+`GET /evaluation/costs` MUST distinguish provider-reported cost, API list-price equivalent, catalog-derived estimate, and unavailable subscription actual cost while preserving existing response fields.
+
+#### Scenario: Mixed Claude and Codex phases are aggregated
+- **WHEN** a period contains a Claude phase with provider-reported cost and an exact catalog-priced Codex phase
+- **THEN** `knownCostUsd` contains only provider-reported cost, `catalogEstimatedCostUsd` contains only the Codex estimate, and `apiListPriceEquivalentUsd` contains both without double counting
+
+#### Scenario: Subscription actual cost is requested
+- **WHEN** the cost response is serialized for CLI subscription-backed phases
+- **THEN** `subscriptionActualCostUsd` is null and the response identifies the estimate catalog version, as-of date, standard API basis, and official source
+
+#### Scenario: Legacy consumer reads the response
+- **WHEN** an existing client reads `knownCostUsd`, provider groups, model token groups, or coverage counts
+- **THEN** those fields remain present and retain their documented provider-reported/token meanings except that catalog-priced phases no longer count as unpriced
+
+#### Scenario: Production route projects persisted Codex facts
+- **WHEN** `GET /evaluation/costs` reads a persisted `RUNNER_PHASE_COMPLETED` payload with configured model and Codex usage
+- **THEN** the public response contains the catalog estimate and updated pricing coverage without a database backfill
