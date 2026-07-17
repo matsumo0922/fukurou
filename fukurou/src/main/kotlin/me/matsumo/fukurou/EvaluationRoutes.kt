@@ -1341,6 +1341,7 @@ data class EvaluationPricingCatalogResponse(
     val asOf: String,
     val basis: String,
     val sourceUrl: String,
+    val maxPhaseInputTokensExclusive: Long,
 ) {
     companion object {
         fun fromCatalog(): EvaluationPricingCatalogResponse {
@@ -1351,6 +1352,7 @@ data class EvaluationPricingCatalogResponse(
                 asOf = metadata.asOf,
                 basis = metadata.basis,
                 sourceUrl = metadata.sourceUrl,
+                maxPhaseInputTokensExclusive = metadata.maxPhaseInputTokensExclusive,
             )
         }
     }

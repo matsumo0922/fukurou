@@ -8,6 +8,7 @@ data class LlmApiListPriceCatalogMetadata(
     val asOf: String,
     val basis: String,
     val sourceUrl: String,
+    val maxPhaseInputTokensExclusive: Long,
 )
 
 /** 保存済み token usage を standard API list price 相当額へ換算する catalog。 */
@@ -17,6 +18,7 @@ object LlmApiListPriceCatalog {
         asOf = "2026-07-17",
         basis = "STANDARD_API",
         sourceUrl = "https://developers.openai.com/api/docs/models/gpt-5.5",
+        maxPhaseInputTokensExclusive = STANDARD_INPUT_LIMIT,
     )
 
     /** 証明可能な Codex phase だけを USD へ換算する。 */

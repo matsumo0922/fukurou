@@ -8,6 +8,11 @@ import kotlin.test.assertNull
 /** LlmApiListPriceCatalog の保守的な適用条件を検証する。 */
 class LlmApiListPriceCatalogTest {
     @Test
+    fun metadataPublishesExclusivePhaseInputBound() {
+        assertEquals(272_000, LlmApiListPriceCatalog.metadata.maxPhaseInputTokensExclusive)
+    }
+
+    @Test
     fun exactGpt55UsageUsesStandardRatesWithoutDoubleChargingReasoning() {
         val price = LlmApiListPriceCatalog.calculate(
             codexFact(

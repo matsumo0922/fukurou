@@ -435,6 +435,7 @@ class EvaluationRouteTest {
         assertTrue(costsBody.contains("\"subscriptionActualCostUsd\":null"))
         assertTrue(costsBody.contains("\"version\":\"openai-gpt-5.5-2026-07-17\""))
         assertTrue(costsBody.contains("\"basis\":\"STANDARD_API\""))
+        assertTrue(costsBody.contains("\"maxPhaseInputTokensExclusive\":272000"))
         assertTrue(costsBody.contains("\"unattributedTokenPhaseCount\":1"))
         assertTrue(costsBody.contains("\"reasoningOutputTokens\":2"))
     }

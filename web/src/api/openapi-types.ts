@@ -2551,6 +2551,7 @@ export interface components {
             asOf: string;
             basis: string;
             sourceUrl: string;
+            maxPhaseInputTokensExclusive: number;
         };
         /** EvaluationProviderCostResponse */
         EvaluationProviderCostResponse: {
