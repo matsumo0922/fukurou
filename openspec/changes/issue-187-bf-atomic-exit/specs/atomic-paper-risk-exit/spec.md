@@ -54,18 +54,30 @@ Issue #187 DoD (f): While HARD_HALT is durable and sticky, the system SHALL atom
 
 #### Scenario: Result is lost after cleanup commit
 - **WHEN** the cleanup transaction commits but its result is not observed by the caller
-- **THEN** the committed cleanup state is SAFE and a later pass completes idempotently without duplicate close executions or account mutations
+- **THEN** a later pass revalidates SAFE against an atomic zero-open-risk readback and completes idempotently without duplicate close executions or account mutations
 
 #### Scenario: Cleanup cannot obtain trustworthy execution input
 - **WHEN** market context or another required fact is missing or ambiguous
 - **THEN** the system creates no inferred or retrospective execution, keeps HARD_HALT active, and reports cleanup as incomplete or unknown
 
+#### Scenario: Flat halted account has no market input
+- **WHEN** HARD_HALT cleanup is UNKNOWN, no open position or risk-increasing order exists, and no trustworthy market tick is available
+- **THEN** the atomic readback stores SAFE without requiring a synthetic execution price
+
+#### Scenario: WebSocket connection remains unavailable
+- **WHEN** HARD_HALT cleanup is UNKNOWN and the market-event WebSocket repeatedly fails to connect
+- **THEN** each bounded connection-loop retry may use a trustworthy current REST tick only for cleanup and never for entry fill or protective execution
+
 #### Scenario: Manual resume is requested before cleanup is safe
 - **WHEN** an operator requests resume while HARD_HALT cleanup state is UNKNOWN
 - **THEN** the system rejects the resume without changing risk state or cleanup evidence
 
+#### Scenario: Stale SAFE survives an old-writer rollback epoch
+- **WHEN** an old binary leaves HARD_HALT cleanup marked SAFE while open position or risk-increasing order rows exist
+- **THEN** the next cleanup attempt or manual resume atomically detects the open risk, changes cleanup to UNKNOWN, rejects resume, and continues cleanup without trusting stale SAFE
+
 ### Requirement: HARD_HALT cleanup does not block risk reduction or broaden scope
-Issue #187 safety guardrails: The system MUST reject new risk-increasing mutations under HARD_HALT while allowing deterministic cancel and close operations. This change SHALL NOT introduce historical-price fills, unrelated strategy mutation, multi-replica coordination, or a general-purpose recovery engine.
+Issue #187 safety guardrails: The system MUST reject new risk-increasing mutations under HARD_HALT while allowing the atomic cleanup primitive and HARD_HALT sweep to perform deterministic cancel and close operations. This change SHALL NOT introduce historical-price fills, unrelated strategy mutation, multi-replica coordination, or a general-purpose recovery engine.
 
 #### Scenario: Entry races after HARD_HALT activation
 - **WHEN** a new risk-increasing placement or fill races with cleanup after HARD_HALT has committed
@@ -74,3 +86,7 @@ Issue #187 safety guardrails: The system MUST reject new risk-increasing mutatio
 #### Scenario: Protective order belongs to a closing position
 - **WHEN** cleanup closes a position that has a linked protective SELL order
 - **THEN** the protective order is canceled as part of the position close transaction rather than treated as a risk-increasing order or independently executed
+
+#### Scenario: Legacy thesis linkage blocks normal EXIT
+- **WHEN** a normal full EXIT cannot resolve canonical thesis linkage without inference
+- **THEN** it performs no mutation and leaves explicit position close/REDUCE and thesis-independent HARD_HALT cleanup available as risk-reducing paths
