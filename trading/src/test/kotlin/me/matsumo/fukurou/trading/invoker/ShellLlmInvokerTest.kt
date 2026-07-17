@@ -381,14 +381,14 @@ private fun request(
     return LlmInvocationRequest(
         invocationId = "invocation-157",
         provider = provider,
-        phase = LlmInvocationPhase.FALSIFIER,
+        phase = LlmInvocationPhase.REFLECTION,
         prompt = "synthetic prompt",
         timeout = Duration.ofSeconds(1),
         workingDirectory = Path.of("."),
         decisionRunContext = DecisionRunContext.EMPTY,
         mcpServer = null,
         environment = environment,
-        allowedTools = emptyList(),
+        toolPolicy = ToolPolicy(emptySet(), emptyList()),
     )
 }
 

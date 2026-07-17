@@ -1314,6 +1314,23 @@ class OneShotLlmRunner(
             )
         }
 
+        if (decision.decision.submission.action.requiresEntryIntent() && proposerResult.failure != null) {
+            runAuditRecorder.recordNoTrade(
+                context = proposerContext,
+                reason = "provider_failure_entry_rejected",
+                cause = proposerResult.failure,
+            ).getOrThrow()
+
+            return OneShotRunnerResult(
+                invocationId = invocationId,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                decision = decision,
+                intent = decision.tradeIntent,
+                tradeResult = null,
+                terminalCause = terminalCauseForNoTrade(proposerResult.failure),
+            )
+        }
+
         if (!decision.decision.submission.action.requiresEntryIntent()) {
             return handleNonEnterDecision(input, decision, proposerResult.attributionIncomplete)
         }
@@ -1435,7 +1452,7 @@ class OneShotLlmRunner(
         input.failureContextUpdated(falsifierContext)
         val falsifierResult = runFalsifierPhase(input, intent, falsifierContext)
 
-        if (!falsifierResult.approved) {
+        if (falsifierResult.failure != null || !falsifierResult.approved) {
             recordFalsificationNoTrade(
                 context = falsifierContext,
                 falsification = falsifierResult.falsification,
@@ -2039,7 +2056,7 @@ private class OneShotLlmRequestFactory(
                 decisionRunContext = input.decisionRunContext,
                 mcpServer = mcpServer,
                 environment = childEnvironment(input.decisionRunContext, input.intentId),
-                allowedTools = allowedTools,
+                toolPolicy = McpToolContractCatalog.canonicalPolicy(input.phase, allowedTools),
                 model = input.assignment.model,
                 effort = input.assignment.effort,
                 useConfiguredModelFallback = false,

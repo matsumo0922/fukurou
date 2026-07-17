@@ -297,7 +297,7 @@ class LlmInputManifestTest {
             decisionRunContext = DecisionRunContext.EMPTY,
             mcpServer = null,
             environment = emptyMap(),
-            allowedTools = listOf("unknown_tool"),
+            toolPolicy = me.matsumo.fukurou.trading.invoker.ToolPolicy(emptySet(), listOf("unknown_tool")),
         )
 
         assertFailsWith<LlmPhaseInputCaptureException> { recorder.appendInput(request) }

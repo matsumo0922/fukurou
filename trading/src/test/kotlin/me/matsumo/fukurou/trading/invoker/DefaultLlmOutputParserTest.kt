@@ -9,15 +9,14 @@ import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 /**
- * Codex CLI 0.142.5 JSONL と session model attribution を検証するテスト。
+ * pinned Claude/Codex output adapter contract を検証するテスト。
  */
 class DefaultLlmOutputParserTest {
 
     @Test
-    fun parseCodex_extractsLastSemanticResponseUsageAndMatchingSessionModel() {
+    fun parseCodexParsesExactSchemaAndIgnoresUnsupportedModelFields() {
         val codexHome = Files.createTempDirectory("codex-output-parser-test")
         val sessionDirectory = codexHome.resolve("sessions/2026/07/10")
         Files.createDirectories(sessionDirectory)
@@ -31,10 +30,9 @@ class DefaultLlmOutputParserTest {
         )
         val stdout = """
             {"type":"thread.started","thread_id":"thread-157"}
-            malformed-line
             {"type":"future.event","payload":{"secret":"ignored"}}
             {"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"draft"}}
-            {"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":12}}
+            {"type":"turn.completed","model":"ignored","usage":{"input_tokens":120,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":12}}
             {"type":"item.completed","item":{"id":"item-2","type":"agent_message","text":"final response"}}
         """.trimIndent()
 
@@ -52,8 +50,9 @@ class DefaultLlmOutputParserTest {
         assertEquals(40, output.usage?.usage?.cacheReadInputTokens)
         assertEquals(30, output.usage?.usage?.outputTokens)
         assertEquals(12, output.usage?.usage?.reasoningOutputTokens)
-        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
-        assertEquals(30, output.usage?.modelUsages?.single()?.usage?.outputTokens)
+        assertEquals(emptyList(), output.usage?.modelUsages)
+        assertNull(output.observedModelIdentity)
+        assertNull(output.providerFailure)
 
         codexHome.toFile().deleteRecursively()
     }
@@ -64,7 +63,7 @@ class DefaultLlmOutputParserTest {
         val stdout = """
             {"type":"thread.started","thread_id":"thread-without-session"}
             {"type":"item.completed","item":{"type":"agent_message","text":"partial response"}}
-            {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":4}}
+            {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0}}
             {"type":"turn.failed","error":{"message":"synthetic failure"}}
         """.trimIndent()
 
@@ -102,7 +101,7 @@ class DefaultLlmOutputParserTest {
         )
         val warnings = mutableListOf<String>()
 
-        val output = DefaultLlmOutputParser(warnings::add).parse(
+        val output = DefaultLlmOutputParser().parse(
             request = request(LlmProvider.CODEX),
             command = command(codexHome),
             processResult = processResult(codexStdout(threadId)),
@@ -110,7 +109,7 @@ class DefaultLlmOutputParserTest {
             completedAt = Instant.parse("2026-07-10T00:00:01Z"),
         )
 
-        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
+        assertNull(output.usage)
         assertEquals(emptyList(), warnings)
 
         codexHome.toFile().deleteRecursively()
@@ -133,7 +132,7 @@ class DefaultLlmOutputParserTest {
         Files.setLastModifiedTime(target, FileTime.from(Instant.parse("2100-01-01T00:00:00Z")))
         val warnings = mutableListOf<String>()
 
-        val output = DefaultLlmOutputParser(warnings::add).parse(
+        val output = DefaultLlmOutputParser().parse(
             request = request(LlmProvider.CODEX),
             command = command(codexHome),
             processResult = processResult(codexStdout(threadId)),
@@ -141,8 +140,8 @@ class DefaultLlmOutputParserTest {
             completedAt = Instant.parse("2026-07-10T00:00:01Z"),
         )
 
-        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
-        assertTrue(warnings.single().contains("fallback truncated session files"))
+        assertNull(output.usage)
+        assertEquals(emptyList(), warnings)
 
         codexHome.toFile().deleteRecursively()
     }
@@ -164,7 +163,7 @@ class DefaultLlmOutputParserTest {
         )
         val warnings = mutableListOf<String>()
 
-        val output = DefaultLlmOutputParser(warnings::add).parse(
+        val output = DefaultLlmOutputParser().parse(
             request = request(LlmProvider.CODEX),
             command = command(codexHome),
             processResult = processResult(codexStdout(threadId)),
@@ -172,9 +171,8 @@ class DefaultLlmOutputParserTest {
             completedAt = Instant.parse("2026-07-10T00:00:01Z"),
         )
 
-        assertEquals(emptyList(), output.usage?.modelUsages)
-        assertTrue(warnings.single().contains("truncated session content"))
-        assertTrue(!warnings.single().contains("matched="))
+        assertNull(output.usage)
+        assertEquals(emptyList(), warnings)
 
         codexHome.toFile().deleteRecursively()
     }
@@ -196,7 +194,7 @@ class DefaultLlmOutputParserTest {
         )
         val warnings = mutableListOf<String>()
 
-        val output = DefaultLlmOutputParser(warnings::add).parse(
+        val output = DefaultLlmOutputParser().parse(
             request = request(LlmProvider.CODEX),
             command = command(codexHome),
             processResult = processResult(codexStdout(threadId)),
@@ -204,7 +202,7 @@ class DefaultLlmOutputParserTest {
             completedAt = Instant.parse("2026-07-10T00:00:01Z"),
         )
 
-        assertEquals("gpt-5.4", output.usage?.modelUsages?.single()?.model)
+        assertNull(output.usage)
         assertEquals(emptyList(), warnings)
 
         codexHome.toFile().deleteRecursively()
@@ -215,6 +213,7 @@ class DefaultLlmOutputParserTest {
         val stdout = """
             {
               "type":"result",
+              "is_error":false,
               "result":"YES",
               "total_cost_usd":0.01,
               "usage":{"input_tokens":3,"output_tokens":1}
@@ -232,6 +231,54 @@ class DefaultLlmOutputParserTest {
         assertEquals("YES", output.responseText)
         assertEquals("0.01", output.usage?.totalCostUsd?.toPlainString())
         assertEquals(3, output.usage?.usage?.inputTokens)
+        assertNull(output.providerFailure)
+    }
+
+    @Test
+    fun parseCodexClassifiesExactFailuresAndRejectsInvalidTerminals() {
+        val thread = """{"type":"thread.started","thread_id":"thread-failure"}"""
+        val completed = """{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}"""
+        val cases = mapOf(
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Not logged in\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"turn failed\"}}") to LlmProviderFailureCategory.AUTHENTICATION,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Session limit reached\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"turn failed\"}}") to LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Quota exhausted\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"turn failed\"}}") to LlmProviderFailureCategory.QUOTA_EXHAUSTED,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Not logged in\"}\n$completed") to LlmProviderFailureCategory.OUTPUT_CONTRACT,
+            processResult("$thread\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"Session limit reached\"}}\n$completed") to LlmProviderFailureCategory.OUTPUT_CONTRACT,
+            failedProcess("ChatGPT login is required, but an API key is currently being used. Logging out.\n") to LlmProviderFailureCategory.AUTHENTICATION,
+            failedProcess("prefix ChatGPT login is required, but an API key is currently being used. Logging out.") to LlmProviderFailureCategory.OUTPUT_CONTRACT,
+        )
+        cases.forEach { (processResult, category) ->
+            val output = DefaultLlmOutputParser().parse(
+                request(LlmProvider.CODEX),
+                command(Files.createTempDirectory("codex-failure-output-test")),
+                processResult,
+                Instant.EPOCH,
+                Instant.EPOCH,
+            )
+
+            assertEquals(category, output.providerFailure?.category)
+        }
+    }
+
+    @Test
+    fun parseClaudeMapsSupportedStructuredFailureCodes() {
+        val cases = mapOf(
+            "authentication_error" to LlmProviderFailureCategory.AUTHENTICATION,
+            "session_limit" to LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
+            "quota_exhausted" to LlmProviderFailureCategory.QUOTA_EXHAUSTED,
+        )
+
+        cases.forEach { (code, category) ->
+            val output = DefaultLlmOutputParser().parse(
+                request(LlmProvider.CLAUDE),
+                command(Files.createTempDirectory("claude-failure-output-test")),
+                processResult("""{"type":"result","subtype":"$code","is_error":true,"result":"failed"}"""),
+                Instant.EPOCH,
+                Instant.EPOCH,
+            )
+
+            assertEquals(category, output.providerFailure?.category)
+        }
     }
 }
 
@@ -261,7 +308,7 @@ private fun request(provider: LlmProvider): LlmInvocationRequest {
         decisionRunContext = DecisionRunContext.EMPTY,
         mcpServer = null,
         environment = emptyMap(),
-        allowedTools = emptyList(),
+        toolPolicy = ToolPolicy(emptySet(), emptyList()),
     )
 }
 
@@ -284,3 +331,5 @@ private fun processResult(stdout: String, exitCode: Int = 0): ProcessRunResult {
         stderr = "",
     )
 }
+
+private fun failedProcess(stderr: String) = processResult("", 1).copy(stderr = stderr)

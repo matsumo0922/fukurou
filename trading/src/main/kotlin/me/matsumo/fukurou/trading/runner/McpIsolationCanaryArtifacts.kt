@@ -110,7 +110,7 @@ private fun recordCliIdentity(provider: LlmProvider) = runBlocking {
             decisionRunContext = DecisionRunContext.EMPTY,
             mcpServer = null,
             environment = System.getenv(),
-            allowedTools = emptyList(),
+            toolPolicy = McpToolContractCatalog.canonicalPolicy(LlmInvocationPhase.PRE_FILTER, emptyList()),
         )
         val recorder = LlmPhaseManifestRecorder(
             repository = runtime.llmInputManifestRepository,
@@ -220,7 +220,7 @@ private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) 
             autoApprovedTools = emptyList(),
         ),
         environment = System.getenv(),
-        allowedTools = allowedTools,
+        toolPolicy = McpToolContractCatalog.canonicalPolicy(phase, allowedTools),
         effort = LlmEffort.LOW,
     )
     val rendered = DefaultLlmCommandRenderer().render(request).getOrThrow()

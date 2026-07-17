@@ -186,6 +186,7 @@ sealed interface LlmDaemonTickResult {
 class LlmDaemonScheduler(
     private val tradingConfig: TradingBotConfig,
     private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
+    preFilterReleaseBarrierOpen: Boolean = LlmLaunchReleaseBarrier.PREFILTER_ACTIVATION_RELEASED,
     dependencies: LlmDaemonSchedulerDependencies,
     runtime: LlmDaemonSchedulerRuntime,
 ) {
@@ -207,6 +208,7 @@ class LlmDaemonScheduler(
     private val daemonConfig: LlmDaemonConfig = tradingConfig.daemon
     private val preFilterGate = LlmDaemonPreFilterGate(
         daemonConfig = daemonConfig,
+        releaseBarrierOpen = preFilterReleaseBarrierOpen,
         preFilter = runtime.preFilter,
         requestBase = requestBase,
         warnLogger = warnLogger,

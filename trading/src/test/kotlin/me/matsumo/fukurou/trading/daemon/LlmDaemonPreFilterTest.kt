@@ -57,6 +57,7 @@ class LlmDaemonPreFilterTest {
         val request = preFilterRequest()
         val gate = LlmDaemonPreFilterGate(
             daemonConfig = LlmDaemonConfig(preFilterEnabled = true),
+            releaseBarrierOpen = true,
             preFilter = LlmDaemonPreFilter { Result.failure(auditFailure) },
             requestBase = request.runnerRequest,
             warnLogger = RateLimitedWarnLogger(logger, Clock.fixed(FIXED_PRE_FILTER_INSTANT, ZoneOffset.UTC)),

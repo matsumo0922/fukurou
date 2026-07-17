@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
 import me.matsumo.fukurou.trading.market.IndicatorCalculator
@@ -132,7 +133,8 @@ class DefaultLlmDaemonPreFilter(
             decisionRunContext = context,
             mcpServer = null,
             environment = childEnvironment(context),
-            allowedTools = emptyList(),
+            toolPolicy = McpToolContractCatalog.canonicalPolicy(LlmInvocationPhase.PRE_FILTER, emptyList()),
+            model = HAIKU_PRE_FILTER_MODEL,
         )
         val auditResult = dependencies.invocationAuditor.invokeAndAudit(
             phaseName = PRE_FILTER_PHASE_NAME,
@@ -225,6 +227,9 @@ class DefaultLlmDaemonPreFilter(
     }
 }
 
+/** daemon pre-filter に固定する Claude Haiku model。 */
+const val HAIKU_PRE_FILTER_MODEL = "claude-haiku-4-5-20251001"
+
 /**
  * DefaultLlmDaemonPreFilter の外部依存。
  *
@@ -244,12 +249,14 @@ data class DefaultLlmDaemonPreFilterDependencies(
  * daemon scheduler から pre-filter 適用可否と fail-open を分離する gate。
  *
  * @param daemonConfig daemon 設定
+ * @param releaseBarrierOpen code-owned release barrier の結果
  * @param preFilter pre-filter 実行境界
  * @param requestBase one-shot runner request
  * @param warnLogger failure warning logger
  */
 class LlmDaemonPreFilterGate(
     private val daemonConfig: LlmDaemonConfig,
+    private val releaseBarrierOpen: Boolean,
     private val preFilter: LlmDaemonPreFilter,
     private val requestBase: OneShotRunnerRequest,
     private val warnLogger: RateLimitedWarnLogger,
@@ -264,7 +271,8 @@ class LlmDaemonPreFilterGate(
         observedAt: Instant,
         triggerSnapshot: LlmRunTriggerSnapshot? = null,
     ): LlmDaemonPreFilterDecision {
-        if (!daemonConfig.preFilterEnabled || !triggerKind.shouldRunPreFilter()) {
+        val preFilterAllowed = releaseBarrierOpen && daemonConfig.preFilterEnabled
+        if (!preFilterAllowed || !triggerKind.shouldRunPreFilter()) {
             return LlmDaemonPreFilterDecision.RUN_FULL
         }
 

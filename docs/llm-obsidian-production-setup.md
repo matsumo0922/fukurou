@@ -168,7 +168,7 @@ ssh dxp4800plus 'docker logs --since 10m fukurou-ktor | tail -200'
 ## Known constraints
 
 - Claude / Codex CLI は access token を自動 refresh する。refresh token 自体が失効または revoke された場合だけ、WebUI または fallback で再ログインする。
-- Runner は stdout / stderr に `is_error: true` を含む CLI 出力を検出した場合、`RUNNER_PHASE_COMPLETED.details.cliErrorReported = "true"` を残す。認証失敗らしい stdout / stderr を検出し、かつ CLI process が非 0 exit または `is_error: true` を含む CLI 出力を返した場合、`RUNNER_PHASE_COMPLETED.details.authFailureSuspected = "true"` と login runbook の warn log も残す。どちらも運用上の発見シグナルであり、runner は `proposer_missing_decision` の no-trade に fail closed する。`proposer_no_tool_calls` は process failure、CLI error 報告、認証失敗疑いのいずれもなく、判断未保存かつ許可済み tool call 0 件の場合だけ記録する。
+- Claude 2.1.199 / Codex 0.142.5 の versioned adapter は structured output の failure code を分類し、schema 不一致を `OUTPUT_CONTRACT` として fail closed にする。Claude no-MCP 起動はコピー済み auth source、空 MCP config、空 `--tools` を必須とし、auth source 欠損は process 起動前に `AUTHENTICATION` として扱う。provider failure の raw output は保存せず、安全な code と adapter version だけを監査する。
 - Codex の低コスト model 名は account / CLI の対応に依存する。未確認の model / effort 組み合わせを `llm.proposer.*` または `llm.falsifier.*` で active 化すると該当 phase が fail-closed する。
 - 既定の Codex Falsifier は `--skip-git-repo-check`、`--sandbox read-only`、`approval_policy="never"` で起動し、`CODEX_HOME/config.toml` に `submit_falsification` だけを tool 単位で `approval_mode = "approve"` として書く。これにより shell sandbox は保ったまま、ENTER 時の Falsifier verdict 保存まで進める。
 - `FUKUROU_CODEX_FALSIFIER_ARGS="--yolo"` や `--dangerously-bypass-approvals-and-sandbox` は通常運用には不要である。外部 sandbox で filesystem / network / secret mount を閉じた command template を明示 opt-in する場合の防御的 validation としてのみ残す。

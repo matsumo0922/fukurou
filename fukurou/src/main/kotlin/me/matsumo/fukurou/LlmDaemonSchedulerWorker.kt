@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
 import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
+import me.matsumo.fukurou.trading.daemon.HAIKU_PRE_FILTER_MODEL
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
@@ -568,8 +569,3 @@ private data class LlmLaunchRuntimeComponents(
  * ENTRY_FILL trigger が見る recent execution 件数。
  */
 private const val ENTRY_FILL_LOOKBACK_LIMIT = 20
-
-/**
- * daemon pre-filter に使う Claude Haiku model。
- */
-private const val HAIKU_PRE_FILTER_MODEL = "claude-haiku-4-5-20251001"
