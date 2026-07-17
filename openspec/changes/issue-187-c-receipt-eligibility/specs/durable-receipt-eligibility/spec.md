@@ -2,17 +2,17 @@
 
 ### Requirement: Committed receipt authority reaches the ledger unchanged
 
-Issue #187 DoD (c): The system SHALL attach the exact durable receipt identity, admission ordinal, and payload hash returned by receipt commit to the realtime trade event published to the application consumer. It MUST NOT publish the event when receipt commit fails or conflicts.
+Issue #187 DoD (c): The system SHALL attach the exact durable receipt identity, admission ordinal, payload hash, and canonical persisted socket-observation timestamp returned by receipt commit to the realtime trade event published to the application consumer. The event `receivedAt` SHALL equal that canonical timestamp. It MUST NOT publish the event when receipt commit fails or conflicts.
 
 #### Scenario: New receipt commits before dispatch
 
 - **WHEN** the WebSocket listener decodes a trade and commits a new durable receipt
-- **THEN** it publishes the trade only after commit with that receipt ID, admission ordinal, and payload hash attached
+- **THEN** it publishes the trade only after commit with that receipt ID, admission ordinal, payload hash, and canonical persisted observation timestamp attached
 
 #### Scenario: Duplicate source event reuses receipt authority
 
 - **WHEN** an identical `(session, source sequence, normalized payload)` is received again
-- **THEN** receipt commit returns the existing receipt and the published event carries the same receipt ID and admission ordinal without creating another receipt
+- **THEN** receipt commit returns the existing receipt and the published event carries the same receipt ID, admission ordinal, and original canonical `receivedAt` without creating another receipt
 
 #### Scenario: Receipt persistence is not trustworthy
 
@@ -21,7 +21,7 @@ Issue #187 DoD (c): The system SHALL attach the exact durable receipt identity, 
 
 ### Requirement: Resting entry creation captures a durable admission boundary transactionally
 
-Issue #187 DoD (c): Every realtime-enabled risk-increasing resting BUY SHALL store the maximum committed receipt admission ordinal for its connected market-data session inside the order creation transaction. Receipt commit and boundary capture MUST serialize on the existing session advisory-lock authority.
+Issue #187 DoD (c): Every realtime-enabled risk-increasing resting BUY SHALL store a conservative global maximum committed receipt admission ordinal inside the order creation transaction. Receipt commit and boundary capture MUST serialize on the connected session's existing advisory-lock authority, and session rows MUST be locked before ledger rows on order and event paths.
 
 #### Scenario: Receipt commits before order creation authority
 
@@ -40,7 +40,7 @@ Issue #187 DoD (c): Every realtime-enabled risk-increasing resting BUY SHALL sto
 
 ### Requirement: Risk-increasing fill requires an exact newer receipt
 
-Issue #187 DoD (c): A resting BUY fill SHALL require an exact persisted receipt whose identity, session, source sequence, admission ordinal, payload hash, and normalized event payload match the consumed event, and whose admission ordinal is strictly greater than the order boundary. Wall-clock receive time MUST NOT be an active fill authority.
+Issue #187 DoD (c): A resting BUY fill SHALL require an exact persisted receipt whose identity, session, source sequence, admission ordinal, payload hash, canonical socket-observation timestamp, `receivedAt`, and normalized event payload match the consumed event, and whose admission ordinal is strictly greater than the order boundary. Wall-clock receive time MUST NOT be an ordering authority.
 
 #### Scenario: Buffered pre-boundary event is processed after order commit
 
@@ -59,8 +59,8 @@ Issue #187 DoD (c): A resting BUY fill SHALL require an exact persisted receipt 
 
 #### Scenario: Exact receipt evidence is contradictory
 
-- **WHEN** receipt ID, session, source sequence, admission ordinal, payload hash, or recomputed normalized payload does not match the persisted receipt
-- **THEN** the system performs no risk-increasing fill and records the eligibility failure through the existing market-data-gap outer reason with additive typed detail
+- **WHEN** receipt ID, session, source sequence, admission ordinal, payload hash, canonical socket-observation timestamp, `receivedAt`, or recomputed normalized payload does not match the persisted receipt
+- **THEN** the system performs no risk-increasing fill and cancels affected entries through the existing market-data-gap reason without requiring a SafetyViolation cancellation-detail row
 
 ### Requirement: Missing or legacy eligibility fails closed without blocking risk reduction
 
@@ -81,24 +81,24 @@ Issue #187 safety guardrails: Missing receipt authority, a null order boundary, 
 - **WHEN** an event is ineligible for one or more risk-increasing resting BUY orders but is a causal realtime event for an open position
 - **THEN** entry fills remain zero while STOP/TP and other risk-reducing position handling continue under their existing status predicates
 
-### Requirement: Additive migration remains fail-closed across upgrade and rollback
+### Requirement: Additive migration and operational rollback remain fail-closed
 
-The system SHALL add the order receipt-boundary column and supporting indexes without rewriting history. Fresh installs and upgrades MUST initialize the schema, new readers MUST fail closed on null legacy boundaries, and rollback readers MUST not fill orders created under the new semantics from buffered events.
+The system SHALL add the order receipt-boundary column without rewriting history or building a new large-table receipt index. Fresh installs and upgrades MUST initialize the schema, new readers MUST fail closed on null legacy boundaries, and operators MUST stop admission and cancel/drain all new-semantics resting BUY orders before starting a pre-change reader.
 
 #### Scenario: Existing database upgrades
 
-- **WHEN** bootstrap runs against an orders table without the receipt-boundary column or the session-ordinal lookup index
-- **THEN** it adds them without changing existing order, receipt, execution, or account history
+- **WHEN** bootstrap runs against an orders table without the receipt-boundary column
+- **THEN** it adds the nullable column without changing existing order, receipt, execution, or account history and boundary lookup uses the existing global admission-ordinal index
 
 #### Scenario: New reader observes a legacy row
 
 - **WHEN** an upgraded reader evaluates an existing resting BUY whose durable boundary is null
 - **THEN** it creates no fill and does not synthesize or backfill a boundary
 
-#### Scenario: Old reader observes a newly created resting order
+#### Scenario: Operator rolls back to an old reader
 
-- **WHEN** a pre-change reader runs against an additive schema and sees a resting order created by the new writer
-- **THEN** the retained legacy wall-clock predicate is fenced so that the old reader cannot fill that order while it can still read and cancel it
+- **WHEN** rollback to a pre-change reader is required
+- **THEN** authenticated `POST /ops/halt` activates durable `HARD_HALT`, the new reader's `ALL_OPEN_RISK` sweep reaches `SAFE`, zero-open-risk readback and a zero-row resting-BUY query agree, and only then is the old reader started against the additive schema
 
 #### Scenario: Commit-order barrier repeats one thousand times
 
