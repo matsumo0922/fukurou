@@ -1136,18 +1136,15 @@ class FukurouMcpServerTest {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val longInvocationId = "recent-run-" + "x".repeat(140)
         insertFailedLlmRun(runtime.llmRunRepository, longInvocationId)
+        runtime.decisionRepository.submitDecision(
+            noTradeDecisionSubmissionFixture(decisionSubmissionContext(longInvocationId)),
+        ).getOrThrow()
         val server = FukurouMcpServer(
             clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
         ).createServer()
-
-        callTool(
-            server = server,
-            toolName = "submit_decision",
-            arguments = noTradeDecisionArguments(invocationId = longInvocationId),
-        )
 
         val result = callTool(
             server = server,
@@ -1432,6 +1429,7 @@ class FukurouMcpServerTest {
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
+            decisionRunContext = decisionSubmissionContext("similar-run"),
         ).createServer()
 
         val decisionResult = callTool(
