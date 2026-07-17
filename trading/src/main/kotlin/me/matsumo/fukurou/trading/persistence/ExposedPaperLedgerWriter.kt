@@ -73,8 +73,10 @@ import me.matsumo.fukurou.trading.domain.isRestingEntryLifecycleCandidate
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
 import me.matsumo.fukurou.trading.risk.RiskHaltState
+import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.safety.RestingEntryFillInvariantEvaluator
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorContext
@@ -118,8 +120,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(request.command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeIntent = resolvePaperWriteContext(request.command.auditContext, riskState)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryFill(
                         EntryFillWriteRequest(
@@ -142,8 +144,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(request.command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeIntent = resolvePaperWriteContext(request.command.auditContext, riskState)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryOrder(
                         EntryOrderInsertRequest(
@@ -184,8 +186,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(request.entry.command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeIntent = resolvePaperWriteContext(request.entry.command.auditContext, riskState)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
                         request.consumption.intentId,
@@ -215,8 +217,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(request.order.command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeIntent = resolvePaperWriteContext(request.order.command.auditContext, riskState)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
                         request.consumption.intentId,
@@ -266,8 +268,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeIntent = resolvePaperWriteContext(command.auditContext, riskState)
                         .intent(PaperWritePolicy.RISK_REDUCING)
                     val position = requireOpenPosition(positionId)
                     closePositionInTransaction(
@@ -292,8 +294,12 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    requirePaperWriteAllowed(PaperWritePolicy.PROTECTION_MAINTENANCE, command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    requirePaperWriteAllowed(
+                        policy = PaperWritePolicy.PROTECTION_MAINTENANCE,
+                        auditContext = command.auditContext,
+                        riskState = riskState,
+                    )
                     val position = requireOpenPosition(command.positionId)
                     val newStopPrice = command.newStopPriceJpy
                     val newTakeProfitPrice = if (command.takeProfitPriceSpecified) {
@@ -329,8 +335,12 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    requirePaperWriteAllowed(PaperWritePolicy.RISK_REDUCING, command.auditContext)
+                    val riskState = lockPaperLedgerMutationRows()
+                    requirePaperWriteAllowed(
+                        policy = PaperWritePolicy.RISK_REDUCING,
+                        auditContext = command.auditContext,
+                        riskState = riskState,
+                    )
                     val order = requireOpenOrder(command.orderId)
                     val isProtectiveStop = order.side == OrderSide.SELL && order.orderType == OrderType.STOP && order.positionId != null
 
@@ -387,8 +397,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY, riskState)
                     val reconcileContext = tickSnapshot.toReconcileMarketContext(
                         fallbackSymbolRules = fallbackSymbolRules,
                         simulator = simulator,
@@ -406,7 +416,7 @@ internal class ExposedPaperLedgerWriter(
                     expireRestingEntryOrders(clock.instant(), progress)
 
                     if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
-                        if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.baselineAligned) {
+                        if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.riskIncreaseAllowed) {
                             fillTriggeredEntryOrders(
                                 context = reconcileContext,
                                 progress = progress,
@@ -431,8 +441,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    lockPaperLedgerMutationRows()
-                    val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY)
+                    val riskState = lockPaperLedgerMutationRows()
+                    val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY, riskState)
                     applyPaperMarketEvent(
                         event = event,
                         simulator = simulator,
@@ -465,15 +475,14 @@ private fun JdbcTransaction.executeRiskExitInTransaction(
     request: PaperRiskExitRequest,
     clock: Clock,
 ): PaperRiskExitResult {
-    lockPaperLedgerMutationRows()
-    val riskState = selectRiskState(forUpdate = true)
+    val riskState = lockPaperLedgerMutationRows()
     val targets = resolveRiskExitTargets(request.scope)
     val hasOpenRisk = targets.positions.isNotEmpty() || targets.orders.isNotEmpty()
 
     prepareHardHaltRiskExit(request.scope, riskState.state, hasOpenRisk)
     missingMarketContextResult(request, targets)?.let { result -> return result }
 
-    val result = mutateRiskExitTargets(request, targets, clock)
+    val result = mutateRiskExitTargets(request, targets, riskState, clock)
 
     if (request.scope == PaperRiskExitScope.AllOpenRisk) {
         check(!hasOpenPaperRisk()) { "ALL_OPEN_RISK did not converge to zero open risk." }
@@ -512,9 +521,10 @@ private fun missingMarketContextResult(
 private fun JdbcTransaction.mutateRiskExitTargets(
     request: PaperRiskExitRequest,
     targets: ExposedRiskExitTargets,
+    riskState: RiskState,
     clock: Clock,
 ): PaperRiskExitResult {
-    val writeIntent = resolvePaperWriteContext(request.auditContext)
+    val writeIntent = resolvePaperWriteContext(request.auditContext, riskState)
         .intent(PaperWritePolicy.RISK_REDUCING)
     val fills = targets.positions.associate { position ->
         val simulationContext = requireNotNull(request.simulationContext)
@@ -714,8 +724,8 @@ private fun JdbcTransaction.closePositionInTransaction(
 }
 
 /** ledger mutation が共有する row lock を authority 順に取得する。 */
-private fun JdbcTransaction.lockPaperLedgerMutationRows() {
-    selectRiskState(forUpdate = true)
+private fun JdbcTransaction.lockPaperLedgerMutationRows(): RiskState {
+    val riskState = selectRiskState(forUpdate = true)
     prepare("SELECT id FROM paper_account WHERE id = ? FOR UPDATE").use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
@@ -724,6 +734,8 @@ private fun JdbcTransaction.lockPaperLedgerMutationRows() {
     }
     lockRowsInIdOrder("SELECT id FROM positions WHERE status = 'OPEN' ORDER BY id FOR UPDATE")
     lockRowsInIdOrder("SELECT id FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL') ORDER BY id FOR UPDATE")
+
+    return riskState
 }
 
 private fun JdbcTransaction.lockRowsInIdOrder(query: String) {
@@ -806,7 +818,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     expireRestingEntryOrders(clock.instant(), progress)
     bindExistingPositionsToSession(event)
 
-    if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.baselineAligned) {
+    if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.riskIncreaseAllowed) {
         applyEventToRestingEntries(
             event = event,
             simulator = simulator,
@@ -1951,7 +1963,10 @@ private fun JdbcTransaction.insertExecution(request: ExecutionInsertRequest) {
 }
 
 /** transaction 入口で current lineage を一度だけ固定する。 */
-private fun JdbcTransaction.resolvePaperWriteContext(auditContext: PaperTradeAuditContext): PaperWriteContext {
+private fun JdbcTransaction.resolvePaperWriteContext(
+    auditContext: PaperTradeAuditContext,
+    riskState: RiskState,
+): PaperWriteContext {
     val account = prepare(
         """
             SELECT account.current_epoch_id, account.initial_cash_jpy,
@@ -1996,6 +2011,7 @@ private fun JdbcTransaction.resolvePaperWriteContext(auditContext: PaperTradeAud
             runtimeConfigHash = activeHash,
         ),
         baselineAligned = accountMatchesEpoch && accountMatchesConfig,
+        riskState = riskState.state,
     )
 }
 
@@ -2008,7 +2024,11 @@ private enum class PaperWritePolicy {
 private data class PaperWriteContext(
     val lineage: PaperExecutionLineage,
     val baselineAligned: Boolean,
+    val riskState: RiskHaltState,
 ) {
+    val riskIncreaseAllowed: Boolean
+        get() = baselineAligned && riskState != RiskHaltState.HARD_HALT
+
     fun intent(policy: PaperWritePolicy): PaperWriteIntent {
         requireAllowed(policy)
 
@@ -2016,14 +2036,21 @@ private data class PaperWriteContext(
     }
 
     fun requireAllowed(policy: PaperWritePolicy) {
+        if (policy == PaperWritePolicy.RISK_INCREASING && riskState == RiskHaltState.HARD_HALT) {
+            throw HardHaltTradingRejectedException("HARD_HALT rejects risk-increasing paper ledger mutations.")
+        }
         require(policy != PaperWritePolicy.RISK_INCREASING || baselineAligned) {
             "PAPER_ACCOUNT_BASELINE_MISMATCH: create, validate, and activate an operator runtime-config draft."
         }
     }
 }
 
-private fun JdbcTransaction.requirePaperWriteAllowed(policy: PaperWritePolicy, auditContext: PaperTradeAuditContext) {
-    resolvePaperWriteContext(auditContext).requireAllowed(policy)
+private fun JdbcTransaction.requirePaperWriteAllowed(
+    policy: PaperWritePolicy,
+    auditContext: PaperTradeAuditContext,
+    riskState: RiskState,
+) {
+    resolvePaperWriteContext(auditContext, riskState).requireAllowed(policy)
 }
 
 private data class PaperWriteIntent(

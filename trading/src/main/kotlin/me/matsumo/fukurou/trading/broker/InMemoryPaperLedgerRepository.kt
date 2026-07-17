@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
+import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
@@ -501,6 +502,7 @@ private class InMemoryPaperLedgerMutationWriter(
     override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
+                requireRiskIncreaseAllowedLocked()
                 fillEntryLocked(
                     EntryFillWriteRequest(
                         entry = request,
@@ -515,6 +517,7 @@ private class InMemoryPaperLedgerMutationWriter(
     override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
+                requireRiskIncreaseAllowedLocked()
                 recordIntentThesisLocked(request.command)
                 val order = request.command.toEntryOrder(
                     orderId = request.orderId,
@@ -739,7 +742,9 @@ private class InMemoryPaperLedgerMutationWriter(
                 expireRestingEntryOrdersLocked(clock.instant(), progress)
 
                 if (reconcileScope == PaperLedgerReconcileScope.FULL_TICK_EXECUTION) {
-                    if (!maxDrawdownPolicy.isHardHalt(accountSnapshot.drawdownRatio.toBigDecimal())) {
+                    val riskIncreaseAllowed = riskIncreaseAllowedLocked() &&
+                        !maxDrawdownPolicy.isHardHalt(accountSnapshot.drawdownRatio.toBigDecimal())
+                    if (riskIncreaseAllowed) {
                         fillTriggeredEntryOrdersLocked(reconcileContext, progress)
                     }
                     triggerPositionProtectionsLocked(reconcileContext, progress)
@@ -809,7 +814,9 @@ private class InMemoryPaperLedgerMutationWriter(
 
                 updateMarksLocked(event.priceJpy, null, fallbackSymbolRules, event.receivedAt)
                 expireRestingEntryOrdersLocked(clock.instant(), progress)
-                if (!maxDrawdownPolicy.isHardHalt(accountSnapshot.drawdownRatio.toBigDecimal())) {
+                val riskIncreaseAllowed = riskIncreaseAllowedLocked() &&
+                    !maxDrawdownPolicy.isHardHalt(accountSnapshot.drawdownRatio.toBigDecimal())
+                if (riskIncreaseAllowed) {
                     val existingPositionIds = positions.mapTo(mutableSetOf(), Position::positionId)
                     fillMarketEventEntryOrdersLocked(event, context, progress)
                     positions
@@ -1165,6 +1172,16 @@ private class InMemoryPaperLedgerMutationWriter(
     private fun InMemoryPaperLedgerState.requireHardHaltIfAvailable() {
         val riskState = accountStateBoundary.currentRiskStateOrNull() ?: return
         if (riskState.state != RiskHaltState.HARD_HALT) throw PaperRiskExitException.HardHaltRequired()
+    }
+
+    private fun InMemoryPaperLedgerState.riskIncreaseAllowedLocked(): Boolean {
+        return accountStateBoundary.currentRiskStateOrNull()?.state != RiskHaltState.HARD_HALT
+    }
+
+    private fun InMemoryPaperLedgerState.requireRiskIncreaseAllowedLocked() {
+        if (!riskIncreaseAllowedLocked()) {
+            throw HardHaltTradingRejectedException("HARD_HALT rejects risk-increasing paper ledger mutations.")
+        }
     }
 
     private fun InMemoryPaperLedgerState.markHardHaltCleanupLocked(cleanupState: HardHaltCleanupState) {

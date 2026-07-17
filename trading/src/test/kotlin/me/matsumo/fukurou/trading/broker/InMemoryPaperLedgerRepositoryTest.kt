@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
@@ -17,7 +18,10 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
+import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
+import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -181,6 +185,215 @@ class InMemoryPaperLedgerRepositoryTest {
         assertEquals(PaperRiskExitCompletion.INCOMPLETE, staleResult.completion)
         assertEquals(HardHaltCleanupState.UNKNOWN, staleRisk.current().getOrThrow().hardHaltCleanupState)
     }
+
+    @Test
+    fun directMarketAndRestingEntriesHonorInMemoryHardHaltMutationBoundary() = runBlocking {
+        DirectInMemoryEntryMutationKind.entries.forEach { mutationKind ->
+            listOf(true, false).forEach { haltFirst ->
+                val boundary = InMemoryAccountStateBoundary()
+                val riskRepository = InMemoryRiskStateRepository(fixedClock(), accountStateBoundary = boundary)
+                val ledgerRepository = InMemoryPaperLedgerRepository(
+                    clock = fixedClock(),
+                    accountStateBoundary = boundary,
+                )
+                if (haltFirst) riskRepository.setHardHalt("direct entry hard halt", fixedInstant()).getOrThrow()
+
+                val result = when (mutationKind) {
+                    DirectInMemoryEntryMutationKind.MARKET -> ledgerRepository.fillMarketEntry(marketEntryRequest())
+                    DirectInMemoryEntryMutationKind.RESTING -> {
+                        ledgerRepository.createRestingEntryOrder(restingEntryRequest())
+                    }
+                }
+                if (!haltFirst) riskRepository.setHardHalt("direct entry hard halt", fixedInstant()).getOrThrow()
+
+                assertEquals(RiskHaltState.HARD_HALT, riskRepository.current().getOrThrow().state)
+                if (haltFirst) {
+                    assertIs<HardHaltTradingRejectedException>(result.exceptionOrNull())
+                    assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+                    assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
+                    assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+                } else {
+                    assertTrue(result.isSuccess)
+                    when (mutationKind) {
+                        DirectInMemoryEntryMutationKind.MARKET -> {
+                            assertEquals(1, ledgerRepository.getOpenPositions().getOrThrow().size)
+                            assertEquals(1, ledgerRepository.getExecutions().getOrThrow().size)
+                        }
+
+                        DirectInMemoryEntryMutationKind.RESTING -> {
+                            assertEquals(1, ledgerRepository.getOpenOrders().getOrThrow().size)
+                            assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun hardHaltPreventsInMemoryTickAndMarketEventEntryFills() = runBlocking {
+        val tickBoundary = InMemoryAccountStateBoundary()
+        val tickRisk = InMemoryRiskStateRepository(fixedClock(), accountStateBoundary = tickBoundary)
+        val tickLedger = InMemoryPaperLedgerRepository(
+            clock = fixedClock(),
+            accountStateBoundary = tickBoundary,
+        )
+        tickLedger.createRestingEntryOrder(restingEntryRequest()).getOrThrow()
+        tickRisk.setHardHalt("tick entry hard halt", fixedInstant()).getOrThrow()
+
+        val tickResult = tickLedger.reconcile(
+            tickSnapshot = entryTickSnapshot(),
+            simulator = FixedEntrySimulator,
+            simulationContext = entrySimulationContext(),
+            reconcileScope = PaperLedgerReconcileScope.FULL_TICK_EXECUTION,
+        ).getOrThrow()
+
+        assertTrue(tickResult.filledOrderIds.isEmpty())
+        assertTrue(tickLedger.getExecutions().getOrThrow().isEmpty())
+        assertEquals(1, tickLedger.getOpenOrders().getOrThrow().size)
+
+        val marketEventBoundary = InMemoryAccountStateBoundary()
+        val marketEventRisk = InMemoryRiskStateRepository(fixedClock(), accountStateBoundary = marketEventBoundary)
+        val marketEventLedger = InMemoryPaperLedgerRepository(
+            clock = fixedClock(),
+            accountStateBoundary = marketEventBoundary,
+        )
+        val sessionId = UUID.randomUUID()
+        marketEventLedger.createRestingEntryOrder(
+            restingEntryRequest(
+                marketEligibility = RestingOrderMarketEligibility(
+                    sessionId = sessionId,
+                    eligibleAfterSequence = 0,
+                    eligibleFrom = fixedInstant(),
+                    queueAheadBtc = BigDecimal.ZERO,
+                    queueSnapshotAt = fixedInstant(),
+                ),
+            ),
+        ).getOrThrow()
+        marketEventRisk.setHardHalt("market event entry hard halt", fixedInstant()).getOrThrow()
+
+        val marketEventResult = marketEventLedger.applyMarketEvent(
+            event = PaperMarketTradeEvent(
+                symbol = TradingSymbol.BTC,
+                side = OrderSide.SELL,
+                priceJpy = BigDecimal("9900000"),
+                sizeBtc = BigDecimal("0.0100"),
+                exchangeAt = fixedInstant().plusSeconds(1),
+                receivedAt = fixedInstant().plusSeconds(1),
+                connectionSessionId = sessionId,
+                sequence = 1,
+            ),
+            simulator = FixedEntrySimulator,
+        ).getOrThrow()
+
+        assertTrue(marketEventResult.filledOrderIds.isEmpty())
+        assertTrue(marketEventLedger.getExecutions().getOrThrow().isEmpty())
+        assertEquals(1, marketEventLedger.getOpenOrders().getOrThrow().size)
+    }
+}
+
+/** direct entry mutation の種類。 */
+private enum class DirectInMemoryEntryMutationKind {
+    MARKET,
+    RESTING,
+}
+
+private fun marketEntryRequest(): MarketEntryFillRequest {
+    val command = directEntryCommand(OrderType.MARKET)
+
+    return MarketEntryFillRequest(
+        command = command,
+        fill = fixedEntryFill(command.sizeBtc, ExecutionLiquidity.TAKER),
+        positionId = UUID.randomUUID(),
+        tradeGroupId = UUID.randomUUID(),
+        stopOrderId = UUID.randomUUID(),
+    )
+}
+
+private fun restingEntryRequest(marketEligibility: RestingOrderMarketEligibility? = null): RestingEntryOrderRequest {
+    val command = directEntryCommand(OrderType.LIMIT)
+
+    return RestingEntryOrderRequest(
+        command = command,
+        orderId = command.commandId,
+        tradeGroupId = UUID.randomUUID(),
+        createdAt = fixedInstant(),
+        expiresAt = fixedInstant().plusSeconds(300),
+        expirySource = OrderExpirySource.SYSTEM_TTL,
+        effectiveTtlSeconds = 300,
+        marketEligibility = marketEligibility,
+    )
+}
+
+private fun directEntryCommand(orderType: OrderType): PlaceOrderCommand {
+    return PlaceOrderCommand(
+        commandId = UUID.randomUUID(),
+        symbol = TradingSymbol.BTC,
+        side = OrderSide.BUY,
+        orderType = orderType,
+        sizeBtc = BigDecimal("0.0010"),
+        priceJpy = BigDecimal("10000000").takeIf { orderType == OrderType.LIMIT },
+        tradeGroupId = null,
+        protectiveStopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = BigDecimal("11000000"),
+        estimatedWinProbability = BigDecimal("0.70"),
+        reasonJa = "direct entry hard halt boundary test",
+        auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+private object FixedEntrySimulator : PaperExecutionSimulator {
+    override fun simulateImmediate(
+        request: ImmediateExecutionRequest,
+        context: PaperSimulationContext,
+    ): SimulatedFill = fixedEntryFill(request.sizeBtc, ExecutionLiquidity.TAKER)
+
+    override fun simulatePendingLimit(
+        request: PendingLimitExecutionRequest,
+        context: PaperSimulationContext,
+    ): PaperOrderUpdate {
+        return PaperOrderUpdate(
+            fill = fixedEntryFill(request.sizeBtc),
+            remainingSizeBtc = BigDecimal.ZERO,
+            expired = false,
+        )
+    }
+}
+
+private fun fixedEntryFill(
+    sizeBtc: BigDecimal,
+    liquidity: ExecutionLiquidity = ExecutionLiquidity.MAKER,
+): SimulatedFill {
+    return SimulatedFill(
+        executionId = UUID.randomUUID(),
+        priceJpy = BigDecimal("9900000"),
+        sizeBtc = sizeBtc,
+        feeJpy = BigDecimal.ZERO,
+        realizedPnlJpy = BigDecimal.ZERO,
+        liquidity = liquidity,
+        executedAt = fixedInstant().plusSeconds(1),
+    )
+}
+
+private fun entryTickSnapshot(): TickSnapshot {
+    return TickSnapshot(
+        symbol = TradingSymbol.BTC.apiSymbol,
+        observedAt = fixedInstant().plusSeconds(1),
+        lastPrice = "9900000",
+        bidPrice = "9900000",
+        askPrice = "9900000",
+        symbolRules = riskExitContext().rules,
+    )
+}
+
+private fun entrySimulationContext(): PaperSimulationContext {
+    return riskExitContext().copy(
+        ticker = riskExitContext().ticker.copy(
+            last = "9900000",
+            bid = "9900000",
+            ask = "9900000",
+        ),
+    )
 }
 
 private const val TARGET_POSITION_ID = "00000000-0000-0000-0000-000000000010"
