@@ -42,7 +42,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
     ): ParsedLlmOutput {
         return when (request.provider) {
             LlmProvider.CLAUDE -> parseClaude(command, processResult.stdout)
-            LlmProvider.CODEX -> parseCodex(command, processResult.stdout)
+            LlmProvider.CODEX -> parseCodex(command, processResult)
         }
     }
 
@@ -96,16 +96,16 @@ class DefaultLlmOutputParser : LlmOutputParser {
     }
 
     @Suppress("LongMethod", "CyclomaticComplexMethod")
-    private fun parseCodex(command: RenderedLlmCommand, stdout: String): ParsedLlmOutput {
+    private fun parseCodex(command: RenderedLlmCommand, processResult: ProcessRunResult): ParsedLlmOutput {
         var threadId: String? = null
         var responseText: String? = null
         var usage: LlmTokenUsage? = null
         var terminalSucceeded: Boolean? = null
         var terminalCount = 0
-        var providerMessage: String? = null
+        var providerCategory: LlmProviderFailureCategory? = null
         var schemaDrift = false
 
-        stdout.lineSequence().filter(String::isNotBlank).forEach { line ->
+        processResult.stdout.lineSequence().filter(String::isNotBlank).forEach { line ->
             val event = runCatching { OutputJson.parseToJsonElement(line) as? JsonObject }.getOrNull()
             if (event == null) {
                 schemaDrift = true
@@ -133,14 +133,14 @@ class DefaultLlmOutputParser : LlmOutputParser {
                     terminalCount++
                     terminalSucceeded = terminalSucceeded ?: false
                     val message = event.objectOrNull("error")?.stringOrNull("message")
-                    providerMessage = providerMessage ?: message
+                    providerCategory = providerCategory ?: message?.knownCompatibilityFailureCategory()
+                        ?: LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE
                     if (message == null) schemaDrift = true
                 }
                 "error" -> {
-                    terminalCount++
-                    terminalSucceeded = terminalSucceeded ?: false
                     val message = event.stringOrNull("message")
-                    providerMessage = providerMessage ?: message
+                    providerCategory = providerCategory ?: message?.knownCompatibilityFailureCategory()
+                        ?: LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE
                     if (message == null) schemaDrift = true
                 }
             }
@@ -148,24 +148,22 @@ class DefaultLlmOutputParser : LlmOutputParser {
 
         val hasExactlyOneTerminal = terminalCount == 1
         val successfulContractComplete = hasExactlyOneTerminal && terminalSucceeded == true &&
-            threadId != null && responseText != null && usage != null
-        val failedContractComplete = hasExactlyOneTerminal && terminalSucceeded == false &&
-            providerMessage != null
-        val compatibilityFailure = providerMessage?.knownCompatibilityFailureCategory()
+            providerCategory == null && threadId != null && responseText != null && usage != null
+        val stderrAuthFailure = terminalCount == 0 && processResult.exitCode != 0 &&
+            processResult.stderr.trimEnd('\r', '\n') in CODEX_STDERR_AUTH_FAILURES
         val providerFailure = when {
+            stderrAuthFailure -> failure(
+                LlmProviderFailureCategory.AUTHENTICATION,
+                "CODEX_LOGIN_RESTRICTION",
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            )
             schemaDrift || !hasExactlyOneTerminal -> outputContractFailure(CODEX_OUTPUT_ADAPTER_VERSION)
-            terminalSucceeded == false && compatibilityFailure != null -> failure(
-                compatibilityFailure,
+            terminalSucceeded == false -> failure(
+                requireNotNull(providerCategory),
                 "CODEX_ERROR_COMPATIBILITY",
                 CODEX_OUTPUT_ADAPTER_VERSION,
             )
-            !successfulContractComplete && !failedContractComplete ->
-                outputContractFailure(CODEX_OUTPUT_ADAPTER_VERSION)
-            terminalSucceeded == false -> failure(
-                LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
-                null,
-                CODEX_OUTPUT_ADAPTER_VERSION,
-            )
+            !successfulContractComplete -> outputContractFailure(CODEX_OUTPUT_ADAPTER_VERSION)
             else -> null
         }
         val usageDetails = usage?.let { tokenUsage ->
@@ -274,6 +272,10 @@ private const val CODEX_THREAD_STARTED_EVENT = "thread.started"
 private const val CODEX_ITEM_COMPLETED_EVENT = "item.completed"
 private const val CODEX_TURN_COMPLETED_EVENT = "turn.completed"
 private const val CODEX_AGENT_MESSAGE_ITEM = "agent_message"
+private val CODEX_STDERR_AUTH_FAILURES = setOf(
+    "API key login is required, but ChatGPT is currently being used. Logging out.",
+    "ChatGPT login is required, but an API key is currently being used. Logging out.",
+)
 private val SAFE_PROVIDER_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
 
 private val OutputJson = Json {

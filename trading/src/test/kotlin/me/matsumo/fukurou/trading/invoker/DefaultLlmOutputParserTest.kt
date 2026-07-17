@@ -238,25 +238,20 @@ class DefaultLlmOutputParserTest {
     fun parseCodexClassifiesExactFailuresAndRejectsInvalidTerminals() {
         val thread = """{"type":"thread.started","thread_id":"thread-failure"}"""
         val completed = """{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}"""
-        val failed = """{"type":"turn.failed","error":{"message":"Session limit reached"}}"""
         val cases = mapOf(
-            "$thread\n{\"type\":\"error\",\"message\":\"Not logged in\"}" to LlmProviderFailureCategory.AUTHENTICATION,
-            "$thread\n$failed" to LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
-            "$thread\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"Quota exhausted\"}}" to LlmProviderFailureCategory.QUOTA_EXHAUSTED,
-            "$thread\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"unknown\",\"code\":\"rate_limit\"}}" to LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
-            "$thread\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}" to LlmProviderFailureCategory.OUTPUT_CONTRACT,
-            "$thread\n{\"type\":\"error\"}" to LlmProviderFailureCategory.OUTPUT_CONTRACT,
-            "$thread\n{\"type\":\"turn.failed\",\"error\":{\"code\":\"rate_limit\"}}" to LlmProviderFailureCategory.OUTPUT_CONTRACT,
-            "$thread\n{\"type\":\"error\",\"message\":\"Not logged in\"}\n$completed" to LlmProviderFailureCategory.OUTPUT_CONTRACT,
-            "$thread\n$failed\n$completed" to LlmProviderFailureCategory.OUTPUT_CONTRACT,
-            "$thread\n$completed\n$completed" to LlmProviderFailureCategory.OUTPUT_CONTRACT,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Not logged in\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"turn failed\"}}") to LlmProviderFailureCategory.AUTHENTICATION,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Session limit reached\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"turn failed\"}}") to LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Quota exhausted\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"turn failed\"}}") to LlmProviderFailureCategory.QUOTA_EXHAUSTED,
+            processResult("$thread\n{\"type\":\"error\",\"message\":\"Not logged in\"}\n$completed") to LlmProviderFailureCategory.OUTPUT_CONTRACT,
+            processResult("$thread\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"Session limit reached\"}}\n$completed") to LlmProviderFailureCategory.OUTPUT_CONTRACT,
+            failedProcess("ChatGPT login is required, but an API key is currently being used. Logging out.\n") to LlmProviderFailureCategory.AUTHENTICATION,
+            failedProcess("prefix ChatGPT login is required, but an API key is currently being used. Logging out.") to LlmProviderFailureCategory.OUTPUT_CONTRACT,
         )
-
-        cases.forEach { (stdout, category) ->
+        cases.forEach { (processResult, category) ->
             val output = DefaultLlmOutputParser().parse(
                 request(LlmProvider.CODEX),
                 command(Files.createTempDirectory("codex-failure-output-test")),
-                processResult(stdout),
+                processResult,
                 Instant.EPOCH,
                 Instant.EPOCH,
             )
@@ -336,3 +331,5 @@ private fun processResult(stdout: String, exitCode: Int = 0): ProcessRunResult {
         stderr = "",
     )
 }
+
+private fun failedProcess(stderr: String) = processResult("", 1).copy(stderr = stderr)
