@@ -8843,6 +8843,16 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun hardHaltCleanupWinsBarrierBeforeRestingFillWithoutRiskIncrease() = runPostgresTest {
+        runHardHaltCleanupFillBarrierRace(cleanupFirst = true)
+    }
+
+    @Test
+    fun restingFillWinsBarrierAfterHardHaltWithoutRiskIncrease() = runPostgresTest {
+        runHardHaltCleanupFillBarrierRace(cleanupFirst = false)
+    }
+
+    @Test
     fun postgres_reconcile_and_event_use_non_default_policy_for_entry_gate() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val policy = MaxDrawdownPolicy(BigDecimal("-0.10"))
@@ -10452,6 +10462,94 @@ private suspend fun PostgresTestContext.runAtomicRiskExitFillBarrierRace(exitFir
     assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
     assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
     assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
+}
+
+private suspend fun PostgresTestContext.runHardHaltCleanupFillBarrierRace(cleanupFirst: Boolean) {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000191")
+    ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+    val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+    val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+    val riskRepository = ExposedRiskStateRepository(database)
+    val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+        Orderbook(
+            symbol = "BTC",
+            bids = listOf(OrderbookLevel(price = "9990000", size = "0.0010")),
+            asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+        ),
+    )
+    val broker = PaperBroker(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = riskRepository,
+        decisionRepository = decisionRepository,
+        marketDataSource = marketDataSource,
+        reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+        requireRealtimeIntegrityForRestingOrders = true,
+        clock = fixedClock(),
+    )
+    broker.applyMarketEvent(
+        paperTradeEvent(
+            sessionId = sessionId,
+            sequence = 1,
+            sizeBtc = "0.0010",
+            priceJpy = "10000000",
+            receivedAt = fixedInstant(),
+        ),
+    ).getOrThrow()
+    val restingEntry = approvedPostgresEntryCommand(
+        decisionRepository,
+        postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9990000"),
+            sizeBtc = BigDecimal("0.0002"),
+            takeProfitPriceJpy = BigDecimal("11000000"),
+        ),
+    )
+    broker.placeOrder(restingEntry).getOrThrow()
+    riskRepository.setHardHalt("barrier race hard halt", fixedInstant()).getOrThrow()
+
+    val cleanupAction: suspend () -> Unit = {
+        broker.sweepHardHalt("barrier race cleanup", null).getOrThrow()
+    }
+    val fillAction: suspend () -> Unit = {
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0100",
+                priceJpy = "9990000",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+    }
+    val riskLockConnection = dataSource.connection
+    riskLockConnection.autoCommit = false
+    riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+        statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+    }
+
+    try {
+        coroutineScope {
+            val first = async(Dispatchers.IO) { if (cleanupFirst) cleanupAction() else fillAction() }
+            awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
+            val second = async(Dispatchers.IO) { if (cleanupFirst) fillAction() else cleanupAction() }
+            try {
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+            } finally {
+                riskLockConnection.commit()
+                riskLockConnection.close()
+            }
+            first.await()
+            second.await()
+        }
+    } finally {
+        if (!riskLockConnection.isClosed) riskLockConnection.close()
+    }
+
+    assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
+    assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+    assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+    assertEquals(HardHaltCleanupState.SAFE, riskRepository.current().getOrThrow().hardHaltCleanupState)
 }
 
 private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
