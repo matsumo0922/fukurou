@@ -130,7 +130,6 @@ import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
-import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
@@ -3127,15 +3126,14 @@ private fun addLongRunnerFixture(
 
 private fun TradingRuntime.withHardHaltDrawdown(config: TradingBotConfig): TradingRuntime {
     val baseBroker = broker as PaperBroker
-    val drawdownRiskStateRepository = InMemoryRiskStateRepository(
-        clock = fixedClock(),
-        initialState = RiskState(
-            state = RiskHaltState.RUNNING,
+    val drawdownRiskStateRepository = requireNotNull(riskStateRepository as? InMemoryRiskStateRepository)
+    drawdownRiskStateRepository.accountStateBoundary.updateRiskState { state ->
+        state.copy(
             drawdownRatio = BigDecimal("-0.1500000000"),
             equityPeak = BigDecimal("100000.0000"),
             updatedAt = fixedInstant(),
-        ),
-    )
+        )
+    }
     val drawdownRiskStateCommandService = InMemoryRiskStateCommandService(
         riskStateRepository = drawdownRiskStateRepository,
         commandEventLog = commandEventLog,

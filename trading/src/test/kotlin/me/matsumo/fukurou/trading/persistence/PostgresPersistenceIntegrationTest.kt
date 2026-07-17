@@ -8006,9 +8006,10 @@ class PostgresPersistenceIntegrationTest {
 
         val repository = ExposedPaperLedgerRepository(database)
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val riskStateRepository = ExposedRiskStateRepository(database)
         val broker = PaperBroker(
             ledgerRepository = repository,
-            riskStateRepository = ExposedRiskStateRepository(database),
+            riskStateRepository = riskStateRepository,
             decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
@@ -8020,6 +8021,7 @@ class PostgresPersistenceIntegrationTest {
 
         broker.placeOrder(command).getOrThrow()
         val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+        riskStateRepository.setHardHalt("integration hard halt", fixedInstant()).getOrThrow()
 
         broker.sweepHardHalt(
             reasonJa = "integration hard halt",
