@@ -151,7 +151,7 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
-        assertEquals(expectedTerminationProof(), result.processTreeTerminationProof)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
         assertFalse(waitForProcessExit(childPid))
     }
 
@@ -177,7 +177,7 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
-        assertEquals(expectedTerminationProof(), result.processTreeTerminationProof)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
         assertFalse(waitForProcessExit(childPid))
     }
 
@@ -308,8 +308,52 @@ class ShellProcessRunnerTest {
         val childPid = waitForChildPid(childPidFile)
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
-        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, result.processTreeTerminationProof)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
         assertFalse(waitForProcessExit(childPid))
+    }
+
+    @Test
+    fun run_supervisorAcknowledgementAndEmptyProxyGroupProveTimeoutTermination() = runBlocking {
+        if (!Files.isExecutable(Path.of("/usr/bin/setsid"))) return@runBlocking
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-ack-test")
+        val command = RenderedLlmCommand(
+            executable = "/bin/sh",
+            args = listOf("-c", "trap 'exit 124' TERM; while true; do /bin/sleep 1; done"),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofMillis(200),
+            stdin = null,
+        )
+
+        val result = ShellProcessRunner(Duration.ofMillis(200)).run(command).getOrThrow()
+
+        assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
+        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, result.processTreeTerminationProof)
+    }
+
+    @Test
+    fun run_descendantDiscoveryFailureStillTerminatesRootAndReturnsDiscoveryFailure() = runBlocking {
+        val tempDirectory = Files.createTempDirectory("fukurou-process-runner-discovery-failure-test")
+        val discoveryFailure = IllegalStateException("synthetic discovery failure")
+        val runner = ShellProcessRunner(
+            terminationGrace = Duration.ofMillis(100),
+            descendantDiscovery = { throw discoveryFailure },
+            linuxSetsidPath = tempDirectory.resolve("missing-setsid"),
+        )
+        val command = RenderedLlmCommand(
+            executable = "/bin/sh",
+            args = listOf("-c", "/bin/sleep 30"),
+            environment = emptyMap(),
+            workingDirectory = tempDirectory,
+            timeout = Duration.ofMillis(100),
+            stdin = null,
+        )
+
+        val result = runner.run(command)
+        val failure = requireNotNull(result.exceptionOrNull())
+
+        assertEquals(discoveryFailure::class, failure::class)
+        assertEquals(discoveryFailure.message, failure.message)
     }
 
     @Test

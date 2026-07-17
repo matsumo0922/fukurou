@@ -6,11 +6,19 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/random.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t fukurou_proxy_cancel_requested = 0;
+
+static void fukurou_proxy_request_cancel(int signal_number) {
+    (void)signal_number;
+    fukurou_proxy_cancel_requested = 1;
+}
 
 static int fukurou_supervisor_proxy(
     enum fukurou_launch_profile profile,
@@ -18,6 +26,11 @@ static int fukurou_supervisor_proxy(
     char *const environment[],
     uint16_t descriptor_count
 ) {
+    struct sigaction action = {0};
+    action.sa_handler = fukurou_proxy_request_cancel;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, NULL) != 0) return 126;
+
     struct fukurou_launch_header header = {
         .magic = FUKUROU_PROTOCOL_MAGIC,
         .version = FUKUROU_PROTOCOL_VERSION,
@@ -78,11 +91,24 @@ static int fukurou_supervisor_proxy(
     }
     int status = 126;
     ssize_t received;
-    do {
+    int request_closed = 0;
+    for (;;) {
+        if (fukurou_proxy_cancel_requested && !request_closed) {
+            if (shutdown(socket_fd, SHUT_WR) != 0 && errno != ENOTCONN) {
+                close(socket_fd);
+                return 126;
+            }
+            request_closed = 1;
+        }
         received = recv(socket_fd, &status, sizeof(status), 0);
-    } while (received < 0 && errno == EINTR);
+        if (received < 0 && errno == EINTR) continue;
+        break;
+    }
     close(socket_fd);
-    return received == sizeof(status) ? status : 126;
+    if (request_closed && received == sizeof(status) && status == FUKUROU_SUPERVISOR_CLEANUP_ACK) {
+        return FUKUROU_PROXY_CLEANUP_ACK_EXIT_STATUS;
+    }
+    return received == sizeof(status) && !request_closed ? status : 126;
 }
 
 #endif
