@@ -23,11 +23,7 @@ import kotlin.test.assertTrue
 class DecisionSubmissionAuthorityTest {
     @Test
     fun `canonical payload classifies every decision submission field`() {
-        val declaredFields = DecisionSubmission::class.java.declaredFields
-            .asSequence()
-            .filterNot { field -> field.isSynthetic || Modifier.isStatic(field.modifiers) }
-            .map { field -> field.name }
-            .toSet()
+        val declaredFields = decisionSubmissionInstanceFields().keys
         val classifiedFields = DECISION_SUBMISSION_BUSINESS_FIELDS + DECISION_SUBMISSION_EXCLUDED_METADATA_FIELDS
 
         assertTrue(
@@ -42,25 +38,34 @@ class DecisionSubmissionAuthorityTest {
     }
 
     @Test
-    fun `canonical payload changes for every mutable persisted business field`() {
+    fun `canonical payload changes for every classified top level business field`() {
+        val baseline = completeSubmission()
+        val instanceFields = decisionSubmissionInstanceFields()
+        val variants = topLevelBusinessFieldVariants(baseline)
+
+        assertEquals(
+            DECISION_SUBMISSION_BUSINESS_FIELDS,
+            variants.keys,
+            "Every classified business field must have one top-level mutation variant.",
+        )
+        variants.forEach { (fieldName, variant) ->
+            val changedFields = instanceFields
+                .filterValues { field -> field.get(baseline) != field.get(variant) }
+                .keys
+
+            assertEquals(setOf(fieldName), changedFields, "$fieldName variant must change only that field.")
+        }
+        assertCanonicalHashesChange(baseline, variants)
+    }
+
+    @Test
+    fun `canonical payload changes for nested intent and trade plan fields`() {
         val baseline = completeSubmission()
         val intent = requireNotNull(baseline.entryIntent)
         val plan = requireNotNull(baseline.tradePlan)
         val pricePredicate = plan.invalidationPredicates[0]
         val timePredicate = plan.invalidationPredicates[1]
         val variants = mapOf(
-            "action" to baseline.copy(action = DecisionAction.ADD_LONG),
-            "closeRatio" to baseline.copy(closeRatio = BigDecimal("0.2")),
-            "setupTags" to baseline.copy(setupTags = listOf("changed")),
-            "estimatedWinProbability" to baseline.copy(estimatedWinProbability = BigDecimal("0.61")),
-            "expectedRMultiple" to baseline.copy(expectedRMultiple = BigDecimal("2.4")),
-            "roundTripCostR" to baseline.copy(roundTripCostR = BigDecimal("0.09")),
-            "toolEvidenceIds" to baseline.copy(toolEvidenceIds = listOf("tool-changed")),
-            "factCheck" to baseline.copy(factCheckJson = """{"a":1,"nested":{"x":3}}"""),
-            "selfReview" to baseline.copy(selfReviewJson = """{"risk":"changed"}"""),
-            "reasonJa" to baseline.copy(reasonJa = "変更した理由"),
-            "missingDataJa" to baseline.copy(missingDataJa = listOf("changed")),
-            "noTradeConditionsJa" to baseline.copy(noTradeConditionsJa = listOf("changed")),
             "intent.side" to baseline.copy(entryIntent = intent.copy(side = OrderSide.SELL)),
             "intent.orderType" to baseline.copy(entryIntent = intent.copy(orderType = OrderType.LIMIT)),
             "intent.sizeBtc" to baseline.copy(entryIntent = intent.copy(sizeBtc = BigDecimal("0.02"))),
@@ -109,11 +114,8 @@ class DecisionSubmissionAuthorityTest {
                 ),
             ),
         )
-        val baselineHash = baseline.canonicalBusinessPayload().hash
 
-        variants.forEach { (field, variant) ->
-            assertNotEquals(baselineHash, variant.canonicalBusinessPayload().hash, field)
-        }
+        assertCanonicalHashesChange(baseline, variants)
 
         val canonicalJson = baseline.canonicalBusinessPayload().canonicalJson
         assertTrue(canonicalJson.contains("\"entryIntent\":{\"symbol\":\"BTC\""))
@@ -257,6 +259,37 @@ private fun completeSubmission(): DecisionSubmission = DecisionSubmission(
         ),
     ),
 )
+
+private fun topLevelBusinessFieldVariants(baseline: DecisionSubmission): Map<String, DecisionSubmission> = mapOf(
+    "action" to baseline.copy(action = DecisionAction.ADD_LONG),
+    "closeRatio" to baseline.copy(closeRatio = BigDecimal("0.2")),
+    "setupTags" to baseline.copy(setupTags = listOf("changed")),
+    "estimatedWinProbability" to baseline.copy(estimatedWinProbability = BigDecimal("0.61")),
+    "expectedRMultiple" to baseline.copy(expectedRMultiple = BigDecimal("2.4")),
+    "roundTripCostR" to baseline.copy(roundTripCostR = BigDecimal("0.09")),
+    "toolEvidenceIds" to baseline.copy(toolEvidenceIds = listOf("tool-changed")),
+    "factCheckJson" to baseline.copy(factCheckJson = """{"a":1,"nested":{"x":3}}"""),
+    "selfReviewJson" to baseline.copy(selfReviewJson = """{"risk":"changed"}"""),
+    "reasonJa" to baseline.copy(reasonJa = "変更した理由"),
+    "missingDataJa" to baseline.copy(missingDataJa = listOf("changed")),
+    "noTradeConditionsJa" to baseline.copy(noTradeConditionsJa = listOf("changed")),
+    "entryIntent" to baseline.copy(entryIntent = null),
+    "tradePlan" to baseline.copy(tradePlan = null),
+)
+
+private fun decisionSubmissionInstanceFields() = DecisionSubmission::class.java.declaredFields
+    .asSequence()
+    .filterNot { field -> field.isSynthetic || Modifier.isStatic(field.modifiers) }
+    .onEach { field -> check(field.trySetAccessible()) { "Cannot inspect DecisionSubmission.${field.name}." } }
+    .associateBy { field -> field.name }
+
+private fun assertCanonicalHashesChange(baseline: DecisionSubmission, variants: Map<String, DecisionSubmission>) {
+    val baselineHash = baseline.canonicalBusinessPayload().hash
+
+    variants.forEach { (field, variant) ->
+        assertNotEquals(baselineHash, variant.canonicalBusinessPayload().hash, field)
+    }
+}
 
 private const val INVOCATION_ID = "decision-authority-run"
 private val FIXED_CLOCK = Clock.fixed(Instant.parse("2026-07-17T00:00:00Z"), ZoneOffset.UTC)
