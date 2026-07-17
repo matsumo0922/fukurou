@@ -8393,7 +8393,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun restingFillDrawdownHaltUsesHardHaltOuterReasonAndTypedDetail() = runPostgresTest {
+    fun hardHaltCleanupCancelsRestingOrderWithHardHaltReason() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000189")
         ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
@@ -8429,29 +8429,19 @@ class PostgresPersistenceIntegrationTest {
         val orderId = broker.placeOrder(command).getOrThrow().orderIds.single()
         val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
         riskStateRepository.setHardHalt("maximum drawdown reached", fixedInstant()).getOrThrow()
-        updateRiskStateDrawdownRatio(database, BigDecimal("-0.2000000000"))
 
-        val result = broker.applyMarketEvent(
-            paperTradeEvent(
-                sessionId = sessionId,
-                sequence = 2,
-                sizeBtc = "0.0100",
-                receivedAt = fixedInstant().plusSeconds(2),
-            ),
-        ).getOrThrow()
+        val result = broker.sweepHardHalt("maximum drawdown reached", null).getOrThrow()
         val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
-        val persisted = selectFillInvariantCancellation(database, orderId)
 
-        assertEquals(listOf(orderId), result.canceledOrderIds)
+        assertTrue(result.accepted, result.messageJa)
+        assertEquals(listOf(orderId), result.orderIds)
         assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
         assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
         assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
         assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
-        assertEquals(OrderStatus.CANCELED.name, persisted.status)
-        assertEquals(PaperOrderCancelReason.HARD_HALT, PaperOrderCancelReason.fromWireCode(persisted.outerReason))
-        assertEquals("FILL_INVARIANT_VIOLATION", persisted.kind)
-        assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT.name, persisted.code)
-        assertEquals(1, persisted.violationCount)
+        assertEquals(PaperOrderCancelReason.HARD_HALT, selectOrderCancelReason(database, orderId))
+        assertEquals(HardHaltCleanupState.SAFE, riskStateRepository.current().getOrThrow().hardHaltCleanupState)
     }
 
     @Test
@@ -13401,12 +13391,15 @@ private fun selectFillInvariantCancellation(database: ExposedDatabase, orderId: 
     }
 }
 
-private fun updateRiskStateDrawdownRatio(database: ExposedDatabase, drawdownRatio: BigDecimal) {
-    exposedTransaction(database) {
-        prepare("UPDATE risk_state SET drawdown_ratio = ? WHERE id = ?").use { statement ->
-            statement.setBigDecimal(1, drawdownRatio)
-            statement.setInt(2, RISK_STATE_SINGLE_ROW_ID)
-            check(statement.executeUpdate() == 1) { "Expected risk_state drawdown ratio to be updated." }
+private fun selectOrderCancelReason(database: ExposedDatabase, orderId: String): PaperOrderCancelReason {
+    return exposedTransaction(database) {
+        prepare("SELECT cancel_reason FROM orders WHERE id = ? AND status = 'CANCELED'").use { statement ->
+            statement.setObject(1, UUID.fromString(orderId))
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "canceled order was not found." }
+
+                PaperOrderCancelReason.fromWireCode(resultSet.getString("cancel_reason"))
+            }
         }
     }
 }
