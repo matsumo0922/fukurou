@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
 import me.matsumo.fukurou.trading.market.MarketEventSession
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
+import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptAuthority
 import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptCommit
 import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptRepository
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
@@ -290,7 +291,16 @@ internal class GmoWebSocketListener(
                 result.fold(
                     onSuccess = { commit ->
                         logReceiptCommit(commit)
-                        sendResult(Result.success(MarketEventSessionSignal.Trade(event)))
+                        val committedEvent = event.copy(
+                            receivedAt = commit.socketObservedAt,
+                            receiptAuthority = PaperMarketEventReceiptAuthority(
+                                receiptId = commit.receiptId,
+                                admissionOrdinal = commit.admissionOrdinal,
+                                payloadHash = commit.payloadHash,
+                                socketObservedAt = commit.socketObservedAt,
+                            ),
+                        )
+                        sendResult(Result.success(MarketEventSessionSignal.Trade(committedEvent)))
                         webSocket.request(1)
                     },
                     onFailure = ::sendTerminalFailure,

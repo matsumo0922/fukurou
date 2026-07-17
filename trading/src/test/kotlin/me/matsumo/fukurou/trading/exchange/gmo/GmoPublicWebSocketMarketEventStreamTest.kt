@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
+import me.matsumo.fukurou.trading.market.MarketEventReceiptIntegrityConflictException
 import me.matsumo.fukurou.trading.market.MarketEventReceiptPersistenceException
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptCommit
@@ -155,6 +156,10 @@ class GmoPublicWebSocketMarketEventStreamTest {
         assertEquals(Instant.parse("2026-07-10T00:00:02Z"), second.receivedAt)
         assertEquals(1, first.sequence)
         assertEquals(2, second.sequence)
+        assertEquals(receiptCommit(first.receivedAt).receiptId, first.receiptAuthority?.receiptId)
+        assertEquals(receiptCommit(first.receivedAt).admissionOrdinal, first.receiptAuthority?.admissionOrdinal)
+        assertEquals(receiptCommit(first.receivedAt).payloadHash, first.receiptAuthority?.payloadHash)
+        assertEquals(first.receivedAt, first.receiptAuthority?.socketObservedAt)
     }
 
     @Test
@@ -195,6 +200,23 @@ class GmoPublicWebSocketMarketEventStreamTest {
         listener.onText(NoOpWebSocket, tradePayload(), true)
 
         assertTrue(messages.receive().exceptionOrNull() is MarketEventReceiptPersistenceException)
+        assertTrue(messages.tryReceive().isFailure)
+    }
+
+    @Test
+    fun `listener は receipt integrity conflict で trade を publish しない`() = runBlocking {
+        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
+        val listener = GmoWebSocketListener(
+            messages = messages,
+            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
+            clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+            receiptRepository = ConflictingReceiptRepository,
+            receiptExecutor = directExecutor,
+        )
+
+        listener.onText(NoOpWebSocket, tradePayload(), true)
+
+        assertTrue(messages.receive().exceptionOrNull() is MarketEventReceiptIntegrityConflictException)
         assertTrue(messages.tryReceive().isFailure)
     }
 
@@ -351,13 +373,19 @@ class GmoPublicWebSocketMarketEventStreamTest {
 
 private object SuccessfulReceiptRepository : PaperMarketEventReceiptRepository {
     override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
-        return Result.success(receiptCommit())
+        return Result.success(receiptCommit(event.receivedAt))
     }
 }
 
 private object FailingReceiptRepository : PaperMarketEventReceiptRepository {
     override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
         return Result.failure(MarketEventReceiptPersistenceException())
+    }
+}
+
+private object ConflictingReceiptRepository : PaperMarketEventReceiptRepository {
+    override suspend fun commit(event: PaperMarketTradeEvent): Result<PaperMarketEventReceiptCommit> {
+        return Result.failure(MarketEventReceiptIntegrityConflictException())
     }
 }
 
@@ -372,15 +400,16 @@ private class BlockingReceiptRepository : PaperMarketEventReceiptRepository {
         entered.countDown()
         check(release.await(1, TimeUnit.SECONDS))
 
-        return Result.success(receiptCommit())
+        return Result.success(receiptCommit(event.receivedAt))
     }
 }
 
-private fun receiptCommit(): PaperMarketEventReceiptCommit {
+private fun receiptCommit(socketObservedAt: Instant = Instant.EPOCH): PaperMarketEventReceiptCommit {
     return PaperMarketEventReceiptCommit(
         receiptId = UUID.fromString("00000000-0000-0000-0000-000000000164"),
         admissionOrdinal = 1,
         payloadHash = "a".repeat(64),
+        socketObservedAt = socketObservedAt,
         duplicate = false,
         transactionDurationNanos = 1,
         advisoryWaitNanos = 1,

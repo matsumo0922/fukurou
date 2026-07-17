@@ -1009,6 +1009,7 @@ private const val VERIFY_ORDERS_SCHEMA_SQL = """
         market_data_session_id,
         market_eligible_after_sequence,
         market_eligible_from,
+        market_eligible_after_admission_ordinal,
         created_at,
         updated_at
     FROM orders

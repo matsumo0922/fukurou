@@ -144,8 +144,8 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    val riskState = lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(request.command.auditContext, riskState)
+                    val creationAuthority = lockRestingOrderCreationRows(request.marketEligibility)
+                    val writeIntent = resolvePaperWriteContext(request.command.auditContext, creationAuthority.riskState)
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertEntryOrder(
                         EntryOrderInsertRequest(
@@ -160,6 +160,7 @@ internal class ExposedPaperLedgerWriter(
                             expirySource = request.expirySource,
                             effectiveTtlSeconds = request.effectiveTtlSeconds,
                             marketEligibility = request.marketEligibility,
+                            marketEligibleAfterAdmissionOrdinal = creationAuthority.admissionBoundary,
                         ),
                         clock,
                     )
@@ -217,8 +218,11 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
-                    val riskState = lockPaperLedgerMutationRows()
-                    val writeIntent = resolvePaperWriteContext(request.order.command.auditContext, riskState)
+                    val creationAuthority = lockRestingOrderCreationRows(request.order.marketEligibility)
+                    val writeIntent = resolvePaperWriteContext(
+                        request.order.command.auditContext,
+                        creationAuthority.riskState,
+                    )
                         .intent(PaperWritePolicy.RISK_INCREASING)
                     insertTradeIntentConsumption(
                         request.consumption.intentId,
@@ -238,6 +242,7 @@ internal class ExposedPaperLedgerWriter(
                             expirySource = request.order.expirySource,
                             effectiveTtlSeconds = request.order.effectiveTtlSeconds,
                             marketEligibility = request.order.marketEligibility,
+                            marketEligibleAfterAdmissionOrdinal = creationAuthority.admissionBoundary,
                         ),
                         clock,
                     )
@@ -441,10 +446,20 @@ internal class ExposedPaperLedgerWriter(
         return withContext(Dispatchers.IO) {
             runCatching {
                 exposedTransaction(database) {
+                    val cursor = lockMarketDataCursor(event.connectionSessionId)
+
+                    if (event.sequence <= cursor) {
+                        return@exposedTransaction emptyReconcileProgress().toPaperReconcileResult()
+                    }
+                    require(event.sequence == cursor + 1) {
+                        "market-data sequence gap: expected ${cursor + 1}, received ${event.sequence}"
+                    }
+
                     val riskState = lockPaperLedgerMutationRows()
                     val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY, riskState)
                     applyPaperMarketEvent(
                         event = event,
+                        cursor = cursor,
                         simulator = simulator,
                         rules = fallbackSymbolRules,
                         writeContext = writeContext,
@@ -738,6 +753,46 @@ private fun JdbcTransaction.lockPaperLedgerMutationRows(): RiskState {
     return riskState
 }
 
+/** realtime resting order transaction が保持する ledger と receipt boundary authority。 */
+private data class RestingOrderCreationAuthority(
+    val riskState: RiskState,
+    val admissionBoundary: Long?,
+)
+
+private fun JdbcTransaction.lockRestingOrderCreationRows(
+    eligibility: RestingOrderMarketEligibility?,
+): RestingOrderCreationAuthority {
+    if (eligibility == null) {
+        return RestingOrderCreationAuthority(
+            riskState = lockPaperLedgerMutationRows(),
+            admissionBoundary = null,
+        )
+    }
+
+    acquireExclusivePaperMarketSessionLock(eligibility.sessionId)
+    verifyMarketEligibilitySession(eligibility)
+    val riskState = lockPaperLedgerMutationRows()
+    val admissionBoundary = selectGlobalPaperMarketAdmissionBoundary()
+
+    return RestingOrderCreationAuthority(riskState, admissionBoundary)
+}
+
+private fun JdbcTransaction.acquireExclusivePaperMarketSessionLock(sessionId: UUID) {
+    prepare("SELECT pg_advisory_xact_lock(?)").use { statement ->
+        statement.setLong(1, paperMarketSessionAdvisoryLockKey(sessionId))
+        statement.executeQuery().use { resultSet -> check(resultSet.next()) }
+    }
+}
+
+private fun JdbcTransaction.selectGlobalPaperMarketAdmissionBoundary(): Long {
+    return prepare("SELECT COALESCE(MAX(admission_ordinal), 0) FROM paper_market_event_receipts").use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next()) { "paper market-event receipt boundary was not returned." }
+            resultSet.getLong(1)
+        }
+    }
+}
+
 private fun JdbcTransaction.lockRowsInIdOrder(query: String) {
     prepare(query).use { statement ->
         statement.executeQuery().use { resultSet ->
@@ -785,6 +840,7 @@ private fun JdbcTransaction.expireRestingEntryOrders(processedAt: Instant, progr
 @Suppress("LongParameterList")
 private fun JdbcTransaction.applyPaperMarketEvent(
     event: PaperMarketTradeEvent,
+    cursor: Long,
     simulator: PaperExecutionSimulator,
     rules: SymbolRules,
     writeContext: PaperWriteContext,
@@ -792,14 +848,9 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     clock: Clock,
     maxDrawdownPolicy: MaxDrawdownPolicy,
 ): PaperReconcileResult {
-    val cursor = lockMarketDataCursor(event.connectionSessionId)
+    check(event.sequence == cursor + 1) { "market-data cursor changed inside event transaction." }
 
-    if (event.sequence <= cursor) {
-        return emptyReconcileProgress().toPaperReconcileResult()
-    }
-    require(event.sequence == cursor + 1) {
-        "market-data sequence gap: expected ${cursor + 1}, received ${event.sequence}"
-    }
+    val receiptEligibility = resolveMarketEventReceiptEligibility(event)
 
     val ticker = Ticker(
         symbol = event.symbol.apiSymbol,
@@ -821,6 +872,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     if (!paperAccountHardHaltReached(maxDrawdownPolicy) && writeContext.riskIncreaseAllowed) {
         applyEventToRestingEntries(
             event = event,
+            receiptEligibility = receiptEligibility,
             simulator = simulator,
             context = simulationContext,
             progress = progress,
@@ -887,9 +939,90 @@ private fun JdbcTransaction.hasUnrecoveredGapBefore(sessionId: UUID): Boolean {
     }
 }
 
+/** realtime entry gate が使う exact receipt 照合結果。 */
+private sealed interface MarketEventReceiptEligibility {
+    /** persisted receipt と event projection が完全一致した結果。 */
+    data class Verified(val admissionOrdinal: Long) : MarketEventReceiptEligibility
+
+    /** receipt authority が欠落または矛盾した fail-closed 結果。 */
+    data object Invalid : MarketEventReceiptEligibility
+}
+
+/** exact receipt 照合用の persisted row。 */
+private data class PersistedMarketEventReceipt(
+    val sessionId: UUID,
+    val sourceSequence: Long,
+    val sourceTimestamp: Long,
+    val socketObservedAt: Long,
+    val normalizedPayload: String,
+    val payloadHash: String,
+    val admissionOrdinal: Long,
+)
+
+private fun JdbcTransaction.resolveMarketEventReceiptEligibility(
+    event: PaperMarketTradeEvent,
+): MarketEventReceiptEligibility {
+    val authority = event.receiptAuthority ?: return MarketEventReceiptEligibility.Invalid
+    if (authority.socketObservedAt != event.receivedAt) return MarketEventReceiptEligibility.Invalid
+
+    val normalizedPayload = event.normalizedReceiptPayload()
+    val normalizedPayloadHash = normalizedPayload.sha256()
+    val receipt = selectPaperMarketEventReceipt(authority.receiptId)
+        ?: return MarketEventReceiptEligibility.Invalid
+    val identityMatches = listOf(
+        receipt.sessionId == event.connectionSessionId,
+        receipt.sourceSequence == event.sequence,
+        receipt.sourceTimestamp == event.exchangeAt.toEpochMilli(),
+    ).all { it }
+    val authorityMatches = listOf(
+        receipt.admissionOrdinal == authority.admissionOrdinal,
+        receipt.payloadHash == authority.payloadHash,
+        receipt.socketObservedAt == authority.socketObservedAt.toEpochMilli(),
+    ).all { it }
+    val payloadMatches = listOf(
+        receipt.normalizedPayload == normalizedPayload,
+        receipt.payloadHash == normalizedPayloadHash,
+        receipt.socketObservedAt == event.receivedAt.toEpochMilli(),
+    ).all { it }
+
+    val receiptMatches = listOf(identityMatches, authorityMatches, payloadMatches).all { it }
+    if (!receiptMatches) {
+        return MarketEventReceiptEligibility.Invalid
+    }
+
+    return MarketEventReceiptEligibility.Verified(receipt.admissionOrdinal)
+}
+
+private fun JdbcTransaction.selectPaperMarketEventReceipt(receiptId: UUID): PersistedMarketEventReceipt? {
+    return prepare(
+        """
+            SELECT session_id, source_sequence, source_timestamp, socket_observed_at,
+                   normalized_payload, payload_hash, admission_ordinal
+            FROM paper_market_event_receipts
+            WHERE id = ?
+        """,
+    ).use { statement ->
+        statement.setObject(1, receiptId)
+        statement.executeQuery().use { resultSet ->
+            if (!resultSet.next()) return@use null
+
+            PersistedMarketEventReceipt(
+                sessionId = resultSet.getObject("session_id", UUID::class.java),
+                sourceSequence = resultSet.getLong("source_sequence"),
+                sourceTimestamp = resultSet.getLong("source_timestamp"),
+                socketObservedAt = resultSet.getLong("socket_observed_at"),
+                normalizedPayload = resultSet.getString("normalized_payload"),
+                payloadHash = resultSet.getString("payload_hash"),
+                admissionOrdinal = resultSet.getLong("admission_ordinal"),
+            )
+        }
+    }
+}
+
 @Suppress("LongParameterList")
 private fun JdbcTransaction.applyEventToRestingEntries(
     event: PaperMarketTradeEvent,
+    receiptEligibility: MarketEventReceiptEligibility,
     simulator: PaperExecutionSimulator,
     context: PaperSimulationContext,
     progress: ReconcileProgress,
@@ -899,6 +1032,16 @@ private fun JdbcTransaction.applyEventToRestingEntries(
 ) {
     selectMarketEligibleEntryOrders(event, clock.instant()).forEach { marketOrder ->
         val order = marketOrder.order
+        val admissionOrdinal = (receiptEligibility as? MarketEventReceiptEligibility.Verified)?.admissionOrdinal
+        val admissionBoundary = marketOrder.marketEligibleAfterAdmissionOrdinal
+
+        if (admissionOrdinal == null || admissionBoundary == null) {
+            cancelForReceiptEligibilityFailure(order, progress, clock)
+
+            return@forEach
+        }
+        if (admissionOrdinal <= admissionBoundary) return@forEach
+
         val shouldTrigger = when (order.orderType) {
             OrderType.LIMIT -> consumeLimitQueue(event, marketOrder)
             OrderType.STOP -> event.priceJpy >= requireNotNull(order.triggerPriceJpy).toBigDecimal()
@@ -960,38 +1103,53 @@ private fun JdbcTransaction.selectMarketEligibleEntryOrders(
     return prepare(
         """
             SELECT id, queue_ahead_btc, queue_consumed_btc
+                 , market_eligible_after_admission_ordinal
             FROM orders
             WHERE status = 'OPEN'
                 AND side = 'BUY'
                 AND position_id IS NULL
                 AND market_data_session_id = ?
-                AND market_eligible_after_sequence < ?
-                AND market_eligible_from < ?
                 AND expires_at > ?
             ORDER BY created_at, id
         """,
     ).use { statement ->
         statement.setObject(1, event.connectionSessionId)
-        statement.setLong(2, event.sequence)
-        statement.setLong(3, event.receivedAt.toEpochMilli())
-        statement.setLong(4, processedAt.toEpochMilli())
+        statement.setLong(2, processedAt.toEpochMilli())
         statement.executeQuery().use { resultSet ->
             buildList {
                 val ordersById = selectOpenOrders().associateBy(Order::orderId)
                 while (resultSet.next()) {
                     val orderId = resultSet.getObject("id", UUID::class.java).toString()
                     val order = requireNotNull(ordersById[orderId])
+                    val admissionBoundary = resultSet.getLong("market_eligible_after_admission_ordinal")
+                        .takeUnless { resultSet.wasNull() }
                     add(
                         MarketEligibleOrder(
                             order = order,
                             queueAheadBtc = resultSet.getBigDecimal("queue_ahead_btc"),
                             queueConsumedBtc = resultSet.getBigDecimal("queue_consumed_btc") ?: BigDecimal.ZERO,
+                            marketEligibleAfterAdmissionOrdinal = admissionBoundary,
                         ),
                     )
                 }
             }
         }
     }
+}
+
+private fun JdbcTransaction.cancelForReceiptEligibilityFailure(
+    order: Order,
+    progress: ReconcileProgress,
+    clock: Clock,
+) {
+    updateOrderStatus(
+        orderId = order.orderId,
+        status = OrderStatus.CANCELED,
+        reasonJa = "durable market-event receipt eligibility unavailable",
+        clock = clock,
+        cancelReason = PaperOrderCancelReason.MARKET_DATA_GAP,
+    )
+    progress.canceledOrderIds += order.orderId
 }
 
 private fun JdbcTransaction.consumeLimitQueue(event: PaperMarketTradeEvent, marketOrder: MarketEligibleOrder): Boolean {
@@ -1208,6 +1366,7 @@ private data class MarketEligibleOrder(
     val order: Order,
     val queueAheadBtc: BigDecimal?,
     val queueConsumedBtc: BigDecimal,
+    val marketEligibleAfterAdmissionOrdinal: Long?,
 )
 
 private fun JdbcTransaction.insertEntryFill(
@@ -1714,7 +1873,6 @@ private fun JdbcTransaction.updateMarks(
 }
 
 private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, clock: Clock) {
-    request.marketEligibility?.let { eligibility -> verifyMarketEligibilitySession(eligibility) }
     val lineage = request.writeIntent.lineage
 
     prepare(
@@ -1727,10 +1885,11 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
                 system_prompt_version, market_snapshot_id, expires_at, expiry_source,
                 effective_ttl_seconds, expired_at, canceled_at, cancel_reason, canceled_by_decision_run_id,
                 queue_ahead_btc, queue_consumed_btc, queue_snapshot_at, market_data_session_id,
-                market_eligible_after_sequence, market_eligible_from, created_at, updated_at,
+                market_eligible_after_sequence, market_eligible_from,
+                market_eligible_after_admission_ordinal, created_at, updated_at,
                 account_epoch_id, execution_semantics_version, runtime_config_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
     ).use { statement ->
         val command = request.command
@@ -1766,10 +1925,11 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
         statement.setObject(34, eligibility?.sessionId)
         statement.setObject(35, eligibility?.eligibleAfterSequence)
         statement.setObject(36, eligibility?.eligibleFrom?.toEpochMilli())
+        statement.setObject(37, request.marketEligibleAfterAdmissionOrdinal)
         val createdAt = request.createdAt?.toEpochMilli() ?: nowMillis(clock)
-        statement.setLong(37, createdAt)
         statement.setLong(38, createdAt)
-        statement.bindLineage(39, lineage)
+        statement.setLong(39, createdAt)
+        statement.bindLineage(40, lineage)
         statement.executeUpdate()
     }
 }
@@ -2652,6 +2812,7 @@ private data class EntryOrderInsertRequest(
     val expirySource: OrderExpirySource? = null,
     val effectiveTtlSeconds: Long? = null,
     val marketEligibility: RestingOrderMarketEligibility? = null,
+    val marketEligibleAfterAdmissionOrdinal: Long? = null,
 )
 
 /**

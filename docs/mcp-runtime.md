@@ -18,8 +18,47 @@ Step6 時点の `fukurou-mcp` runtime と Docker 配線の正本メモ。
 - request audit の append に失敗した logical request は取得済み response を利用せず、追加 retry もしない。`GMO_PUBLIC_REST_REQUEST_COMPLETED` は Activity の既定 timeline から除外され、`/ops/audit?eventType=GMO_PUBLIC_REST_REQUEST_COMPLETED` の明示 filter で取得する。
 - request audit は request hot path で `command_event_log` へ同期保存する。5 秒周期の reconciler は通常 ticker / trades / candles の 3 attempt を行うため、retry と symbol cache miss を除いても 1 日約 51,840 event が下限目安になる。現在は `command_event_log` の retention / pruning を行わない。event type 限定 retention、専用 table、durable outbox による batch 化はいずれも未実装で、選択には production の event 量、保存時間、DB latency の観測値を必要とする。監査完了前に response を利用する非 durable async 化は行わない。
 - `ProtectionReconciler` は一般的な tick 取得失敗を従来どおり degraded tick として扱う一方、GMO rate-limit exhaustion と request audit failure は pass failure へ遷移させる。WebSocket periodic maintenance でも maintenance success を記録せず、readiness と failure audit に障害を反映する。`HARD_HALT` 中は WebSocket loop の起動前、connect / begin-session failure、session 終了後の backoff、market event、periodic maintenance で、global trading lock 下の atomic open-risk readback / cleanup を必ず再試行する。readback で flat または order-only と確認できれば REST tick を取得せず、open position が残る場合だけ REST ticker を risk-reducing close の候補にする。REST ticker は app の `observedAt` と exchange の `sourceTimestamp` を分離し、source timestamp を parse できて現在時刻から5秒以内、未来方向の clock skew も5秒以内の場合だけ close execution authority にする。orderbook 取得後の ledger mutation 直前にも同じ source timestamp を現在時刻で再検査し、不正・stale・過度な未来時刻では ledger mutation を作らず `HARD_HALT / UNKNOWN` を維持する。realtime trade event は causal event のため REST freshness gate の対象外である。`PaperBroker` の optional market-data fallback も同じ 2 種類を握りつぶさず、注文判断を fail closed にする。
+- production WebSocket listener は durable receipt commit が返す exact authority を event に付け、`ProtectionReconcilerWorker` の Exposed ledger が同じ receipt を event transaction 内で再読する。`TradingRuntimeFactory.connectedPostgres` の order path は realtime resting BUY の作成 transaction 内で global receipt admission boundary を保存する。entry は exact receipt ordinal が boundary より新しい場合だけ fill gate へ進み、wall clock、missing evidence、legacy null boundary から eligibility を推測しない。evidence failure は entry だけを `market_data_gap` で取り消し、STOP / virtual TP と cursor は継続する。
 - fukurou 埋め込み時の短期足 kline request 予算は `GMO_MAX_DAILY_KLINE_REQUESTS` で強制する。standalone 起動時はこの fukurou 固有予算を注入しない。
 - full run の material manifest capture は、5分足 ATR を固定するため GMO Public REST の kline request を run ごとに最大1回追加する。deploy 後は `GMO_PUBLIC_REST_REQUEST_COMPLETED` を operation / outcome 別に確認し、kline request 数、permit wait、`RATE_LIMITED` / `ERR-5003` の増加がないことを監視する。
+
+## receipt-aware reader の rollback
+
+旧 reader は receipt admission boundary を entry fill に使わないため、open な新 semantics order を引き継ぐ hot rollback は行わない。operator は Cloudflare Access で認証した production endpoint に次を送る。
+
+```http
+POST /ops/halt
+Content-Type: application/json
+
+{"level":"HARD","reason":"receipt eligibility rollback"}
+```
+
+新 image を動かしたまま `GET /ops/risk-state` で `state=HARD_HALT` を確認する。この response は cleanup state を公開しないため、`SAFE` を API field から推測しない。production DB の read-only session で次の query を実行し、正本である `risk_state.hard_halt_cleanup_state=SAFE` と、同じ readback の `open_positions=0`、`open_orders=0`、`btc_quantity=0` を確認する。
+
+```sql
+SELECT
+    risk_state.hard_halt_cleanup_state,
+    (SELECT COUNT(*) FROM positions WHERE status = 'OPEN') AS open_positions,
+    (SELECT COUNT(*) FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL')) AS open_orders,
+    paper_account.btc_quantity
+FROM risk_state
+CROSS JOIN paper_account
+WHERE risk_state.id = 1
+  AND paper_account.id = 1;
+```
+
+receipt-aware reader が作成した risk-increasing resting BUY が残っていないことを、次の独立 query が0行であることでも確認する。
+
+```sql
+SELECT id
+FROM orders
+WHERE status IN ('OPEN', 'PENDING_CANCEL')
+  AND side = 'BUY'
+  AND position_id IS NULL
+  AND order_type IN ('LIMIT', 'STOP');
+```
+
+`GET /ops/risk-state` の `HARD_HALT`、SQL 正本の cleanup `SAFE`、同じ SQL の zero-open-risk readback、resting BUY zero-row の4条件が一致した後にだけ新 image を停止して旧 image を起動する。どれか1つでも不一致または readback 不能なら rollback を停止する。receipt-aware image が再び active になるまで `POST /ops/resume` を実行しない。nullable column は残し、既存 row の boundary backfill や history rewrite は行わない。
 
 ## local smoke
 
@@ -220,7 +259,7 @@ Evaluation Report Console の Historical Outcome Ridge と Evidence Relationship
 Evaluation Report Console の current context は `/ops/current-context/ws` の browser read-only WebSocket で配信する。protocol version 1 の envelope は connection-scoped session ID、その session 内で単調増加する sequence、`SNAPSHOT / UPDATE / HEARTBEAT` を持つ。handshake は Origin 必須とし、`FUKUROU_PUBLIC_ORIGIN` に設定した単一の trusted public origin と scheme、host、effective port がすべて一致する接続だけを許可する。forwarded header は authority にせず、設定未指定は fail closed とする。各 source は実データ由来の `observedAt`、server の `receivedAt`、`staleAfterMillis`、freshness を持つ。server は15秒 ping / 45秒 timeout と slow-client closeを適用する。client は envelope と source payload を runtime validation し、gap、session mismatch、malformed envelope、45秒無受信で接続を閉じ、次の full snapshot まで resync 状態を保つ。market quote と runtime risk state は freshness を伴う別 projection であり、pin 済み report revision、claim validation、paper execution の authority にはならない。
 - paper STOP は `ProtectionReconciler` が動いている間だけ約定判定される。live の native STOP は bot 停止中も取引所側で作動するため、paper の方が保護が弱い。
 - paper の resting BUY LIMIT は発注時に exact-price bid と先行する同価格の自 paper order を `queueAheadBtc` として保存する。WebSocket の eligible SELL 数量が `queueAheadBtc + order.sizeBtc` に達した event でだけ、LIMIT 価格の maker 全量約定にする。partial fill と先行 exchange order cancellation は再現しない。
-- WebSocket trade は listener が `paper_market_event_receipts` へcommitした後だけ既存consumerへ渡す。receipt persistence failureまたは同一session/sequenceのpayload hash conflictではtradeをenqueueせず、typed exception detailを持つ`DATABASE_FAILURE` infrastructure gapへ収束させる。receiptはfill eligibilityへ使わないdark writeで、正常時のpaper約定順序とlegacy cursorを変更しない。容量監視はreceipt rows、table/index bytes、WAL bytes、payloadを含まないtransaction/advisory waitを同じ観測窓で集計し、30日/365日projectionを`docs/design.md`の式で算出する。
+- WebSocket trade は listener が `paper_market_event_receipts` へcommitした後だけconsumerへ渡す。receipt persistence failureまたは同一session/sequenceのpayload hash conflictではtradeをenqueueせず、typed exception detailを持つ`DATABASE_FAILURE` infrastructure gapへ収束させる。listener は commit 済み receipt authority と canonical `receivedAt` を event に付け、PostgreSQL ledger は exact receipt と order の global admission boundary を risk-increasing fill eligibility に使う。legacy cursor は receipt ordinal と独立して継続する。容量監視はreceipt rows、table/index bytes、WAL bytes、payloadを含まないtransaction/advisory waitを同じ観測窓で集計し、30日/365日projectionを`docs/design.md`の式で算出する。
 - transport がhealthyでも、resting BUY LIMITのqueue snapshotは直近realtime tradeを必要とする。`lastTradeAt` が30秒を超える、または未観測の場合は `QUEUE_SNAPSHOT_UNAVAILABLE` としてfail-closedにする。
 - queue snapshot 取得不能、板 depth 外、取得中の session 変更は 0 とみなさず注文を fail-closed にする。REST history/candle/ticker や再接続後の履歴を resting fill、STOP、TP の根拠にしない。同期 MARKET、手動 close、crossing LIMIT は既存の即時 command contract を使う。
 - WebSocket 待機中も `ProtectionReconciler` は periodic maintenance と transport liveness を独立に管理する。GMO Public WebSocket は server Ping を1分ごとに送り、Pongが3回連続で無い場合に接続を閉じる。Pong成功、subscription acknowledgement、trade は transport activity として `gmoPublic.websocketTransportLivenessTimeout` を更新し、trade無音だけでは gap、再接続、再購読を作らない。close/error、transport timeout、受信buffer overflow、subscription拒否、decode失敗は `TRANSPORT_LIVENESS_LOST` または該当理由のgapとして監査し、impact完了後に `gmoPublic.websocketReconnectBackoff` で再接続する。subscribe/unsubscribe は同一IPで1秒1回までのため、socketごとに1回だけsubscribeする。REST tick は HARD_HALT、kill criterion、ATR trailing の保守だけに使い、resting entryを約定させない。
