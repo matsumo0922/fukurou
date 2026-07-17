@@ -27,7 +27,7 @@
 
 ## 5. Validation and delivery
 
-- [ ] 5.1 Run targeted MCP, gateway, canonicalization, and PostgreSQL tests under the validation lease and record command, result, scope, wait time, and HEAD SHA.
-- [ ] 5.2 Run initial full `make test`, `make detekt`, and `make build` under one validation lease and record the evidence.
+- [x] 5.1 Run targeted MCP, gateway, canonicalization, and PostgreSQL tests under the validation lease and record command, result, scope, wait time, and HEAD SHA.
+- [x] 5.2 Run initial full `make test`, `make detekt`, and `make build` under one validation lease and record the evidence.
 - [ ] 5.3 Validate the OpenSpec change, check `git diff --check` and untracked files, then publish the PR with Scenario-to-test evidence and documentation impact.
 - [ ] 5.4 Complete independent review remediation, run one final full validation at final HEAD, synchronize the PR description/CI evidence, and post APPROVED or HANDOFF.
