@@ -18,6 +18,14 @@ interface DecisionRepository {
     suspend fun submitDecision(submission: DecisionSubmission): Result<DecisionSubmissionResult>
 
     /**
+     * server-owned invocation / phase authority の下で decision を冪等に保存する。
+     */
+    suspend fun submitDecision(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+    ): Result<DecisionSubmissionResult>
+
+    /**
      * Falsifier の verdict を append-only で保存する。
      */
     suspend fun submitFalsification(submission: FalsificationSubmission): Result<FalsificationRecord>
@@ -78,6 +86,13 @@ interface TerminalEvidenceDecisionRepository : DecisionRepository {
         evidence: TrustedTerminalToolEvidenceBundle,
     ): Result<DecisionSubmissionResult>
 
+    /** authority、terminal evidence、decision entity を同一 transaction で保存する。 */
+    suspend fun submitTerminalDecision(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+        evidence: TrustedTerminalToolEvidenceBundle,
+    ): Result<DecisionSubmissionResult>
+
     /** trusted terminal bundle と falsification entity を同じ repository boundary へ渡す。 */
     suspend fun submitTerminalFalsification(
         submission: FalsificationSubmission,
@@ -95,6 +110,22 @@ suspend fun DecisionRepository.submitTerminalDecision(
     return runCatching {
         validateDisabledTerminalEvidence(evidence)
         submitDecision(submission).getOrThrow()
+    }
+}
+
+/** phase-aware authority と capture 設定を保ったまま terminal decision を保存する。 */
+suspend fun DecisionRepository.submitTerminalDecision(
+    authority: DecisionSubmissionAuthority,
+    submission: DecisionSubmission,
+    evidence: TrustedTerminalToolEvidenceBundle,
+): Result<DecisionSubmissionResult> {
+    if (this is TerminalEvidenceDecisionRepository) {
+        return submitTerminalDecision(authority, submission, evidence)
+    }
+
+    return runCatching {
+        validateDisabledTerminalEvidence(evidence)
+        submitDecision(authority, submission).getOrThrow()
     }
 }
 

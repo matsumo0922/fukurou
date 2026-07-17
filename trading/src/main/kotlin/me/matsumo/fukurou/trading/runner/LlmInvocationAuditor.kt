@@ -223,6 +223,9 @@ class LlmInvocationAuditor(
         phaseManifest: me.matsumo.fukurou.trading.audit.LlmPhaseInputManifest?,
     ): LlmDecisionSubmissionGateway? {
         val server = request.mcpServer ?: return null
+        require(request.invocationId == request.decisionRunContext.decisionRunId) {
+            "MCP invocation does not match decision run identity."
+        }
         val manifest = requireNotNull(phaseManifest) { "MCP launch requires a persisted phase manifest." }
         val repository = requireNotNull(decisionRepository) {
             "MCP launch requires an app-owned decision repository."

@@ -5,6 +5,7 @@ import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -95,7 +96,10 @@ import me.matsumo.fukurou.trading.daemon.RestingSuppressionReason
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionConflictException
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
@@ -103,6 +107,7 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.canonicalBusinessPayload
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
@@ -204,6 +209,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -6560,6 +6566,192 @@ class PostgresPersistenceIntegrationTest {
         assertTrue(missingParentDecision.isFailure)
         assertTrue(unknownParentDecision.isFailure)
         assertEquals(DecisionProtocolCounts(3, 3, 1, 0, 0), counts)
+    }
+
+    @Test
+    fun decisionSubmissionAuthority_upgradeIsEmptyAndOldReaderRemainsCompatible() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        exposedTransaction(database) { executeUpdate("DROP TABLE decision_submission_authorities") }
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val legacySubmission = noTradeDecisionSubmission().copy(invocationId = "legacy-duplicate")
+        val firstLegacyId = repository.submitDecision(legacySubmission).getOrThrow().decision.decisionId
+        val secondLegacyId = repository.submitDecision(legacySubmission).getOrThrow().decision.decisionId
+
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions WHERE invocation_id='legacy-duplicate'", 2)
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities", 0)
+        }
+        assertNotEquals(firstLegacyId, secondLegacyId)
+
+        repository.submitDecision(legacySubmission.copy(invocationId = null)).getOrThrow()
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 3)
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities", 0)
+        }
+    }
+
+    @Test
+    fun decisionSubmissionAuthority_retriesConflictUnknownAndRollbackFailClosed() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val submission = noTradeDecisionSubmission().copy(invocationId = "authority-basic")
+        val authority = DecisionSubmissionAuthority("authority-basic", LlmInvocationPhase.PROPOSER)
+
+        val first = repository.submitDecision(authority, submission).getOrThrow()
+        val retry = repository.submitDecision(authority, submission).getOrThrow()
+        val conflict = repository.submitDecision(authority, submission.copy(reasonJa = "changed"))
+
+        assertEquals(first.decision.decisionId, retry.decision.decisionId)
+        assertEquals(
+            first.decision.submission.canonicalBusinessPayload().hash,
+            retry.decision.submission.canonicalBusinessPayload().hash,
+        )
+        assertIs<DecisionSubmissionConflictException>(conflict.exceptionOrNull())
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities WHERE state='COMPLETED'", 1)
+            executeUpdate(
+                """INSERT INTO trade_plans
+                    (id, decision_id, parent_trade_plan_id, revision_count, symbol, thesis_ja,
+                     invalidation_conditions_ja, target_price_jpy, time_stop_at, setup_tags, created_at)
+                    VALUES ('00000000-0000-0000-0000-000000000099', '${first.decision.decisionId}', NULL, 0,
+                            'BTC', 'inconsistent extra plan', '[]', NULL, NULL, '[]', 0)
+                """.trimIndent(),
+            )
+        }
+        val extraAssociation = repository.submitDecision(authority, submission)
+        assertIs<DecisionSubmissionUnknownException>(extraAssociation.exceptionOrNull())
+
+        val pendingSubmission = submission.copy(invocationId = "authority-pending")
+        insertDecisionSubmissionAuthorityFixture(
+            database = database,
+            authority = DecisionSubmissionAuthority("authority-pending", LlmInvocationPhase.PROPOSER),
+            submission = pendingSubmission,
+            state = "PENDING",
+        )
+        val pending = repository.submitDecision(
+            DecisionSubmissionAuthority("authority-pending", LlmInvocationPhase.PROPOSER),
+            pendingSubmission,
+        )
+        assertIs<DecisionSubmissionUnknownException>(pending.exceptionOrNull())
+
+        val inconsistentSubmission = submission.copy(invocationId = "authority-inconsistent")
+        insertDecisionSubmissionAuthorityFixture(
+            database = database,
+            authority = DecisionSubmissionAuthority("authority-inconsistent", LlmInvocationPhase.PROPOSER),
+            submission = inconsistentSubmission,
+            state = "COMPLETED",
+            decisionId = UUID.randomUUID(),
+            completedAt = fixedInstant(),
+        )
+        val inconsistent = repository.submitDecision(
+            DecisionSubmissionAuthority("authority-inconsistent", LlmInvocationPhase.PROPOSER),
+            inconsistentSubmission,
+        )
+        assertIs<DecisionSubmissionUnknownException>(inconsistent.exceptionOrNull())
+
+        val crossInvocationSubmission = submission.copy(invocationId = "authority-cross-invocation")
+        insertDecisionSubmissionAuthorityFixture(
+            database = database,
+            authority = DecisionSubmissionAuthority("authority-cross-invocation", LlmInvocationPhase.PROPOSER),
+            submission = crossInvocationSubmission,
+            state = "COMPLETED",
+            decisionId = first.decision.decisionId,
+            completedAt = fixedInstant(),
+        )
+        val crossInvocation = repository.submitDecision(
+            DecisionSubmissionAuthority("authority-cross-invocation", LlmInvocationPhase.PROPOSER),
+            crossInvocationSubmission,
+        )
+        assertIs<DecisionSubmissionUnknownException>(crossInvocation.exceptionOrNull())
+
+        val rollbackAuthority = DecisionSubmissionAuthority("authority-rollback", LlmInvocationPhase.PROPOSER)
+        val invalid = submission.copy(invocationId = "authority-rollback", reasonJa = "")
+        assertTrue(repository.submitDecision(rollbackAuthority, invalid).isFailure)
+        val afterRollback = repository.submitDecision(
+            rollbackAuthority,
+            invalid.copy(reasonJa = "valid after rollback"),
+        ).getOrThrow()
+
+        assertEquals("valid after rollback", afterRollback.decision.submission.reasonJa)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 2)
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities", 5)
+        }
+    }
+
+    @Test
+    fun decisionSubmissionAuthority_concurrentWinnerAndRollbackPromotionRemainSingular() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val concurrentSubmission = noTradeDecisionSubmission().copy(invocationId = "authority-concurrent")
+        val concurrentAuthority = DecisionSubmissionAuthority("authority-concurrent", LlmInvocationPhase.PROPOSER)
+        val concurrentResults = coroutineScope {
+            List(2) { async { repository.submitDecision(concurrentAuthority, concurrentSubmission).getOrThrow() } }
+                .awaitAll()
+        }
+
+        assertEquals(1, concurrentResults.map { result -> result.decision.decisionId }.distinct().size)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities", 1)
+            installFirstDecisionInsertRollbackFixture()
+        }
+
+        val promotionSubmission = noTradeDecisionSubmission().copy(invocationId = "authority-promotion")
+        val promotionAuthority = DecisionSubmissionAuthority("authority-promotion", LlmInvocationPhase.PROPOSER)
+        val promotedResults = coroutineScope {
+            List(2) { async { repository.submitDecision(promotionAuthority, promotionSubmission) } }.awaitAll()
+        }
+
+        assertEquals(1, promotedResults.count { result -> result.isSuccess })
+        assertEquals(1, promotedResults.count { result -> result.isFailure })
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 2)
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities", 2)
+            assertSqlCount(
+                "SELECT COUNT(*) FROM decision_submission_authorities " +
+                    "WHERE invocation_id='authority-promotion' AND state='COMPLETED'",
+                1,
+            )
+        }
+    }
+
+    @Test
+    fun decisionSubmissionAuthority_responseLossRetryDoesNotDuplicateAnyDecisionEffects() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        seedTerminalEvidencePhaseManifest(database)
+        ExposedDecisionMaterialStateRepository(database).append(identityManifest(TERMINAL_EVIDENCE_INVOCATION_ID))
+            .getOrThrow()
+        val repository = ExposedDecisionRepository(database, fixedClock())
+        val authority = DecisionSubmissionAuthority(TERMINAL_EVIDENCE_INVOCATION_ID, LlmInvocationPhase.PROPOSER)
+        val submission = enterDecisionSubmission().copy(invocationId = TERMINAL_EVIDENCE_INVOCATION_ID)
+        val evidence = terminalDecisionEvidence()
+
+        val committed = repository.submitTerminalDecision(authority, submission, evidence).getOrThrow()
+        val retry = repository.submitTerminalDecision(authority, submission, evidence).getOrThrow()
+
+        assertEquals(committed.decision.decisionId, retry.decision.decisionId)
+        assertEquals(committed.tradePlan?.tradePlanId, retry.tradePlan?.tradePlanId)
+        assertEquals(committed.tradeIntent?.intentId, retry.tradeIntent?.intentId)
+        assertEquals(
+            submission.canonicalBusinessPayload().hash,
+            retry.decision.submission.canonicalBusinessPayload().hash,
+        )
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM decision_submission_authorities", 1)
+            assertSqlCount("SELECT COUNT(*) FROM decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM trade_plans", 1)
+            assertSqlCount("SELECT COUNT(*) FROM trade_intents", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_terminal_evidence_links", 1)
+            assertSqlCount("SELECT COUNT(*) FROM llm_decision_phase_evidence_coverage", 1)
+            assertSqlCount("SELECT COUNT(*) FROM opportunity_episodes", 1)
+            assertSqlCount("SELECT COUNT(*) FROM decision_identity_generation_failures", 0)
+            assertSqlCount("SELECT COUNT(*) FROM dedupe_shadow_observations", 1)
+        }
     }
 
     @Test
@@ -14413,6 +14605,84 @@ private fun seedTerminalEvidencePhaseManifest(database: ExposedDatabase) {
             """.trimIndent(),
         )
     }
+}
+
+private fun terminalDecisionEvidence(): TrustedTerminalToolEvidenceBundle {
+    val responseJson = "{\"price\":\"100\"}"
+
+    return TrustedTerminalToolEvidenceBundle(
+        invocationId = TERMINAL_EVIDENCE_INVOCATION_ID,
+        phaseManifestId = TERMINAL_EVIDENCE_PHASE_MANIFEST_ID,
+        phase = LlmInvocationPhase.PROPOSER,
+        captureEnabled = true,
+        bundle = TerminalToolEvidenceBundle(
+            status = TerminalToolEvidenceBundleStatus.COMPLETE,
+            incompleteReason = null,
+            entries = listOf(
+                TerminalToolEvidence(
+                    ordinal = 0,
+                    toolName = "get_ticker",
+                    responseJson = responseJson,
+                    responseHash = ManifestPersistencePolicy.sha256(responseJson),
+                    sourceTimestamp = null,
+                    sourceTimestampStatus = ToolEvidenceSourceTimestampStatus.MISSING,
+                    isError = false,
+                ),
+            ),
+        ),
+    )
+}
+
+private fun insertDecisionSubmissionAuthorityFixture(
+    database: ExposedDatabase,
+    authority: DecisionSubmissionAuthority,
+    submission: DecisionSubmission,
+    state: String,
+    decisionId: UUID? = null,
+    completedAt: Instant? = null,
+) {
+    val payload = submission.canonicalBusinessPayload()
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            """INSERT INTO decision_submission_authorities
+                (invocation_id, phase, payload_schema_version, payload_hash, state, decision_id,
+                 trade_plan_id, trade_intent_id, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setString(1, authority.invocationId)
+            statement.setString(2, authority.phase.name)
+            statement.setInt(3, payload.schemaVersion)
+            statement.setString(4, payload.hash)
+            statement.setString(5, state)
+            statement.setObject(6, decisionId)
+            statement.setLong(7, fixedInstant().toEpochMilli())
+            statement.setObject(8, completedAt?.toEpochMilli())
+            statement.executeUpdate()
+        }
+    }
+}
+
+private fun JdbcTransaction.installFirstDecisionInsertRollbackFixture() {
+    executeUpdate("CREATE SEQUENCE decision_submission_rollback_sequence")
+    executeUpdate(
+        """CREATE FUNCTION fail_first_decision_insert() RETURNS trigger AS ${'$'}${'$'}
+            BEGIN
+                IF nextval('decision_submission_rollback_sequence') = 1 THEN
+                    PERFORM pg_sleep(0.25);
+                    RAISE EXCEPTION 'synthetic first decision insert rollback';
+                END IF;
+                RETURN NEW;
+            END;
+            ${'$'}${'$'} LANGUAGE plpgsql
+        """.trimIndent(),
+    )
+    executeUpdate(
+        """CREATE TRIGGER fail_first_decision_insert
+            BEFORE INSERT ON decisions
+            FOR EACH ROW EXECUTE FUNCTION fail_first_decision_insert()
+        """.trimIndent(),
+    )
 }
 
 private const val TERMINAL_EVIDENCE_INVOCATION_ID = "terminal-evidence-run"

@@ -18,7 +18,10 @@ import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionConflictException
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
@@ -150,12 +153,7 @@ class LlmDecisionSubmissionGateway private constructor(
                                             terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
                                         )
                                     }
-                                }.getOrElse {
-                                    buildJsonObject {
-                                        put("accepted", false)
-                                        put("error", "SUBMISSION_REJECTED")
-                                    }
-                                }
+                                }.getOrElse(::gatewayErrorResponse)
                                 LlmSubmissionGatewayCodec.writeFrame(channel, response)
                             }
                         }
@@ -236,7 +234,11 @@ class LlmDecisionSubmissionGateway private constructor(
                         }
                     }
                     LlmSubmissionGatewayCodec.decisionResult(
-                        repository.submitTerminalDecision(submission, trustedTerminalEvidence).getOrThrow(),
+                        repository.submitTerminalDecision(
+                            authority = DecisionSubmissionAuthority(invocationId, phase),
+                            submission = submission,
+                            evidence = trustedTerminalEvidence,
+                        ).getOrThrow(),
                     )
                 }
                 OPERATION_SUBMIT_FALSIFICATION -> {
@@ -254,6 +256,16 @@ class LlmDecisionSubmissionGateway private constructor(
             }
         }
     }
+}
+
+private fun gatewayErrorResponse(throwable: Throwable): JsonObject = buildJsonObject {
+    val code = when (throwable) {
+        is DecisionSubmissionConflictException -> DECISION_SUBMISSION_CONFLICT_CODE
+        is DecisionSubmissionUnknownException -> DECISION_SUBMISSION_UNKNOWN_CODE
+        else -> SUBMISSION_REJECTED_CODE
+    }
+    put("accepted", false)
+    put("error", code)
 }
 
 private fun Throwable?.combineCleanupFailure(next: Throwable): Throwable {
@@ -549,6 +561,9 @@ fun gatewayFrameFits(payload: JsonObject): Boolean = payload.toString().encodeTo
 
 const val OPERATION_SUBMIT_DECISION = "SUBMIT_DECISION"
 const val OPERATION_SUBMIT_FALSIFICATION = "SUBMIT_FALSIFICATION"
+const val DECISION_SUBMISSION_CONFLICT_CODE = "DECISION_SUBMISSION_CONFLICT"
+const val DECISION_SUBMISSION_UNKNOWN_CODE = "DECISION_SUBMISSION_UNKNOWN"
+private const val SUBMISSION_REJECTED_CODE = "SUBMISSION_REJECTED"
 private const val LEGACY_GATEWAY_PROTOCOL_VERSION = 1
 private const val TERMINAL_EVIDENCE_GATEWAY_PROTOCOL_VERSION = 2
 const val MAX_GATEWAY_FRAME_BYTES = 128 * 1024

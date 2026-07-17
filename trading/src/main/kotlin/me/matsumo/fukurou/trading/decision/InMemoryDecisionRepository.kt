@@ -20,6 +20,7 @@ import java.util.UUID
  * @param clock 保存時刻に使う clock
  * @param maxTradePlanRevisions TradePlan 正式修正の上限
  */
+@Suppress("TooManyFunctions")
 class InMemoryDecisionRepository(
     private val clock: Clock = Clock.systemUTC(),
     private val maxTradePlanRevisions: Int = MAX_TRADE_PLAN_REVISIONS,
@@ -33,6 +34,7 @@ class InMemoryDecisionRepository(
     private val falsifications = mutableListOf<FalsificationRecord>()
     private val intentConsumptions = mutableListOf<TradeIntentConsumptionRecord>()
     private val openEpisodesByThesis = mutableMapOf<String, InMemoryEpisodeContext>()
+    private val submissionAuthorities = mutableMapOf<DecisionSubmissionAuthority, InMemorySubmissionAuthority>()
 
     /**
      * 保存済み record の snapshot 読み取り境界。
@@ -50,73 +52,121 @@ class InMemoryDecisionRepository(
     override suspend fun submitDecision(submission: DecisionSubmission): Result<DecisionSubmissionResult> {
         return runCatching {
             mutex.withLock {
-                validateDecisionSubmission(submission, maxTradePlanRevisions)
+                insertDecisionSubmissionLocked(submission)
+            }
+        }
+    }
 
-                val now = Instant.now(clock)
-                val parentTradePlan = submission.tradePlan
-                    ?.parentTradePlanId
-                    ?.let { parentTradePlanId ->
-                        tradePlans.firstOrNull { tradePlan -> tradePlan.tradePlanId == parentTradePlanId }
-                    }
-
-                validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
-
-                val manifest = submission.invocationId?.let { invocationId ->
-                    materialStateRepository.find(invocationId).getOrThrow()
+    override suspend fun submitDecision(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+    ): Result<DecisionSubmissionResult> {
+        return runCatching {
+            mutex.withLock {
+                require(submission.invocationId == authority.invocationId) {
+                    "Decision submission invocation does not match authority."
                 }
-                val identity = submission.entryIntent?.let { intent ->
-                    submission.tradePlan?.let { plan ->
-                        manifest?.let { exact ->
-                            val thesisId = DecisionIdentityGenerator.thesisId(plan)
-                            val context = openEpisodesByThesis[thesisId]
-                            val canonical = exact.canonicalProjection(
-                                anchorPriceJpy = context?.anchorPriceJpy ?: intent.priceJpy,
-                                thresholdRatio = context?.priceMoveThresholdRatio ?: exact.priceMoveThresholdRatio,
-                                predicates = context?.predicates ?: plan.invalidationPredicates,
-                                observedAt = now,
+                val payload = submission.canonicalBusinessPayload()
+                submissionAuthorities[authority]?.let { existing ->
+                    existing.requireSamePayload(payload)
+
+                    return@withLock existing.completedResult
+                        ?: throw DecisionSubmissionUnknownException()
+                }
+
+                submissionAuthorities[authority] = InMemorySubmissionAuthority.pending(payload)
+                try {
+                    val result = insertDecisionSubmissionLocked(submission)
+                    submissionAuthorities[authority] = InMemorySubmissionAuthority.completed(payload, result)
+
+                    result
+                } catch (throwable: Throwable) {
+                    submissionAuthorities.remove(authority)
+                    throw throwable
+                }
+            }
+        }
+    }
+
+    /** test fixture 用に committed PENDING authority を作る。 */
+    internal suspend fun seedIncompleteDecisionSubmissionAuthority(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+    ) {
+        mutex.withLock {
+            submissionAuthorities[authority] = InMemorySubmissionAuthority.pending(
+                submission.canonicalBusinessPayload(),
+            )
+        }
+    }
+
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
+    private suspend fun insertDecisionSubmissionLocked(submission: DecisionSubmission): DecisionSubmissionResult {
+        validateDecisionSubmission(submission, maxTradePlanRevisions)
+
+        val now = Instant.now(clock)
+        val parentTradePlan = submission.tradePlan
+            ?.parentTradePlanId
+            ?.let { parentTradePlanId ->
+                tradePlans.firstOrNull { tradePlan -> tradePlan.tradePlanId == parentTradePlanId }
+            }
+
+        validateTradePlanLineage(submission, parentTradePlan, maxTradePlanRevisions)
+
+        val manifest = submission.invocationId?.let { invocationId ->
+            materialStateRepository.find(invocationId).getOrThrow()
+        }
+        val identity = submission.entryIntent?.let { intent ->
+            submission.tradePlan?.let { plan ->
+                manifest?.let { exact ->
+                    val thesisId = DecisionIdentityGenerator.thesisId(plan)
+                    val context = openEpisodesByThesis[thesisId]
+                    val canonical = exact.canonicalProjection(
+                        anchorPriceJpy = context?.anchorPriceJpy ?: intent.priceJpy,
+                        thresholdRatio = context?.priceMoveThresholdRatio ?: exact.priceMoveThresholdRatio,
+                        predicates = context?.predicates ?: plan.invalidationPredicates,
+                        observedAt = now,
+                    )
+                    val episodeId = context?.episodeId ?: UUID.randomUUID()
+                    DecisionIdentityGenerator.generate(episodeId, plan, intent, canonical).also {
+                        if (context == null) {
+                            openEpisodesByThesis.clear()
+                            openEpisodesByThesis[thesisId] = InMemoryEpisodeContext(
+                                episodeId = episodeId,
+                                anchorPriceJpy = intent.priceJpy ?: exact.lastPriceJpy,
+                                priceMoveThresholdRatio = exact.priceMoveThresholdRatio,
+                                predicates = plan.invalidationPredicates,
                             )
-                            val episodeId = context?.episodeId ?: UUID.randomUUID()
-                            DecisionIdentityGenerator.generate(episodeId, plan, intent, canonical).also {
-                                if (context == null) {
-                                    openEpisodesByThesis.clear()
-                                    openEpisodesByThesis[thesisId] = InMemoryEpisodeContext(
-                                        episodeId = episodeId,
-                                        anchorPriceJpy = intent.priceJpy ?: exact.lastPriceJpy,
-                                        priceMoveThresholdRatio = exact.priceMoveThresholdRatio,
-                                        predicates = plan.invalidationPredicates,
-                                    )
-                                }
-                            }
                         }
                     }
                 }
-                val decision = DecisionRecord(
-                    decisionId = UUID.randomUUID(),
-                    submission = submission,
-                    createdAt = now,
-                    identity = identity,
-                )
-                val tradePlan = submission.tradePlan?.toRecord(decision.decisionId, now)
-                val tradeIntent = submission.entryIntent?.toRecord(
-                    decisionId = decision.decisionId,
-                    tradePlanId = requireNotNull(tradePlan?.tradePlanId) {
-                        "${submission.action.name} decision requires trade_plan."
-                    },
-                    estimatedWinProbability = submission.estimatedWinProbability,
-                    createdAt = now,
-                )?.copy(identity = identity)
-
-                decisions += decision
-                tradePlan?.let { record -> tradePlans += record }
-                tradeIntent?.let { record -> tradeIntents += record }
-
-                DecisionSubmissionResult(
-                    decision = decision,
-                    tradeIntent = tradeIntent,
-                    tradePlan = tradePlan,
-                )
             }
         }
+        val decision = DecisionRecord(
+            decisionId = UUID.randomUUID(),
+            submission = submission,
+            createdAt = now,
+            identity = identity,
+        )
+        val tradePlan = submission.tradePlan?.toRecord(decision.decisionId, now)
+        val tradeIntent = submission.entryIntent?.toRecord(
+            decisionId = decision.decisionId,
+            tradePlanId = requireNotNull(tradePlan?.tradePlanId) {
+                "${submission.action.name} decision requires trade_plan."
+            },
+            estimatedWinProbability = submission.estimatedWinProbability,
+            createdAt = now,
+        )?.copy(identity = identity)
+
+        decisions += decision
+        tradePlan?.let { record -> tradePlans += record }
+        tradeIntent?.let { record -> tradeIntents += record }
+
+        return DecisionSubmissionResult(
+            decision = decision,
+            tradeIntent = tradeIntent,
+            tradePlan = tradePlan,
+        )
     }
 
     private data class InMemoryEpisodeContext(
@@ -125,6 +175,43 @@ class InMemoryDecisionRepository(
         val priceMoveThresholdRatio: BigDecimal,
         val predicates: List<TradePlanInvalidationPredicate>,
     )
+
+    private data class InMemorySubmissionAuthority(
+        val payloadSchemaVersion: Int,
+        val payloadHash: String,
+        val state: DecisionSubmissionAuthorityState,
+        val result: DecisionSubmissionResult?,
+    ) {
+        val completedResult: DecisionSubmissionResult?
+            get() = result.takeIf { state == DecisionSubmissionAuthorityState.COMPLETED }
+
+        fun requireSamePayload(payload: DecisionSubmissionCanonicalPayload) {
+            if (payloadSchemaVersion != payload.schemaVersion || payloadHash != payload.hash) {
+                throw DecisionSubmissionConflictException()
+            }
+        }
+
+        companion object {
+            fun pending(payload: DecisionSubmissionCanonicalPayload) = InMemorySubmissionAuthority(
+                payloadSchemaVersion = payload.schemaVersion,
+                payloadHash = payload.hash,
+                state = DecisionSubmissionAuthorityState.PENDING,
+                result = null,
+            )
+
+            fun completed(
+                payload: DecisionSubmissionCanonicalPayload,
+                result: DecisionSubmissionResult,
+            ): InMemorySubmissionAuthority {
+                return InMemorySubmissionAuthority(
+                    payloadSchemaVersion = payload.schemaVersion,
+                    payloadHash = payload.hash,
+                    state = DecisionSubmissionAuthorityState.COMPLETED,
+                    result = result,
+                )
+            }
+        }
+    }
 
     override suspend fun submitFalsification(submission: FalsificationSubmission): Result<FalsificationRecord> {
         return runCatching {

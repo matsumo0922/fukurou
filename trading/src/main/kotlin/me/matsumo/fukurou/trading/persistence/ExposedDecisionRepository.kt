@@ -18,7 +18,12 @@ import me.matsumo.fukurou.trading.audit.toTerminalEvidenceCanonicalString
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRecord
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthorityState
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionCanonicalPayload
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionConflictException
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.EntryIntentSafetySnapshot
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
@@ -32,6 +37,7 @@ import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanRecord
+import me.matsumo.fukurou.trading.decision.canonicalBusinessPayload
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentity
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.identity.canonicalProjection
@@ -162,6 +168,51 @@ private const val INSERT_TRADE_INTENT_CONSUMPTION_SQL = """
     VALUES (?, ?, ?, ?)
 """
 
+/** strict authority を競合時に上書きせずclaimする SQL。 */
+private const val INSERT_DECISION_SUBMISSION_AUTHORITY_SQL = """
+    INSERT INTO decision_submission_authorities (
+        invocation_id,
+        phase,
+        payload_schema_version,
+        payload_hash,
+        state,
+        decision_id,
+        trade_plan_id,
+        trade_intent_id,
+        created_at,
+        completed_at
+    )
+    VALUES (?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, ?, NULL)
+    ON CONFLICT (invocation_id, phase) DO NOTHING
+"""
+
+/** strict authority を winner commit / rollback まで待って読む SQL。 */
+private const val SELECT_DECISION_SUBMISSION_AUTHORITY_FOR_UPDATE_SQL = """
+    SELECT
+        payload_schema_version,
+        payload_hash,
+        state,
+        decision_id,
+        trade_plan_id,
+        trade_intent_id,
+        completed_at
+    FROM decision_submission_authorities
+    WHERE invocation_id = ? AND phase = ?
+    FOR UPDATE
+"""
+
+/** winner result IDs を durable authority へ確定する SQL。 */
+private const val COMPLETE_DECISION_SUBMISSION_AUTHORITY_SQL = """
+    UPDATE decision_submission_authorities
+    SET
+        state = 'COMPLETED',
+        decision_id = ?,
+        trade_plan_id = ?,
+        trade_intent_id = ?,
+        completed_at = ?
+    WHERE invocation_id = ? AND phase = ? AND state = 'PENDING'
+"""
+
 /**
  * intent ID で trade_intents を読む SQL。
  */
@@ -216,6 +267,11 @@ private const val SELECT_TRADE_INTENT_BY_DECISION_ID_SQL = """
     LIMIT 1
 """
 
+/** decision に紐づく trade intent 件数を exact reconstruction 用に読む SQL。 */
+private const val COUNT_TRADE_INTENTS_BY_DECISION_ID_SQL = """
+    SELECT COUNT(*) FROM trade_intents WHERE decision_id = ?
+"""
+
 /**
  * TradePlan ID で trade_plans を読む SQL。
  */
@@ -260,6 +316,11 @@ private const val SELECT_TRADE_PLAN_BY_DECISION_ID_SQL = """
     LIMIT 1
 """
 
+/** decision に紐づく TradePlan 件数を exact reconstruction 用に読む SQL。 */
+private const val COUNT_TRADE_PLANS_BY_DECISION_ID_SQL = """
+    SELECT COUNT(*) FROM trade_plans WHERE decision_id = ?
+"""
+
 /**
  * invocation ID で latest decision を読む SQL。
  */
@@ -293,6 +354,37 @@ private const val SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL = """
     WHERE invocation_id = ?
     ORDER BY created_at DESC
     LIMIT 1
+"""
+
+/** decision ID で exact result を再構成する SQL。 */
+private const val SELECT_DECISION_BY_ID_SQL = """
+    SELECT
+        id,
+        opportunity_episode_id,
+        thesis_id,
+        geometry_hash,
+        material_state_hash,
+        identity_schema_version,
+        invocation_id,
+        llm_provider,
+        prompt_hash,
+        system_prompt_version,
+        market_snapshot_id,
+        action,
+        close_ratio,
+        setup_tags,
+        estimated_win_probability,
+        expected_r_multiple,
+        round_trip_cost_r,
+        tool_evidence_ids,
+        fact_check,
+        self_review,
+        reason_ja,
+        missing_data_ja,
+        no_trade_conditions_ja,
+        created_at
+    FROM decisions
+    WHERE id = ?
 """
 
 /**
@@ -463,6 +555,26 @@ class ExposedDecisionRepository(
         }
     }
 
+    override suspend fun submitDecision(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+    ): Result<DecisionSubmissionResult> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    maxAttempts = 1
+                    submitDecisionWithAuthority(
+                        authority = authority,
+                        submission = submission,
+                        evidence = null,
+                        now = clock.instant(),
+                        maxTradePlanRevisions = maxTradePlanRevisions,
+                    )
+                }
+            }
+        }
+    }
+
     override suspend fun submitFalsification(submission: FalsificationSubmission): Result<FalsificationRecord> {
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -489,6 +601,31 @@ class ExposedDecisionRepository(
                     insertTerminalEvidenceAssociation("DECISION", result.decision.decisionId, evidence, now)
 
                     result
+                }
+            }
+        }
+    }
+
+    override suspend fun submitTerminalDecision(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+        evidence: TrustedTerminalToolEvidenceBundle,
+    ): Result<DecisionSubmissionResult> {
+        if (!evidence.captureEnabled) {
+            return submitWithoutTerminalEvidence(evidence) { submitDecision(authority, submission) }
+        }
+
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    maxAttempts = 1
+                    submitDecisionWithAuthority(
+                        authority = authority,
+                        submission = submission,
+                        evidence = evidence,
+                        now = clock.instant(),
+                        maxTradePlanRevisions = maxTradePlanRevisions,
+                    )
                 }
             }
         }
@@ -819,6 +956,169 @@ private fun TerminalToolEvidenceBundleStatus.toCoverageStatus(): String = when (
 private val TERMINAL_EVIDENCE_SUBMISSION_TOOLS = setOf("submit_decision", "submit_falsification")
 private const val TERMINAL_BUNDLE_CAPTURED_STATUS = "TERMINAL_BUNDLE_CAPTURED"
 private const val TERMINAL_BUNDLE_INCOMPLETE_STATUS = "TERMINAL_BUNDLE_INCOMPLETE"
+
+private fun JdbcTransaction.submitDecisionWithAuthority(
+    authority: DecisionSubmissionAuthority,
+    submission: DecisionSubmission,
+    evidence: TrustedTerminalToolEvidenceBundle?,
+    now: Instant,
+    maxTradePlanRevisions: Int,
+): DecisionSubmissionResult {
+    require(submission.invocationId == authority.invocationId) {
+        "Decision submission invocation does not match authority."
+    }
+    val payload = submission.canonicalBusinessPayload()
+    val winner = insertDecisionSubmissionAuthority(authority, payload, now)
+    val persistedAuthority = selectDecisionSubmissionAuthorityForUpdate(authority)
+        ?: throw DecisionSubmissionUnknownException()
+    persistedAuthority.requireSamePayload(payload)
+    if (!winner) return reconstructCompletedDecisionSubmission(authority, persistedAuthority)
+
+    evidence?.let { trusted ->
+        require(trusted.invocationId == authority.invocationId && trusted.phase == authority.phase) {
+            "Terminal evidence does not match decision submission authority."
+        }
+        validateTrustedTerminalEvidence(trusted)
+        requireCompleteEvidenceForDecision(submission, trusted)
+    }
+    val result = insertDecisionSubmission(submission, now, maxTradePlanRevisions)
+    evidence?.let { trusted ->
+        insertTerminalEvidenceAssociation("DECISION", result.decision.decisionId, trusted, now)
+    }
+    completeDecisionSubmissionAuthority(authority, result, now)
+
+    return result
+}
+
+private fun JdbcTransaction.insertDecisionSubmissionAuthority(
+    authority: DecisionSubmissionAuthority,
+    payload: DecisionSubmissionCanonicalPayload,
+    now: Instant,
+): Boolean {
+    return jdbcConnection().prepareStatement(INSERT_DECISION_SUBMISSION_AUTHORITY_SQL).use { statement ->
+        statement.setString(1, authority.invocationId)
+        statement.setString(2, authority.phase.name)
+        statement.setInt(3, payload.schemaVersion)
+        statement.setString(4, payload.hash)
+        statement.setLong(5, now.toEpochMilli())
+        statement.executeUpdate() == 1
+    }
+}
+
+private fun JdbcTransaction.selectDecisionSubmissionAuthorityForUpdate(
+    authority: DecisionSubmissionAuthority,
+): PersistedDecisionSubmissionAuthority? {
+    return jdbcConnection().prepareStatement(SELECT_DECISION_SUBMISSION_AUTHORITY_FOR_UPDATE_SQL).use { statement ->
+        statement.setString(1, authority.invocationId)
+        statement.setString(2, authority.phase.name)
+        statement.executeQuery().use { result ->
+            if (!result.next()) return@use null
+            PersistedDecisionSubmissionAuthority(
+                payloadSchemaVersion = result.getInt("payload_schema_version"),
+                payloadHash = result.getString("payload_hash"),
+                state = result.getString("state"),
+                decisionId = result.getNullableUuid("decision_id"),
+                tradePlanId = result.getNullableUuid("trade_plan_id"),
+                tradeIntentId = result.getNullableUuid("trade_intent_id"),
+                completedAt = result.getNullableLong("completed_at"),
+            )
+        }
+    }
+}
+
+private fun PersistedDecisionSubmissionAuthority.requireSamePayload(payload: DecisionSubmissionCanonicalPayload) {
+    if (payloadSchemaVersion != payload.schemaVersion || payloadHash != payload.hash) {
+        throw DecisionSubmissionConflictException()
+    }
+}
+
+@Suppress("CyclomaticComplexMethod")
+private fun JdbcTransaction.reconstructCompletedDecisionSubmission(
+    key: DecisionSubmissionAuthority,
+    authority: PersistedDecisionSubmissionAuthority,
+): DecisionSubmissionResult {
+    val decisionId = authority.decisionId
+    val authorityHasCompletionState = authority.state == DecisionSubmissionAuthorityState.COMPLETED.name &&
+        authority.completedAt != null
+    if (!authorityHasCompletionState || decisionId == null) throw DecisionSubmissionUnknownException()
+
+    val decision = selectDecision(requireNotNull(decisionId)) ?: throw DecisionSubmissionUnknownException()
+    if (decision.submission.invocationId != key.invocationId) throw DecisionSubmissionUnknownException()
+    val planAssociationCountMatches = countDecisionAssociations(
+        COUNT_TRADE_PLANS_BY_DECISION_ID_SQL,
+        decisionId,
+    ) == if (authority.tradePlanId == null) 0 else 1
+    val intentAssociationCountMatches = countDecisionAssociations(
+        COUNT_TRADE_INTENTS_BY_DECISION_ID_SQL,
+        decisionId,
+    ) == if (authority.tradeIntentId == null) 0 else 1
+    if (!planAssociationCountMatches || !intentAssociationCountMatches) {
+        throw DecisionSubmissionUnknownException()
+    }
+
+    val tradePlan = authority.tradePlanId?.let(::selectTradePlan)
+    val tradeIntent = authority.tradeIntentId?.let(::selectTradeIntent)
+    val actualTradePlan = selectTradePlanByDecisionId(decisionId)
+    val actualTradeIntent = selectTradeIntentByDecisionId(decisionId)
+    val planMatches = tradePlan?.decisionId == decisionId && actualTradePlan?.tradePlanId == authority.tradePlanId
+    val intentMatches = tradeIntent?.decisionId == decisionId && actualTradeIntent?.intentId == authority.tradeIntentId
+    val nullablePlanMatches = if (authority.tradePlanId == null) actualTradePlan == null else planMatches
+    val nullableIntentMatches = if (authority.tradeIntentId == null) actualTradeIntent == null else intentMatches
+    val intentPlanMatches = tradeIntent == null || tradeIntent.tradePlanId == authority.tradePlanId
+    val resultReferencesMatch = nullablePlanMatches && nullableIntentMatches
+    if (!resultReferencesMatch || !intentPlanMatches) {
+        throw DecisionSubmissionUnknownException()
+    }
+
+    return DecisionSubmissionResult(
+        decision = decision.copy(
+            submission = decision.submission.copy(
+                entryIntent = tradeIntent?.draft,
+                tradePlan = tradePlan?.draft,
+            ),
+        ),
+        tradeIntent = tradeIntent,
+        tradePlan = tradePlan,
+    )
+}
+
+private fun JdbcTransaction.countDecisionAssociations(sql: String, decisionId: UUID): Int {
+    return jdbcConnection().prepareStatement(sql).use { statement ->
+        statement.setObject(1, decisionId)
+        statement.executeQuery().use { result ->
+            check(result.next())
+
+            result.getInt(1)
+        }
+    }
+}
+
+private fun JdbcTransaction.completeDecisionSubmissionAuthority(
+    authority: DecisionSubmissionAuthority,
+    result: DecisionSubmissionResult,
+    now: Instant,
+) {
+    val updated = jdbcConnection().prepareStatement(COMPLETE_DECISION_SUBMISSION_AUTHORITY_SQL).use { statement ->
+        statement.setObject(1, result.decision.decisionId)
+        statement.setObject(2, result.tradePlan?.tradePlanId)
+        statement.setObject(3, result.tradeIntent?.intentId)
+        statement.setLong(4, now.toEpochMilli())
+        statement.setString(5, authority.invocationId)
+        statement.setString(6, authority.phase.name)
+        statement.executeUpdate()
+    }
+    check(updated == 1) { "Decision submission authority completion failed." }
+}
+
+private data class PersistedDecisionSubmissionAuthority(
+    val payloadSchemaVersion: Int,
+    val payloadHash: String,
+    val state: String,
+    val decisionId: UUID?,
+    val tradePlanId: UUID?,
+    val tradeIntentId: UUID?,
+    val completedAt: Long?,
+)
 
 @Suppress("CyclomaticComplexMethod", "LongMethod")
 private fun JdbcTransaction.insertDecisionSubmission(
@@ -1279,6 +1579,15 @@ private fun JdbcTransaction.selectFalsification(intentId: UUID): FalsificationRe
 private fun JdbcTransaction.selectLatestDecisionByInvocationId(invocationId: String): DecisionRecord? {
     return jdbcConnection().prepareStatement(SELECT_LATEST_DECISION_BY_INVOCATION_ID_SQL).use { statement ->
         statement.setString(1, invocationId)
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.toDecisionRecord() else null
+        }
+    }
+}
+
+private fun JdbcTransaction.selectDecision(decisionId: UUID): DecisionRecord? {
+    return jdbcConnection().prepareStatement(SELECT_DECISION_BY_ID_SQL).use { statement ->
+        statement.setObject(1, decisionId)
         statement.executeQuery().use { resultSet ->
             if (resultSet.next()) resultSet.toDecisionRecord() else null
         }

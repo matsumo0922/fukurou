@@ -10,10 +10,14 @@ import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionConflictException
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_CONFLICT_CODE
+import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_UNKNOWN_CODE
 import me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway
 import me.matsumo.fukurou.trading.runner.LlmSubmissionGatewayCodec
 import me.matsumo.fukurou.trading.runner.MAX_GATEWAY_FRAME_BYTES
@@ -143,6 +147,12 @@ class LlmDecisionSubmissionGatewayClientTest {
         gateway.close()
     }
 
+    @Test
+    fun `mcp client restores typed decision authority errors`() {
+        assertTypedGatewayError<DecisionSubmissionConflictException>(DECISION_SUBMISSION_CONFLICT_CODE)
+        assertTypedGatewayError<DecisionSubmissionUnknownException>(DECISION_SUBMISSION_UNKNOWN_CODE)
+    }
+
     private fun noTradeDecision() = DecisionSubmission(
         invocationId = INVOCATION_ID,
         llmProvider = "fixture",
@@ -196,6 +206,34 @@ class LlmDecisionSubmissionGatewayClientTest {
                 submitForPhase(client, phase, "x".repeat(paddingSize + 1))
             }
         }
+        server.close()
+        executor.shutdownNow()
+        Files.deleteIfExists(path)
+    }
+
+    private inline fun <reified T : Throwable> assertTypedGatewayError(code: String) {
+        val path = Path.of("/tmp/fukurou-mcp-error-${System.nanoTime()}.sock")
+        val server = ServerSocketChannel.open(StandardProtocolFamily.UNIX).apply {
+            bind(UnixDomainSocketAddress.of(path))
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val response = executor.submit {
+            server.accept().use { accepted ->
+                LlmSubmissionGatewayCodec.readFrame(accepted)
+                LlmSubmissionGatewayCodec.writeFrame(
+                    accepted,
+                    buildJsonObject {
+                        put("accepted", false)
+                        put("error", code)
+                    },
+                )
+            }
+        }
+
+        connectedClient(path, LlmInvocationPhase.PROPOSER).use { client ->
+            assertFailsWith<T> { client.submitDecision(noTradeDecision()) }
+        }
+        response.get(5, TimeUnit.SECONDS)
         server.close()
         executor.shutdownNow()
         Files.deleteIfExists(path)

@@ -48,6 +48,9 @@ object McpLaunchBootstrap {
         val password = passwordBytes.decodeToString().trimEnd('\n', '\r')
 
         require(manifest.version == MCP_MANIFEST_VERSION) { "Unsupported MCP manifest version." }
+        require(manifest.invocationId == manifest.decisionRunId) {
+            "MCP manifest invocation does not match decision run identity."
+        }
         val phase = runCatching { LlmInvocationPhase.valueOf(manifest.phase) }
             .getOrElse { throw IllegalArgumentException("Unsupported MCP manifest phase.") }
         val canonicalTools = McpToolContractCatalog.toolsFor(phase)

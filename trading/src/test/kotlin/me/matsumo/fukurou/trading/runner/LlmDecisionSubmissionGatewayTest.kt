@@ -3,10 +3,12 @@ package me.matsumo.fukurou.trading.runner
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.requiresCompleteTerminalEvidence
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -250,6 +252,30 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     @Test
+    fun `gateway preserves idempotent result and typed conflict unknown codes`() = runBlocking {
+        val repository = InMemoryDecisionRepository()
+        val submission = decision(DecisionAction.NO_TRADE)
+
+        val first = exchangeDecision(repository, submission)
+        val retry = exchangeDecision(repository, submission)
+        val conflict = exchangeDecision(repository, submission.copy(reasonJa = "changed"))
+
+        assertEquals(first.getValue("decision_id"), retry.getValue("decision_id"))
+        assertEquals(DECISION_SUBMISSION_CONFLICT_CODE, conflict.getValue("error").jsonPrimitive.content)
+        assertEquals(1, repository.snapshots.decisions().size)
+
+        val incompleteRepository = InMemoryDecisionRepository()
+        incompleteRepository.seedIncompleteDecisionSubmissionAuthority(
+            DecisionSubmissionAuthority(INVOCATION_ID, LlmInvocationPhase.PROPOSER),
+            submission,
+        )
+        val unknown = exchangeDecision(incompleteRepository, submission)
+
+        assertEquals(DECISION_SUBMISSION_UNKNOWN_CODE, unknown.getValue("error").jsonPrimitive.content)
+        assertTrue(incompleteRepository.snapshots.decisions().isEmpty())
+    }
+
+    @Test
     fun `risk reduction gateway denies entry without stage two dependency`() = runBlocking {
         val repository = InMemoryDecisionRepository()
         val path = Path.of("/tmp/fukurou-gateway-${System.nanoTime()}.sock")
@@ -318,6 +344,18 @@ class LlmDecisionSubmissionGatewayTest {
             effectiveInvocationHash = EFFECTIVE_HASH,
             hooks = hooks,
         )
+
+    private fun exchangeDecision(repository: InMemoryDecisionRepository, submission: DecisionSubmission): JsonObject {
+        val path = Path.of("/tmp/fukurou-gateway-idempotency-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val response = connect(path).use { channel ->
+            LlmSubmissionGatewayCodec.writeFrame(channel, request(LlmInvocationPhase.PROPOSER, submission))
+            LlmSubmissionGatewayCodec.readFrame(channel)
+        }
+        gateway.close()
+
+        return response
+    }
 
     private fun request(
         phase: LlmInvocationPhase,

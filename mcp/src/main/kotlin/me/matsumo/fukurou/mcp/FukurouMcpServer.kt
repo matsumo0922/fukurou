@@ -60,7 +60,9 @@ import me.matsumo.fukurou.trading.broker.toJsonObject
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionConflictException
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
@@ -367,6 +369,8 @@ private val ToolErrorTypes: List<Pair<KClass<out Throwable>, String>> = listOf(
     ToolCallNotAllowedException::class to "tool_call_not_allowed",
     ToolCompletionAuditFailedException::class to "audit_failed_after_execution",
     GmoRequestAuditException::class to "audit_failed_after_execution",
+    DecisionSubmissionConflictException::class to "decision_submission_conflict",
+    DecisionSubmissionUnknownException::class to "decision_submission_unknown",
     MarketInvalidRequestException::class to "invalid_request",
     GmoRateLimitException::class to "rate_limited",
     GmoApiStatusException::class to "gmo_status_error",
@@ -1598,8 +1602,14 @@ private suspend fun handleSubmitDecision(
             }
         }
 
-        submissionGatewayClient?.submitDecision(submission)
-            ?: decisionSubmissionJson(tradingRuntime.decisionRepository.submitDecision(submission).getOrThrow())
+        if (invocationPhase != null) {
+            requireNotNull(submissionGatewayClient) {
+                "Production decision submission requires the app-owned gateway."
+            }.submitDecision(submission)
+        } else {
+            submissionGatewayClient?.submitDecision(submission)
+                ?: decisionSubmissionJson(tradingRuntime.decisionRepository.submitDecision(submission).getOrThrow())
+        }
     }
 
     return result.fold(
@@ -1942,9 +1952,13 @@ private fun parseDecisionSubmission(
 ): Result<DecisionSubmission> {
     return runCatching {
         val action = parseDecisionAction(request.stringArgument("action")).getOrThrow()
+        val callerInvocationId = request.stringArgument("invocation_id")
+        require(callerInvocationId == null || callerInvocationId == decisionRunContext.decisionRunId) {
+            "invocation_id must match the server-owned decision run ID."
+        }
 
         DecisionSubmission(
-            invocationId = request.stringArgument("invocation_id") ?: decisionRunContext.decisionRunId,
+            invocationId = decisionRunContext.decisionRunId,
             llmProvider = request.stringArgument("llm_provider") ?: decisionRunContext.llmProvider,
             promptHash = request.stringArgument("prompt_hash") ?: decisionRunContext.promptHash,
             systemPromptVersion = request.stringArgument("system_prompt_version")
