@@ -33,4 +33,4 @@
 
 - [x] 6.1 Correct the rollback runbook to read `HARD_HALT` from `GET /ops/risk-state`, durable cleanup `SAFE` from read-only `risk_state.hard_halt_cleanup_state`, and require agreement with zero-open-risk and resting-BUY zero-row SQL without adding an API field
 - [x] 6.2 Replace the sequential 1,000-iteration evidence with at least 500 receipt-first and 500 order-first PostgreSQL choreographies that deterministically observe the shared/exclusive session advisory-lock waiter before release and delayed event application
-- [ ] 6.3 Update scenario evidence and run the affected contract tests, OpenSpec validation, relevant detekt, and diff checks under the validation lease
+- [x] 6.3 Update scenario evidence and run the affected contract tests, OpenSpec validation, relevant detekt, and diff checks under the validation lease
