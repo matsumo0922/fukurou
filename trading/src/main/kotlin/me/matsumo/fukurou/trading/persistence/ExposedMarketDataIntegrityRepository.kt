@@ -253,6 +253,7 @@ private fun JdbcTransaction.insertPaperMarketEventReceipt(
         receiptId = receiptId,
         admissionOrdinal = admissionOrdinal,
         payloadHash = payloadHash,
+        socketObservedAt = Instant.ofEpochMilli(event.receivedAt.toEpochMilli()),
         duplicate = false,
         transactionDurationNanos = 0,
         advisoryWaitNanos = advisoryWaitNanos,
@@ -279,7 +280,7 @@ private fun JdbcTransaction.selectPaperMarketEventReceipt(
 ): StoredPaperMarketEventReceipt? {
     return prepare(
         """
-            SELECT id, admission_ordinal, payload_hash
+            SELECT id, admission_ordinal, payload_hash, socket_observed_at
             FROM paper_market_event_receipts
             WHERE session_id = ? AND source_sequence = ?
             FOR UPDATE
@@ -294,6 +295,7 @@ private fun JdbcTransaction.selectPaperMarketEventReceipt(
                 receiptId = rows.getObject("id", UUID::class.java),
                 admissionOrdinal = rows.getLong("admission_ordinal"),
                 payloadHash = rows.getString("payload_hash"),
+                socketObservedAt = Instant.ofEpochMilli(rows.getLong("socket_observed_at")),
             )
         }
     }
@@ -308,7 +310,7 @@ private fun JdbcTransaction.nextPaperMarketAdmissionOrdinal(): Long {
     }
 }
 
-private fun PaperMarketTradeEvent.normalizedReceiptPayload(): String {
+internal fun PaperMarketTradeEvent.normalizedReceiptPayload(): String {
     val payload = buildJsonObject {
         put("exchangeAt", exchangeAt.toString())
         put("priceJpy", priceJpy.stripTrailingZeros().toPlainString())
@@ -337,7 +339,7 @@ private fun String.stableAdvisoryLockKey(): Long {
     return ByteBuffer.wrap(digest, 0, Long.SIZE_BYTES).long
 }
 
-private fun String.sha256(): String {
+internal fun String.sha256(): String {
     return MessageDigest.getInstance("SHA-256")
         .digest(toByteArray(Charsets.UTF_8))
         .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
@@ -351,12 +353,14 @@ private data class StoredPaperMarketEventReceipt(
     val receiptId: UUID,
     val admissionOrdinal: Long,
     val payloadHash: String,
+    val socketObservedAt: Instant,
 ) {
     fun toCommit(duplicate: Boolean, advisoryWaitNanos: Long): PaperMarketEventReceiptCommit {
         return PaperMarketEventReceiptCommit(
             receiptId = receiptId,
             admissionOrdinal = admissionOrdinal,
             payloadHash = payloadHash,
+            socketObservedAt = socketObservedAt,
             duplicate = duplicate,
             transactionDurationNanos = 0,
             advisoryWaitNanos = advisoryWaitNanos,

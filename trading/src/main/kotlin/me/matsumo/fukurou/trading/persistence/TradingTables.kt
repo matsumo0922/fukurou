@@ -659,6 +659,9 @@ object OrdersTable : Table("orders") {
     /** 注文が realtime event を受理できる時刻境界。 */
     val marketEligibleFrom = long("market_eligible_from").nullable()
 
+    /** 注文作成 transaction が観測した durable receipt admission ordinal 境界。 */
+    val marketEligibleAfterAdmissionOrdinal = long("market_eligible_after_admission_ordinal").nullable()
+
     /**
      * 作成時刻。epoch millis で保存する。
      */

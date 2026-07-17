@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.market
 
 import java.sql.SQLException
+import java.time.Instant
 import java.util.UUID
 
 /**
@@ -9,6 +10,7 @@ import java.util.UUID
  * @param receiptId receipt row ID
  * @param admissionOrdinal receipt admission の単調増加 ordinal
  * @param payloadHash normalized payload の SHA-256 hash
+ * @param socketObservedAt DB に保存された canonical socket observation 時刻
  * @param duplicate 同一 source event の既存 receipt を返した場合は true
  * @param transactionDurationNanos commit/fsync 完了までの処理時間
  * @param advisoryWaitNanos session-scoped shared advisory lock の待機時間
@@ -17,6 +19,7 @@ data class PaperMarketEventReceiptCommit(
     val receiptId: UUID,
     val admissionOrdinal: Long,
     val payloadHash: String,
+    val socketObservedAt: Instant,
     val duplicate: Boolean,
     val transactionDurationNanos: Long,
     val advisoryWaitNanos: Long,

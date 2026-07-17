@@ -1,29 +1,29 @@
 ## 1. Durable authority and schema
 
-- [ ] 1.1 Add the typed receipt authority to realtime paper events and preserve exact receipt ID, ordinal, payload hash, and canonical persisted observation timestamp across duplicate commits
-- [ ] 1.2 Add the nullable order admission-boundary column with fresh-install and upgrade coverage; reuse and query-plan verify the existing unique global admission-ordinal index
+- [x] 1.1 Add the typed receipt authority to realtime paper events and preserve exact receipt ID, ordinal, payload hash, and canonical persisted observation timestamp across duplicate commits
+- [x] 1.2 Add the nullable order admission-boundary column with fresh-install and upgrade coverage; reuse and query-plan verify the existing unique global admission-ordinal index
 
 ## 2. Receipt propagation and order-boundary capture
 
-- [ ] 2.1 Publish WebSocket trade events only after attaching the committed receipt authority, preserving typed persistence/conflict failure behavior
-- [ ] 2.2 Capture the global maximum committed receipt ordinal under the exclusive session advisory lock inside each realtime resting-order creation transaction
-- [ ] 2.3 Preserve existing queue snapshot/session validation and intent rollback when durable boundary capture cannot prove a connected stable session
-- [ ] 2.4 Enforce and cover the complete touched lock order: advisory-before-session-before-ledger for order admission, session-before-ledger for event application, and session-before-order for gap/disconnect
+- [x] 2.1 Publish WebSocket trade events only after attaching the committed receipt authority, preserving typed persistence/conflict failure behavior
+- [x] 2.2 Capture the global maximum committed receipt ordinal under the exclusive session advisory lock inside each realtime resting-order creation transaction
+- [x] 2.3 Preserve existing queue snapshot/session validation and intent rollback when durable boundary capture cannot prove a connected stable session
+- [x] 2.4 Enforce and cover the complete touched lock order: advisory-before-session-before-ledger for order admission, session-before-ledger for event application, and session-before-order for gap/disconnect
 
 ## 3. Exact fill eligibility
 
-- [ ] 3.1 Resolve and verify the exact persisted receipt in the event transaction, including identity, session, sequence, ordinal, payload hash, canonical timestamp, and normalized payload
-- [ ] 3.2 Replace wall-clock entry eligibility with strict receipt ordinal ordering and fail closed for null, missing, mismatched, or legacy evidence using market-data-gap cancellation without an invalid SafetyViolation detail insert
-- [ ] 3.3 Keep old-session BUY orders non-rebound and preserve realtime STOP/TP, mark handling, and cursor advancement
+- [x] 3.1 Resolve and verify the exact persisted receipt in the event transaction, including identity, session, sequence, ordinal, payload hash, canonical timestamp, and normalized payload
+- [x] 3.2 Replace wall-clock entry eligibility with strict receipt ordinal ordering and fail closed for null, missing, mismatched, or legacy evidence using market-data-gap cancellation without an invalid SafetyViolation detail insert
+- [x] 3.3 Keep old-session BUY orders non-rebound and preserve realtime STOP/TP, mark handling, and cursor advancement
 
 ## 4. Contract and production-path tests
 
-- [ ] 4.1 Cover listener receipt propagation, duplicate identity reuse, and persistence/conflict publish-zero behavior
-- [ ] 4.2 Add deterministic PostgreSQL receipt-first/order-second and order-first/receipt-second barrier tests, including at least 1,000 pre-boundary iterations with constant-bounded open rows and zero fills/executions
-- [ ] 4.3 Cover missing/null/session/payload/timestamp evidence, legacy rows, wall-clock disagreement, authenticated HARD_HALT rollback with cleanup-SAFE plus zero-open-risk/zero-row agreement, and risk-reducing position protection
+- [x] 4.1 Cover listener receipt propagation, duplicate identity reuse, and persistence/conflict publish-zero behavior
+- [x] 4.2 Add deterministic PostgreSQL receipt-first/order-second and order-first/receipt-second barrier tests, including at least 1,000 pre-boundary iterations with constant-bounded open rows and zero fills/executions
+- [x] 4.3 Cover missing/null/session/payload/timestamp evidence, legacy rows, wall-clock disagreement, authenticated HARD_HALT rollback with cleanup-SAFE plus zero-open-risk/zero-row agreement, and risk-reducing position protection
 - [ ] 4.4 Close both production inventories: the `TradingRuntimeFactory.connectedPostgres` order-authority root and the `ProtectionReconcilerWorker` durable event-consumer root; record each OpenSpec Scenario's proving test and SHA
 
 ## 5. Documentation and validation
 
-- [ ] 5.1 Update README and current receipt/eligibility descriptions in `docs/design.md` and `docs/mcp-runtime.md`; document the exact `/ops/halt` rollback request, cleanup-SAFE/readback checks, resting-BUY zero-row query, and resume prohibition; then grep affected names for stale dark-write claims
+- [x] 5.1 Update README and current receipt/eligibility descriptions in `docs/design.md` and `docs/mcp-runtime.md`; document the exact `/ops/halt` rollback request, cleanup-SAFE/readback checks, resting-BUY zero-row query, and resume prohibition; then grep affected names for stale dark-write claims
 - [ ] 5.2 Run targeted tests, `openspec validate issue-187-c-receipt-eligibility`, `make test`, `make detekt`, and `make build` under the validation lease and record command, scope, result, wait time, and HEAD
