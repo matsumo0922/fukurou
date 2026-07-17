@@ -15,16 +15,24 @@ The system SHALL derive the strict decision submission key from the server-owned
 - **WHEN** a decision-capable production invocation phase handles `submit_decision` without an app-owned gateway
 - **THEN** the system rejects the submission and does not fall back to a direct repository write
 
+#### Scenario: Manifest and decision-run identities diverge
+- **WHEN** the gateway-bound manifest invocation ID differs from the server decision-run ID
+- **THEN** startup or submission fails before authority creation rather than choosing either identity implicitly
+
 ### Requirement: Same-payload retry returns the committed result
 The system SHALL store a durable authority for each server-owned `(invocationId, phase)` and SHALL return the originally committed decision, TradePlan, and TradeIntent IDs when the same canonical business payload is retried.
 
 #### Scenario: Gateway response is lost after commit
 - **WHEN** a decision submission commits but its gateway response is discarded and the same invocation, phase, and canonical payload are submitted again
-- **THEN** the retry returns the original result IDs without adding decision, TradePlan, TradeIntent, evidence, link, or coverage rows
+- **THEN** the retry returns the original result IDs without adding decision, TradePlan, TradeIntent, evidence, link, coverage, opportunity episode, identity failure, or dedupe shadow rows
 
 #### Scenario: Concurrent identical submissions
 - **WHEN** multiple transactions concurrently submit the same invocation, phase, and canonical payload
 - **THEN** one transaction creates the entities and every successful caller receives the same result IDs
+
+#### Scenario: Concurrent winner rolls back
+- **WHEN** the transaction that first inserts the authority rolls back while an identical contender is waiting on the same key
+- **THEN** the contender becomes the sole winner, commits one result, and no orphan authority or entity remains
 
 #### Scenario: Semantically equivalent representation
 - **WHEN** a retry differs only in canonical JSON object key order or numerically equivalent decimal scale

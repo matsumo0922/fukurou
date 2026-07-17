@@ -7,17 +7,17 @@
 ## 2. PostgreSQL authority and atomic persistence
 
 - [ ] 2.1 Add the empty additive `decision_submission_authorities` table to the schema bootstrap without legacy backfill or changes to `decisions`.
-- [ ] 2.2 Implement transactional key arbitration, exact result reconstruction, conflict/UNKNOWN handling, and winner-only terminal evidence persistence in `ExposedDecisionRepository`.
-- [ ] 2.3 Add PostgreSQL tests for identical retry, changed payload, committed PENDING/inconsistent authority, transaction rollback, and concurrent same-key submission.
-- [ ] 2.4 Add a response-loss integration test proving retry returns the same decision/plan/intent IDs and does not duplicate evidence/link/coverage rows.
+- [ ] 2.2 Implement rows-affected winner arbitration, pre-side-effect short-circuit, decision-by-ID exact result reconstruction, conflict/UNKNOWN handling, and winner-only terminal evidence persistence in `ExposedDecisionRepository`.
+- [ ] 2.3 Add PostgreSQL tests for identical retry, changed payload, committed PENDING/inconsistent authority, transaction rollback, concurrent same-key submission, and winner rollback followed by contender promotion.
+- [ ] 2.4 Add a response-loss integration test proving retry returns the same decision/plan/intent IDs and does not duplicate evidence/link/coverage, opportunity episode, identity failure, or dedupe shadow rows.
 - [ ] 2.5 Add schema upgrade/old-reader compatibility tests proving legacy rows remain unchanged and do not seed strict authority.
 
 ## 3. Production gateway and MCP identity
 
-- [ ] 3.1 Pass gateway-bound invocation and phase into the authoritative repository call and preserve typed conflict/UNKNOWN codes across gateway responses and the MCP client.
+- [ ] 3.1 Pass gateway-bound invocation and phase into the authoritative repository call, assert manifest invocation equals decision-run identity, and preserve typed conflict/UNKNOWN codes across gateway responses and the MCP client.
 - [ ] 3.2 Make caller `invocation_id` an equality check only and always construct the saved submission from `DecisionRunContext`.
 - [ ] 3.3 Remove the decision-capable production direct repository fallback while preserving an explicit test-only/phase-less fixture boundary.
-- [ ] 3.4 Add MCP/gateway production-call-path tests for spoof rejection, missing gateway rejection, response-loss retry, typed errors, and zero direct repository mutation.
+- [ ] 3.4 Add MCP/gateway production-call-path tests for spoof rejection, manifest/decision-run mismatch, missing gateway rejection, response-loss retry, typed errors, one-terminal-decision-per-phase, and zero direct repository mutation while risk-reducing act tools remain independent.
 
 ## 4. Documentation and evidence
 
