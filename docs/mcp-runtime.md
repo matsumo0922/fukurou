@@ -33,13 +33,18 @@ Content-Type: application/json
 {"level":"HARD","reason":"receipt eligibility rollback"}
 ```
 
-新 image を動かしたまま `GET /ops/risk-state` で `state=HARD_HALT` と `hardHaltCleanupState=SAFE` を確認し、次の readback が `open_positions=0`、`open_orders=0`、`btc_quantity=0` を返すことを確認する。
+新 image を動かしたまま `GET /ops/risk-state` で `state=HARD_HALT` を確認する。この response は cleanup state を公開しないため、`SAFE` を API field から推測しない。production DB の read-only session で次の query を実行し、正本である `risk_state.hard_halt_cleanup_state=SAFE` と、同じ readback の `open_positions=0`、`open_orders=0`、`btc_quantity=0` を確認する。
 
 ```sql
 SELECT
+    risk_state.hard_halt_cleanup_state,
     (SELECT COUNT(*) FROM positions WHERE status = 'OPEN') AS open_positions,
     (SELECT COUNT(*) FROM orders WHERE status IN ('OPEN', 'PENDING_CANCEL')) AS open_orders,
-    (SELECT btc_quantity FROM paper_account WHERE id = 1) AS btc_quantity;
+    paper_account.btc_quantity
+FROM risk_state
+CROSS JOIN paper_account
+WHERE risk_state.id = 1
+  AND paper_account.id = 1;
 ```
 
 receipt-aware reader が作成した risk-increasing resting BUY が残っていないことを、次の独立 query が0行であることでも確認する。
@@ -53,7 +58,7 @@ WHERE status IN ('OPEN', 'PENDING_CANCEL')
   AND order_type IN ('LIMIT', 'STOP');
 ```
 
-cleanup `SAFE`、zero-open-risk readback、resting BUY zero-row の3条件が一致した後にだけ新 image を停止して旧 image を起動する。receipt-aware image が再び active になるまで `POST /ops/resume` を実行しない。nullable column は残し、既存 row の boundary backfill や history rewrite は行わない。
+`GET /ops/risk-state` の `HARD_HALT`、SQL 正本の cleanup `SAFE`、同じ SQL の zero-open-risk readback、resting BUY zero-row の4条件が一致した後にだけ新 image を停止して旧 image を起動する。どれか1つでも不一致または readback 不能なら rollback を停止する。receipt-aware image が再び active になるまで `POST /ops/resume` を実行しない。nullable column は残し、既存 row の boundary backfill や history rewrite は行わない。
 
 ## local smoke
 

@@ -68,7 +68,7 @@ Alternative rejected: failing the entire event transaction before protection. Th
 
 （agent 仮決め）Add nullable `orders.market_eligible_after_admission_ordinal`. Existing rows remain null and are not backfilled. New realtime-enabled resting orders retain legacy session/sequence/time fields for old-reader shape compatibility, while new code ignores the wall-clock field for entry eligibility.
 
-An old binary has a `FULL_TICK_EXECUTION` path that ignores `market_eligible_from`; no column sentinel can make a hot rollback safe. Rollback is therefore operationally fail-closed: issue the existing authenticated `POST /ops/halt` with `level=HARD`, keep the new image running until the existing `ALL_OPEN_RISK` sweep reports durable cleanup `SAFE`, and verify both the risk-state zero-open-risk readback and zero `orders` rows matching resting BUY lifecycle predicates before stopping it. Only then may a pre-change image start. The additive nullable column remains readable/ignorable by the old binary. This change does not claim that an old binary can safely consume new-semantics open orders.
+An old binary has a `FULL_TICK_EXECUTION` path that ignores `market_eligible_from`; no column sentinel can make a hot rollback safe. Rollback is therefore operationally fail-closed: issue the existing authenticated `POST /ops/halt` with `level=HARD`, use `GET /ops/risk-state` only to confirm `state=HARD_HALT`, and keep the new image running until a production read-only SQL session confirms the durable authority `risk_state.hard_halt_cleanup_state=SAFE`. The API response does not expose cleanup state. The same SQL readback must report zero open positions, zero open orders, and zero BTC, and an independent query must return zero `orders` rows matching resting BUY lifecycle predicates. Only then may a pre-change image start. The additive nullable column remains readable/ignorable by the old binary. This change does not claim that an old binary can safely consume new-semantics open orders.
 
 ### 5. Keep the guarantee on the durable PostgreSQL production path
 
@@ -76,9 +76,9 @@ An old binary has a `FULL_TICK_EXECUTION` path that ignores `market_eligible_fro
 
 ### 6. Prove commit ordering, not scheduler timing
 
-（ユーザー確認済み）A deterministic PostgreSQL barrier test coordinates the shared receipt lock and exclusive order-boundary lock. The required receipt-first/order-second/buffer-consume outcome runs at least 1,000 iterations and asserts zero BUY executions/fills. Separate tests cover order-first/receipt-second eligibility, duplicate receipt identity, missing/null/mismatch evidence, risk-reducing protection, and fresh/upgrade/old-reader compatibility.
+（ユーザー確認済み）A deterministic PostgreSQL barrier test coordinates the shared receipt lock and exclusive order-boundary lock. It runs at least 500 receipt-first/order-second and 500 order-first/receipt-second iterations. Each receipt-first iteration holds the receipt transaction after its shared session lock, observes the order transaction waiting for the exclusive lock, then releases and consumes the pre-boundary event. Each order-first iteration holds the order transaction after its exclusive session lock, observes the receipt transaction waiting for the shared lock, then releases and consumes the post-boundary event. The test queries `pg_locks` for the exact session advisory key and expected granted/waiting mode before release; scheduler timing and sleeps are not the correctness oracle.
 
-The 1,000-iteration test reuses one Testcontainers database and keeps open positions and orders at a constant bound by canceling/closing each iteration's fixture before the next. It asserts both the receipt-first commit barrier and delayed consumer release explicitly. It must not introduce sleeps as the correctness oracle.
+The 1,000-iteration test reuses one Testcontainers database and keeps open positions and orders at a constant bound by canceling each iteration's fixture before the next. Fillable pre-boundary events create zero executions. Post-boundary exact receipts are applied through the normal eligibility path without being rejected, while the separate exact-receipt test retains an actual post-boundary fill assertion.
 
 ## Risks / Trade-offs
 
@@ -95,7 +95,7 @@ The 1,000-iteration test reuses one Testcontainers database and keeps open posit
 2. New listener publishes committed receipt authority; new writer captures boundaries for newly created realtime resting orders.
 3. New fill logic fails closed on null/missing/mismatched evidence and ignores wall-clock eligibility.
 4. Deploy uses the normal single production image path. No NAS bootstrap is required.
-5. Rollback leaves schema and rows intact, but is allowed only after authenticated `POST /ops/halt` activates durable `HARD_HALT`, the new image's `ALL_OPEN_RISK` sweep reaches `SAFE`, and both its zero-open-risk readback and a zero-row resting-BUY query agree. The old binary may then ignore the nullable column safely. The operator runbook records the exact request, readback, query, and prohibition on `/ops/resume` until a receipt-aware image is active.
+5. Rollback leaves schema and rows intact, but is allowed only after authenticated `POST /ops/halt`, `GET /ops/risk-state` confirms `HARD_HALT`, read-only SQL confirms `risk_state.hard_halt_cleanup_state=SAFE` plus zero open risk, and a zero-row resting-BUY query agrees. The old binary may then ignore the nullable column safely. The operator runbook records the exact request, API boundary, SQL readback, query, and prohibition on `/ops/resume` until a receipt-aware image is active.
 
 ## Open Questions
 

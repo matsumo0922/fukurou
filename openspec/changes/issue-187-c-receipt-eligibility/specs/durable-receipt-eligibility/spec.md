@@ -98,9 +98,9 @@ The system SHALL add the order receipt-boundary column without rewriting history
 #### Scenario: Operator rolls back to an old reader
 
 - **WHEN** rollback to a pre-change reader is required
-- **THEN** authenticated `POST /ops/halt` activates durable `HARD_HALT`, the new reader's `ALL_OPEN_RISK` sweep reaches `SAFE`, zero-open-risk readback and a zero-row resting-BUY query agree, and only then is the old reader started against the additive schema
+- **THEN** authenticated `POST /ops/halt` activates durable `HARD_HALT`, `GET /ops/risk-state` confirms only `state=HARD_HALT`, read-only SQL confirms `risk_state.hard_halt_cleanup_state=SAFE`, zero-open-risk readback and a zero-row resting-BUY query agree, and only then is the old reader started against the additive schema
 
 #### Scenario: Commit-order barrier repeats one thousand times
 
-- **WHEN** the deterministic receipt-first/order-second/buffer-consume race is repeated at least 1,000 times against PostgreSQL
-- **THEN** pre-boundary BUY fills and executions remain zero in every iteration
+- **WHEN** at least 500 receipt-first/order-second and 500 order-first/receipt-second transactions contend on the same PostgreSQL session advisory lock and the delayed event is consumed after both transactions commit
+- **THEN** each iteration observes the expected shared or exclusive advisory-lock waiter before release, open rows remain constant-bounded, pre-boundary BUY fills and executions remain zero, and post-boundary exact receipts retain their existing eligibility semantics

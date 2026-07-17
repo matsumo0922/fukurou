@@ -8294,137 +8294,80 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun durable_receipt_boundary_rejects_one_thousand_pre_boundary_events_with_bounded_open_rows() = runPostgresTest {
+    fun receipt_and_order_transactions_contend_on_session_barrier_one_thousand_times() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000194")
         ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
         val writer = ExposedPaperLedgerWriter(database, postgresSymbolRules(), fixedClock())
+        val iterationsPerDirection = 500
+        var receiptFirstContentions = 0
+        var orderFirstContentions = 0
         var maximumOpenRows = 0L
 
-        repeat(1_000) { index ->
+        repeat(iterationsPerDirection) { index ->
             val sequence = index + 1L
-            val event = durablePaperTradeEvent(
-                database,
-                paperTradeEvent(
-                    sessionId = sessionId,
-                    sequence = sequence,
-                    sizeBtc = "0.0100",
-                    receivedAt = fixedInstant().plusSeconds(sequence + 1),
-                ),
-            )
             val command = postgresEntryCommand(
                 orderType = OrderType.LIMIT,
                 priceJpy = BigDecimal("9990000"),
                 sizeBtc = BigDecimal("0.0010"),
                 takeProfitPriceJpy = BigDecimal("11000000"),
             )
-            val request = realtimeRestingEntryRequest(command, sessionId, sequence - 1)
+            val event = runReceiptFirstOrderSecondChoreography(
+                database,
+                dataSource,
+                writer,
+                sessionId,
+                sequence,
+                command,
+            )
+            receiptFirstContentions += 1
 
-            writer.createRestingEntryOrder(request).getOrThrow()
             val boundary = selectOrderAdmissionBoundary(database, command.commandId)
             assertEquals(event.receiptAuthority?.admissionOrdinal, boundary)
             maximumOpenRows = maxOf(maximumOpenRows, selectOpenRestingBuyCount(database))
 
             writer.applyMarketEvent(event, FillSimulator(clock = fixedClock())).getOrThrow()
             assertEquals(0L, selectExecutionCount(database))
+            assertEquals(OrderStatus.OPEN, selectOrderStatus(database, command.commandId))
             cancelOrderFixture(database, command.commandId)
             maximumOpenRows = maxOf(maximumOpenRows, selectOpenRestingBuyCount(database))
         }
 
+        repeat(iterationsPerDirection) { index ->
+            val sequence = iterationsPerDirection + index + 1L
+            val command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                sizeBtc = BigDecimal("0.0010"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+            )
+            val event = runOrderFirstReceiptSecondChoreography(
+                database,
+                dataSource,
+                writer,
+                sessionId,
+                sequence,
+                command,
+            )
+            orderFirstContentions += 1
+
+            val boundary = selectOrderAdmissionBoundary(database, command.commandId)
+            assertTrue(requireNotNull(event.receiptAuthority).admissionOrdinal > boundary)
+            maximumOpenRows = maxOf(maximumOpenRows, selectOpenRestingBuyCount(database))
+
+            writer.applyMarketEvent(event, FillSimulator(clock = fixedClock())).getOrThrow()
+            assertEquals(0L, selectExecutionCount(database))
+            assertEquals(OrderStatus.OPEN, selectOrderStatus(database, command.commandId))
+            cancelOrderFixture(database, command.commandId)
+            maximumOpenRows = maxOf(maximumOpenRows, selectOpenRestingBuyCount(database))
+        }
+
+        assertEquals(iterationsPerDirection, receiptFirstContentions)
+        assertEquals(iterationsPerDirection, orderFirstContentions)
         assertEquals(1L, maximumOpenRows)
         assertEquals(0L, selectExecutionCount(database))
         assertEquals(0L, selectOpenRestingBuyCount(database))
         assertTrue(globalAdmissionBoundaryPlan(database).contains("idx_paper_market_receipts_admission_ordinal_unique"))
-    }
-
-    @Test
-    fun receipt_and_order_transactions_serialize_on_session_barrier_in_both_directions() = runPostgresTest {
-        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000199")
-        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
-        val writer = ExposedPaperLedgerWriter(database, postgresSymbolRules(), fixedClock())
-        val receiptFirstCommand = postgresEntryCommand(
-            orderType = OrderType.LIMIT,
-            priceJpy = BigDecimal("9990000"),
-            sizeBtc = BigDecimal("0.0010"),
-            takeProfitPriceJpy = BigDecimal("11000000"),
-        )
-        val tableLockConnection = dataSource.connection
-        tableLockConnection.autoCommit = false
-        tableLockConnection.createStatement().use { statement ->
-            statement.execute("LOCK TABLE paper_market_event_receipts IN ACCESS EXCLUSIVE MODE")
-        }
-
-        val receiptFirstEvent = try {
-            coroutineScope {
-                val receipt = async(Dispatchers.IO) {
-                    durablePaperTradeEvent(
-                        database,
-                        paperTradeEvent(sessionId, sequence = 1, sizeBtc = "0.0100"),
-                    )
-                }
-                awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
-                val order = async(Dispatchers.IO) {
-                    writer.createRestingEntryOrder(
-                        realtimeRestingEntryRequest(receiptFirstCommand, sessionId, processedSequence = 0),
-                    )
-                }
-                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
-                tableLockConnection.commit()
-                tableLockConnection.close()
-                order.await().getOrThrow()
-                receipt.await()
-            }
-        } finally {
-            if (!tableLockConnection.isClosed) tableLockConnection.close()
-        }
-        assertEquals(
-            receiptFirstEvent.receiptAuthority?.admissionOrdinal,
-            selectOrderAdmissionBoundary(database, receiptFirstCommand.commandId),
-        )
-        writer.applyMarketEvent(receiptFirstEvent, FillSimulator(clock = fixedClock())).getOrThrow()
-        cancelOrderFixture(database, receiptFirstCommand.commandId)
-
-        val orderFirstCommand = postgresEntryCommand(
-            orderType = OrderType.LIMIT,
-            priceJpy = BigDecimal("9990000"),
-            sizeBtc = BigDecimal("0.0010"),
-            takeProfitPriceJpy = BigDecimal("11000000"),
-        )
-        val riskLockConnection = dataSource.connection
-        riskLockConnection.autoCommit = false
-        riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
-            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
-        }
-
-        val orderFirstEvent = try {
-            coroutineScope {
-                val order = async(Dispatchers.IO) {
-                    writer.createRestingEntryOrder(
-                        realtimeRestingEntryRequest(orderFirstCommand, sessionId, processedSequence = 1),
-                    )
-                }
-                awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
-                val receipt = async(Dispatchers.IO) {
-                    durablePaperTradeEvent(
-                        database,
-                        paperTradeEvent(sessionId, sequence = 2, sizeBtc = "0.0100"),
-                    )
-                }
-                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
-                riskLockConnection.commit()
-                riskLockConnection.close()
-                order.await().getOrThrow()
-                receipt.await()
-            }
-        } finally {
-            if (!riskLockConnection.isClosed) riskLockConnection.close()
-        }
-        val orderBoundary = selectOrderAdmissionBoundary(database, orderFirstCommand.commandId)
-
-        assertTrue(requireNotNull(orderFirstEvent.receiptAuthority).admissionOrdinal > orderBoundary)
-        cancelOrderFixture(database, orderFirstCommand.commandId)
-        assertEquals(0L, selectExecutionCount(database))
     }
 
     @Test
@@ -13893,6 +13836,172 @@ private fun realtimeRestingEntryRequest(
     )
 }
 
+private suspend fun runReceiptFirstOrderSecondChoreography(
+    database: ExposedDatabase,
+    dataSource: DataSource,
+    writer: ExposedPaperLedgerWriter,
+    sessionId: UUID,
+    sequence: Long,
+    command: PlaceOrderCommand,
+): PaperMarketTradeEvent {
+    val tableLockConnection = dataSource.connection
+    tableLockConnection.autoCommit = false
+    tableLockConnection.createStatement().use { statement ->
+        statement.execute("LOCK TABLE paper_market_event_receipts IN ACCESS EXCLUSIVE MODE")
+    }
+
+    return try {
+        coroutineScope {
+            val receipt = async(Dispatchers.IO) {
+                durablePaperTradeEvent(
+                    database,
+                    paperTradeEvent(sessionId, sequence, sizeBtc = "0.0100"),
+                )
+            }
+            awaitPaperMarketSessionAdvisoryLock(
+                dataSource,
+                sessionId,
+                PaperMarketSessionAdvisoryLockMode.SHARED,
+                granted = true,
+            )
+            val order = async(Dispatchers.IO) {
+                writer.createRestingEntryOrder(
+                    realtimeRestingEntryRequest(command, sessionId, processedSequence = sequence - 1),
+                )
+            }
+            awaitPaperMarketSessionAdvisoryLock(
+                dataSource,
+                sessionId,
+                PaperMarketSessionAdvisoryLockMode.EXCLUSIVE,
+                granted = false,
+            )
+
+            tableLockConnection.commit()
+            tableLockConnection.close()
+            val event = receipt.await()
+            order.await().getOrThrow()
+
+            event
+        }
+    } finally {
+        closeTransactionBlocker(tableLockConnection)
+    }
+}
+
+private suspend fun runOrderFirstReceiptSecondChoreography(
+    database: ExposedDatabase,
+    dataSource: DataSource,
+    writer: ExposedPaperLedgerWriter,
+    sessionId: UUID,
+    sequence: Long,
+    command: PlaceOrderCommand,
+): PaperMarketTradeEvent {
+    val riskLockConnection = dataSource.connection
+    riskLockConnection.autoCommit = false
+    riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+        statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+    }
+
+    return try {
+        coroutineScope {
+            val order = async(Dispatchers.IO) {
+                writer.createRestingEntryOrder(
+                    realtimeRestingEntryRequest(command, sessionId, processedSequence = sequence - 1),
+                )
+            }
+            awaitPaperMarketSessionAdvisoryLock(
+                dataSource,
+                sessionId,
+                PaperMarketSessionAdvisoryLockMode.EXCLUSIVE,
+                granted = true,
+            )
+            val receipt = async(Dispatchers.IO) {
+                durablePaperTradeEvent(
+                    database,
+                    paperTradeEvent(
+                        sessionId,
+                        sequence,
+                        sizeBtc = "0.0100",
+                        priceJpy = "10000000",
+                    ),
+                )
+            }
+            awaitPaperMarketSessionAdvisoryLock(
+                dataSource,
+                sessionId,
+                PaperMarketSessionAdvisoryLockMode.SHARED,
+                granted = false,
+            )
+
+            riskLockConnection.commit()
+            riskLockConnection.close()
+            order.await().getOrThrow()
+
+            receipt.await()
+        }
+    } finally {
+        closeTransactionBlocker(riskLockConnection)
+    }
+}
+
+/** paper market session advisory lock の PostgreSQL mode。 */
+private enum class PaperMarketSessionAdvisoryLockMode(
+    val postgresName: String,
+) {
+    SHARED("ShareLock"),
+    EXCLUSIVE("ExclusiveLock"),
+}
+
+private suspend fun awaitPaperMarketSessionAdvisoryLock(
+    dataSource: DataSource,
+    sessionId: UUID,
+    mode: PaperMarketSessionAdvisoryLockMode,
+    granted: Boolean,
+) {
+    val lockKey = paperMarketSessionAdvisoryLockKey(sessionId)
+    val classId = lockKey ushr Int.SIZE_BITS
+    val objectId = lockKey and 0xFFFF_FFFFL
+
+    repeat(2_000) {
+        val observed = dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks
+                        WHERE locktype = 'advisory'
+                          AND classid::bigint = ?
+                          AND objid::bigint = ?
+                          AND mode = ?
+                          AND granted = ?
+                    )
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setLong(1, classId)
+                statement.setLong(2, objectId)
+                statement.setString(3, mode.postgresName)
+                statement.setBoolean(4, granted)
+                statement.executeQuery().use { rows ->
+                    check(rows.next())
+                    rows.getBoolean(1)
+                }
+            }
+        }
+        if (observed) return
+
+        kotlinx.coroutines.delay(1)
+    }
+
+    error("paper market session advisory lock was not observed: mode=${mode.postgresName}, granted=$granted")
+}
+
+private fun closeTransactionBlocker(connection: Connection) {
+    if (connection.isClosed) return
+
+    runCatching { connection.rollback() }
+    connection.close()
+}
+
 private fun selectOrderAdmissionBoundary(database: ExposedDatabase, orderId: UUID): Long {
     return exposedTransaction(database) {
         prepare("SELECT market_eligible_after_admission_ordinal FROM orders WHERE id = ?").use { statement ->
@@ -13915,6 +14024,18 @@ private fun selectOpenRestingBuyCount(database: ExposedDatabase): Long {
 
 private fun selectExecutionCount(database: ExposedDatabase): Long {
     return selectLongForTest(database, "SELECT COUNT(*) FROM executions")
+}
+
+private fun selectOrderStatus(database: ExposedDatabase, orderId: UUID): OrderStatus {
+    return exposedTransaction(database) {
+        prepare("SELECT status FROM orders WHERE id = ?").use { statement ->
+            statement.setObject(1, orderId)
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "order was not found." }
+                OrderStatus.valueOf(resultSet.getString(1))
+            }
+        }
+    }
 }
 
 private fun selectLongForTest(database: ExposedDatabase, sql: String): Long {

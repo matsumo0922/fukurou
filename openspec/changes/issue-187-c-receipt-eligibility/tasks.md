@@ -28,3 +28,9 @@
 
 - [x] 5.1 Update README and current receipt/eligibility descriptions in `docs/design.md` and `docs/mcp-runtime.md`; document the exact `/ops/halt` rollback request, cleanup-SAFE/readback checks, resting-BUY zero-row query, and resume prohibition; then grep affected names for stale dark-write claims
 - [x] 5.2 Run targeted tests, `openspec validate issue-187-c-receipt-eligibility`, `make test`, `make detekt`, and `make build` under the validation lease and record command, scope, result, wait time, and HEAD
+
+## 6. PR #250 review remediation
+
+- [x] 6.1 Correct the rollback runbook to read `HARD_HALT` from `GET /ops/risk-state`, durable cleanup `SAFE` from read-only `risk_state.hard_halt_cleanup_state`, and require agreement with zero-open-risk and resting-BUY zero-row SQL without adding an API field
+- [x] 6.2 Replace the sequential 1,000-iteration evidence with at least 500 receipt-first and 500 order-first PostgreSQL choreographies that deterministically observe the shared/exclusive session advisory-lock waiter before release and delayed event application
+- [ ] 6.3 Update scenario evidence and run the affected contract tests, OpenSpec validation, relevant detekt, and diff checks under the validation lease
