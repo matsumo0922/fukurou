@@ -54,7 +54,7 @@ Codexの`input_tokens`はcached tokenを含むため、`uncachedInput = inputTok
 - `subscriptionActualCostUsd`: subscription実費を観測できないため常にnull
 - `pricingCatalog`: version、as-of、basis、source URL
 
-provider別responseにもlist-price equivalent/coverageを追加し、model別token responseにはlist-price equivalentをnullableで追加する。既存fieldの削除・rename・意味変更はしない。（agent 仮決め）
+provider別responseにもlist-price equivalent/coverageを追加する。model別token responseはprovider-observed `usage.modelUsages`だけを集計する既存契約を維持し、list-price equivalentを追加しない。`configuredModel`はlist-price projectionにだけ使い、legacy `byModel`や`unattributedTokenPhaseCount`の帰属根拠にしない。既存fieldの削除・rename・意味変更はしない。（review決定済み）
 
 ### 5. production routeから証明する
 

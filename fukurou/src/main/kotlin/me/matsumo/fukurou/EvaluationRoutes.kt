@@ -1317,7 +1317,6 @@ data class EvaluationModelTokenResponse(
     val reasoningOutputTokens: Long,
     val cacheCreationInputTokens: Long,
     val cacheReadInputTokens: Long,
-    val apiListPriceEquivalentUsd: String?,
 ) {
     companion object {
         fun fromStats(stats: LlmModelTokenStats): EvaluationModelTokenResponse {
@@ -1328,7 +1327,6 @@ data class EvaluationModelTokenResponse(
                 reasoningOutputTokens = stats.reasoningOutputTokens,
                 cacheCreationInputTokens = stats.cacheCreationInputTokens,
                 cacheReadInputTokens = stats.cacheReadInputTokens,
-                apiListPriceEquivalentUsd = stats.apiListPriceEquivalentUsd?.toDecimalString(),
             )
         }
     }

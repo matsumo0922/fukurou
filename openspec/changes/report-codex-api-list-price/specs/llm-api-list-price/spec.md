@@ -49,6 +49,14 @@ The evaluation service MUST NOT invent a model, coerce incomplete usage to zero,
 - **WHEN** an existing client reads `knownCostUsd`, provider groups, model token groups, or coverage counts
 - **THEN** those fields remain present and retain their documented provider-reported/token meanings, including the existing `unpricedPhaseCount`
 
+#### Scenario: Configured model exists without provider-observed model usage
+- **WHEN** a phase has `configuredModel` and aggregate token usage but `usage.modelUsages` is empty
+- **THEN** list-price projection may use `configuredModel`, while legacy `byModel` excludes the phase and `unattributedTokenPhaseCount` continues to count it as unattributed
+
+#### Scenario: Model token groups are returned
+- **WHEN** `byModel` contains provider-observed token groups
+- **THEN** model entries contain only the legacy token fields and do not contain an API list-price equivalent
+
 #### Scenario: API list-price coverage is read
 - **WHEN** catalog-priced and proof-insufficient Codex phases coexist
 - **THEN** dedicated covered and unpriced counts describe the list-price projection without changing provider-reported coverage

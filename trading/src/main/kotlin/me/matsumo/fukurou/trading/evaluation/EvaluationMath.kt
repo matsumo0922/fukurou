@@ -271,16 +271,9 @@ object EvaluationMath {
         val apiListPriceFacts = llmFacts.filter { fact -> fact.provider == "codex" && fact.usage != null }
         val byProvider = llmFacts.toProviderCostStats()
         val byModel = llmFacts
-            .flatMap { fact -> fact.attributedModelUsages().map { usage -> fact to usage } }
-            .groupBy { (_, usage) -> usage.model }
-            .map { (model, modelFacts) ->
-                modelFacts.map { (_, usage) -> usage }.toModelTokenStats(
-                    model = model,
-                    apiListPriceEquivalentUsd = modelFacts
-                        .mapNotNull { (fact, _) -> LlmApiListPriceCatalog.calculate(fact) }
-                        .knownCostSumOrNull(),
-                )
-            }
+            .flatMap { fact -> fact.usage?.modelUsages.orEmpty() }
+            .groupBy { usage -> usage.model }
+            .map { (model, modelUsages) -> modelUsages.toModelTokenStats(model) }
             .sortedBy { stats -> stats.model }
 
         return LlmCostStats(
@@ -662,10 +655,7 @@ private fun List<BenchmarkPoint>.returnOf(selector: (BenchmarkPoint) -> BigDecim
         .divideEvaluation(firstValue)
 }
 
-private fun List<LlmModelUsage>.toModelTokenStats(
-    model: String,
-    apiListPriceEquivalentUsd: BigDecimal?,
-): LlmModelTokenStats {
+private fun List<LlmModelUsage>.toModelTokenStats(model: String): LlmModelTokenStats {
     return LlmModelTokenStats(
         model = model,
         inputTokens = sumOf { usage -> usage.usage.inputTokens ?: 0L },
@@ -673,23 +663,13 @@ private fun List<LlmModelUsage>.toModelTokenStats(
         reasoningOutputTokens = sumOf { usage -> usage.usage.reasoningOutputTokens ?: 0L },
         cacheCreationInputTokens = sumOf { usage -> usage.usage.cacheCreationInputTokens ?: 0L },
         cacheReadInputTokens = sumOf { usage -> usage.usage.cacheReadInputTokens ?: 0L },
-        apiListPriceEquivalentUsd = apiListPriceEquivalentUsd,
     )
-}
-
-private fun LlmPhaseUsageFact.attributedModelUsages(): List<LlmModelUsage> {
-    val details = usage ?: return emptyList()
-    if (details.modelUsages.isNotEmpty()) return details.modelUsages
-    val model = configuredModel ?: return emptyList()
-    val aggregateUsage = details.usage ?: return emptyList()
-
-    return listOf(LlmModelUsage(model, aggregateUsage))
 }
 
 private fun LlmPhaseUsageFact.hasUnattributedTokens(): Boolean {
     val parsedUsage = usage ?: return false
 
-    return parsedUsage.usage != null && attributedModelUsages().isEmpty()
+    return parsedUsage.usage != null && parsedUsage.modelUsages.isEmpty()
 }
 
 private fun List<BigDecimal>.knownCostSumOrNull(): BigDecimal? {

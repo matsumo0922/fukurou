@@ -2573,7 +2573,6 @@ export interface components {
             reasoningOutputTokens: number;
             cacheCreationInputTokens: number;
             cacheReadInputTokens: number;
-            apiListPriceEquivalentUsd?: string | null;
         };
         /** EvaluationCostsResponse */
         EvaluationCostsResponse: {

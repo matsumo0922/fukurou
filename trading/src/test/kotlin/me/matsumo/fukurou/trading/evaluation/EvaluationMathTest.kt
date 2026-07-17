@@ -10,6 +10,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * EvaluationMath の数式 contract を検証するテスト。
@@ -423,16 +424,12 @@ class EvaluationMathTest {
         assertEquals(1, stats.unpricedPhaseCount)
         assertEquals(1, stats.apiListPriceCoveredPhaseCount)
         assertEquals(1, stats.apiListPriceUnpricedPhaseCount)
-        assertEquals(0, stats.unattributedTokenPhaseCount)
+        assertEquals(2, stats.unattributedTokenPhaseCount)
         assertEquals(
             "0.0062",
             stats.byProvider.single().apiListPriceEquivalentUsd?.stripTrailingZeros()?.toPlainString(),
         )
-        assertEquals(
-            "0.0062",
-            stats.byModel.first { model -> model.model == "gpt-5.5" }
-                .apiListPriceEquivalentUsd?.stripTrailingZeros()?.toPlainString(),
-        )
+        assertTrue(stats.byModel.isEmpty())
     }
 }
 

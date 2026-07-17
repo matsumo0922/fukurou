@@ -545,7 +545,6 @@ data class LlmModelTokenStats(
     val reasoningOutputTokens: Long,
     val cacheCreationInputTokens: Long,
     val cacheReadInputTokens: Long,
-    val apiListPriceEquivalentUsd: BigDecimal?,
 )
 
 /**

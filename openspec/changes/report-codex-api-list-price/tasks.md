@@ -13,3 +13,8 @@
 
 - [x] 3.1 Update current cost semantics in `docs/design.md` and verify README/docs references for changed response names
 - [x] 3.2 Run targeted production-path tests, full test/detekt/build, OpenSpec strict validation, web verification, and diff checks within the 800-line hard stop
+
+## 4. Review follow-up
+
+- [x] 4.1 Preserve observed-model-only legacy attribution and remove model-level API list-price projection from implementation, public contract, tests, design, spec, and docs
+- [x] 4.2 Run compile, targeted evaluation math/route tests, detekt, web verification, strict OpenSpec validation, and final diff checks

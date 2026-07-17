@@ -417,6 +417,7 @@ class EvaluationRouteTest {
 
         val summaryBody = client.get("/evaluation/summary").bodyAsText()
         val costsBody = client.get("/evaluation/costs").bodyAsText()
+        val costsJson = Json.parseToJsonElement(costsBody).jsonObject
 
         assertTrue(summaryBody.contains("\"killCriterion\""))
         assertTrue(summaryBody.contains("\"falseSuppressionCount\":0"))
@@ -436,8 +437,15 @@ class EvaluationRouteTest {
         assertTrue(costsBody.contains("\"version\":\"openai-gpt-5.5-2026-07-17\""))
         assertTrue(costsBody.contains("\"basis\":\"STANDARD_API\""))
         assertTrue(costsBody.contains("\"maxPhaseInputTokensExclusive\":272000"))
-        assertTrue(costsBody.contains("\"unattributedTokenPhaseCount\":1"))
-        assertTrue(costsBody.contains("\"reasoningOutputTokens\":2"))
+        assertEquals("2", costsJson.getValue("unattributedTokenPhaseCount").jsonPrimitive.content)
+        assertEquals(
+            listOf("claude-test"),
+            costsJson.getValue("byModel").jsonArray.map { element ->
+                val model = element.jsonObject
+                assertTrue("apiListPriceEquivalentUsd" !in model)
+                model.getValue("model").jsonPrimitive.content
+            },
+        )
     }
 
     @Test
