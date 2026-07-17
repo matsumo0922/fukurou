@@ -67,11 +67,11 @@ class DefaultLlmCommandRendererTest {
         )
 
         val claudeCommand = renderer.render(
-            request(LlmProvider.CLAUDE, LlmInvocationPhase.PROPOSER, null)
+            request(LlmProvider.CLAUDE, LlmInvocationPhase.REFLECTION, null)
                 .copy(useConfiguredModelFallback = false),
         ).getOrThrow()
         val codexCommand = renderer.render(
-            request(LlmProvider.CODEX, LlmInvocationPhase.FALSIFIER, null)
+            request(LlmProvider.CODEX, LlmInvocationPhase.REFLECTION, null)
                 .copy(useConfiguredModelFallback = false),
         ).getOrThrow()
 
@@ -130,7 +130,6 @@ class DefaultLlmCommandRendererTest {
             provider = LlmProvider.CLAUDE,
             phase = LlmInvocationPhase.PROPOSER,
             mcpServerName = "custom-mcp",
-            allowedTools = listOf("mcp__custom-mcp__submit_decision"),
         )
 
         val command = renderer.render(request).getOrThrow()
@@ -156,10 +155,6 @@ class DefaultLlmCommandRendererTest {
             provider = LlmProvider.CLAUDE,
             phase = LlmInvocationPhase.PROPOSER,
             mcpServerName = "custom-mcp",
-            allowedTools = listOf(
-                "mcp__custom-mcp__get_ticker",
-                "mcp__custom-mcp__submit_decision",
-            ),
         )
 
         val command = renderer.render(request).getOrThrow()
@@ -170,10 +165,8 @@ class DefaultLlmCommandRendererTest {
         assertNotEquals(-1, mcpConfigIndex)
         assertTrue(command.args.contains("--strict-mcp-config"))
         assertNotEquals(-1, allowedToolsIndex)
-        assertEquals(
-            "mcp__custom-mcp__get_ticker,mcp__custom-mcp__submit_decision",
-            command.args[allowedToolsIndex + 1],
-        )
+        assertTrue(command.args[allowedToolsIndex + 1].contains("mcp__custom-mcp__get_ticker"))
+        assertTrue(command.args[allowedToolsIndex + 1].contains("mcp__custom-mcp__submit_decision"))
         assertEquals(1, command.args.count { argument -> argument == "--tools" })
         assertNotEquals(-1, toolsIndex)
         assertEquals("ToolSearch", command.args[toolsIndex + 1])
@@ -189,7 +182,6 @@ class DefaultLlmCommandRendererTest {
             provider = LlmProvider.CLAUDE,
             phase = LlmInvocationPhase.REFLECTION,
             mcpServerName = null,
-            allowedTools = listOf("mcp__custom-mcp__submit_decision"),
         )
 
         val command = renderer.render(request).getOrThrow()
@@ -197,7 +189,7 @@ class DefaultLlmCommandRendererTest {
         val allowedToolsIndex = command.args.indexOf("--allowedTools")
         val toolsIndex = command.args.indexOf("--tools")
 
-        assertTrue(command.args.contains("--bare"))
+        assertFalse(command.args.contains("--bare"))
         assertTrue(command.args.contains("--strict-mcp-config"))
         assertEquals("""{"mcpServers":{}}""", Files.readString(mcpConfigPath))
         assertEquals("", command.args[allowedToolsIndex + 1])
@@ -207,6 +199,38 @@ class DefaultLlmCommandRendererTest {
         assertTrue(command.cleanupPaths.contains(mcpConfigPath))
 
         command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderClaude_withoutMcpAndAuthFailsTypedBeforeStart() {
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.REFLECTION,
+            mcpServerName = null,
+            environment = mapOf(HOME_ENV to "/missing-claude-home"),
+        )
+
+        val failure = DefaultLlmCommandRenderer().render(request).exceptionOrNull()
+
+        assertEquals(
+            LlmProviderFailureCategory.AUTHENTICATION,
+            (failure as LlmProviderContractException).providerFailure.category,
+        )
+    }
+
+    @Test
+    fun renderRejectsMissingAndArbitraryProposerToolPolicy() {
+        val canonical = request(LlmProvider.CLAUDE, LlmInvocationPhase.PROPOSER, "fukurou-mcp")
+        val missingRequired = canonical.copy(toolPolicy = ToolPolicy(emptySet(), canonical.allowedTools))
+        val arbitrary = canonical.copy(
+            toolPolicy = ToolPolicy(
+                canonical.toolPolicy.requiredTools,
+                canonical.allowedTools + "mcp__fukurou-mcp__place_order",
+            ),
+        )
+
+        assertTrue(DefaultLlmCommandRenderer().render(missingRequired).isFailure)
+        assertTrue(DefaultLlmCommandRenderer().render(arbitrary).isFailure)
     }
 
     @Test
@@ -672,6 +696,22 @@ class DefaultLlmCommandRendererTest {
         environment: Map<String, String> = emptyMap(),
         autoApprovedTools: List<String> = emptyList(),
     ): LlmInvocationRequest {
+        val enabledTools = if (mcpServerName == null) {
+            allowedTools
+        } else {
+            allowedTools.ifEmpty {
+                McpToolContractCatalog.toolsFor(phase).map { tool -> "mcp__${mcpServerName}__$tool" }
+            }
+        }
+        val needsTestClaudeAuth = provider == LlmProvider.CLAUDE && mcpServerName == null && environment.isEmpty()
+        val effectiveEnvironment = if (needsTestClaudeAuth) {
+            val home = Files.createTempDirectory("fukurou-test-claude-home")
+            Files.createDirectories(home.resolve(".claude"))
+            Files.writeString(home.resolve(".claude/.credentials.json"), "{}")
+            mapOf(HOME_ENV to home.toString())
+        } else {
+            environment
+        }
         return LlmInvocationRequest(
             invocationId = "invocation-test",
             provider = provider,
@@ -695,8 +735,12 @@ class DefaultLlmCommandRendererTest {
                     autoApprovedTools = autoApprovedTools,
                 )
             },
-            environment = environment,
-            allowedTools = allowedTools,
+            environment = effectiveEnvironment,
+            toolPolicy = if (mcpServerName == null) {
+                ToolPolicy(emptySet(), enabledTools)
+            } else {
+                McpToolContractCatalog.canonicalPolicy(phase, enabledTools)
+            },
         )
     }
 }

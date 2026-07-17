@@ -1601,6 +1601,46 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun providerContractFailureRejectsPersistedEntryButPreservesPersistedExit() = runBlocking {
+        val entryFixture = runnerFixture { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
+            cleanExit(stdout = "{}")
+        }
+        val entryResult = entryFixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, entryResult.status)
+        assertTrue(entryFixture.eventLog.events().containsNoTradeReason("provider_failure_entry_rejected"))
+        assertEquals(1, entryFixture.processRunner.launches.size)
+
+        val exitFixture = runnerFixture { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
+            cleanExit(stdout = "{}")
+        }
+        val exitResult = exitFixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(DecisionAction.EXIT, exitResult.decision?.decision?.submission?.action)
+        assertEquals(1, exitFixture.processRunner.launches.size)
+    }
+
+    @Test
+    fun failedFalsifierCannotApprovePersistedEntry() = runBlocking {
+        val fixture = runnerFixture { command ->
+            if (command.isProposerLaunch()) {
+                submitDecision(fixtureRepository, command, DecisionAction.ENTER).getOrThrow()
+                return@runnerFixture cleanExit()
+            }
+            submitFalsification(fixtureRepository, command, FalsificationVerdict.APPROVED).getOrThrow()
+            cleanExit(stdout = "{}")
+        }
+
+        val result = fixture.runOneShot(defaultRequest()).getOrThrow()
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertNull(result.tradeResult)
+        assertEquals(2, fixture.processRunner.launches.size)
+    }
+
+    @Test
     fun proposerCliErrorExitZeroWithoutAuth_recordsMissingDecisionReasonAndCliErrorSignal() = runBlocking {
         val humanLogs = mutableListOf<String>()
         val fixture = runnerFixture(
@@ -1672,7 +1712,7 @@ class OneShotLlmRunnerTest {
             logger = { message -> humanLogs += message },
         ) {
             nonZeroExit(
-                stdout = "API Error: 401 Invalid authentication credentials",
+                stdout = """{"type":"result","subtype":"authentication_error","is_error":true,"result":"Invalid authentication credentials"}""",
             )
         }
 
@@ -1681,7 +1721,7 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
-        assertFalse(proposerDetails.containsKey("cliErrorReported"))
+        assertEquals("true", proposerDetails.stringValue("cliErrorReported"))
         assertEquals("1", proposerDetails.stringValue("exitCode"))
         assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
         assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
@@ -1702,7 +1742,8 @@ class OneShotLlmRunnerTest {
 
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertFalse(proposerDetails.containsKey("authFailureSuspected"))
-        assertFalse(proposerDetails.containsKey("cliErrorReported"))
+        assertEquals("true", proposerDetails.stringValue("cliErrorReported"))
+        assertEquals("OUTPUT_CONTRACT", proposerDetails.stringValue("failureCategory"))
         assertEquals("1", proposerDetails.stringValue("exitCode"))
         assertFalse(authFailureLogFound)
     }
@@ -2286,7 +2327,7 @@ class OneShotLlmRunnerTest {
         assertEquals("EXITED", proposerDetails.stringValue("status"))
         assertEquals("0", proposerDetails.stringValue("exitCode"))
         assertFalse(proposerDetails.containsKey("error"))
-        assertTrue(proposerPhase.payload.contains("[REDACTED]"))
+        assertEquals("true", proposerDetails.stringValue("rawOutputOmitted"))
         assertFalse(proposerPhase.payload.contains("test-password"))
         assertFalse(proposerPhase.payload.contains("fukurou-token"))
     }
@@ -2295,6 +2336,9 @@ class OneShotLlmRunnerTest {
     fun phaseAuditStoresClaudeAndCodexStructuredUsage() = runBlocking {
         val claudeUsageStdout = """
             {
+              "type": "result",
+              "is_error": false,
+              "result": "submitted",
               "total_cost_usd": 0.02,
               "num_turns": 2,
               "duration_ms": 1000,
@@ -3389,8 +3433,23 @@ private class FakeProcessRunner(
 
     override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
         launches += command
+        val result = launchHandler(command)
+        val successfulEmptyOutput = result.status == ProcessRunStatus.EXITED &&
+            result.exitCode == 0 && result.stdout.isBlank() && result.stderr.isBlank()
 
-        return Result.success(launchHandler(command))
+        return Result.success(if (successfulEmptyOutput) result.copy(stdout = pinnedSuccessOutput(command)) else result)
+    }
+}
+
+private fun pinnedSuccessOutput(command: RenderedLlmCommand): String {
+    return if (command.args.contains("exec")) {
+        """
+            {"type":"thread.started","thread_id":"fixture-thread"}
+            {"type":"item.completed","item":{"type":"agent_message","text":""}}
+            {"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}
+        """.trimIndent()
+    } else {
+        """{"type":"result","is_error":false,"result":""}"""
     }
 }
 

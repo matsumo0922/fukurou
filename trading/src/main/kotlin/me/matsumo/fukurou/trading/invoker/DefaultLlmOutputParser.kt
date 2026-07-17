@@ -3,42 +3,36 @@ package me.matsumo.fukurou.trading.invoker
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
 import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
-import java.nio.file.Files
-import java.nio.file.Path
 import java.time.Instant
-import java.time.LocalDate
-import java.time.ZoneOffset
-import java.util.logging.Logger
 
 /**
  * provider output を正規化した結果。
  *
  * @param responseText semantic response 本文
  * @param usage invocation 単位の structured usage
+ * @param configuredModelIdentity renderer が確定した model identity
+ * @param observedModelIdentity provider output が報告した model identity
+ * @param providerFailure schema または provider が報告した typed failure
+ * @param adapterSchemaVersion pinned CLI output adapter revision
  */
 data class ParsedLlmOutput(
     val responseText: String,
     val usage: LlmUsageDetails?,
+    val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,
+    val observedModelIdentity: LlmObservedModelIdentity? = null,
+    val providerFailure: LlmProviderFailure? = null,
+    val adapterSchemaVersion: String = LLM_INVOCATION_CONTRACT_VERSION,
 )
 
-/**
- * Claude JSON と Codex JSONL を解析する既定 output parser。
- *
- * @param warningLogger model attribution の bounded scan を打ち切った場合の warning 出力
- */
-class DefaultLlmOutputParser(
-    private val warningLogger: (String) -> Unit = { message ->
-        Logger.getLogger(DefaultLlmOutputParser::class.java.name).warning(message)
-    },
-) : LlmOutputParser {
+/** Claude 2.1.199 result JSON と Codex 0.142.5 JSONL の versioned adapter。 */
+class DefaultLlmOutputParser : LlmOutputParser {
 
     override fun parse(
         request: LlmInvocationRequest,
@@ -48,243 +42,191 @@ class DefaultLlmOutputParser(
         completedAt: Instant,
     ): ParsedLlmOutput {
         return when (request.provider) {
-            LlmProvider.CLAUDE -> parseClaude(processResult.stdout)
-            LlmProvider.CODEX -> parseCodex(command, processResult.stdout, startedAt, completedAt)
+            LlmProvider.CLAUDE -> parseClaude(command, processResult.stdout)
+            LlmProvider.CODEX -> parseCodex(command, processResult.stdout)
         }
     }
 
-    private fun parseClaude(stdout: String): ParsedLlmOutput {
-        val responseText = runCatching {
-            OutputJson.parseToJsonElement(stdout)
-                .jsonObject["result"]
-                ?.jsonPrimitive
-                ?.contentOrNull
-        }.getOrNull() ?: stdout
-
-        return ParsedLlmOutput(
-            responseText = responseText,
-            usage = LlmUsageParser.parseClaudeStdout(stdout),
-        )
-    }
-
-    private fun parseCodex(
-        command: RenderedLlmCommand,
-        stdout: String,
-        startedAt: Instant,
-        completedAt: Instant,
-    ): ParsedLlmOutput {
-        val parsed = parseCodexEvents(stdout)
-        val model = parsed.threadId?.let { threadId ->
-            resolveCodexModel(command, threadId, startedAt, completedAt)
+    private fun parseClaude(command: RenderedLlmCommand, stdout: String): ParsedLlmOutput {
+        val result = runCatching { OutputJson.parseToJsonElement(stdout) as? JsonObject }.getOrNull()
+        if (result == null) {
+            return contractFailure(command, CLAUDE_OUTPUT_ADAPTER_VERSION)
         }
-        val usage = parsed.usage?.let { tokenUsage ->
-            LlmUsageDetails(
-                totalCostUsd = null,
-                numTurns = null,
-                durationMs = null,
-                usage = tokenUsage,
-                modelUsages = model?.let { modelName ->
-                    listOf(LlmModelUsage(modelName, tokenUsage))
-                }.orEmpty(),
+
+        val responseText = result.stringOrNull("result")
+        val isError = result.booleanOrNull("is_error")
+        val contractComplete = result.stringOrNull("type") == CLAUDE_RESULT_TYPE &&
+            responseText != null && isError != null
+        val providerCode = result.objectOrNull("error")?.safeCodeOrNull()
+            ?: result.stringOrNull("subtype")?.safeProviderCodeOrNull()
+        val structuredFailure = providerCode?.knownFailureCategory()
+        val compatibilityFailure = responseText?.knownClaudeFailureCategory()
+        val providerFailure = when {
+            isError == true && structuredFailure != null -> failure(
+                structuredFailure,
+                providerCode,
+                CLAUDE_OUTPUT_ADAPTER_VERSION,
             )
+            isError == true && compatibilityFailure != null -> failure(
+                compatibilityFailure,
+                "CLAUDE_RESULT_COMPATIBILITY",
+                CLAUDE_OUTPUT_ADAPTER_VERSION,
+            )
+            !contractComplete -> outputContractFailure(CLAUDE_OUTPUT_ADAPTER_VERSION)
+            isError == true -> failure(
+                LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
+                providerCode,
+                CLAUDE_OUTPUT_ADAPTER_VERSION,
+            )
+            else -> null
         }
+        val usage = LlmUsageParser.parseClaudeStdout(stdout)
+        val observedModel = result.stringOrNull("model")
+            ?: usage?.modelUsages?.singleOrNull()?.model
 
         return ParsedLlmOutput(
-            responseText = parsed.responseText.orEmpty(),
+            responseText = responseText.orEmpty(),
             usage = usage,
+            configuredModelIdentity = command.configuredModelIdentity,
+            observedModelIdentity = observedModel?.let { model ->
+                LlmObservedModelIdentity(model, CLAUDE_OUTPUT_MODEL_SOURCE)
+            },
+            providerFailure = providerFailure,
+            adapterSchemaVersion = CLAUDE_OUTPUT_ADAPTER_VERSION,
         )
     }
 
-    private fun parseCodexEvents(stdout: String): ParsedCodexEvents {
+    @Suppress("LongMethod", "CyclomaticComplexMethod")
+    private fun parseCodex(command: RenderedLlmCommand, stdout: String): ParsedLlmOutput {
         var threadId: String? = null
         var responseText: String? = null
         var usage: LlmTokenUsage? = null
+        var observedModel: String? = null
+        var terminal: CodexTerminal? = null
+        var providerCode: String? = null
+        var schemaDrift = false
 
-        // renderer が強制する `codex exec` は invocation ごとに単一 turn を生成する。
-        // 将来の event 追加や重複に対しては、同じ invocation の最後の完了値を採用する。
-        stdout.lineSequence().forEach { line ->
-            val event = runCatching { OutputJson.parseToJsonElement(line).jsonObject }.getOrNull()
-                ?: return@forEach
+        stdout.lineSequence().filter(String::isNotBlank).forEach { line ->
+            val event = runCatching { OutputJson.parseToJsonElement(line) as? JsonObject }.getOrNull()
+            if (event == null) {
+                schemaDrift = true
+                return@forEach
+            }
 
             when (event.stringOrNull("type")) {
                 CODEX_THREAD_STARTED_EVENT -> {
                     threadId = event.stringOrNull("thread_id") ?: threadId
+                    observedModel = event.stringOrNull("model") ?: observedModel
                 }
-
                 CODEX_ITEM_COMPLETED_EVENT -> {
                     val item = event.objectOrNull("item")
                     if (item?.stringOrNull("type") == CODEX_AGENT_MESSAGE_ITEM) {
                         responseText = item.stringOrNull("text") ?: responseText
                     }
                 }
-
                 CODEX_TURN_COMPLETED_EVENT -> {
-                    usage = event.objectOrNull("usage")?.toCodexTokenUsage() ?: usage
+                    terminal = CodexTerminal.COMPLETED
+                    usage = event.objectOrNull("usage")?.toCodexTokenUsage()
+                    observedModel = event.stringOrNull("model") ?: observedModel
+                    if (usage == null) schemaDrift = true
+                }
+                CODEX_TURN_FAILED_EVENT -> {
+                    terminal = CodexTerminal.FAILED
+                    providerCode = event.objectOrNull("error")?.safeCodeOrNull()
+                    if (event.objectOrNull("error") == null) schemaDrift = true
                 }
             }
         }
 
-        return ParsedCodexEvents(
-            threadId = threadId,
-            responseText = responseText,
-            usage = usage,
+        val successfulContractComplete = terminal == CodexTerminal.COMPLETED &&
+            threadId != null && responseText != null && usage != null
+        val failedContractComplete = terminal == CodexTerminal.FAILED && threadId != null
+        val structuredFailure = providerCode?.knownFailureCategory()
+        val providerFailure = when {
+            terminal == CodexTerminal.FAILED && structuredFailure != null -> failure(
+                structuredFailure,
+                providerCode,
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            )
+            schemaDrift || (!successfulContractComplete && !failedContractComplete) ->
+                outputContractFailure(CODEX_OUTPUT_ADAPTER_VERSION)
+            terminal == CodexTerminal.FAILED -> failure(
+                LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
+                providerCode,
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            )
+            else -> null
+        }
+        val usageDetails = usage?.let { tokenUsage ->
+            LlmUsageDetails(
+                totalCostUsd = null,
+                numTurns = null,
+                durationMs = null,
+                usage = tokenUsage,
+                modelUsages = observedModel?.let { model -> listOf(LlmModelUsage(model, tokenUsage)) }.orEmpty(),
+            )
+        }
+
+        return ParsedLlmOutput(
+            responseText = responseText.orEmpty(),
+            usage = usageDetails,
+            configuredModelIdentity = command.configuredModelIdentity,
+            observedModelIdentity = observedModel?.let { model ->
+                LlmObservedModelIdentity(model, CODEX_OUTPUT_MODEL_SOURCE)
+            },
+            providerFailure = providerFailure,
+            adapterSchemaVersion = CODEX_OUTPUT_ADAPTER_VERSION,
         )
     }
 
-    private fun resolveCodexModel(
-        command: RenderedLlmCommand,
-        threadId: String,
-        startedAt: Instant,
-        completedAt: Instant,
-    ): String? {
-        val codexHomeValue = command.environment[CODEX_HOME_ENV] ?: return null
-        val codexHome = runCatching { Path.of(codexHomeValue) }.getOrNull() ?: return null
-        val sessionRoot = codexHome.resolve(CODEX_SESSIONS_DIRECTORY)
-        val filesByDate = invocationDates(startedAt, completedAt)
-            .associateWith { date -> sessionFiles(sessionRoot, date) }
-        val filenameCandidates = filesByDate.values
-            .flatten()
-            .filter { path -> path.fileName.toString().contains(threadId) }
-        val filenameModel = filenameCandidates
-            .firstNotNullOfOrNull { path -> resolveModelFromSession(path, threadId) }
-
-        if (filenameModel != null) {
-            return filenameModel
-        }
-
-        val filenameCandidateSet = filenameCandidates.toSet()
-        val fallbackCandidates = filesByDate.flatMap { (date, files) ->
-            val candidates = files.filterNot { path -> path in filenameCandidateSet }
-
-            if (candidates.size > MAX_SESSION_FILES_PER_DAY) {
-                warningLogger(
-                    "Codex model attribution fallback truncated session files " +
-                        "date=$date candidates=${candidates.size} limit=$MAX_SESSION_FILES_PER_DAY.",
-                )
-            }
-
-            candidates
-                .sortedByLastModifiedDescending()
-                .take(MAX_SESSION_FILES_PER_DAY)
-        }
-
-        return fallbackCandidates.firstNotNullOfOrNull { path -> resolveModelFromSession(path, threadId) }
-    }
-
-    private fun invocationDates(startedAt: Instant, completedAt: Instant): Set<LocalDate> {
-        return setOf(
-            startedAt.atZone(ZoneOffset.UTC).toLocalDate(),
-            completedAt.atZone(ZoneOffset.UTC).toLocalDate(),
+    private fun contractFailure(command: RenderedLlmCommand, adapterVersion: String): ParsedLlmOutput {
+        return ParsedLlmOutput(
+            responseText = "",
+            usage = null,
+            configuredModelIdentity = command.configuredModelIdentity,
+            observedModelIdentity = null,
+            providerFailure = outputContractFailure(adapterVersion),
+            adapterSchemaVersion = adapterVersion,
         )
     }
-
-    private fun sessionFiles(sessionRoot: Path, date: LocalDate): List<Path> {
-        val directory = sessionRoot
-            .resolve(date.year.toString())
-            .resolve(date.monthValue.toString().padStart(2, '0'))
-            .resolve(date.dayOfMonth.toString().padStart(2, '0'))
-
-        return runCatching {
-            if (!Files.isDirectory(directory)) {
-                return@runCatching emptyList()
-            }
-
-            Files.list(directory).use { paths ->
-                paths
-                    .filter { path -> Files.isRegularFile(path) }
-                    .toList()
-            }
-        }.getOrDefault(emptyList())
-    }
-
-    private fun List<Path>.sortedByLastModifiedDescending(): List<Path> {
-        return map { path ->
-            path to runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)
-        }
-            .sortedByDescending { (_, lastModifiedMillis) -> lastModifiedMillis }
-            .map { (path, _) -> path }
-    }
-
-    private fun resolveModelFromSession(path: Path, threadId: String): String? {
-        return runCatching {
-            val scanState = CodexSessionScanState()
-            var lineCount = 0
-
-            Files.newBufferedReader(path).use { reader ->
-                while (lineCount < MAX_SESSION_LINES) {
-                    val line = reader.readLine() ?: break
-                    lineCount += 1
-                    if (!scanState.sessionMatches && lineCount > MAX_SESSION_META_LINES) {
-                        return@runCatching null
-                    }
-                    if (scanState.update(line, threadId)) {
-                        return@runCatching null
-                    }
-                }
-
-                if (reader.readLine() != null && scanState.model == null) {
-                    warningLogger(
-                        "Codex model attribution truncated session content " +
-                            "limit=$MAX_SESSION_LINES.",
-                    )
-                }
-            }
-
-            scanState.model.takeIf { scanState.sessionMatches }
-        }.getOrNull()
-    }
 }
 
-/**
- * Codex session JSONL の model attribution scan 状態。
- *
- * @param sessionMatches session metadata の thread ID が invocation と一致したか
- * @param model matching session の turn context から最後に取得した model
- */
-private class CodexSessionScanState(
-    var sessionMatches: Boolean = false,
-    var model: String? = null,
-) {
-    /**
-     * 1 event を反映し、別 thread の session と確定した場合に true を返す。
-     */
-    fun update(line: String, threadId: String): Boolean {
-        val event = runCatching { OutputJson.parseToJsonElement(line).jsonObject }.getOrNull()
-            ?: return false
-        val payload = event.objectOrNull("payload") ?: return false
-
-        return when (event.stringOrNull("type")) {
-            CODEX_SESSION_META_EVENT -> {
-                sessionMatches = payload.stringOrNull("id") == threadId
-
-                !sessionMatches
-            }
-
-            CODEX_TURN_CONTEXT_EVENT -> {
-                if (sessionMatches) {
-                    model = payload.stringOrNull("model") ?: model
-                }
-
-                false
-            }
-
-            else -> false
-        }
-    }
+private enum class CodexTerminal {
+    COMPLETED,
+    FAILED,
 }
 
-private data class ParsedCodexEvents(
-    val threadId: String?,
-    val responseText: String?,
-    val usage: LlmTokenUsage?,
-)
+private fun JsonObject.objectOrNull(key: String): JsonObject? = this[key] as? JsonObject
 
-private fun JsonObject.objectOrNull(key: String): JsonObject? {
-    return this[key] as? JsonObject
+private fun JsonObject.stringOrNull(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
+
+private fun JsonObject.booleanOrNull(key: String): Boolean? = (this[key] as? JsonPrimitive)?.booleanOrNull
+
+private fun JsonObject.safeCodeOrNull(): String? {
+    return stringOrNull("code")?.safeProviderCodeOrNull()
+        ?: stringOrNull("type")?.safeProviderCodeOrNull()
 }
 
-private fun JsonObject.stringOrNull(key: String): String? {
-    return (this[key] as? JsonPrimitive)?.contentOrNull
+private fun String.safeProviderCodeOrNull(): String? {
+    val normalized = uppercase().replace('-', '_')
+    return normalized.takeIf(SAFE_PROVIDER_CODE::matches)
+}
+
+private fun String.knownFailureCategory(): LlmProviderFailureCategory? = when (this) {
+    "AUTHENTICATION", "AUTHENTICATION_ERROR", "INVALID_AUTHENTICATION", "UNAUTHORIZED" ->
+        LlmProviderFailureCategory.AUTHENTICATION
+    "RATE_LIMIT", "RATE_LIMIT_ERROR", "SESSION_LIMIT", "TOO_MANY_REQUESTS" ->
+        LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT
+    "QUOTA_EXHAUSTED", "USAGE_LIMIT", "INSUFFICIENT_QUOTA" ->
+        LlmProviderFailureCategory.QUOTA_EXHAUSTED
+    else -> null
+}
+
+private fun String.knownClaudeFailureCategory(): LlmProviderFailureCategory? = when (trim()) {
+    "Not logged in", "Invalid authentication credentials" -> LlmProviderFailureCategory.AUTHENTICATION
+    "Session limit reached", "Rate limit exceeded" -> LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT
+    "Quota exhausted", "Usage limit reached" -> LlmProviderFailureCategory.QUOTA_EXHAUSTED
+    else -> null
 }
 
 private fun JsonObject.toCodexTokenUsage(): LlmTokenUsage? {
@@ -292,10 +234,7 @@ private fun JsonObject.toCodexTokenUsage(): LlmTokenUsage? {
     val cachedInputTokens = longOrNull("cached_input_tokens")
     val outputTokens = longOrNull("output_tokens")
     val reasoningOutputTokens = longOrNull("reasoning_output_tokens")
-    val hasTokenUsage = listOf(inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens)
-        .any { value -> value != null }
-
-    if (!hasTokenUsage) return null
+    if (inputTokens == null || outputTokens == null) return null
 
     return LlmTokenUsage(
         inputTokens = inputTokens,
@@ -306,20 +245,35 @@ private fun JsonObject.toCodexTokenUsage(): LlmTokenUsage? {
     )
 }
 
-private fun JsonObject.longOrNull(key: String): Long? {
-    return (this[key] as? JsonPrimitive)?.longOrNull
+private fun JsonObject.longOrNull(key: String): Long? = (this[key] as? JsonPrimitive)?.longOrNull
+
+private fun outputContractFailure(adapterVersion: String): LlmProviderFailure {
+    return failure(LlmProviderFailureCategory.OUTPUT_CONTRACT, "SCHEMA_DRIFT", adapterVersion)
 }
 
+private fun failure(
+    category: LlmProviderFailureCategory,
+    providerCode: String?,
+    adapterVersion: String,
+): LlmProviderFailure {
+    return LlmProviderFailure(category, providerCode, adapterVersion)
+}
+
+/** Claude output adapter が対応する image pin。 */
+const val CLAUDE_OUTPUT_ADAPTER_VERSION = "claude-code-2.1.199-result-v1"
+
+/** Codex output adapter が対応する image pin。 */
+const val CODEX_OUTPUT_ADAPTER_VERSION = "codex-cli-0.142.5-jsonl-v1"
+
+private const val CLAUDE_RESULT_TYPE = "result"
+private const val CLAUDE_OUTPUT_MODEL_SOURCE = "CLAUDE_RESULT"
+private const val CODEX_OUTPUT_MODEL_SOURCE = "CODEX_JSONL"
 private const val CODEX_THREAD_STARTED_EVENT = "thread.started"
 private const val CODEX_ITEM_COMPLETED_EVENT = "item.completed"
 private const val CODEX_TURN_COMPLETED_EVENT = "turn.completed"
+private const val CODEX_TURN_FAILED_EVENT = "turn.failed"
 private const val CODEX_AGENT_MESSAGE_ITEM = "agent_message"
-private const val CODEX_SESSION_META_EVENT = "session_meta"
-private const val CODEX_TURN_CONTEXT_EVENT = "turn_context"
-private const val CODEX_SESSIONS_DIRECTORY = "sessions"
-private const val MAX_SESSION_FILES_PER_DAY = 256
-private const val MAX_SESSION_META_LINES = 32
-private const val MAX_SESSION_LINES = 10_000
+private val SAFE_PROVIDER_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
 
 private val OutputJson = Json {
     ignoreUnknownKeys = true

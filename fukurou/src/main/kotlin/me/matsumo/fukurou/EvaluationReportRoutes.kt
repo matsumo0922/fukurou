@@ -37,6 +37,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -653,7 +654,10 @@ private class EvaluationReportStore(
                     ),
                     mcpServer = null,
                     environment = safeEnvironment,
-                    allowedTools = emptyList(),
+                    toolPolicy = McpToolContractCatalog.canonicalPolicy(
+                        LlmInvocationPhase.EVALUATION_REPORT,
+                        emptyList(),
+                    ),
                     effort = effort,
                 ),
                 llmInvoker = invoker,

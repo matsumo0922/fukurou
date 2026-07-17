@@ -391,7 +391,9 @@ static int canonical_claude_config_path(const char *path, const char *home) {
 static int exact_mcp_tool_allowlist(const char *value) {
     static const char *proposer = "mcp__fukurou-mcp__get_trade_intent,mcp__fukurou-mcp__get_ticker,mcp__fukurou-mcp__get_candles,mcp__fukurou-mcp__get_orderbook,mcp__fukurou-mcp__get_trades,mcp__fukurou-mcp__get_symbol_rules,mcp__fukurou-mcp__calc_indicator,mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__get_positions,mcp__fukurou-mcp__get_open_orders,mcp__fukurou-mcp__get_account_status,mcp__fukurou-mcp__knowledge_get_recent_lessons,mcp__fukurou-mcp__knowledge_search_similar_setups,mcp__fukurou-mcp__submit_decision";
     static const char *falsifier = "mcp__fukurou-mcp__get_trade_intent,mcp__fukurou-mcp__preview_order,mcp__fukurou-mcp__get_ticker,mcp__fukurou-mcp__get_candles,mcp__fukurou-mcp__get_orderbook,mcp__fukurou-mcp__get_trades,mcp__fukurou-mcp__get_symbol_rules,mcp__fukurou-mcp__calc_indicator,mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__get_positions,mcp__fukurou-mcp__get_open_orders,mcp__fukurou-mcp__get_account_status,mcp__fukurou-mcp__knowledge_get_recent_lessons,mcp__fukurou-mcp__knowledge_search_similar_setups,mcp__fukurou-mcp__submit_falsification";
-    return *value == '\0' || strcmp(value, proposer) == 0 || strcmp(value, falsifier) == 0;
+    static const char *risk_reduction = "mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__get_positions,mcp__fukurou-mcp__get_open_orders,mcp__fukurou-mcp__get_account_status,mcp__fukurou-mcp__submit_decision";
+    return *value == '\0' || strcmp(value, proposer) == 0 || strcmp(value, falsifier) == 0 ||
+        strcmp(value, risk_reduction) == 0;
 }
 
 static int claude_arguments_allowed(struct launch_request *request, char **arguments, char **environment) {
@@ -406,7 +408,6 @@ static int claude_arguments_allowed(struct launch_request *request, char **argum
             strcmp(arguments[index], "high") != 0 && strcmp(arguments[index], "xhigh") != 0)) return 0;
         index++;
     }
-    if (index < request->header.argc && strcmp(arguments[index], "--bare") == 0) index++;
     if (index + 12 != request->header.argc || strcmp(arguments[index++], "--mcp-config") != 0 ||
         !canonical_claude_config_path(arguments[index], environment_value(environment, "CLAUDE_CONFIG_DIR")) ||
         !bounded_text(arguments[index++], 256) ||
@@ -1190,6 +1191,9 @@ static int protocol_selftest(void) {
     };
     struct launch_request rro_request = {.header = {.argc = 5}};
     if (!canary_arguments_allowed(&rro_request, rro_arguments)) return 125;
+    if (!exact_mcp_tool_allowlist("mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__get_positions,mcp__fukurou-mcp__get_open_orders,mcp__fukurou-mcp__get_account_status,mcp__fukurou-mcp__submit_decision") ||
+        exact_mcp_tool_allowlist("mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__submit_decision") ||
+        exact_mcp_tool_allowlist("mcp__fukurou-mcp__get_balance,mcp__fukurou-mcp__place_order")) return 125;
     rro_arguments[4] = "BUY";
     if (canary_arguments_allowed(&rro_request, rro_arguments)) return 125;
     if (environment_entries_allowed(FUKUROU_PROFILE_MCP_CURRENT_V1, duplicate_environment, 2) ||

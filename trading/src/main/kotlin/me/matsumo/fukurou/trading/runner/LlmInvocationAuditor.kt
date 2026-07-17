@@ -25,6 +25,9 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProcessStartedMarker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.LlmProviderContractException
+import me.matsumo.fukurou.trading.invoker.LlmProviderFailure
+import me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
@@ -104,9 +107,7 @@ class LlmInvocationAuditor(
                 runCatching {
                     requireNotNull(phaseManifestRecorder).appendObservation(
                         manifest = manifest,
-                        observedModels = invocationResult?.usage?.modelUsages
-                            ?.map { modelUsage -> modelUsage.model }
-                            .orEmpty(),
+                        observedModels = invocationResult.observedModels(),
                         started = processStarted,
                     )
                 }.exceptionOrNull()
@@ -116,8 +117,12 @@ class LlmInvocationAuditor(
         val cleanupFailures = listOf(processCleanupFailure, gatewayCleanupFailure, manifestCleanupFailure)
         val startFailure = (invocationThrowable ?: resultFailure).takeIf { processResult == null }
         val usage = invocationResult?.usage
-        val auditSignals = (processResult?.auditSignals() ?: LlmPhaseAuditSignals()).copy(
+        val providerFailure = primaryProviderFailure(invocationResult, startFailure, cleanupFailures)
+        val auditSignals = LlmPhaseAuditSignals(
+            authFailureSuspected = providerFailure?.category == LlmProviderFailureCategory.AUTHENTICATION,
+            cliErrorReported = invocationResult?.providerFailure != null,
             cleanupFailed = cleanupFailures.any { failure -> failure != null },
+            providerFailure = providerFailure,
         )
         val appendFailure = withContext(NonCancellable) {
             runCatching {
@@ -129,6 +134,7 @@ class LlmInvocationAuditor(
                         request = request,
                         processResult = processResult,
                         startFailure = startFailure,
+                        invocationResult = invocationResult,
                         usage = usage,
                         auditSignals = auditSignals,
                     ),
@@ -147,6 +153,12 @@ class LlmInvocationAuditor(
         }
         if (auditSignals.authFailureSuspected && authFailureMessage != null) {
             humanLogger(authFailureMessage)
+        }
+
+        providerFailure?.takeIf { failure ->
+            failure.category in PROVIDER_ADAPTER_FAILURE_CATEGORIES
+        }?.let { failure ->
+            return Result.failure(LlmProviderContractException(failure))
         }
 
         val processFailed = processResult?.didFail() ?: false
@@ -296,17 +308,19 @@ class LlmInvocationAuditor(
         return redactor.redactAndTruncate(auditMessage)
     }
 
+    @Suppress("LongParameterList", "CyclomaticComplexMethod")
     private fun phaseDetails(
         request: LlmInvocationRequest,
         processResult: ProcessRunResult?,
         startFailure: Throwable?,
+        invocationResult: LlmInvocationResult?,
         usage: LlmUsageDetails?,
         auditSignals: LlmPhaseAuditSignals,
     ): JsonObject {
         val serializedUsage = usage?.let(LlmUsageParser::toJsonObject)
         val details = buildJsonObject {
             put("provider", request.provider.name.lowercase())
-            putAssignmentAuditDetails(request, usage)
+            putAssignmentAuditDetails(request, invocationResult)
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
             if (auditSignals.cleanupFailed) {
@@ -321,15 +335,24 @@ class LlmInvocationAuditor(
                     }
                 }
             }
-            when (request.provider) {
-                LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
-                    put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
-                    put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
-                }
+            auditSignals.providerFailure?.let { failure ->
+                put("failureCategory", failure.category.name)
+                failure.providerCode?.let { code -> put("providerCode", code) }
+                put("adapterSchemaVersion", failure.adapterSchemaVersion)
+            }
+            if (auditSignals.providerFailure != null) {
+                put("rawOutputOmitted", "true")
+            } else {
+                when (request.provider) {
+                    LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
+                        put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
+                        put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+                    }
 
-                LlmProvider.CODEX -> {
-                    if (processResult != null) {
-                        put("rawOutputOmitted", "true")
+                    LlmProvider.CODEX -> {
+                        if (processResult != null) {
+                            put("rawOutputOmitted", "true")
+                        }
                     }
                 }
             }
@@ -352,54 +375,38 @@ class LlmInvocationAuditor(
 
     private fun kotlinx.serialization.json.JsonObjectBuilder.putAssignmentAuditDetails(
         request: LlmInvocationRequest,
-        usage: LlmUsageDetails?,
+        invocationResult: LlmInvocationResult?,
     ) {
-        val observedModels = usage?.modelUsages?.map { modelUsage -> modelUsage.model }.orEmpty()
+        val configuredIdentity = invocationResult?.configuredModelIdentity
+            ?: request.model?.let { model ->
+                me.matsumo.fukurou.trading.invoker.LlmConfiguredModelIdentity(
+                    model,
+                    me.matsumo.fukurou.trading.invoker.LlmConfiguredModelSource.REQUEST,
+                )
+            }
+            ?: me.matsumo.fukurou.trading.invoker.LlmConfiguredModelIdentity.CLI_DEFAULT
+        val observedModels = invocationResult.observedModels()
         redactor.requireNoKnownSecret(
-            request.model,
+            configuredIdentity.name,
+            configuredIdentity.source.name,
             request.effort.name,
             request.effort.renderedEffortOrNull(),
             *observedModels.toTypedArray(),
         )
         ManifestPersistencePolicy.validateObservedIdentityStrings(
-            request.model,
+            configuredIdentity.name,
+            configuredIdentity.source.name,
             request.effort.name,
             request.effort.renderedEffortOrNull(),
             *observedModels.toTypedArray(),
         )
-        request.model?.let { configuredModel -> put("configuredModel", configuredModel) }
+        configuredIdentity.name?.let { configuredModel -> put("configuredModel", configuredModel) }
+        put("configuredModelSource", configuredIdentity.source.name)
         put("configuredEffort", request.effort.name)
         request.effort.renderedEffortOrNull()?.let { renderedEffort -> put("renderedEffort", renderedEffort) }
 
         observedModels.takeIf(List<String>::isNotEmpty)?.let { models -> put("observedModels", models.joinToString(",")) }
         put("modelObserved", observedModels.isNotEmpty().toString())
-    }
-
-    private fun ProcessRunResult.auditSignals(): LlmPhaseAuditSignals {
-        val cliErrorReported = cliErrorReported()
-
-        return LlmPhaseAuditSignals(
-            authFailureSuspected = authFailureSuspected(cliErrorReported),
-            cliErrorReported = cliErrorReported,
-        )
-    }
-
-    private fun ProcessRunResult.authFailureSuspected(cliErrorReported: Boolean): Boolean {
-        val exitFailed = exitCode?.let { completedExitCode -> completedExitCode != 0 } ?: false
-        val output = combinedOutput()
-        val outputContainsAuthFailure = LLM_CLI_AUTH_FAILURE_PATTERNS.any { pattern ->
-            output.contains(pattern, ignoreCase = true)
-        }
-
-        return outputContainsAuthFailure && (exitFailed || cliErrorReported)
-    }
-
-    private fun ProcessRunResult.cliErrorReported(): Boolean {
-        return LLM_CLI_ERROR_OUTPUT_PATTERN.containsMatchIn(combinedOutput())
-    }
-
-    private fun ProcessRunResult.combinedOutput(): String {
-        return "$stdout\n$stderr"
     }
 
     private fun ProcessRunResult.didFail(): Boolean {
@@ -412,6 +419,44 @@ class LlmInvocationAuditor(
 
 private fun Throwable?.hasSuppressedProcessStartedMarker(): Boolean {
     return this?.suppressed?.any { failure -> failure === LlmProcessStartedMarker } == true
+}
+
+private fun primaryProviderFailure(
+    invocationResult: LlmInvocationResult?,
+    startFailure: Throwable?,
+    cleanupFailures: List<Throwable?>,
+): LlmProviderFailure? {
+    val adapterFailure = invocationResult?.providerFailure
+    val startContractFailure = (startFailure as? LlmProviderContractException)?.providerFailure
+    val structuredFailure = listOfNotNull(startContractFailure, adapterFailure)
+        .firstOrNull { failure -> failure.category in STRUCTURED_PROVIDER_FAILURE_CATEGORIES }
+    if (structuredFailure != null) return structuredFailure
+    if (adapterFailure?.category == LlmProviderFailureCategory.OUTPUT_CONTRACT) return adapterFailure
+
+    val processResult = invocationResult?.processResult
+    if (processResult?.status == ProcessRunStatus.TIMED_OUT) {
+        return lifecycleFailure(LlmProviderFailureCategory.PROCESS_TIMEOUT)
+    }
+    if (processResult?.exitCode?.let { exitCode -> exitCode != 0 } == true) {
+        return lifecycleFailure(LlmProviderFailureCategory.PROCESS_EXIT)
+    }
+    if (cleanupFailures.any { failure -> failure != null }) {
+        return lifecycleFailure(LlmProviderFailureCategory.CLEANUP)
+    }
+
+    return adapterFailure
+        ?: startFailure?.let { lifecycleFailure(LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE) }
+}
+
+private fun LlmInvocationResult?.observedModels(): List<String> {
+    return (
+        listOfNotNull(this?.observedModelIdentity?.name) +
+            this?.usage?.modelUsages.orEmpty().map { usage -> usage.model }
+        ).distinct()
+}
+
+private fun lifecycleFailure(category: LlmProviderFailureCategory): LlmProviderFailure {
+    return LlmProviderFailure(category, null, me.matsumo.fukurou.trading.invoker.LLM_INVOCATION_CONTRACT_VERSION)
 }
 
 private fun Throwable.suppressInOrder(failures: List<Throwable?>) {
@@ -461,6 +506,7 @@ private data class LlmPhaseAuditSignals(
     val authFailureSuspected: Boolean = false,
     val cliErrorReported: Boolean = false,
     val cleanupFailed: Boolean = false,
+    val providerFailure: LlmProviderFailure? = null,
 )
 
 /**
@@ -483,16 +529,16 @@ const val LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE =
  * stdout / stderr の raw output に対する推定シグナルであり、provider や CLI version によっては
  * false positive を含みうる。fail-closed の挙動は変えず、運用上の気づきだけを追加する。
  */
-private val LLM_CLI_AUTH_FAILURE_PATTERNS = listOf(
-    "invalid authentication",
-    "401",
-    "unauthorized",
-    "not logged in",
-    "token expired",
-    "please run /login",
+private val PROVIDER_ADAPTER_FAILURE_CATEGORIES = setOf(
+    LlmProviderFailureCategory.AUTHENTICATION,
+    LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
+    LlmProviderFailureCategory.QUOTA_EXHAUSTED,
+    LlmProviderFailureCategory.OUTPUT_CONTRACT,
+    LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
 )
 
-/**
- * Claude CLI の result JSON が error 終了を示す出力断片。
- */
-private val LLM_CLI_ERROR_OUTPUT_PATTERN = Regex(""""is_error"\s*:\s*true""")
+private val STRUCTURED_PROVIDER_FAILURE_CATEGORIES = setOf(
+    LlmProviderFailureCategory.AUTHENTICATION,
+    LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
+    LlmProviderFailureCategory.QUOTA_EXHAUSTED,
+)

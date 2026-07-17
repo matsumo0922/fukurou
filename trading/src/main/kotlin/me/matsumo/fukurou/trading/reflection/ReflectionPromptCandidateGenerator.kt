@@ -31,6 +31,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.runner.CHILD_ENV_ALLOWLIST
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.MAX_DAILY_INVOCATION_COUNT_WINDOW
@@ -429,7 +430,7 @@ class ReflectionPromptCandidateGenerator(
             decisionRunContext = context,
             mcpServer = null,
             environment = reflectionChildEnvironment(context, startedAt),
-            allowedTools = emptyList(),
+            toolPolicy = McpToolContractCatalog.canonicalPolicy(LlmInvocationPhase.REFLECTION, emptyList()),
         )
     }
 

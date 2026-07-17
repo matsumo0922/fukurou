@@ -130,6 +130,9 @@ class ShellLlmInvoker(
                 responseText = parsedOutput.responseText,
                 usage = parsedOutput.usage,
                 processResult = processResult,
+                configuredModelIdentity = parsedOutput.configuredModelIdentity,
+                observedModelIdentity = parsedOutput.observedModelIdentity,
+                providerFailure = parsedOutput.providerFailure,
                 cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()?.let { failure ->
                     LlmArtifactCleanupQuarantine.activate(failure)
                     failure.classifyLlmFailure(request.provider)

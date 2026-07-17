@@ -78,7 +78,7 @@ class LlmInvocationAuditorTest {
             ),
             mcpServer = null,
             environment = emptyMap(),
-            allowedTools = emptyList(),
+            toolPolicy = me.matsumo.fukurou.trading.invoker.ToolPolicy(emptySet(), emptyList()),
         )
         val invoker = StaticAuditLlmInvoker(
             stdout = """{"total_cost_usd":"0.0123","note":"reflection-secret-token"}""",
@@ -270,7 +270,7 @@ class LlmInvocationAuditorTest {
         assertTrue(result.isFailure)
         assertEquals("FAILED_TO_START", details["status"]?.jsonPrimitive?.content)
         assertTrue(details["error"]?.jsonPrimitive?.content.orEmpty().contains("synthetic claude failure"))
-        assertFalse(details.containsKey("failureCategory"))
+        assertEquals("UNKNOWN_PROVIDER_FAILURE", details["failureCategory"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -726,7 +726,7 @@ private fun auditRequest(provider: LlmProvider): LlmInvocationRequest {
         decisionRunContext = DecisionRunContext.EMPTY,
         mcpServer = null,
         environment = emptyMap(),
-        allowedTools = emptyList(),
+        toolPolicy = me.matsumo.fukurou.trading.invoker.ToolPolicy(emptySet(), emptyList()),
     )
 }
 
@@ -748,6 +748,11 @@ private class StaticStructuredAuditLlmInvoker(
                 ),
                 responseText = "partial response",
                 usage = usage,
+                providerFailure = me.matsumo.fukurou.trading.invoker.LlmProviderFailure(
+                    me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory.AUTHENTICATION,
+                    "UNAUTHORIZED",
+                    me.matsumo.fukurou.trading.invoker.CODEX_OUTPUT_ADAPTER_VERSION,
+                ),
             ),
         )
     }

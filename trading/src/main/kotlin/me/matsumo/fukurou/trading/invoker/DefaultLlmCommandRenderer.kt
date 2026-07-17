@@ -142,6 +142,10 @@ class DefaultLlmCommandRenderer(
 
     override fun render(request: LlmInvocationRequest): Result<RenderedLlmCommand> {
         return runCatching {
+            McpToolContractCatalog.requireCanonicalPolicy(request.phase, request.toolPolicy)
+            require((request.mcpServer != null) == request.toolPolicy.enabledTools.isNotEmpty()) {
+                "MCP server and enabled tool policy must be present together."
+            }
             when (request.provider) {
                 LlmProvider.CLAUDE -> renderClaude(request)
                 LlmProvider.CODEX -> renderCodex(request)
@@ -182,7 +186,17 @@ class DefaultLlmCommandRenderer(
         generatedPaths: MutableList<Path>,
     ): RenderedLlmCommand {
         val targetDirectory = requireNotNull(mcpConfigFile.path.parent)
-        request.environment.claudeAuthSourcePath()?.let { sourcePath ->
+        val authSourcePath = request.environment.claudeAuthSourcePath()
+        if (request.mcpServer == null && authSourcePath == null) {
+            throw LlmProviderContractException(
+                LlmProviderFailure(
+                    category = LlmProviderFailureCategory.AUTHENTICATION,
+                    providerCode = "CLAUDE_AUTH_SOURCE_MISSING",
+                    adapterSchemaVersion = LLM_INVOCATION_CONTRACT_VERSION,
+                ),
+            )
+        }
+        authSourcePath?.let { sourcePath ->
             val targetPath = targetDirectory.resolve(sourcePath.fileName.toString())
             generatedPaths.add(1, targetPath)
             claudeAuthCopy(sourcePath, targetPath)
@@ -204,7 +218,7 @@ class DefaultLlmCommandRenderer(
             "--allowedTools",
             allowedTools,
         )
-        val args = baseArgs + claudeBareArgs(hasMcpServer) + mcpArgs + claudeToolArgs(hasMcpServer) +
+        val args = baseArgs + mcpArgs + claudeToolArgs(hasMcpServer) +
             ENFORCED_CLAUDE_COMMON_ARGS
         val claudeHome = targetDirectory.toString()
         val commandEnvironment = request.environment.withoutLlmSecrets().withClaudeHome(claudeHome)
@@ -217,6 +231,7 @@ class DefaultLlmCommandRenderer(
                 timeout = request.timeout,
                 stdin = null,
                 cleanupPaths = generatedPaths + listOfNotNull(request.mcpServer?.manifestPath),
+                configuredModelIdentity = request.configuredModelIdentity(config.claudeModel),
             ),
         )
     }
@@ -254,6 +269,7 @@ class DefaultLlmCommandRenderer(
                     timeout = request.timeout,
                     stdin = null,
                     cleanupPaths = codexHome.cleanupPaths + listOfNotNull(request.mcpServer?.manifestPath),
+                    configuredModelIdentity = request.configuredModelIdentity(config.codexModel),
                 ),
             )
         }.getOrElse { throwable ->
@@ -263,8 +279,6 @@ class DefaultLlmCommandRenderer(
         }
     }
 }
-
-private fun claudeBareArgs(hasMcpServer: Boolean) = if (hasMcpServer) emptyList() else listOf("--bare")
 
 private fun claudeToolArgs(hasMcpServer: Boolean) = if (hasMcpServer) CLAUDE_MCP_ONLY_TOOL_ARGS else CLAUDE_NO_TOOL_ARGS
 
@@ -294,6 +308,17 @@ private fun LlmInvocationRequest.codexModelArgs(fallbackModel: String?): List<St
     return listOf("-m", model)
 }
 
+private fun LlmInvocationRequest.configuredModelIdentity(fallbackModel: String?): LlmConfiguredModelIdentity {
+    model?.let { configuredModel ->
+        return LlmConfiguredModelIdentity(configuredModel, LlmConfiguredModelSource.REQUEST)
+    }
+    fallbackModel?.takeIf { useConfiguredModelFallback }?.let { configuredModel ->
+        return LlmConfiguredModelIdentity(configuredModel, LlmConfiguredModelSource.RENDERER_CONFIG)
+    }
+
+    return LlmConfiguredModelIdentity.CLI_DEFAULT
+}
+
 internal fun LlmEffort.renderedEffortOrNull(): String? {
     return when (this) {
         LlmEffort.DEFAULT -> null
@@ -313,6 +338,7 @@ private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): Ren
         timeout = request.timeout,
         stdin = request.stdin,
         cleanupPaths = request.cleanupPaths,
+        configuredModelIdentity = request.configuredModelIdentity,
     )
 }
 
@@ -336,6 +362,7 @@ private data class RenderedCommandRequest(
     val timeout: java.time.Duration,
     val stdin: String?,
     val cleanupPaths: List<Path>,
+    val configuredModelIdentity: LlmConfiguredModelIdentity,
 )
 
 private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {

@@ -1667,7 +1667,7 @@ class OpsRouteTest {
         assertEquals("FAILED_TO_START", details.getValue("status").jsonPrimitive.content)
         assertEquals("null", details.getValue("exitCode").jsonPrimitive.content)
         assertEquals(
-            "INVOCATION_RESULT_UNAVAILABLE",
+            "UNKNOWN_PROVIDER_FAILURE",
             details.getValue("failureCategory").jsonPrimitive.content,
         )
         assertEquals("FileSystemException", details.getValue("failureType").jsonPrimitive.content)
@@ -1870,7 +1870,7 @@ private fun codexAuditRequest(): LlmInvocationRequest {
         decisionRunContext = DecisionRunContext.EMPTY,
         mcpServer = null,
         environment = emptyMap(),
-        allowedTools = emptyList(),
+        toolPolicy = me.matsumo.fukurou.trading.invoker.ToolPolicy(emptySet(), emptyList()),
     )
 }
 

@@ -21,6 +21,11 @@ object McpToolContractCatalog {
     val riskReductionTools = setOf(
         "get_balance", "get_positions", "get_open_orders", "get_account_status", "submit_decision",
     )
+    private val requiredToolsByPhase = mapOf(
+        LlmInvocationPhase.PROPOSER to setOf("submit_decision"),
+        LlmInvocationPhase.FALSIFIER to setOf("submit_falsification"),
+        LlmInvocationPhase.RISK_REDUCTION_ONLY to setOf("submit_decision"),
+    )
     val allTools = proposerTools + falsifierTools
 
     fun toolsFor(phase: LlmInvocationPhase): Set<String> = when (phase) {
@@ -40,6 +45,26 @@ object McpToolContractCatalog {
             "MCP tool allowlist contains unknown tool or missing schema."
         }
         require(shortNames.toSet() == toolsFor(phase)) { "MCP tool allowlist is not canonical for phase." }
+    }
+
+    /** phase の canonical tool policy を組み立てる。 */
+    fun canonicalPolicy(phase: LlmInvocationPhase, enabledTools: List<String>): ToolPolicy {
+        requireCanonical(phase, enabledTools)
+        val requiredShortNames = requiredToolsByPhase[phase].orEmpty()
+        val requiredTools = enabledTools
+            .filter { tool -> tool.substringAfterLast("__") in requiredShortNames }
+            .toSet()
+
+        return ToolPolicy(requiredTools, enabledTools)
+    }
+
+    /** required / enabled の両方が phase の canonical policy と完全一致することを検証する。 */
+    fun requireCanonicalPolicy(phase: LlmInvocationPhase, policy: ToolPolicy) {
+        requireCanonical(phase, policy.enabledTools)
+        val requiredShortNames = policy.requiredTools.map { tool -> tool.substringAfterLast("__") }.toSet()
+        require(requiredShortNames == requiredToolsByPhase[phase].orEmpty()) {
+            "MCP required tool policy is not canonical for phase."
+        }
     }
 
     fun schema(toolName: String): JsonObject = Json.parseToJsonElement(

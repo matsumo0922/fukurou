@@ -65,6 +65,22 @@ enum class LlmInvocationPhase {
 }
 
 /**
+ * phase が要求・有効化する tool の固定 policy。
+ *
+ * @param requiredTools phase 完了に必要な fully-qualified tool 名
+ * @param enabledTools CLI に公開する fully-qualified tool 名
+ */
+data class ToolPolicy(
+    val requiredTools: Set<String>,
+    val enabledTools: List<String>,
+) {
+    init {
+        require(enabledTools.size == enabledTools.distinct().size) { "Tool policy contains duplicate enabled tools." }
+        require(requiredTools.all(enabledTools::contains)) { "Tool policy is missing a required tool." }
+    }
+}
+
+/**
  * MCP stdio server を CLI に登録するための設定。
  *
  * @param name MCP server 名
@@ -97,7 +113,7 @@ data class LlmMcpServerConfig(
  * @param decisionRunContext MCP audit へ伝播する context
  * @param mcpServer stdio MCP server 設定。null の場合は MCP を登録しない
  * @param environment CLI process へ allowlist で渡す環境変数
- * @param allowedTools CLI に許可する MCP tool 名
+ * @param toolPolicy phase が要求・有効化する tool policy
  * @param model この invocation に設定した model。null の場合は CLI の既定値を使う
  * @param effort この invocation に設定した reasoning effort
  * @param useConfiguredModelFallback renderer config の provider model override を使うか。role assignment は false にする
@@ -112,11 +128,82 @@ data class LlmInvocationRequest(
     val decisionRunContext: DecisionRunContext,
     val mcpServer: LlmMcpServerConfig?,
     val environment: Map<String, String>,
-    val allowedTools: List<String>,
+    val toolPolicy: ToolPolicy,
     val model: String? = null,
     val effort: LlmEffort = LlmEffort.DEFAULT,
     val useConfiguredModelFallback: Boolean = true,
+) {
+    /** 既存 manifest / MCP surface が参照する有効 tool 一覧。 */
+    val allowedTools: List<String> get() = toolPolicy.enabledTools
+}
+
+/** configured model の由来。 */
+enum class LlmConfiguredModelSource {
+    REQUEST,
+    RENDERER_CONFIG,
+    CLI_DEFAULT,
+}
+
+/**
+ * invocation に設定された model identity。
+ *
+ * @param name model 名。CLI_DEFAULT の場合は null
+ * @param source model 名の由来
+ */
+data class LlmConfiguredModelIdentity(
+    val name: String?,
+    val source: LlmConfiguredModelSource,
+) {
+    init {
+        require((source == LlmConfiguredModelSource.CLI_DEFAULT) == (name == null)) {
+            "CLI default model identity must not invent a model name."
+        }
+    }
+
+    companion object {
+        /** CLI が既定 model を選択する identity。 */
+        val CLI_DEFAULT = LlmConfiguredModelIdentity(null, LlmConfiguredModelSource.CLI_DEFAULT)
+    }
+}
+
+/** provider output が報告した model identity。 */
+data class LlmObservedModelIdentity(
+    val name: String,
+    val source: String,
 )
+
+/** provider-neutral failure category。 */
+enum class LlmProviderFailureCategory {
+    AUTHENTICATION,
+    RATE_OR_SESSION_LIMIT,
+    QUOTA_EXHAUSTED,
+    OUTPUT_CONTRACT,
+    PROCESS_TIMEOUT,
+    PROCESS_EXIT,
+    CLEANUP,
+    UNKNOWN_PROVIDER_FAILURE,
+}
+
+/**
+ * raw provider output を含まない typed failure。
+ *
+ * @param category provider-neutral category
+ * @param providerCode allowlist 済み provider code
+ * @param adapterSchemaVersion failure を解釈した adapter schema version
+ */
+data class LlmProviderFailure(
+    val category: LlmProviderFailureCategory,
+    val providerCode: String? = null,
+    val adapterSchemaVersion: String,
+)
+
+/** process start 前に検出した typed provider contract failure。 */
+class LlmProviderContractException(
+    val providerFailure: LlmProviderFailure,
+) : IllegalStateException("LLM provider contract rejected the invocation.")
+
+/** provider-neutral invocation contract revision。 */
+const val LLM_INVOCATION_CONTRACT_VERSION = "llm-invocation-contract-v1"
 
 /**
  * renderer が生成した実行 command。
@@ -128,6 +215,7 @@ data class LlmInvocationRequest(
  * @param timeout process timeout
  * @param stdin 標準入力へ渡す文字列
  * @param cleanupPaths provider output の解析後に削除する runner 生成ファイル
+ * @param configuredModelIdentity renderer が確定した configured model identity
  */
 data class RenderedLlmCommand(
     val executable: String,
@@ -137,6 +225,7 @@ data class RenderedLlmCommand(
     val timeout: Duration,
     val stdin: String?,
     val cleanupPaths: List<Path> = emptyList(),
+    val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,
 )
 
 /**
@@ -187,6 +276,9 @@ data class ProcessRunResult(
  * @param usage provider output から抽出した structured usage
  * @param processResult process 実行結果
  * @param cleanupFailure process output の解析後に一時 artifact を削除できなかった failure
+ * @param configuredModelIdentity renderer が確定した configured model identity
+ * @param observedModelIdentity provider output が報告した model identity
+ * @param providerFailure provider adapter が検出した typed failure
  */
 data class LlmInvocationResult(
     val request: LlmInvocationRequest,
@@ -194,4 +286,7 @@ data class LlmInvocationResult(
     val responseText: String,
     val usage: LlmUsageDetails? = null,
     val cleanupFailure: Throwable? = null,
+    val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,
+    val observedModelIdentity: LlmObservedModelIdentity? = null,
+    val providerFailure: LlmProviderFailure? = null,
 )
