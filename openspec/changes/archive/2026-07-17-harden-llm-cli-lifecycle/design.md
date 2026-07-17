@@ -14,7 +14,7 @@ The remaining gaps are concrete:
 - `/evaluation/costs` preserves unknown monetary cost correctly but does not compute versioned Codex list-price estimates or distinguish all monetary concepts;
 - deploy canaries cover substantial isolation behavior but do not permanently require authenticated pinned CLI output/auth/tool-resolution contracts for every phase.
 
-This PR is stage 1 of the user-confirmed four-PR delivery plan. It is security-sensitive and crosses the shared invocation model plus all provider callers, but it does not change process lifecycle, evaluation cost, Web/OpenAPI, Docker pinning, or deploy scripts. Existing history and old Issue #189 planning artifacts are not design inputs; current code and the current issue acceptance criteria are authoritative. **（ユーザー確認済み）**
+This PR is stage 1 of the user-confirmed four-PR delivery plan. It is security-sensitive and crosses the shared invocation model plus all provider callers, but it does not change process lifecycle, evaluation cost, Web/OpenAPI, Docker pinning, or deploy scripts. Existing history and old Issue #189 planning artifacts are not design inputs; current code and the current issue acceptance criteria are authoritative.
 
 ## Goals / Non-Goals
 
@@ -41,11 +41,11 @@ This PR is stage 1 of the user-confirmed four-PR delivery plan. It is security-s
 
 `LlmDaemonPreFilterGate` will receive the code-owned barrier result and require both the barrier and runtime configuration to be true. While the barrier is closed, eligible heartbeat triggers continue through the existing full-run path; the barrier does not suppress normal decision execution. Deployment preflight and regression tests will assert the same invariant.
 
-The barrier fix ships with the provider invocation contract because it changes the same pre-filter rendering/composition surface and is too small to justify an independent merge/deploy cycle. An environment-only kill switch was rejected because runtime configuration is precisely the surface the code-owned barrier must dominate. **（ユーザー確認済み）**
+The barrier fix ships with the provider invocation contract because it changes the same pre-filter rendering/composition surface and is too small to justify an independent merge/deploy cycle. An environment-only kill switch was rejected because runtime configuration is precisely the surface the code-owned barrier must dominate.
 
 ### 2. Use one explicit invocation contract with phase-owned tool policy
 
-`LlmInvocationRequest` will require a `ToolPolicy` that contains required and enabled tool identifiers. There will be no default. Empty policy renders strict empty MCP configuration and provider-supported no-tool arguments. Claude no-MCP rendering removes `--bare`, retains the copied auth source in the per-run home, and continues stripping parent LLM secrets. The fixed production supervisor will accept the existing canonical `RISK_REDUCTION_ONLY` allowlist in addition to the existing empty, Proposer, and Falsifier policies; an exact-policy test prevents widening it to arbitrary tools. **（agent 仮決め）**
+`LlmInvocationRequest` will require a `ToolPolicy` that contains required and enabled tool identifiers. There will be no default. Empty policy renders strict empty MCP configuration and provider-supported no-tool arguments. Claude no-MCP rendering removes `--bare`, retains the copied auth source in the per-run home, and continues stripping parent LLM secrets. The fixed production supervisor will accept the existing canonical `RISK_REDUCTION_ONLY` allowlist in addition to the existing empty, Proposer, and Falsifier policies; an exact-policy test prevents widening it to arbitrary tools.
 
 Model and effort remain request/config metadata. Pre-filter continues to request the pinned Haiku model explicitly. Reflection and report callers migrate in the same provider-contract PR so no consumer temporarily receives an implicit tool policy.
 
@@ -57,11 +57,11 @@ Claude result JSON and Codex JSONL will be parsed by provider-specific adapters 
 
 Failure categories are provider-neutral: `AUTHENTICATION`, `RATE_OR_SESSION_LIMIT`, `QUOTA_EXHAUSTED`, `OUTPUT_CONTRACT`, `PROCESS_TIMEOUT`, `PROCESS_EXIT`, `CLEANUP`, and `UNKNOWN_PROVIDER_FAILURE`. Provider adapters may attach a safe provider code, but raw Codex output, credentials, prompt, path, and tool payload remain unpersisted.
 
-When one invocation exposes multiple facts, audit retains the secondary facts but chooses one primary category in this order: a supported structured provider category, `OUTPUT_CONTRACT`, timeout, non-zero process exit, cleanup, then unknown provider failure. This preserves an actionable 429/session/quota reason without hiding process and cleanup evidence. **（agent 仮決め）**
+When one invocation exposes multiple facts, audit retains the secondary facts but chooses one primary category in this order: a supported structured provider category, `OUTPUT_CONTRACT`, timeout, non-zero process exit, cleanup, then unknown provider failure. This preserves an actionable 429/session/quota reason without hiding process and cleanup evidence.
 
-Model attribution records two facts separately. Configured identity stores the effective model name when the request or renderer config names one; otherwise it stores an explicit `CLI_DEFAULT` source with no invented model name. Observed identity is populated only from supported provider output and is explicitly unavailable when the output omits it. Codex session-file scanning is removed. If no authoritative model name exists, usage remains and cost is unpriced. Continuing bounded session scans was rejected because a CLI storage layout is not an output contract. **（agent 仮決め）**
+Model attribution records two facts separately. Configured identity stores the effective model name when the request or renderer config names one; otherwise it stores an explicit `CLI_DEFAULT` source with no invented model name. Observed identity is populated only from supported provider output and is explicitly unavailable when the output omits it. Codex session-file scanning is removed. If no authoritative model name exists, usage remains and cost is unpriced. Continuing bounded session scans was rejected because a CLI storage layout is not an output contract.
 
-A provider/output-contract failure is not allowed to authorize `ENTER` or `ADD_LONG`, and a failed Falsifier cannot approve an entry. A persisted `EXIT`, `REDUCE`, or `ADJUST_PROTECTION` decision continues through the existing bounded safety path even if the surrounding provider output contract failed; treating every adapter failure as a total decision rejection would make a provider formatting defect trap exposure. `NO_TRADE` remains inert. **（agent 仮決め）**
+A provider/output-contract failure is not allowed to authorize `ENTER` or `ADD_LONG`, and a failed Falsifier cannot approve an entry. A persisted `EXIT`, `REDUCE`, or `ADJUST_PROTECTION` decision continues through the existing bounded safety path even if the surrounding provider output contract failed; treating every adapter failure as a total decision rejection would make a provider formatting defect trap exposure. `NO_TRADE` remains inert.
 
 ### 4. Keep this stage inside its bounded PR envelope
 
@@ -71,14 +71,14 @@ Line estimates use `git diff --numstat` additions plus deletions and include tes
 |---|---|---|---:|---:|
 | PR 1: provider invocation and activation contract | Reconnect the barrier; require `ToolPolicy`; align the fixed supervisor with canonical RISK_REDUCTION_ONLY; remove Claude `--bare`; add strict no-tool auth, typed Claude/Codex adapters/failures, configured/output model attribution; remove Codex session scan; migrate callers. | current `main` | 700-1,100 across 10-18 files | 1,300 |
 
-This PR is expected to change 700-1,100 lines across 10-18 files with a hard stop at 1,300 changed lines. Tests and current-state documentation count toward the limit. If the implementation needs process lifecycle, cost, deploy, DB schema, a new privilege, or more than 1,300 lines, it stops and returns the boundary for user decision. **（ユーザー確認済み）**
+This PR is expected to change 700-1,100 lines across 10-18 files with a hard stop at 1,300 changed lines. Tests and current-state documentation count toward the limit. If the implementation needs process lifecycle, cost, deploy, DB schema, a new privilege, or more than 1,300 lines, it stops and returns the boundary for user decision.
 
 ## Risks / Trade-offs
 
 - [Real-provider smoke can be blocked by provider quota or outage] → Record a typed blocking result, retain the current production image, and require a later successful exact-candidate rerun; never substitute mocks for release evidence.
 - [Provider CLI schema changes despite version pinning] → Fail the adapter contract, keep semantic execution fail-closed, and update the pinned version and adapter in one reviewed PR.
 - [Barrier and docs drift again] → Assert barrier use in daemon composition and candidate preflight tests, and grep README/docs during each implementation completion check. The existing deploy may provision or fence host resources before candidate preflight, but it cannot start the candidate runtime while the barrier invariant fails.
-- [Removing `--bare` may not match a future Claude auth format] → Keep pre-filter code-gated, test copied-auth rendering and pinned output fixtures now, and require exact-candidate real-provider smoke in the later deploy stage. **（agent 仮決め）**
+- [Removing `--bare` may not match a future Claude auth format] → Keep pre-filter code-gated, test copied-auth rendering and pinned output fixtures now, and require exact-candidate real-provider smoke in the later deploy stage.
 - [Provider error wording can drift] → Prefer structured fields/codes from pinned output and keep a bounded compatibility mapping; unknown output remains fail-closed and explicitly classified.
 - [Pinned image and adapter fixture can drift independently] → Keep an adapter-supported version constant and test it against the Docker pin and pinned output fixtures.
 
