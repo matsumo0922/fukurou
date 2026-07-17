@@ -24,13 +24,16 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProcessStartedMarker
+import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.LlmProviderContractException
 import me.matsumo.fukurou.trading.invoker.LlmProviderFailure
 import me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory
+import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifestWriter
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.invoker.renderedEffortOrNull
 import me.matsumo.fukurou.trading.invoker.safeExceptionType
@@ -101,6 +104,7 @@ class LlmInvocationAuditor(
         val gatewayCleanupFailure = withContext(NonCancellable) {
             runCatching { submissionGateway?.close() }.exceptionOrNull()
         }
+        val semanticSubmissionState = submissionGateway?.semanticSubmissionState()
         val manifestCleanupFailure = cleanupUnstartedManifest(request, processStarted)
         val observationFailure = phaseManifest?.let { manifest ->
             withContext(NonCancellable) {
@@ -124,6 +128,15 @@ class LlmInvocationAuditor(
             cleanupFailed = cleanupFailures.any { failure -> failure != null },
             providerFailure = providerFailure,
         )
+        val terminalProjection = LlmPhaseTerminalProjection(
+            semanticCommit = semanticSubmissionState.toSemanticCommitTerminal(),
+            processExit = processExitTerminal(request, processResult, processStarted),
+            cleanup = if (cleanupFailures.any { failure -> failure != null }) {
+                CleanupTerminal.FAILED
+            } else {
+                CleanupTerminal.COMPLETED
+            },
+        )
         val appendFailure = withContext(NonCancellable) {
             runCatching {
                 appendPhase(
@@ -137,6 +150,7 @@ class LlmInvocationAuditor(
                         invocationResult = invocationResult,
                         usage = usage,
                         auditSignals = auditSignals,
+                        terminalProjection = terminalProjection,
                     ),
                 ).getOrThrow()
             }.exceptionOrNull()
@@ -319,6 +333,7 @@ class LlmInvocationAuditor(
         invocationResult: LlmInvocationResult?,
         usage: LlmUsageDetails?,
         auditSignals: LlmPhaseAuditSignals,
+        terminalProjection: LlmPhaseTerminalProjection,
     ): JsonObject {
         val serializedUsage = usage?.let(LlmUsageParser::toJsonObject)
         val details = buildJsonObject {
@@ -326,6 +341,7 @@ class LlmInvocationAuditor(
             putAssignmentAuditDetails(request, invocationResult)
             put("status", processResult?.status?.name ?: "FAILED_TO_START")
             put("exitCode", processResult?.exitCode?.toString() ?: "null")
+            put("terminal", terminalProjection.toJson())
             if (auditSignals.cleanupFailed) {
                 put("cleanupFailed", "true")
             }
@@ -418,6 +434,61 @@ class LlmInvocationAuditor(
 
         return timedOut || nonZeroExit
     }
+}
+
+private fun LlmSemanticSubmissionState?.toSemanticCommitTerminal(): SemanticCommitTerminal {
+    return when (this) {
+        null -> SemanticCommitTerminal.NOT_APPLICABLE
+        LlmSemanticSubmissionState.NOT_ATTEMPTED,
+        LlmSemanticSubmissionState.REJECTED,
+        -> SemanticCommitTerminal.NOT_COMMITTED
+        LlmSemanticSubmissionState.IN_FLIGHT -> SemanticCommitTerminal.UNKNOWN
+        LlmSemanticSubmissionState.COMMITTED -> SemanticCommitTerminal.COMMITTED
+    }
+}
+
+private fun processExitTerminal(
+    request: LlmInvocationRequest,
+    processResult: ProcessRunResult?,
+    processStarted: Boolean,
+): ProcessExitTerminal {
+    val proof = processResult?.processTreeTerminationProof
+        ?: LlmProcessTreeTerminationRegistry.find(request.invocationId)
+    return when {
+        proof == ProcessTreeTerminationProof.PROVEN_EXITED -> ProcessExitTerminal.PROVEN_EXITED
+        processStarted -> ProcessExitTerminal.UNCONFIRMED
+        else -> ProcessExitTerminal.NOT_STARTED
+    }
+}
+
+private fun LlmPhaseTerminalProjection.toJson(): JsonObject = buildJsonObject {
+    put("semanticCommit", semanticCommit.name)
+    put("processExit", processExit.name)
+    put("cleanup", cleanup.name)
+}
+
+private data class LlmPhaseTerminalProjection(
+    val semanticCommit: SemanticCommitTerminal,
+    val processExit: ProcessExitTerminal,
+    val cleanup: CleanupTerminal,
+)
+
+private enum class SemanticCommitTerminal {
+    COMMITTED,
+    NOT_COMMITTED,
+    UNKNOWN,
+    NOT_APPLICABLE,
+}
+
+private enum class ProcessExitTerminal {
+    PROVEN_EXITED,
+    UNCONFIRMED,
+    NOT_STARTED,
+}
+
+private enum class CleanupTerminal {
+    COMPLETED,
+    FAILED,
 }
 
 private fun Throwable?.hasSuppressedProcessStartedMarker(): Boolean {
