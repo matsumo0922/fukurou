@@ -8,6 +8,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import java.lang.reflect.Modifier
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
@@ -20,6 +21,26 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class DecisionSubmissionAuthorityTest {
+    @Test
+    fun `canonical payload classifies every decision submission field`() {
+        val declaredFields = DecisionSubmission::class.java.declaredFields
+            .asSequence()
+            .filterNot { field -> field.isSynthetic || Modifier.isStatic(field.modifiers) }
+            .map { field -> field.name }
+            .toSet()
+        val classifiedFields = DECISION_SUBMISSION_BUSINESS_FIELDS + DECISION_SUBMISSION_EXCLUDED_METADATA_FIELDS
+
+        assertTrue(
+            DECISION_SUBMISSION_BUSINESS_FIELDS.intersect(DECISION_SUBMISSION_EXCLUDED_METADATA_FIELDS).isEmpty(),
+            "DecisionSubmission field classifications must not overlap.",
+        )
+        assertEquals(
+            classifiedFields,
+            declaredFields,
+            "Every DecisionSubmission field must be classified as business payload or excluded metadata.",
+        )
+    }
+
     @Test
     fun `canonical payload changes for every mutable persisted business field`() {
         val baseline = completeSubmission()
@@ -239,3 +260,28 @@ private fun completeSubmission(): DecisionSubmission = DecisionSubmission(
 
 private const val INVOCATION_ID = "decision-authority-run"
 private val FIXED_CLOCK = Clock.fixed(Instant.parse("2026-07-17T00:00:00Z"), ZoneOffset.UTC)
+
+private val DECISION_SUBMISSION_BUSINESS_FIELDS = setOf(
+    "action",
+    "closeRatio",
+    "setupTags",
+    "estimatedWinProbability",
+    "expectedRMultiple",
+    "roundTripCostR",
+    "toolEvidenceIds",
+    "factCheckJson",
+    "selfReviewJson",
+    "reasonJa",
+    "missingDataJa",
+    "noTradeConditionsJa",
+    "entryIntent",
+    "tradePlan",
+)
+
+private val DECISION_SUBMISSION_EXCLUDED_METADATA_FIELDS = setOf(
+    "invocationId",
+    "llmProvider",
+    "promptHash",
+    "systemPromptVersion",
+    "marketSnapshotId",
+)

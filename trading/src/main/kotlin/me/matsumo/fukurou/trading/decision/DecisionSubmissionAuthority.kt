@@ -46,7 +46,12 @@ class DecisionSubmissionConflictException : IllegalStateException("Decision subm
 /** authority から完了済み result を安全に再構成できないことを表す。 */
 class DecisionSubmissionUnknownException : IllegalStateException("Decision submission result is unknown.")
 
-/** schema v1 の business payload へ投影し、SHA-256 hash を返す。 */
+/**
+ * schema v1 の business payload へ投影し、SHA-256 hash を返す。
+ *
+ * [DecisionSubmission] に business field を追加する場合は、この投影を更新し、
+ * [DECISION_SUBMISSION_PAYLOAD_SCHEMA_VERSION] を bump する。
+ */
 fun DecisionSubmission.canonicalBusinessPayload(): DecisionSubmissionCanonicalPayload {
     val projection = buildJsonObject {
         put("schemaVersion", DECISION_SUBMISSION_PAYLOAD_SCHEMA_VERSION)
