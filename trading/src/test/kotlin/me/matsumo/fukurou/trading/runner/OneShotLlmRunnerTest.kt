@@ -3446,7 +3446,7 @@ private fun pinnedSuccessOutput(command: RenderedLlmCommand): String {
         """
             {"type":"thread.started","thread_id":"fixture-thread"}
             {"type":"item.completed","item":{"type":"agent_message","text":""}}
-            {"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}
+            {"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}
         """.trimIndent()
     } else {
         """{"type":"result","is_error":false,"result":""}"""
