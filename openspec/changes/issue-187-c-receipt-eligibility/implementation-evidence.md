@@ -26,4 +26,20 @@ Production root inventory is fixed by `DurableReceiptEligibilityWiringTest`: `Tr
 
 ## Validation ledger
 
-Final validation is recorded after the implementation evidence commit so every command can name the exact tested HEAD.
+Validated HEAD: `0e0ea11c53a87c99ee4086119027d15bde44c187`
+
+All Gradle validation used the machine-wide validation lease and the isolated
+`GRADLE_USER_HOME=/private/tmp/fukurou-187-c-gradle-user-home` with
+`GRADLE_OPTS=-Dorg.gradle.daemon=false`.
+
+| Command and scope | Result | Lease wait | Wall time |
+|---|---|---|---|
+| Targeted `:trading:test` and `:fukurou:test` contract runs for receipt persistence/propagation, two-way commit barriers, 1,000 pre-boundary events, exact post-boundary fill, invalid evidence, old-session isolation, stale-session intent rollback, position protection, cursor/fill invariants, production wiring, and compile checks | PASS | 0s | 42s combined contract run; 1m 6s isolated 1,000-iteration run |
+| `openspec validate issue-187-c-receipt-eligibility` | PASS | Not required | Less than 1s |
+| `make test` | PASS | 0s | 8m 23s |
+| `make detekt` | PASS | 0s | 19s |
+| `make build` | PASS | 0s | 8s |
+
+The final evidence/task commit changes only OpenSpec records after this tested
+HEAD. `git diff --check`, the OpenSpec validator, and the stale dark-write grep
+are rerun against the final tree.

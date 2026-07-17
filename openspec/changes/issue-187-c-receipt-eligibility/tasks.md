@@ -27,4 +27,4 @@
 ## 5. Documentation and validation
 
 - [x] 5.1 Update README and current receipt/eligibility descriptions in `docs/design.md` and `docs/mcp-runtime.md`; document the exact `/ops/halt` rollback request, cleanup-SAFE/readback checks, resting-BUY zero-row query, and resume prohibition; then grep affected names for stale dark-write claims
-- [ ] 5.2 Run targeted tests, `openspec validate issue-187-c-receipt-eligibility`, `make test`, `make detekt`, and `make build` under the validation lease and record command, scope, result, wait time, and HEAD
+- [x] 5.2 Run targeted tests, `openspec validate issue-187-c-receipt-eligibility`, `make test`, `make detekt`, and `make build` under the validation lease and record command, scope, result, wait time, and HEAD
