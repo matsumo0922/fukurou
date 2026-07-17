@@ -9,7 +9,7 @@ Issue #189 non-regression invariant: The daemon MUST evaluate a code-owned relea
 
 #### Scenario: Deployment candidate unexpectedly opens the barrier
 - **WHEN** a deployment candidate reports the pre-filter release barrier as open before Issue #154 activation
-- **THEN** deployment preflight fails before production mutation
+- **THEN** deployment preflight fails before the candidate runtime is started or activated
 
 ### Requirement: No-tool Claude invocations preserve authentication without tools
 Issue #189 auth-smoke prerequisite: Claude invocations without an MCP server MUST use the copied per-run authentication state, strict empty MCP configuration, and an explicit empty tool policy without passing an option that disables the supported authentication source.
@@ -33,6 +33,10 @@ Issue #189 sandbox/tool-inventory DoD: Every LLM invocation request MUST carry a
 - **WHEN** a phase requires a tool that is not enabled by its policy
 - **THEN** rendering fails before credentials, MCP runtime, or provider process are exposed
 
+#### Scenario: Risk-reduction policy reaches the fixed launcher
+- **WHEN** Claude runs the canonical `RISK_REDUCTION_ONLY` phase after standard material capture fails
+- **THEN** the fixed supervisor accepts exactly that phase policy without accepting an arbitrary tool set
+
 ### Requirement: Pinned CLI output is parsed as a versioned contract
 Issue #189 deploy-smoke prerequisite: Claude and Codex output parsers MUST validate the pinned CLI event/result schema, preserve semantic response and token usage separately, and return a typed schema failure for an incompatible or incomplete terminal payload.
 
@@ -42,7 +46,7 @@ Issue #189 deploy-smoke prerequisite: Claude and Codex output parsers MUST valid
 
 #### Scenario: CLI output schema drifts
 - **WHEN** a pinned-provider smoke or runtime invocation omits a required terminal field or emits an unsupported schema
-- **THEN** the invocation records a typed output-contract failure and cannot be treated as a successful decision phase
+- **THEN** the invocation records a typed output-contract failure, cannot authorize `ENTER` or `ADD_LONG`, and does not invalidate an already persisted bounded `EXIT`, `REDUCE`, or `ADJUST_PROTECTION` decision
 
 ### Requirement: Provider failures have stable typed categories
 Issue #189 typed-failure DoD: The runtime MUST classify authentication, rate/session limit, quota exhaustion, output contract, timeout, non-zero process exit, and cleanup failure into stable provider-neutral categories while retaining provider-specific safe detail separately.
@@ -60,7 +64,7 @@ Issue #189 typed-failure DoD: The runtime MUST classify authentication, rate/ses
 - **THEN** audit records `UNKNOWN_PROVIDER_FAILURE`, remains fail-closed, and retains only redacted safe diagnostics
 
 ### Requirement: Model attribution does not depend on retained session files
-Issue #189 session-retention and cost-attribution prerequisites: Every invocation MUST persist configured model identity and SHALL prefer model identity reported by the supported provider output. Runtime cost and audit attribution MUST NOT require scanning the CLI session directory.
+Issue #189 session-retention and cost-attribution prerequisites: Every invocation MUST persist configured model identity as an effective model name or an explicit `CLI_DEFAULT` source without inventing a name, and SHALL store provider-observed model identity separately when supported output reports it. Runtime cost and audit attribution MUST NOT require scanning the CLI session directory.
 
 #### Scenario: Provider output reports a model
 - **WHEN** the supported output schema contains model identity
@@ -68,4 +72,4 @@ Issue #189 session-retention and cost-attribution prerequisites: Every invocatio
 
 #### Scenario: Provider output omits model identity
 - **WHEN** model identity is absent from otherwise valid provider output
-- **THEN** audit retains configured model identity, marks observed identity unavailable, and does not scan session files
+- **THEN** audit retains the effective configured name or explicit `CLI_DEFAULT` source, marks observed identity unavailable, and does not scan session files
