@@ -6,10 +6,13 @@ import kotlinx.serialization.json.JsonPrimitive
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.requiresCompleteTerminalEvidence
 import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
+import java.io.IOException
 import java.math.BigDecimal
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
@@ -17,6 +20,8 @@ import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermission
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -49,6 +54,7 @@ class LlmDecisionSubmissionGatewayTest {
         )
 
         assertTrue(Files.exists(path))
+        assertEquals(LlmSemanticSubmissionState.NOT_ATTEMPTED, gateway.semanticSubmissionState())
         gateway.close()
         assertFalse(Files.exists(path))
     }
@@ -182,6 +188,7 @@ class LlmDecisionSubmissionGatewayTest {
 
         assertEquals("true", response.getValue("accepted").toString())
         assertEquals(DecisionAction.NO_TRADE, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action)
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, gateway.semanticSubmissionState())
         gateway.close()
         assertFalse(Files.exists(path))
     }
@@ -227,6 +234,89 @@ class LlmDecisionSubmissionGatewayTest {
 
         assertEquals("false", response.getValue("accepted").toString())
         assertEquals(null, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow())
+        assertEquals(LlmSemanticSubmissionState.REJECTED, gateway.semanticSubmissionState())
+        gateway.close()
+    }
+
+    @Test
+    fun `in flight repository transaction remains unknown when close times out`() = runBlocking {
+        val delegate = InMemoryDecisionRepository()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val repository = object : DecisionRepository by delegate {
+            override suspend fun submitDecision(
+                submission: DecisionSubmission,
+            ): Result<me.matsumo.fukurou.trading.decision.DecisionSubmissionResult> {
+                entered.countDown()
+                while (true) {
+                    try {
+                        if (release.await(5, TimeUnit.SECONDS)) break
+                    } catch (_: InterruptedException) {
+                        // A blocking repository transaction can outlive gateway shutdown interruption.
+                    }
+                }
+                return delegate.submitDecision(submission)
+            }
+        }
+        val path = Path.of("/tmp/fukurou-gateway-race-${System.nanoTime()}.sock")
+        val gateway = LlmDecisionSubmissionGateway.start(
+            socketPath = path,
+            repository = repository,
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+        )
+        val channel = connect(path)
+        LlmSubmissionGatewayCodec.writeFrame(
+            channel,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)),
+        )
+        assertTrue(entered.await(1, TimeUnit.SECONDS))
+
+        assertFailsWith<IllegalStateException> { gateway.close() }
+
+        assertEquals(LlmSemanticSubmissionState.IN_FLIGHT, gateway.semanticSubmissionState())
+        release.countDown()
+        channel.close()
+    }
+
+    @Test
+    fun `repository completion failure after commit remains unknown`() = runBlocking {
+        val delegate = InMemoryDecisionRepository()
+        val repository = object : DecisionRepository by delegate {
+            override suspend fun submitDecision(
+                submission: DecisionSubmission,
+            ): Result<me.matsumo.fukurou.trading.decision.DecisionSubmissionResult> {
+                delegate.submitDecision(submission).getOrThrow()
+
+                return Result.failure(IOException("repository completion was lost"))
+            }
+        }
+        val path = Path.of("/tmp/fukurou-gateway-ambiguous-${System.nanoTime()}.sock")
+        val gateway = LlmDecisionSubmissionGateway.start(
+            socketPath = path,
+            repository = repository,
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+        )
+
+        val response = connect(path).use { channel ->
+            LlmSubmissionGatewayCodec.writeFrame(
+                channel,
+                request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)),
+            )
+            LlmSubmissionGatewayCodec.readFrame(channel)
+        }
+
+        assertEquals("false", response.getValue("accepted").toString())
+        assertEquals(
+            DecisionAction.NO_TRADE,
+            delegate.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action,
+        )
+        assertEquals(LlmSemanticSubmissionState.IN_FLIGHT, gateway.semanticSubmissionState())
         gateway.close()
     }
 

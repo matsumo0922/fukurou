@@ -46,7 +46,7 @@ WORKDIR /app
 
 # 非 root 実行ユーザを用意する。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git libcap2-bin nodejs npm \
+    && apt-get install -y --no-install-recommends ca-certificates curl git libcap2-bin nodejs npm util-linux \
     && npm install -g @anthropic-ai/claude-code@2.1.199 @openai/codex@0.142.5 \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \

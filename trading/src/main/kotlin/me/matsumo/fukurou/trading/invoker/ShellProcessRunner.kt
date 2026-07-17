@@ -22,6 +22,8 @@ import kotlin.time.toDuration
 class ShellProcessRunner(
     private val terminationGrace: Duration = Duration.ofSeconds(10),
     private val linuxProcRoot: Path = Path.of(LINUX_PROC_ROOT),
+    private val descendantDiscovery: (Process) -> List<ProcessHandle> = Process::descendantsDeepestFirst,
+    private val linuxSetsidPath: Path = Path.of(LINUX_SETSID_PATH),
 ) : ProcessStartAwareRunner {
 
     init {
@@ -64,7 +66,10 @@ class ShellProcessRunner(
                 }
 
                 if (exitCode == null) {
-                    val terminationProof = destroyProcessTreeNonCancellable(startedProcess).getOrThrow()
+                    val terminationProof = destroyProcessTreeNonCancellable(
+                        process = startedProcess,
+                        supervisorAcknowledgementRequired = true,
+                    ).getOrThrow()
 
                     return@coroutineScope ProcessRunResult(
                         status = ProcessRunStatus.TIMED_OUT,
@@ -75,7 +80,10 @@ class ShellProcessRunner(
                     )
                 }
 
-                val terminationProof = destroyProcessTreeNonCancellable(startedProcess).getOrThrow()
+                val terminationProof = destroyProcessTreeNonCancellable(
+                    process = startedProcess,
+                    supervisorAcknowledgementRequired = false,
+                ).getOrThrow()
 
                 ProcessRunResult(
                     status = ProcessRunStatus.EXITED,
@@ -85,7 +93,10 @@ class ShellProcessRunner(
                     processTreeTerminationProof = terminationProof,
                 )
             } catch (throwable: CancellationException) {
-                val destroyResult = destroyProcessTreeNonCancellable(startedProcess)
+                val destroyResult = destroyProcessTreeNonCancellable(
+                    process = startedProcess,
+                    supervisorAcknowledgementRequired = true,
+                )
                 destroyResult.exceptionOrNull()?.let { destroyFailure -> throwable.addSuppressed(destroyFailure) }
 
                 if (destroyResult.getOrNull() == ProcessTreeTerminationProof.PROVEN_EXITED) {
@@ -99,9 +110,9 @@ class ShellProcessRunner(
     private fun startProcess(command: RenderedLlmCommand): StartedProcess {
         Files.createDirectories(command.workingDirectory)
 
-        val useProcessGroup = Files.isExecutable(Path.of(LINUX_SETSID_PATH))
+        val useProcessGroup = Files.isExecutable(linuxSetsidPath)
         val processCommand = if (useProcessGroup) {
-            listOf(LINUX_SETSID_PATH, command.executable) + command.args
+            listOf(linuxSetsidPath.toString(), command.executable) + command.args
         } else {
             listOf(command.executable) + command.args
         }
@@ -119,34 +130,54 @@ class ShellProcessRunner(
         )
     }
 
-    private suspend fun destroyProcessTree(startedProcess: StartedProcess): ProcessTreeTerminationProof {
+    private suspend fun destroyProcessTree(
+        startedProcess: StartedProcess,
+        supervisorAcknowledgementRequired: Boolean,
+    ): ProcessTreeTerminationProof {
         return withContext(Dispatchers.IO) {
             val process = startedProcess.process
             val processGroupId = startedProcess.processGroupId
             if (processGroupId != null) {
-                terminateLinuxProcessGroup(process, processGroupId)
-                return@withContext ProcessTreeTerminationProof.PROVEN_EXITED
+                return@withContext terminateLinuxProcessGroup(
+                    process = process,
+                    processGroupId = processGroupId,
+                    supervisorAcknowledgementRequired = supervisorAcknowledgementRequired,
+                )
             }
 
-            val descendants = process.descendantsDeepestFirst()
+            var discoveryFailure: Throwable? = null
+            var remainingDescendants = emptyList<ProcessHandle>()
+            try {
+                val descendants = descendantDiscovery(process)
+                descendants.forEach { descendant -> runCatching { descendant.destroy() } }
+                awaitProcessHandles(descendants, terminationGrace)
 
-            descendants.forEach { descendant -> runCatching { descendant.destroy() } }
-            awaitProcessHandles(descendants, terminationGrace)
+                remainingDescendants = (descendants + descendantDiscovery(process))
+                    .distinctBy(ProcessHandle::pidSafely)
+                remainingDescendants.filter(ProcessHandle::isAliveSafely)
+                    .forEach { descendant -> runCatching { descendant.destroyForcibly() } }
+                remainingDescendants.forEach { descendant -> descendant.awaitExitQuietly() }
+            } catch (throwable: Throwable) {
+                discoveryFailure = throwable
+            }
 
-            val remainingDescendants = (descendants + process.descendantsDeepestFirst())
-                .distinctBy(ProcessHandle::pidSafely)
-            remainingDescendants.filter(ProcessHandle::isAliveSafely)
-                .forEach { descendant -> runCatching { descendant.destroyForcibly() } }
-            remainingDescendants.forEach { descendant -> descendant.awaitExitQuietly() }
-
-            process.destroy()
-            val processExitedGracefully = process.waitFor(terminationGrace.toMillis(), TimeUnit.MILLISECONDS)
-            if (!processExitedGracefully && process.isAlive) process.destroyForcibly()
-            val processExited = process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
+            val rootTerminationFailure = runCatching {
+                process.destroy()
+                val processExitedGracefully = process.waitFor(terminationGrace.toMillis(), TimeUnit.MILLISECONDS)
+                if (!processExitedGracefully && process.isAlive) process.destroyForcibly()
+                check(process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)) {
+                    "LLM root process did not exit after TERM/KILL sequence."
+                }
+            }.exceptionOrNull()
+            discoveryFailure?.let { failure ->
+                rootTerminationFailure?.let(failure::addSuppressed)
+                throw failure
+            }
+            rootTerminationFailure?.let { failure -> throw failure }
             val processTreeExited = remainingDescendants.none { descendant ->
                 descendant.pidSafely()?.isProcessAlive() ?: true
             }
-            check(processExited && processTreeExited) {
+            check(processTreeExited) {
                 "LLM process tree did not exit after TERM/KILL sequence."
             }
             ProcessTreeTerminationProof.UNCERTAIN
@@ -155,16 +186,23 @@ class ShellProcessRunner(
 
     private suspend fun destroyProcessTreeNonCancellable(
         process: StartedProcess,
+        supervisorAcknowledgementRequired: Boolean,
     ): Result<ProcessTreeTerminationProof> {
         return withContext(NonCancellable) {
             runCatching {
-                destroyProcessTree(process)
+                destroyProcessTree(process, supervisorAcknowledgementRequired)
             }
         }
     }
 
-    private fun terminateLinuxProcessGroup(process: Process, processGroupId: Long) {
-        signalProcessGroup(processGroupId, "TERM")
+    private fun terminateLinuxProcessGroup(
+        process: Process,
+        processGroupId: Long,
+        supervisorAcknowledgementRequired: Boolean,
+    ): ProcessTreeTerminationProof {
+        if (process.isAlive || isLinuxProcessGroupRunning(processGroupId)) {
+            signalProcessGroup(processGroupId, "TERM")
+        }
         val gracefulDeadline = System.nanoTime() + terminationGrace.toNanos()
         while (isLinuxProcessGroupRunning(processGroupId) && System.nanoTime() < gracefulDeadline) {
             Thread.sleep(PROCESS_TREE_EXIT_POLL_MILLIS)
@@ -174,6 +212,14 @@ class ShellProcessRunner(
         val processExited = process.waitFor(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
         check(processExited && !isLinuxProcessGroupRunning(processGroupId)) {
             "LLM Linux process group did not exit after TERM/KILL sequence."
+        }
+
+        val supervisorAcknowledged = runCatching { process.exitValue() == SUPERVISOR_CLEANUP_ACK_EXIT_STATUS }
+            .getOrDefault(false)
+        return if (!supervisorAcknowledgementRequired || supervisorAcknowledged) {
+            ProcessTreeTerminationProof.PROVEN_EXITED
+        } else {
+            ProcessTreeTerminationProof.UNCERTAIN
         }
     }
 
@@ -344,6 +390,7 @@ private const val PROCESS_TREE_KILL_WAIT_SECONDS = 2L
 private const val PROCESS_TREE_ENUMERATION_ATTEMPTS = 20
 private const val PROCESS_TREE_EXIT_POLL_MILLIS = 10L
 private const val PROCESS_GROUP_SIGNAL_WAIT_SECONDS = 2L
+private const val SUPERVISOR_CLEANUP_ACK_EXIT_STATUS = 124
 private const val LINUX_SETSID_PATH = "/usr/bin/setsid"
 private const val LINUX_KILL_PATH = "/bin/kill"
 private const val LINUX_PROC_ROOT = "/proc"

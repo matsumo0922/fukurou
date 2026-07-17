@@ -243,13 +243,28 @@ enum class ProcessRunStatus {
     TIMED_OUT,
 }
 
-/** root と全 descendant の終了を証明できたかを表す。 */
+/** supervisor acknowledgement を含め、provider / MCP tree の終了を証明できたかを表す。 */
 enum class ProcessTreeTerminationProof {
-    /** TERM/KILL/wait と再列挙により全 process の終了を確認した。 */
+    /** supervisor acknowledgement または bounded TERM/KILL/wait により全 process の終了を確認した。 */
     PROVEN_EXITED,
 
     /** late fork、列挙、signal、wait のいずれかに不確実性が残る。 */
     UNCERTAIN,
+}
+
+/** app-owned submission gateway が観測した semantic submission の phase-local state。 */
+enum class LlmSemanticSubmissionState {
+    /** repository submission は開始されていない。 */
+    NOT_ATTEMPTED,
+
+    /** repository submission が進行中で、commit 成否をまだ確定できない。 */
+    IN_FLIGHT,
+
+    /** repository submission が正常に完了した。 */
+    COMMITTED,
+
+    /** request または repository submission が確定的に拒否された。 */
+    REJECTED,
 }
 
 /**

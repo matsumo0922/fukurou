@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define APP_UID 10001
@@ -33,6 +34,9 @@
 #define FENCE_FILE FENCE_DIRECTORY "/fence-v1"
 #define FENCE_HASH_FILE FENCE_DIRECTORY "/fence-v1.sha256"
 #define MAX_JOBS 64
+#define MAX_AI_PROCESSES 1024
+#define CLEANUP_GRACE_MILLIS 1000LL
+#define CLEANUP_DEADLINE_MILLIS 4000LL
 
 struct launch_request {
     struct fukurou_launch_header header;
@@ -43,7 +47,20 @@ struct launch_request {
 
 struct job {
     pid_t pid;
+    pid_t pgid;
     int response_fd;
+    pid_t proxy_pid;
+    unsigned long long proxy_start_ticks;
+    int root_reaped;
+    int wait_status;
+};
+
+struct process_identity {
+    pid_t pid;
+    pid_t pgid;
+    uid_t uid;
+    char state;
+    unsigned long long start_ticks;
 };
 
 static struct job jobs[MAX_JOBS];
@@ -53,6 +70,9 @@ static unsigned long long fence_generation = 0;
 static int launches_enabled = 0;
 static char fence_state[48] = "CORRUPT";
 static int launch_listener = -1;
+static pid_t application_pid = -1;
+static int application_reaped = 0;
+static int application_wait_status = 0;
 
 static int read_database_state(unsigned long long *generation, int *maintenance_enabled, unsigned *active_registrations);
 static int reconcile_database(void);
@@ -93,6 +113,181 @@ static int read_process_start_ticks(pid_t pid, unsigned long long *start_ticks) 
         cursor = end + 1;
     }
     return -1;
+}
+
+static long long monotonic_millis(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
+    return (long long)value.tv_sec * 1000LL + value.tv_nsec / 1000000LL;
+}
+
+static int read_process_identity(pid_t pid, struct process_identity *identity) {
+    char path[64], contents[4096];
+    snprintf(path, sizeof(path), "/proc/%ld", (long)pid);
+    struct stat metadata;
+    if (stat(path, &metadata) != 0) return -1;
+    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    ssize_t length = read(fd, contents, sizeof(contents) - 1);
+    close(fd);
+    if (length <= 0) return -1;
+    contents[length] = '\0';
+    char *cursor = strrchr(contents, ')');
+    if (cursor == NULL || cursor[1] != ' ') return -1;
+    cursor += 2;
+    char state = '\0';
+    long parent = 0, pgid = 0;
+    unsigned long long start_ticks = 0;
+    if (sscanf(cursor, "%c %ld %ld", &state, &parent, &pgid) != 3) return -1;
+    for (unsigned field = 3; field <= 22; field++) {
+        char *end = strchr(cursor, ' ');
+        if (field == 22) {
+            char *parse_end = NULL;
+            errno = 0;
+            start_ticks = strtoull(cursor, &parse_end, 10);
+            if (errno != 0 || parse_end == cursor || start_ticks == 0) return -1;
+            break;
+        }
+        if (end == NULL) return -1;
+        cursor = end + 1;
+    }
+    (void)parent;
+    *identity = (struct process_identity){
+        .pid = pid, .pgid = (pid_t)pgid, .uid = metadata.st_uid, .state = state, .start_ticks = start_ticks,
+    };
+    return 0;
+}
+
+static int is_proxy_exempt(const struct process_identity *identity) {
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].proxy_pid == identity->pid && jobs[index].proxy_start_ticks == identity->start_ticks &&
+            jobs[index].response_fd >= 0) return 1;
+    }
+    return 0;
+}
+
+static int is_known_job_group(pid_t pgid) {
+    if (pgid <= 0) return 0;
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].pgid == pgid) return 1;
+    }
+    return 0;
+}
+
+static size_t scan_ai_processes(struct process_identity processes[MAX_AI_PROCESSES], int rogue_only) {
+    DIR *directory = opendir("/proc");
+    if (directory == NULL) return MAX_AI_PROCESSES;
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        char *end = NULL;
+        long value = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || value <= 0 || value > INT32_MAX) continue;
+        struct process_identity identity;
+        if (read_process_identity((pid_t)value, &identity) != 0 ||
+            (identity.uid != LLM_UID && identity.uid != MCP_UID) || is_proxy_exempt(&identity) ||
+            (rogue_only && is_known_job_group(identity.pgid))) continue;
+        if (count == MAX_AI_PROCESSES) { closedir(directory); return MAX_AI_PROCESSES; }
+        processes[count++] = identity;
+    }
+    closedir(directory);
+    return count;
+}
+
+static int process_group_running(pid_t pgid) {
+    DIR *directory = opendir("/proc");
+    if (directory == NULL) return 1;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        char *end = NULL;
+        long value = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || value <= 0 || value > INT32_MAX) continue;
+        struct process_identity identity;
+        if (read_process_identity((pid_t)value, &identity) == 0 && identity.pgid == pgid) {
+            closedir(directory);
+            return 1;
+        }
+    }
+    closedir(directory);
+    return 0;
+}
+
+static void record_reaped_child(pid_t child, int status) {
+    if (child == application_pid) {
+        application_reaped = 1;
+        application_wait_status = status;
+        return;
+    }
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].pid == child) {
+            jobs[index].root_reaped = 1;
+            jobs[index].wait_status = status;
+            return;
+        }
+    }
+}
+
+static void drain_adopted_children(void) {
+    for (;;) {
+        int status = 0;
+        pid_t child = waitpid(-1, &status, WNOHANG);
+        if (child <= 0) return;
+        record_reaped_child(child, status);
+    }
+}
+
+static void signal_ai_scope(int signal_number) {
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].pgid > 0) kill(-jobs[index].pgid, signal_number);
+    }
+    struct process_identity processes[MAX_AI_PROCESSES];
+    size_t count = scan_ai_processes(processes, 0);
+    if (count == MAX_AI_PROCESSES) return;
+    for (size_t index = 0; index < count; index++) kill(processes[index].pid, signal_number);
+}
+
+static int cleanup_all_ai_jobs(void) {
+    long long started = monotonic_millis();
+    int sent_kill = 0;
+    signal_ai_scope(SIGTERM);
+    for (;;) {
+        drain_adopted_children();
+        struct process_identity processes[MAX_AI_PROCESSES];
+        size_t count = scan_ai_processes(processes, 0);
+        int groups_running = 0;
+        for (size_t index = 0; index < MAX_JOBS; index++) {
+            if (jobs[index].pgid > 0 && process_group_running(jobs[index].pgid)) groups_running = 1;
+        }
+        if (!groups_running && count == 0) break;
+        long long elapsed = monotonic_millis() - started;
+        if (!sent_kill && elapsed >= CLEANUP_GRACE_MILLIS) {
+            signal_ai_scope(SIGKILL);
+            sent_kill = 1;
+        }
+        if (elapsed >= CLEANUP_DEADLINE_MILLIS) {
+            launches_enabled = 0;
+            if (launch_listener >= 0) { close(launch_listener); launch_listener = -1; unlink(FUKUROU_LAUNCH_SOCKET); }
+            return -1;
+        }
+        usleep(10000);
+    }
+    drain_adopted_children();
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].pid == 0) continue;
+        jobs[index].pid = 0;
+        jobs[index].pgid = 0;
+    }
+    for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].proxy_pid <= 0) continue;
+        int acknowledgement = FUKUROU_SUPERVISOR_CLEANUP_ACK;
+        send(jobs[index].response_fd, &acknowledgement, sizeof(acknowledgement), MSG_NOSIGNAL);
+        close(jobs[index].response_fd);
+        jobs[index] = (struct job){0};
+    }
+    return 0;
 }
 
 static int deterministic_uuid(const char *namespace_prefix, const char *invocation_id, const char *role, char output[37]) {
@@ -622,6 +817,7 @@ static size_t available_job_slot(void) {
 
 static void reject_spawned_child(pid_t child, int start_gate, struct launch_request *request) {
     close(start_gate);
+    kill(-child, SIGKILL);
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     close_request_descriptors(request);
@@ -633,6 +829,11 @@ static void accept_launch(int listener) {
     struct ucred credentials;
     socklen_t credential_length = sizeof(credentials);
     if (getsockopt(connection, SOL_SOCKET, SO_PEERCRED, &credentials, &credential_length) != 0) {
+        close(connection);
+        return;
+    }
+    unsigned long long proxy_start_ticks = 0;
+    if (read_process_start_ticks(credentials.pid, &proxy_start_ticks) != 0) {
         close(connection);
         return;
     }
@@ -675,6 +876,7 @@ static void accept_launch(int listener) {
     }
     if (child == 0) {
         close(start_gate[1]);
+        if (setpgid(0, 0) != 0 || getpgrp() != getpid()) _exit(126);
         char permission = 0;
         if (read(start_gate[0], &permission, 1) != 1 || permission != '1') _exit(126);
         close(start_gate[0]);
@@ -689,6 +891,11 @@ static void accept_launch(int listener) {
         _exit(126);
     }
     close(start_gate[0]);
+    if (setpgid(child, child) != 0 || getpgid(child) != child) {
+        reject_spawned_child(child, start_gate[1], &request);
+        close(connection);
+        return;
+    }
     const char *invocation_id = environment_value(environment, "FUKUROU_INVOCATION_ID");
     const char *registration_role = request.header.profile == FUKUROU_PROFILE_MCP_CURRENT_V1 ? "MCP" : "PROVIDER";
     int receipt_result = request.header.profile == FUKUROU_PROFILE_FOUNDATION_CANARY_V1 ||
@@ -703,20 +910,45 @@ static void accept_launch(int listener) {
     }
     close(start_gate[1]);
     close_request_descriptors(&request);
-    jobs[slot] = (struct job){.pid = child, .response_fd = connection};
+    jobs[slot] = (struct job){
+        .pid = child,
+        .pgid = child,
+        .response_fd = connection,
+        .proxy_pid = credentials.pid,
+        .proxy_start_ticks = proxy_start_ticks,
+    };
 }
 
 static void reap_jobs(void) {
     for (size_t index = 0; index < MAX_JOBS; index++) {
+        if (jobs[index].pid == 0 || jobs[index].root_reaped) continue;
+        int status = 0;
+        pid_t child = waitpid(jobs[index].pid, &status, WNOHANG);
+        if (child == jobs[index].pid) record_reaped_child(child, status);
+    }
+    struct process_identity rogues[MAX_AI_PROCESSES];
+    if (scan_ai_processes(rogues, 1) > 0) {
+        cleanup_all_ai_jobs();
+        return;
+    }
+    for (size_t index = 0; index < MAX_JOBS; index++) {
         if (jobs[index].pid == 0) continue;
-        int wait_status = 0;
-        pid_t result = waitpid(jobs[index].pid, &wait_status, WNOHANG);
-        if (result <= 0) continue;
+        if (!jobs[index].root_reaped) continue;
+        if (process_group_running(jobs[index].pgid)) continue;
+        int wait_status = jobs[index].wait_status;
         int status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : 128 + WTERMSIG(wait_status);
         send(jobs[index].response_fd, &status, sizeof(status), MSG_NOSIGNAL);
         close(jobs[index].response_fd);
         jobs[index] = (struct job){0};
     }
+}
+
+static int job_connection_abandoned(struct job *job, short revents) {
+    if (!(revents & (POLLIN | POLLRDHUP | POLLHUP | POLLERR))) return 0;
+    char byte = 0;
+    ssize_t received = recv(job->response_fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+    return received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) ||
+        (revents & (POLLRDHUP | POLLHUP | POLLERR));
 }
 
 static void accept_control(int listener) {
@@ -1286,8 +1518,134 @@ static int protocol_selftest(void) {
     return 0;
 }
 
+static int cleanup_selftest_proxy(int response_fd, uid_t uid) {
+    if (setgroups(0, NULL) != 0 || setresgid(uid == MCP_UID ? MCP_GID : LLM_GID, uid == MCP_UID ? MCP_GID : LLM_GID,
+        uid == MCP_UID ? MCP_GID : LLM_GID) != 0 || setresuid(uid, uid, uid) != 0) return 125;
+    int acknowledgement = 0;
+    ssize_t received = recv(response_fd, &acknowledgement, sizeof(acknowledgement), 0);
+    return received == sizeof(acknowledgement) && acknowledgement == FUKUROU_SUPERVISOR_CLEANUP_ACK ? 0 : 125;
+}
+
+static int cleanup_selftest_job(int gate, int ready, uid_t uid, unsigned fixture) {
+    if (setpgid(0, 0) != 0 || getpgrp() != getpid()) return 125;
+    char permission = 0;
+    if (read(gate, &permission, 1) != 1 || permission != '1') pause();
+    if (setgroups(0, NULL) != 0 || setresgid(uid == MCP_UID ? MCP_GID : LLM_GID, uid == MCP_UID ? MCP_GID : LLM_GID,
+        uid == MCP_UID ? MCP_GID : LLM_GID) != 0 || setresuid(uid, uid, uid) != 0) return 125;
+    if (fixture == 2 || fixture == 3) {
+        pid_t descendant = fork();
+        if (descendant < 0) return 125;
+        if (descendant == 0) {
+            if (fixture == 2) signal(SIGTERM, SIG_IGN);
+            if (fixture == 3 && setsid() < 0) _exit(125);
+            for (;;) pause();
+        }
+        if (fixture == 2) {
+            write(ready, "1", 1);
+            return 0;
+        }
+    }
+    if (write(ready, "1", 1) != 1) return 125;
+    for (;;) pause();
+}
+
+static pid_t spawn_cleanup_selftest_rogue(uid_t uid, int ready) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    if (setsid() < 0 || setgroups(0, NULL) != 0 ||
+        setresgid(uid == MCP_UID ? MCP_GID : LLM_GID, uid == MCP_UID ? MCP_GID : LLM_GID,
+            uid == MCP_UID ? MCP_GID : LLM_GID) != 0 || setresuid(uid, uid, uid) != 0 ||
+        write(ready, "1", 1) != 1) _exit(125);
+    close(ready);
+    for (;;) pause();
+}
+
+static int cleanup_selftest_case(unsigned iteration, int cancellation_shape) {
+    memset(jobs, 0, sizeof(jobs));
+    unsigned fixture = iteration % 5U;
+    uid_t uid = iteration % 2U == 0 ? LLM_UID : MCP_UID;
+    int response[2], gate[2], ready[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, response) != 0 ||
+        pipe2(gate, O_CLOEXEC) != 0 || pipe2(ready, O_CLOEXEC) != 0) return 125;
+    pid_t proxy = fork();
+    if (proxy < 0) return 125;
+    if (proxy == 0) {
+        close(response[0]);
+        _exit(cleanup_selftest_proxy(response[1], uid));
+    }
+    close(response[1]);
+    unsigned long long proxy_start_ticks = 0;
+    if (read_process_start_ticks(proxy, &proxy_start_ticks) != 0) return 125;
+    pid_t root = fork();
+    if (root < 0) return 125;
+    if (root == 0) {
+        close(gate[1]); close(ready[0]);
+        _exit(cleanup_selftest_job(gate[0], ready[1], uid, fixture));
+    }
+    close(gate[0]); close(ready[1]);
+    if (setpgid(root, root) != 0 || getpgid(root) != root) return 125;
+    jobs[0] = (struct job){
+        .pid = root, .pgid = root, .response_fd = response[0],
+        .proxy_pid = proxy, .proxy_start_ticks = proxy_start_ticks,
+    };
+    pid_t rogue = -1;
+    if (fixture == 4) {
+        int rogue_ready[2];
+        if (pipe2(rogue_ready, O_CLOEXEC) != 0) return 125;
+        rogue = spawn_cleanup_selftest_rogue(uid, rogue_ready[1]);
+        close(rogue_ready[1]);
+        if (rogue < 0) return 125;
+        char value = 0;
+        if (read(rogue_ready[0], &value, 1) != 1) return 125;
+        close(rogue_ready[0]);
+        unsigned long long rogue_start_ticks = 0;
+        if (read_process_start_ticks(rogue, &rogue_start_ticks) != 0) return 125;
+        jobs[1] = (struct job){
+            .response_fd = open("/dev/null", O_WRONLY | O_CLOEXEC),
+            .proxy_pid = rogue,
+            .proxy_start_ticks = rogue_start_ticks + 1U,
+        };
+    }
+    if (fixture != 0 || cancellation_shape) {
+        if (write(gate[1], "1", 1) != 1) return 125;
+        char value = 0;
+        if (read(ready[0], &value, 1) != 1) return 125;
+    }
+    close(gate[1]); close(ready[0]);
+    if (cleanup_all_ai_jobs() != 0) return 125;
+    int proxy_status = 0;
+    if (waitpid(proxy, &proxy_status, 0) != proxy || !WIFEXITED(proxy_status) || WEXITSTATUS(proxy_status) != 0) return 125;
+    drain_adopted_children();
+    struct process_identity remaining[MAX_AI_PROCESSES];
+    if (scan_ai_processes(remaining, 0) != 0 || available_job_slot() != 0) return 125;
+    (void)rogue;
+    return 0;
+}
+
+static int cleanup_selftest(void) {
+    if (getpid() != 1 || getuid() != 0 || access("/usr/bin/setsid", X_OK) != 0 || access("/proc/self/stat", R_OK) != 0) {
+        return 125;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    for (unsigned iteration = 0; iteration < 100; iteration++) {
+        if (cleanup_selftest_case(iteration, 0) != 0) {
+            fprintf(stderr, "cleanup selftest failed: shape=timeout iteration=%u fixture=%u\n", iteration, iteration % 5U);
+            return 125;
+        }
+    }
+    for (unsigned iteration = 0; iteration < 100; iteration++) {
+        if (cleanup_selftest_case(iteration, 1) != 0) {
+            fprintf(stderr, "cleanup selftest failed: shape=cancellation iteration=%u fixture=%u\n", iteration, iteration % 5U);
+            return 125;
+        }
+    }
+    printf("CLEANUP_SELFTEST_OK timeout=100 cancellation=100 cases=gate-before,gate-after,root-first,session-escape,proxy-exact,pid-reuse inventory=empty\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--protocol-selftest") == 0) return protocol_selftest();
+    if (argc == 2 && strcmp(argv[1], "--cleanup-selftest") == 0) return cleanup_selftest();
     if (argc == 7 && strcmp(argv[1], "--deploy-operation-probe") == 0) {
         const char *catalog_hash = argv[2];
         if (strlen(catalog_hash) != 64) return 2;
@@ -1327,17 +1685,41 @@ int main(int argc, char **argv) {
     }
     int control = create_socket(CONTROL_SOCKET, 0600);
     if (launches_enabled) launch_listener = create_socket(FUKUROU_LAUNCH_SOCKET, 0666);
-    pid_t application = start_application();
-    if (application < 0) fatal("cannot start application");
+    application_pid = start_application();
+    if (application_pid < 0) fatal("cannot start application");
 
     for (;;) {
-        struct pollfd descriptors[2] = {{control, POLLIN, 0}, {launch_listener, POLLIN, 0}};
-        if (poll(descriptors, 2, 200) < 0 && errno != EINTR) fatal("poll failed");
+        struct pollfd descriptors[MAX_JOBS + 2] = {{control, POLLIN, 0}, {launch_listener, POLLIN, 0}};
+        size_t job_indexes[MAX_JOBS];
+        nfds_t descriptor_count = 2;
+        for (size_t index = 0; index < MAX_JOBS; index++) {
+            if (jobs[index].pid == 0) continue;
+            descriptors[descriptor_count] = (struct pollfd){
+                .fd = jobs[index].response_fd,
+                .events = POLLIN | POLLRDHUP,
+            };
+            job_indexes[descriptor_count - 2] = index;
+            descriptor_count++;
+        }
+        if (poll(descriptors, descriptor_count, 200) < 0 && errno != EINTR) fatal("poll failed");
         if (descriptors[0].revents & POLLIN) accept_control(control);
         if (launch_listener >= 0 && descriptors[1].revents & POLLIN) accept_launch(launch_listener);
+        int cancellation_requested = 0;
+        for (nfds_t descriptor = 2; descriptor < descriptor_count; descriptor++) {
+            if (job_connection_abandoned(&jobs[job_indexes[descriptor - 2]], descriptors[descriptor].revents)) {
+                cancellation_requested = 1;
+            }
+        }
+        if (cancellation_requested) cleanup_all_ai_jobs();
         reap_jobs();
-        int status = 0;
-        pid_t result = waitpid(application, &status, WNOHANG);
-        if (result == application) return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        if (!application_reaped) {
+            int status = 0;
+            pid_t result = waitpid(application_pid, &status, WNOHANG);
+            if (result == application_pid) record_reaped_child(result, status);
+        }
+        if (application_reaped) {
+            return WIFEXITED(application_wait_status)
+                ? WEXITSTATUS(application_wait_status) : 128 + WTERMSIG(application_wait_status);
+        }
     }
 }

@@ -5,8 +5,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryLlmInputManifestRepository
@@ -24,6 +26,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
+import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
@@ -99,6 +102,7 @@ class LlmInvocationAuditorTest {
         assertEquals("proposer", requireNotNull(payload["phase"]).jsonPrimitive.content)
         assertEquals("claude", requireNotNull(details["provider"]).jsonPrimitive.content)
         assertEquals("EXITED", requireNotNull(details["status"]).jsonPrimitive.content)
+        assertTerminal(details, "NOT_APPLICABLE", "PROVEN_EXITED", "COMPLETED")
         assertEquals("0.0123", requireNotNull(details["usage"]).jsonObject["totalCostUsd"]?.jsonPrimitive?.content)
         assertTrue(requireNotNull(details["stdout"]).jsonPrimitive.content.contains("[REDACTED]"))
         assertFalse(event.payload.contains("reflection-secret-token"))
@@ -240,6 +244,7 @@ class LlmInvocationAuditorTest {
         assertEquals("EXITED", details["status"]?.jsonPrimitive?.content)
         assertEquals("0", details["exitCode"]?.jsonPrimitive?.content)
         assertEquals("true", details["cleanupFailed"]?.jsonPrimitive?.content)
+        assertTerminal(details, "NOT_APPLICABLE", "PROVEN_EXITED", "FAILED")
         assertTrue(details["cleanupFailed"]?.jsonPrimitive?.isString == true)
         assertEquals("12", auditUsage["usage"]?.jsonObject?.get("inputTokens")?.jsonPrimitive?.content)
         assertFalse(commandEventLog.events().single().payload.contains("path-marker"))
@@ -271,6 +276,7 @@ class LlmInvocationAuditorTest {
         assertEquals("FAILED_TO_START", details["status"]?.jsonPrimitive?.content)
         assertTrue(details["error"]?.jsonPrimitive?.content.orEmpty().contains("synthetic claude failure"))
         assertEquals("UNKNOWN_PROVIDER_FAILURE", details["failureCategory"]?.jsonPrimitive?.content)
+        assertTerminal(details, "NOT_APPLICABLE", "NOT_STARTED", "COMPLETED")
     }
 
     @Test
@@ -413,6 +419,7 @@ class LlmInvocationAuditorTest {
             callbackInvoked = true,
             failure = failure,
             expectedCoverage = me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_REPORTED_BY_PROVIDER,
+            expectedProcessExit = "PROVEN_EXITED",
         )
     }
 
@@ -422,6 +429,7 @@ class LlmInvocationAuditorTest {
             callbackInvoked = true,
             failure = IllegalStateException("synthetic post-start failure"),
             expectedCoverage = me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_REPORTED_BY_PROVIDER,
+            expectedProcessExit = "UNCONFIRMED",
         )
     }
 
@@ -431,7 +439,28 @@ class LlmInvocationAuditorTest {
             callbackInvoked = false,
             failure = IllegalStateException("synthetic pre-start failure"),
             expectedCoverage = me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_OBSERVABLE_BEFORE_START,
+            expectedProcessExit = "NOT_STARTED",
         )
+    }
+
+    @Test
+    fun appendPhase_keepsDeterministicProducerPayloadWithoutTerminalProjection() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+
+        auditor.appendPhase(
+            context = DecisionRunContext.EMPTY,
+            phaseName = "deterministic",
+            duration = Duration.ZERO,
+            details = buildJsonObject { put("status", "COMPLETED") },
+        ).getOrThrow()
+
+        val payload = Json.parseToJsonElement(commandEventLog.events().single().payload).jsonObject
+        assertFalse(requireNotNull(payload["details"]).jsonObject.containsKey("terminal"))
     }
 
     @Test
@@ -643,8 +672,10 @@ class LlmInvocationAuditorTest {
         callbackInvoked: Boolean,
         failure: Throwable,
         expectedCoverage: me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus,
+        expectedProcessExit: String,
     ) {
         val repository = InMemoryLlmInputManifestRepository()
+        val commandEventLog = InMemoryCommandEventLog()
         val clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC)
         val request = auditRequest(LlmProvider.CLAUDE).copy(phase = LlmInvocationPhase.PRE_FILTER)
         val invoker = ShellLlmInvoker(
@@ -653,7 +684,7 @@ class LlmInvocationAuditorTest {
         )
 
         val result = runCatching {
-            manifestAuditor(repository, clock)
+            manifestAuditor(repository, clock, commandEventLog)
                 .invokeAndAudit("pre_filter", request.decisionRunContext, request, invoker)
                 .getOrThrow()
         }
@@ -661,6 +692,26 @@ class LlmInvocationAuditorTest {
 
         assertSame(failure, result.exceptionOrNull())
         assertEquals(expectedCoverage, observation?.modelCoverageStatus)
+        val payload = Json.parseToJsonElement(commandEventLog.events().single().payload).jsonObject
+        assertTerminal(
+            requireNotNull(payload["details"]).jsonObject,
+            "NOT_APPLICABLE",
+            expectedProcessExit,
+            "COMPLETED",
+        )
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
+    private fun assertTerminal(
+        details: kotlinx.serialization.json.JsonObject,
+        semanticCommit: String,
+        processExit: String,
+        cleanup: String,
+    ) {
+        val terminal = requireNotNull(details["terminal"]).jsonObject
+        assertEquals(semanticCommit, terminal["semanticCommit"]?.jsonPrimitive?.content)
+        assertEquals(processExit, terminal["processExit"]?.jsonPrimitive?.content)
+        assertEquals(cleanup, terminal["cleanup"]?.jsonPrimitive?.content)
     }
 
     private fun assumeProcessDescendantEnumerationIsAvailable() {

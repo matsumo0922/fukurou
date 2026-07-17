@@ -36,6 +36,8 @@ FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 
 deploy 後、`llm-auth` volume が root owner で作られている場合、auth copy を作れずに失敗することがある。必要ならauth sourceだけ一度ownerを直す。per-run artifactはcomposeがapp UID/shared groupで作る`/run/fukurou/llm-homes` tmpfsに置き、provider所有のnested treeもfixed cleanup helperが回収するため、運用手順でchownしない。
 
+timeout / cancel 後は `RUNNER_PHASE_COMPLETED.details.terminal` の `semanticCommit`、`processExit`、`cleanup` を別々に確認する。`processExit=UNCONFIRMED` は supervisor cleanup acknowledgement が欠けた状態であり、process が見えないことだけで安全と判断しない。operator が UID 10002 / 10003 の process inventory を確認して再起動するまで新しい LLM launch は fail closed になる。`cleanup=FAILED` では `/run/fukurou/llm-homes/.cleanup-quarantine` と残存 artifact を一緒に監査し、削除するか container restart で tmpfs 全体を破棄する。永続 `llm-auth` source は cleanup 対象に含めない。
+
 ```sh
 ssh dxp4800plus \
   'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:10004 /tmp/fukurou-cli-home && chmod -R g+rwX /tmp/fukurou-cli-home"'
