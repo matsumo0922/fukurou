@@ -16,6 +16,40 @@ class ReleaseDeployFoundationContractTest {
     private val root = repositoryRoot()
 
     @Test
+    fun `production image publication is gated by exact target quality`() {
+        val workflow = Files.readString(root.resolve(".github/workflows/deploy.yml"))
+        val resolveJob = workflow.substringAfter("\n  resolve:").substringBefore("\n  quality:")
+        val qualityJob = workflow.substringAfter("\n  quality:").substringBefore("\n  build:")
+        val buildJob = workflow.substringAfter("\n  build:").substringBefore("\n  deploy:")
+
+        assertTrue(resolveJob.contains("deploy_sha: \${{ steps.resolve.outputs.deploy_sha }}"))
+        assertTrue(resolveJob.contains("requires_quality: \${{ steps.resolve.outputs.requires_quality }}"))
+        assertTrue(resolveJob.contains("GITHUB_EVENT_NAME"))
+        assertTrue(resolveJob.contains("origin/main"))
+        assertFalse(resolveJob.contains("packages: write"))
+
+        assertTrue(qualityJob.contains("needs: resolve"))
+        assertTrue(qualityJob.contains("if: needs.resolve.outputs.requires_quality == 'true'"))
+        assertTrue(qualityJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
+        assertTrue(qualityJob.contains("make test"))
+        assertTrue(qualityJob.contains("make detekt"))
+        assertTrue(qualityJob.contains("git diff --exit-code"))
+        assertFalse(qualityJob.contains("packages: write"))
+
+        assertTrue(buildJob.contains("needs: [resolve, quality]"))
+        assertTrue(buildJob.contains("if: always()"))
+        assertTrue(buildJob.contains("needs.resolve.result == 'success'"))
+        assertTrue(buildJob.contains("needs.quality.result == 'success'"))
+        assertTrue(buildJob.contains("needs.quality.result == 'skipped'"))
+        assertTrue(buildJob.contains("needs.resolve.outputs.requires_quality == 'false'"))
+        assertTrue(buildJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
+        assertTrue(buildJob.contains("FUKUROU_REVISION=\${{ needs.resolve.outputs.deploy_sha }}"))
+        assertFalse(buildJob.contains("steps.resolve.outputs.deploy_sha"))
+        assertTrue(buildJob.indexOf("Verify exact target checkout") < buildJob.indexOf("Login to GHCR"))
+        assertTrue(buildJob.contains("packages: write"))
+    }
+
+    @Test
     fun `typed operations and hooks remain cumulative and allowlisted`() {
         val contract = Json.parseToJsonElement(
             Files.readString(root.resolve("scripts/deploy/deploy-contract-v1.json")),
