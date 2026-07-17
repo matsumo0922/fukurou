@@ -18,18 +18,14 @@ env:
   IMAGE_NAME: ghcr.io/matsumo0922/fukurou
 
 jobs:
-  build:
-    name: Build image
+  resolve:
+    name: Resolve deploy target
     runs-on: ubuntu-latest
-    concurrency:
-      group: fukurou-build-${{ github.event.inputs.image_sha || github.sha }}
-      cancel-in-progress: true
     permissions:
       contents: read
-      packages: write
     outputs:
       deploy_sha: ${{ steps.resolve.outputs.deploy_sha }}
-      image_name: ${{ env.IMAGE_NAME }}
+      requires_quality: ${{ steps.resolve.outputs.requires_quality }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +36,7 @@ jobs:
         id: resolve
         shell: bash
         env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
           INPUT_IMAGE_SHA: ${{ github.event.inputs.image_sha }}
         run: |
           set -euo pipefail
@@ -57,9 +54,84 @@ jobs:
           git merge-base --is-ancestor "${deploy_sha}" origin/main
           git checkout --detach "${deploy_sha}"
 
+          requires_quality=true
+          main_tip="$(git rev-parse origin/main)"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${deploy_sha}" != "${main_tip}" ]]; then
+            requires_quality=false
+          fi
+
           {
             echo "deploy_sha=${deploy_sha}"
+            echo "requires_quality=${requires_quality}"
           } >> "${GITHUB_OUTPUT}"
+
+  quality:
+    name: Verify JVM quality
+    needs: resolve
+    if: needs.resolve.outputs.requires_quality == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact deploy target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.deploy_sha }}
+
+      - name: Verify exact target checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.deploy_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${EXPECTED_SHA}" ]]
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run JVM quality gates
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-deploy-quality
+        run: |
+          set -euo pipefail
+          make test
+          make detekt
+          git diff --exit-code
+
+  build:
+    name: Build image
+    needs: [resolve, quality]
+    if: always() && needs.resolve.result == 'success' && (needs.quality.result == 'success' || (needs.resolve.outputs.requires_quality == 'false' && needs.quality.result == 'skipped'))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fukurou-build-${{ needs.resolve.outputs.deploy_sha }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      deploy_sha: ${{ needs.resolve.outputs.deploy_sha }}
+      image_name: ${{ env.IMAGE_NAME }}
+    steps:
+      - name: Checkout exact deploy target
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.deploy_sha }}
+
+      - name: Verify exact target checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.deploy_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${EXPECTED_SHA}" ]]
 
       - name: Resolve image tags
         id: image_tags
@@ -67,7 +139,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          tags="${IMAGE_NAME}:${{ steps.resolve.outputs.deploy_sha }}"
+          tags="${IMAGE_NAME}:${{ needs.resolve.outputs.deploy_sha }}"
           if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
             tags="${tags}"$'\n'"${IMAGE_NAME}:main"
           fi
@@ -96,7 +168,7 @@ jobs:
           push: true
           tags: ${{ steps.image_tags.outputs.tags }}
           build-args: |
-            FUKUROU_REVISION=${{ steps.resolve.outputs.deploy_sha }}
+            FUKUROU_REVISION=${{ needs.resolve.outputs.deploy_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -105,7 +177,7 @@ jobs:
         env:
           DEPLOY_SIGNING_PRIVATE_KEY: ${{ secrets.DEPLOY_SIGNING_PRIVATE_KEY }}
           CANDIDATE_DIGEST: ${{ steps.build_push.outputs.digest }}
-          DEPLOY_SHA: ${{ steps.resolve.outputs.deploy_sha }}
+          DEPLOY_SHA: ${{ needs.resolve.outputs.deploy_sha }}
         run: |
           set -euo pipefail
 
@@ -161,7 +233,7 @@ jobs:
       - name: Upload signed deploy bundle
         uses: actions/upload-artifact@v4
         with:
-          name: deploy-bundle-${{ steps.resolve.outputs.deploy_sha }}
+          name: deploy-bundle-${{ needs.resolve.outputs.deploy_sha }}
           path: deploy-artifact/
           if-no-files-found: error
           retention-days: 1

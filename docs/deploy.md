@@ -32,7 +32,9 @@ docker compose pull && docker compose up -d
 - GitHub 管理の deploy script source は `scripts/deploy/` に置くが、NAS root への反映は手動
 - production compose は `docker-compose.prod.yml` で管理し、deploy script が指定 SHA のものだけを使う
 
-`.github/workflows/deploy.yml` の `build` job（GitHub-hosted）は commit SHA 単位の concurrency group（`cancel-in-progress: true`）で並列 build 同士の重複トリガーだけをキャンセルする。`deploy` job（self-hosted）は `fukurou-production-deploy` group（`cancel-in-progress: false`）で直列化し、production deploy が同時実行されないようにする。異なる SHA の `build` job は並列実行できるため、1 件の `deploy` job が runner 割り当て待ちで滞留しても後続 push の `build` job 開始を塞がない。`deploy` job には `timeout-minutes: 35` を設定し、25分のexecutor watchdogとrecoveryを収容しつつrunner上のハングを停止する。
+`.github/workflows/deploy.yml` は GitHub-hosted の `resolve`、`quality`、`build` と、self-hosted の `deploy` に分かれる。`resolve` は対象 SHA が `origin/main` から到達可能であることを確認し、`quality` と `build` は同じ SHA を checkout して `HEAD` 一致を検証する。automatic main push と最新 main SHA の手動 deploy は、`quality` の `make test`、`make detekt`、clean-tree 検査が成功するまで、GHCR login、image build/push、signed bundle 作成、NAS deployへ進まない。
+
+過去の main SHA を明示した `workflow_dispatch` は recovery 経路として `quality` を skip し、既存どおり image build/deployへ進む。`build` は resolved SHA 単位の concurrency group（`cancel-in-progress: true`）で並列 build 同士の重複トリガーだけをキャンセルする。`deploy` は `fukurou-production-deploy` group（`cancel-in-progress: false`）で直列化し、production deploy が同時実行されないようにする。異なる SHA の `build` job は並列実行できるため、1 件の `deploy` job が runner 割り当て待ちで滞留しても後続 push の quality/build 開始を塞がない。`deploy` job には `timeout-minutes: 35` を設定し、25分のexecutor watchdogとrecoveryを収容しつつrunner上のハングを停止する。
 
 異なる SHA の `build` job が並列に走ると、古い commit の build が新しい commit の build より遅れて完了し、`deploy` job が一時的に古い commit へ後退する場合がある。この場合は次の通常 push、または対象 SHA を明示指定した `workflow_dispatch` の再実行でロールフォワードする。
 
@@ -289,7 +291,7 @@ Access policy は `/app/*` と `/ops/*` を対象にし、runtime config draft /
 
 ## 初回デプロイ確認
 
-`main` push により `.github/workflows/deploy.yml` が実行される。build job が image を push し、deploy job が NAS runner 上で次を実行する。
+`main` push により `.github/workflows/deploy.yml` が実行される。resolve job が対象 SHA を固定し、quality job がその SHA の JVM test、detekt、clean-tree を確認する。quality 成功後だけ build job が image を pushし、deploy job が NAS runner 上で次を実行する。
 
 ```sh
 sudo /usr/local/sbin/deploy-fukurou \
