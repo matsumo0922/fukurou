@@ -8621,7 +8621,40 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(beforeOrders, ledgerRepository.getOpenOrders().getOrThrow())
         assertEquals(beforeExecutionCount, ledgerRepository.getExecutions().getOrThrow().size)
 
+        setTradeIntentThesis(database, requireNotNull(entry.intentId), "ths-target")
+        val pendingWithNullThesis = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                sizeBtc = BigDecimal("0.0002"),
+                takeProfitPriceJpy = BigDecimal("12000000"),
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val pendingOrderId = broker.placeOrder(pendingWithNullThesis).getOrThrow().orderIds.single()
+        val beforePendingLinkageFailure = ledgerRepository.getOpenOrders().getOrThrow()
+
+        val pendingLinkageFailure = broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "pending null linkage integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        )
+
+        assertIs<PaperRiskExitException.AmbiguousLinkage>(pendingLinkageFailure.exceptionOrNull())
+        assertEquals(beforeAccount, ledgerRepository.getAccountSnapshot().getOrThrow())
+        assertEquals(beforePendingLinkageFailure, ledgerRepository.getOpenOrders().getOrThrow())
+        assertEquals(beforeExecutionCount, ledgerRepository.getExecutions().getOrThrow().size)
+
+        setTradeIntentThesis(database, requireNotNull(pendingWithNullThesis.intentId), "ths-unrelated")
         setTradeIntentThesis(database, requireNotNull(entry.intentId), "ths-contradictory-a")
+        val protectiveStop = ledgerRepository.getOpenOrders().getOrThrow().single { order ->
+            order.side == OrderSide.SELL && order.positionId == positionId.toString()
+        }
         val contradictory = approvedPostgresEntryCommand(
             decisionRepository,
             postgresEntryCommand(
@@ -8629,15 +8662,17 @@ class PostgresPersistenceIntegrationTest {
                 priceJpy = BigDecimal("9900000"),
                 sizeBtc = BigDecimal("0.0002"),
                 takeProfitPriceJpy = BigDecimal("12000000"),
-            ).copy(tradeGroupId = UUID.fromString(requireNotNull(beforeOrders.single().tradeGroupId))),
+            ).copy(tradeGroupId = UUID.fromString(requireNotNull(protectiveStop.tradeGroupId))),
         )
         setTradeIntentThesis(database, requireNotNull(contradictory.intentId), "ths-contradictory-b")
         makeOpenOrderContradictory(
             database = database,
-            orderId = UUID.fromString(beforeOrders.single().orderId),
+            orderId = UUID.fromString(protectiveStop.orderId),
             intentId = requireNotNull(contradictory.intentId),
         )
         val beforeContradictoryOrders = ledgerRepository.getOpenOrders().getOrThrow()
+
+        assertTrue(beforeContradictoryOrders.any { order -> order.orderId == pendingOrderId })
 
         val contradictoryLinkage = broker.exitPosition(
             ClosePositionCommand(
