@@ -6,7 +6,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
-import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
 import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
@@ -60,7 +59,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
         val providerCode = result.objectOrNull("error")?.safeCodeOrNull()
             ?: result.stringOrNull("subtype")?.safeProviderCodeOrNull()
         val structuredFailure = providerCode?.knownFailureCategory()
-        val compatibilityFailure = responseText?.knownClaudeFailureCategory()
+        val compatibilityFailure = responseText?.knownCompatibilityFailureCategory()
         val providerFailure = when {
             isError == true && structuredFailure != null -> failure(
                 structuredFailure,
@@ -101,9 +100,9 @@ class DefaultLlmOutputParser : LlmOutputParser {
         var threadId: String? = null
         var responseText: String? = null
         var usage: LlmTokenUsage? = null
-        var observedModel: String? = null
-        var terminal: CodexTerminal? = null
-        var providerCode: String? = null
+        var terminalSucceeded: Boolean? = null
+        var terminalCount = 0
+        var providerMessage: String? = null
         var schemaDrift = false
 
         stdout.lineSequence().filter(String::isNotBlank).forEach { line ->
@@ -116,7 +115,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
             when (event.stringOrNull("type")) {
                 CODEX_THREAD_STARTED_EVENT -> {
                     threadId = event.stringOrNull("thread_id") ?: threadId
-                    observedModel = event.stringOrNull("model") ?: observedModel
+                    if (threadId == null) schemaDrift = true
                 }
                 CODEX_ITEM_COMPLETED_EVENT -> {
                     val item = event.objectOrNull("item")
@@ -125,34 +124,46 @@ class DefaultLlmOutputParser : LlmOutputParser {
                     }
                 }
                 CODEX_TURN_COMPLETED_EVENT -> {
-                    terminal = CodexTerminal.COMPLETED
+                    terminalCount++
+                    terminalSucceeded = terminalSucceeded ?: true
                     usage = event.objectOrNull("usage")?.toCodexTokenUsage()
-                    observedModel = event.stringOrNull("model") ?: observedModel
                     if (usage == null) schemaDrift = true
                 }
-                CODEX_TURN_FAILED_EVENT -> {
-                    terminal = CodexTerminal.FAILED
-                    providerCode = event.objectOrNull("error")?.safeCodeOrNull()
-                    if (event.objectOrNull("error") == null) schemaDrift = true
+                "turn.failed" -> {
+                    terminalCount++
+                    terminalSucceeded = terminalSucceeded ?: false
+                    val message = event.objectOrNull("error")?.stringOrNull("message")
+                    providerMessage = providerMessage ?: message
+                    if (message == null) schemaDrift = true
+                }
+                "error" -> {
+                    terminalCount++
+                    terminalSucceeded = terminalSucceeded ?: false
+                    val message = event.stringOrNull("message")
+                    providerMessage = providerMessage ?: message
+                    if (message == null) schemaDrift = true
                 }
             }
         }
 
-        val successfulContractComplete = terminal == CodexTerminal.COMPLETED &&
+        val hasExactlyOneTerminal = terminalCount == 1
+        val successfulContractComplete = hasExactlyOneTerminal && terminalSucceeded == true &&
             threadId != null && responseText != null && usage != null
-        val failedContractComplete = terminal == CodexTerminal.FAILED && threadId != null
-        val structuredFailure = providerCode?.knownFailureCategory()
+        val failedContractComplete = hasExactlyOneTerminal && terminalSucceeded == false &&
+            providerMessage != null
+        val compatibilityFailure = providerMessage?.knownCompatibilityFailureCategory()
         val providerFailure = when {
-            terminal == CodexTerminal.FAILED && structuredFailure != null -> failure(
-                structuredFailure,
-                providerCode,
+            schemaDrift || !hasExactlyOneTerminal -> outputContractFailure(CODEX_OUTPUT_ADAPTER_VERSION)
+            terminalSucceeded == false && compatibilityFailure != null -> failure(
+                compatibilityFailure,
+                "CODEX_ERROR_COMPATIBILITY",
                 CODEX_OUTPUT_ADAPTER_VERSION,
             )
-            schemaDrift || (!successfulContractComplete && !failedContractComplete) ->
+            !successfulContractComplete && !failedContractComplete ->
                 outputContractFailure(CODEX_OUTPUT_ADAPTER_VERSION)
-            terminal == CodexTerminal.FAILED -> failure(
+            terminalSucceeded == false -> failure(
                 LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
-                providerCode,
+                null,
                 CODEX_OUTPUT_ADAPTER_VERSION,
             )
             else -> null
@@ -163,7 +174,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
                 numTurns = null,
                 durationMs = null,
                 usage = tokenUsage,
-                modelUsages = observedModel?.let { model -> listOf(LlmModelUsage(model, tokenUsage)) }.orEmpty(),
+                modelUsages = emptyList(),
             )
         }
 
@@ -171,9 +182,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
             responseText = responseText.orEmpty(),
             usage = usageDetails,
             configuredModelIdentity = command.configuredModelIdentity,
-            observedModelIdentity = observedModel?.let { model ->
-                LlmObservedModelIdentity(model, CODEX_OUTPUT_MODEL_SOURCE)
-            },
+            observedModelIdentity = null,
             providerFailure = providerFailure,
             adapterSchemaVersion = CODEX_OUTPUT_ADAPTER_VERSION,
         )
@@ -189,11 +198,6 @@ class DefaultLlmOutputParser : LlmOutputParser {
             adapterSchemaVersion = adapterVersion,
         )
     }
-}
-
-private enum class CodexTerminal {
-    COMPLETED,
-    FAILED,
 }
 
 private fun JsonObject.objectOrNull(key: String): JsonObject? = this[key] as? JsonObject
@@ -222,7 +226,7 @@ private fun String.knownFailureCategory(): LlmProviderFailureCategory? = when (t
     else -> null
 }
 
-private fun String.knownClaudeFailureCategory(): LlmProviderFailureCategory? = when (trim()) {
+private fun String.knownCompatibilityFailureCategory(): LlmProviderFailureCategory? = when (trim()) {
     "Not logged in", "Invalid authentication credentials" -> LlmProviderFailureCategory.AUTHENTICATION
     "Session limit reached", "Rate limit exceeded" -> LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT
     "Quota exhausted", "Usage limit reached" -> LlmProviderFailureCategory.QUOTA_EXHAUSTED
@@ -230,11 +234,10 @@ private fun String.knownClaudeFailureCategory(): LlmProviderFailureCategory? = w
 }
 
 private fun JsonObject.toCodexTokenUsage(): LlmTokenUsage? {
-    val inputTokens = longOrNull("input_tokens")
-    val cachedInputTokens = longOrNull("cached_input_tokens")
-    val outputTokens = longOrNull("output_tokens")
-    val reasoningOutputTokens = longOrNull("reasoning_output_tokens")
-    if (inputTokens == null || outputTokens == null) return null
+    val inputTokens = longOrNull("input_tokens") ?: return null
+    val cachedInputTokens = longOrNull("cached_input_tokens") ?: return null
+    val outputTokens = longOrNull("output_tokens") ?: return null
+    val reasoningOutputTokens = longOrNull("reasoning_output_tokens") ?: return null
 
     return LlmTokenUsage(
         inputTokens = inputTokens,
@@ -267,11 +270,9 @@ const val CODEX_OUTPUT_ADAPTER_VERSION = "codex-cli-0.142.5-jsonl-v1"
 
 private const val CLAUDE_RESULT_TYPE = "result"
 private const val CLAUDE_OUTPUT_MODEL_SOURCE = "CLAUDE_RESULT"
-private const val CODEX_OUTPUT_MODEL_SOURCE = "CODEX_JSONL"
 private const val CODEX_THREAD_STARTED_EVENT = "thread.started"
 private const val CODEX_ITEM_COMPLETED_EVENT = "item.completed"
 private const val CODEX_TURN_COMPLETED_EVENT = "turn.completed"
-private const val CODEX_TURN_FAILED_EVENT = "turn.failed"
 private const val CODEX_AGENT_MESSAGE_ITEM = "agent_message"
 private val SAFE_PROVIDER_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
 
