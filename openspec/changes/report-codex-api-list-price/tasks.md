@@ -1,8 +1,8 @@
 ## 1. Evaluation facts and catalog
 
 - [ ] 1.1 Project nullable `configuredModel` from persisted runner phase payloads into `LlmPhaseUsageFact`, with repository integration coverage
-- [ ] 1.2 Add the versioned exact-model API list-price catalog and BigDecimal calculation for uncached input, cached input, and non-duplicated output
-- [ ] 1.3 Extend cost aggregation and model/provider coverage so provider-reported, catalog-estimated, equivalent, and unpriced phases remain distinct
+- [ ] 1.2 Add the versioned exact-model API list-price catalog, conservative `<272K` applicability gate, token consistency checks, and BigDecimal calculation
+- [ ] 1.3 Add a list-price projection and dedicated coverage without changing provider-reported `knownCostUsd` or `unpricedPhaseCount` semantics
 
 ## 2. Public contract
 

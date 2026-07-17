@@ -30,9 +30,11 @@
 
 `configuredModel`がない`CLI_DEFAULT`や、catalogにexact matchしないalias/modelは推測しない。Codex CLIの現在のdefaultが`gpt-5.5`でも、保存factがmodelを証明しない限りunpricedにする。（agent 仮決め）
 
-### 2. static catalogはexact `gpt-5.5` standard priceだけを持つ
+### 2. static catalogは証明可能なexact `gpt-5.5` standard priceだけを持つ
 
-`trading` evaluation packageにversioned catalogを置き、version、as-of date、official source URL、per-million ratesを公開用metadataへ投影する。初期entryは`gpt-5.5`のuncached input 5、cached input 0.5、output 30 USDとする。（agent 仮決め）
+`trading` evaluation packageにversioned catalogを置き、version、as-of date、official source URL、適用上限、per-million ratesを公開用metadataへ投影する。初期entryは公式pricingが`gpt-5.5 (<272K context length)`に示すuncached input 5、cached input 0.5、output 30 USDとする。（agent 仮決め）
+
+保存usageはphase内の複数requestを合算し、各requestのcontext lengthを保持しない。したがってphase合計inputが272,000未満なら各requestも上限未満であることを証明できるため基本価格を適用し、合計inputが272,000以上なら実際には全requestが上限未満でも保守的にunpricedとする。証明不能なlong-context倍率を推測しない。（agent 仮決め）
 
 価格はselected periodのevent発生日に関係なく、このbuildが持つcatalogで参考換算する。これはhistorical invoiceではなくcurrent catalog equivalentであり、response metadataとdocsで明記する。価格履歴を導入していないため、過去請求の再現を保証しない。（agent 仮決め）
 
@@ -40,20 +42,19 @@
 
 Codexの`input_tokens`はcached tokenを含むため、`uncachedInput = inputTokens - cacheReadInputTokens`とする。`output_tokens`はreasoning tokenを含み、`reasoning_output_tokens`は内数なのでoutput rateを`outputTokens`へ一度だけ適用する。
 
-全必須値が非null/非負で、`cacheReadInputTokens <= inputTokens`の場合だけ換算する。矛盾、overflowを伴う集計、unknown modelはunpricedとしてcoverageへ残す。金額計算と合計は`BigDecimal`で行い、途中でbinary floating pointを使わない。
+全必須値が非null/非負で、`cacheReadInputTokens <= inputTokens`かつ`reasoningOutputTokens <= outputTokens`の場合だけ換算する。reasoning countがnullの場合は内訳不明として許容するが、存在する矛盾値は拒否する。矛盾、overflowを伴う集計、unknown model、価格帯を証明できないphaseはlist-price専用coverageでunpricedとして残す。金額計算と合計は`BigDecimal`で行い、途中でbinary floating pointを使わない。
 
-### 4. cost sourceをadditive fieldで分離する
+### 4. 既存cost sourceの意味を変えずadditive fieldで分離する
 
-既存`knownCostUsd`はprovider structured outputが報告したcostの合計として維持する。新規fieldは次の意味を持つ。
+既存`knownCostUsd`と`unpricedPhaseCount`はprovider structured output基準のまま維持する。共有`LlmCostStats`の既存fieldをcatalog換算で変更しないため、EvaluationReport、Reflection、Web UIは従来どおり整合する。新規fieldは`/evaluation/costs`用のadditiveなlist-price projectionとして次の意味を持つ。
 
-- `apiListPriceEquivalentUsd`: provider-reported costがあればそれを使い、欠落したexact Codex phaseだけcatalog estimateで補った合計
-- `catalogEstimatedCostUsd`: static catalogで算出した部分だけの合計
-- `apiListPriceCoveredPhaseCount`: 上記equivalentに含まれるphase数
-- `unpricedPhaseCount`: provider-reported costもcatalog estimateもないphase数
+- `apiListPriceEquivalentUsd`: static catalogで換算できたCodex phaseだけの合計。provider-reported costとは合算しない
+- `apiListPriceCoveredPhaseCount`: catalog換算に含まれるCodex phase数
+- `apiListPriceUnpricedPhaseCount`: Codex usageはあるがmodel、token整合性、または価格帯を証明できず換算しなかったphase数
 - `subscriptionActualCostUsd`: subscription実費を観測できないため常にnull
 - `pricingCatalog`: version、as-of、basis、source URL
 
-provider別responseにもequivalent/estimate/coverageを追加し、model別token responseにはcatalog estimateをnullableで追加する。既存fieldの削除・renameはしない。（agent 仮決め）
+provider別responseにもlist-price equivalent/coverageを追加し、model別token responseにはlist-price equivalentをnullableで追加する。既存fieldの削除・rename・意味変更はしない。（agent 仮決め）
 
 ### 5. production routeから証明する
 
@@ -62,9 +63,10 @@ pure calculation testに加え、`ExposedEvaluationRepository`のevent payload p
 ## Risks / Trade-offs
 
 - [Catalogが将来の公式価格とdriftする] → version/as-of/sourceをresponseへ返し、unknown/new modelをunpricedにする。価格更新は明示的なcode reviewを要する。
-- [current catalogを過去eventへ適用して請求額と誤認する] → field名を`Equivalent`/`Estimated`にし、subscription actualを別nullable fieldで返し、historical invoiceではないとdocsへ明記する。
+- [current catalogを過去eventへ適用して請求額と誤認する] → field名を`Equivalent`にし、subscription actualを別nullable fieldで返し、historical invoiceではないとdocsへ明記する。
 - [configured model欠落でproductionの一部Codex usageが価格化されない] → default modelを捏造せずcoverageとして可視化する。model明示はruntime config側で行う。
-- [provider-reported costとcatalog estimateを二重計上する] → phase単位でprovider-reportedを優先し、catalogはcost欠落時だけ適用する。
+- [provider-reported costとcatalog estimateを同じ金額basisと誤認する] → 合算fieldを作らず、既存provider costとlist-price equivalentを別々に返す。
+- [phase集計からlong-context価格帯を判定できない] → 合計input自体が272,000未満のphaseだけ基本価格帯を適用し、それ以上は保守的にlist-price unpricedとする。
 - [wire contractがclient snapshotとdriftする] → route test、committed OpenAPI snapshot、generated TypeScript typeの差分検査を同じtaskに含める。
 
 ## Migration Plan

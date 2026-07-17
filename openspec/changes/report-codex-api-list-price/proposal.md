@@ -5,9 +5,9 @@ Issue #189 の `/evaluation/costs` は Claude CLI が返す monetary cost だけ
 ## What Changes
 
 - `RUNNER_PHASE_COMPLETED` の既存 `configuredModel` と token usage を evaluation fact へ投影する。
-- exact `gpt-5.5` model にだけ適用する versioned static API list-price catalog を追加する。
+- exact `gpt-5.5` model かつ保存factだけで `<272K context length` の基本価格帯を証明できるphaseに適用する versioned static API list-price catalog を追加する。
 - cached input を input から控除し、uncached input / cached input / output を別単価で換算する。reasoning output は output の内数として二重加算しない。
-- `/evaluation/costs` に provider-reported cost、API list-price equivalent、catalog-derived estimate、subscription actual cost unavailable の区別と coverage を additive に返す。
+- `/evaluation/costs` に既存provider-reported costとは別のAPI list-price equivalent、subscription actual cost unavailable、専用coverageを additive に返す。既存のunpriced countの意味は変えない。
 - unknown model、`CLI_DEFAULT`、不完全または矛盾した token usage は `$0` にせず unpriced のまま残す。
 - route-local OpenAPI、committed OpenAPI snapshot/generated types、評価ドキュメントを同じ変更で更新する。
 - 実provider smoke、pricing自動取得、過去の請求再現、DB migration はこのPRに含めない。
