@@ -22,7 +22,9 @@ import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
 import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
+import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import java.math.BigDecimal
 import java.time.Clock
@@ -82,6 +84,7 @@ class InMemoryPaperLedgerRepository private constructor(
         executions: List<Execution> = emptyList(),
         decisionRunIdsByPositionId: Map<String, String?> = emptyMap(),
         decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext> = emptyMap(),
+        thesisCandidatesByIntentId: Map<String, Set<String?>> = emptyMap(),
         equitySnapshotRepository: InMemoryEquitySnapshotRepository = InMemoryEquitySnapshotRepository(),
         fallbackSymbolRules: SymbolRules = PaperMarketConfig().toSymbolRules(TradingSymbol.BTC),
         clock: Clock = Clock.systemUTC(),
@@ -99,6 +102,7 @@ class InMemoryPaperLedgerRepository private constructor(
                 executions = executions,
                 decisionRunIdsByPositionId = decisionRunIdsByPositionId,
                 decisionContextsByRunId = decisionContextsByRunId,
+                thesisCandidatesByIntentId = thesisCandidatesByIntentId,
             ),
             runtime = InMemoryPaperLedgerRuntime(
                 equitySnapshotRepository = equitySnapshotRepository,
@@ -157,6 +161,7 @@ private data class InMemoryPaperLedgerAccountSeed(
  * @param executions execution 一覧
  * @param decisionRunIdsByPositionId position ID と LLM invocation ID の対応
  * @param decisionContextsByRunId decision run ID と entry decision context の対応
+ * @param thesisCandidatesByIntentId intent ID と canonical thesis 候補の対応
  */
 private data class InMemoryPaperLedgerRecordsSeed(
     val positions: List<Position>,
@@ -164,6 +169,7 @@ private data class InMemoryPaperLedgerRecordsSeed(
     val executions: List<Execution>,
     val decisionRunIdsByPositionId: Map<String, String?>,
     val decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext>,
+    val thesisCandidatesByIntentId: Map<String, Set<String?>>,
 )
 
 /**
@@ -185,6 +191,12 @@ private data class InMemoryClosePositionUpdate(
         "position を close しました。"
     }
 }
+
+/** in-memory atomic risk-exit が mutation 前に確定する対象集合。 */
+private data class RiskExitTargets(
+    val positions: List<Position>,
+    val orders: List<Order>,
+)
 
 /**
  * InMemory paper ledger の runtime 依存。
@@ -222,6 +234,8 @@ private class InMemoryPaperLedgerState(
     val decisionRunIdsByPositionId: MutableMap<String, String?> = records.decisionRunIdsByPositionId.toMutableMap()
     val decisionContextsByRunId: Map<String, ExecutionActivityDecisionContext> =
         records.decisionContextsByRunId
+    val thesisCandidatesByIntentId: MutableMap<String, MutableSet<String?>> = records.thesisCandidatesByIntentId
+        .mapValuesTo(mutableMapOf()) { (_, candidates) -> candidates.toMutableSet() }
     val equitySnapshotRepository: InMemoryEquitySnapshotRepository = runtime.equitySnapshotRepository
     val fallbackSymbolRules: SymbolRules = runtime.fallbackSymbolRules
     val clock: Clock = runtime.clock
@@ -232,6 +246,13 @@ private class InMemoryPaperLedgerState(
     val executionMarketSources: MutableMap<String, PaperMarketTradeEvent> = mutableMapOf()
     var marketSessionId: UUID? = null
     var lastMarketSequence: Long = 0
+
+    init {
+        accountStateBoundary.registerOpenRiskReader {
+            positions.any { position -> position.status == PositionStatus.OPEN } ||
+                orders.any(Order::isRiskIncreasingOpenOrder)
+        }
+    }
 
     fun <T> read(block: InMemoryPaperLedgerState.() -> T): T {
         return accountStateBoundary.read { block() }
@@ -494,6 +515,7 @@ private class InMemoryPaperLedgerMutationWriter(
     override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
+                recordIntentThesisLocked(request.command)
                 val order = request.command.toEntryOrder(
                     orderId = request.orderId,
                     positionId = null,
@@ -623,6 +645,70 @@ private class InMemoryPaperLedgerMutationWriter(
                     positionIds = listOfNotNull(order.positionId),
                     executionIds = emptyList(),
                     messageJa = "order を cancel しました。",
+                )
+            }
+        }
+    }
+
+    override suspend fun executeRiskExit(request: PaperRiskExitRequest): Result<PaperRiskExitResult> {
+        return runCatching {
+            state.write {
+                require(request.reasonJa.isNotBlank()) { "risk-exit reason is required." }
+
+                val targets = resolveRiskExitTargetsLocked(request.scope)
+                val hasOpenRisk = targets.positions.isNotEmpty() || targets.orders.isNotEmpty()
+
+                if (request.scope == PaperRiskExitScope.AllOpenRisk) {
+                    requireHardHaltIfAvailable()
+                    if (hasOpenRisk) markHardHaltCleanupLocked(HardHaltCleanupState.UNKNOWN)
+                }
+
+                if (targets.positions.isNotEmpty() && request.simulationContext == null) {
+                    if (request.scope == PaperRiskExitScope.AllOpenRisk) {
+                        return@write PaperRiskExitResult(
+                            completion = PaperRiskExitCompletion.INCOMPLETE,
+                            canceledOrderIds = emptyList(),
+                            closeOrderIds = emptyList(),
+                            closedPositionIds = emptyList(),
+                            executionIds = emptyList(),
+                        )
+                    }
+
+                    throw PaperRiskExitException.MarketContextUnavailable()
+                }
+
+                val fills = targets.positions.associate { position ->
+                    val context = requireNotNull(request.simulationContext)
+                    position.positionId to request.simulator.marketFill(
+                        side = OrderSide.SELL,
+                        sizeBtc = position.sizeBtc.toBigDecimal(),
+                        context = context,
+                    )
+                }
+                val canceledOrderIds = targets.orders.map { order ->
+                    cancelRiskIncreasingOrderLocked(order, request)
+                    order.orderId
+                }
+                val closeResults = targets.positions.map { position ->
+                    closePositionLocked(
+                        positionId = position.positionId,
+                        orderId = UUID.randomUUID(),
+                        fill = requireNotNull(fills[position.positionId]),
+                        reasonJa = request.reasonJa,
+                    )
+                }
+
+                if (request.scope == PaperRiskExitScope.AllOpenRisk) {
+                    check(!hasAnyOpenRiskLocked()) { "ALL_OPEN_RISK did not converge to zero open risk." }
+                    markHardHaltCleanupLocked(HardHaltCleanupState.SAFE)
+                }
+
+                PaperRiskExitResult(
+                    completion = PaperRiskExitCompletion.SAFE,
+                    canceledOrderIds = canceledOrderIds,
+                    closeOrderIds = closeResults.flatMap(PaperTradeResult::orderIds),
+                    closedPositionIds = closeResults.flatMap(PaperTradeResult::positionIds),
+                    executionIds = closeResults.flatMap(PaperTradeResult::executionIds),
                 )
             }
         }
@@ -972,6 +1058,7 @@ private class InMemoryPaperLedgerMutationWriter(
             .orEmpty()
 
         if (request.insertEntryOrder) {
+            recordIntentThesisLocked(command)
             orders += entryOrder
         } else {
             updateRestingEntryOrderFillLocked(entryOrder.orderId, targetPositionId.toString(), command.reasonJa)
@@ -1001,6 +1088,94 @@ private class InMemoryPaperLedgerMutationWriter(
             },
             divergenceMemos = divergenceMemos,
         )
+    }
+
+    private fun InMemoryPaperLedgerState.resolveRiskExitTargetsLocked(scope: PaperRiskExitScope): RiskExitTargets {
+        val openPositions = positions.filter { position -> position.status == PositionStatus.OPEN }
+        val riskIncreasingOrders = orders.filter(Order::isRiskIncreasingOpenOrder)
+
+        if (scope == PaperRiskExitScope.AllOpenRisk) {
+            return RiskExitTargets(openPositions, riskIncreasingOrders)
+        }
+
+        val targetPositionId = (scope as PaperRiskExitScope.SameThesis).targetPositionId.toString()
+        val targetPosition = openPositions.firstOrNull { position -> position.positionId == targetPositionId }
+            ?: throw PaperRiskExitException.StaleTarget(scope.targetPositionId)
+        val targetThesis = resolvePositionThesisLocked(targetPosition)
+
+        val classifiedOrders = riskIncreasingOrders.associateWith { order -> resolveOrderThesisLocked(order) }
+        val matchingPositions = openPositions.filter { position -> resolvePositionThesisLocked(position) == targetThesis }
+        val matchingOrders = classifiedOrders.filterValues { thesis -> thesis == targetThesis }.keys.toList()
+
+        return RiskExitTargets(matchingPositions, matchingOrders)
+    }
+
+    private fun InMemoryPaperLedgerState.resolvePositionThesisLocked(position: Position): String {
+        val entryOrders = orders.filter { order ->
+            order.tradeGroupId == position.tradeGroupId && order.side == OrderSide.BUY
+        }
+        val candidates = entryOrders.map { order -> resolveOrderThesisLocked(order) }.toSet()
+
+        if (candidates.size != 1) {
+            throw PaperRiskExitException.AmbiguousLinkage("position=${position.positionId}")
+        }
+
+        return candidates.single()
+    }
+
+    private fun InMemoryPaperLedgerState.resolveOrderThesisLocked(order: Order): String {
+        val intentId = order.intentId
+            ?: throw PaperRiskExitException.AmbiguousLinkage("order=${order.orderId}:missing_intent")
+        val candidates = thesisCandidatesByIntentId[intentId]
+            ?: throw PaperRiskExitException.AmbiguousLinkage("order=${order.orderId}:missing_thesis")
+
+        if (candidates.size != 1 || candidates.single() == null) {
+            throw PaperRiskExitException.AmbiguousLinkage("order=${order.orderId}:non_unique_thesis")
+        }
+
+        return requireNotNull(candidates.single())
+    }
+
+    private fun InMemoryPaperLedgerState.recordIntentThesisLocked(command: PlaceOrderCommand) {
+        val intentId = command.intentId?.toString() ?: return
+        thesisCandidatesByIntentId.getOrPut(intentId, ::mutableSetOf) += command.canonicalThesisId
+    }
+
+    private fun InMemoryPaperLedgerState.cancelRiskIncreasingOrderLocked(order: Order, request: PaperRiskExitRequest) {
+        val index = orders.indexOfFirst { candidate -> candidate.orderId == order.orderId }
+        check(index >= 0)
+        val canceledAt = Instant.now(clock)
+        val cancelReason = if (request.scope == PaperRiskExitScope.AllOpenRisk) {
+            PaperOrderCancelReason.HARD_HALT
+        } else {
+            PaperOrderCancelReason.POSITION_CLOSE
+        }
+        orders[index] = order.copy(
+            status = OrderStatus.CANCELED,
+            reasonJa = request.reasonJa,
+            canceledAt = canceledAt.toString(),
+            cancelReason = cancelReason,
+            canceledByDecisionRunId = request.auditContext.decisionRunContext.decisionRunId,
+            updatedAt = canceledAt.toString(),
+        )
+        orderMarketEligibility.remove(order.orderId)
+        orderQueueConsumedBtc.remove(order.orderId)
+    }
+
+    private fun InMemoryPaperLedgerState.requireHardHaltIfAvailable() {
+        val riskState = accountStateBoundary.currentRiskStateOrNull() ?: return
+        if (riskState.state != RiskHaltState.HARD_HALT) throw PaperRiskExitException.HardHaltRequired()
+    }
+
+    private fun InMemoryPaperLedgerState.markHardHaltCleanupLocked(cleanupState: HardHaltCleanupState) {
+        accountStateBoundary.updateRiskStateIfPresent { riskState ->
+            riskState.copy(hardHaltCleanupState = cleanupState)
+        }
+    }
+
+    private fun InMemoryPaperLedgerState.hasAnyOpenRiskLocked(): Boolean {
+        return positions.any { position -> position.status == PositionStatus.OPEN } ||
+            orders.any(Order::isRiskIncreasingOpenOrder)
     }
 
     private fun InMemoryPaperLedgerState.upsertPositionForEntryFillLocked(
@@ -1558,6 +1733,12 @@ private fun Order.toPlaceOrderCommand(): PlaceOrderCommand {
         reasonJa = reasonJa.orEmpty(),
         auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = clientRequestId),
     )
+}
+
+private fun Order.isRiskIncreasingOpenOrder(): Boolean {
+    val isCancelable = status == OrderStatus.OPEN || status == OrderStatus.PENDING_CANCEL
+
+    return isCancelable && side == OrderSide.BUY
 }
 
 private fun SimulatedFill.toExecution(

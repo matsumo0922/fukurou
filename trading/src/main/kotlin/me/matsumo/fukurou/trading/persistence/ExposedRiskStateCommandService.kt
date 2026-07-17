@@ -7,6 +7,8 @@ import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupIncompleteException
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -55,13 +57,44 @@ class ExposedRiskStateCommandService(
     }
 
     override suspend fun resume(reason: String, decisionRunContext: DecisionRunContext): Result<RiskState> {
-        return mutateAndAudit(
-            reason = reason,
-            decisionRunContext = decisionRunContext,
-            eventType = CommandEventType.MANUAL_RESUME_REQUESTED,
-            blankReasonMessage = "manual resume reason is required.",
-        ) { commandReason, occurredAt, _ ->
-            updateResume(commandReason, occurredAt)
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                require(reason.isNotBlank()) { "manual resume reason is required." }
+
+                val occurredAt = clock.instant()
+                val resumedState = exposedTransaction(database) {
+                    ensureRiskStateRow(occurredAt)
+                    val previousState = selectRiskState(forUpdate = true)
+                    val hasOpenRisk = hasOpenPaperRisk()
+                    val cleanupIsSafe = previousState.hardHaltCleanupState == HardHaltCleanupState.SAFE
+                    val hardHaltCleanupIncomplete = previousState.state == RiskHaltState.HARD_HALT &&
+                        (!cleanupIsSafe || hasOpenRisk)
+
+                    if (hardHaltCleanupIncomplete) {
+                        if (cleanupIsSafe && hasOpenRisk) updateHardHaltCleanupState(HardHaltCleanupState.UNKNOWN)
+
+                        return@exposedTransaction null
+                    }
+
+                    updateResume(reason, occurredAt)
+                    val riskState = selectRiskState(forUpdate = true)
+                    insertEvent(
+                        CommandEvent(
+                            decisionRunContext = decisionRunContext,
+                            toolName = RISK_STATE_COMMAND_NAME,
+                            toolCallId = null,
+                            clientRequestId = null,
+                            eventType = CommandEventType.MANUAL_RESUME_REQUESTED,
+                            payload = buildRiskStateCommandPayload(reason, previousState),
+                            occurredAt = occurredAt,
+                        ),
+                    )
+
+                    riskState
+                }
+
+                resumedState ?: throw HardHaltCleanupIncompleteException()
+            }
         }
     }
 

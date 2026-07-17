@@ -14,7 +14,6 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Orderbook
-import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.ProtectionStatus
@@ -707,6 +706,45 @@ private class PaperBrokerTradeDelegate(
         }
     }
 
+    override suspend fun exitPosition(command: ClosePositionCommand): Result<PaperTradeResult> {
+        return runCatching {
+            validateClosePositionCommand(command)
+            require(command.positionId != null && !command.closeAll && command.closeRatio.compareTo(BigDecimal.ONE) == 0) {
+                "atomic full EXIT requires one positionId and closeRatio=1."
+            }
+
+            val ticker = runtime.tickerFor(TradingSymbol.BTC).getOrThrow()
+            val symbolRules = runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+            val context = marketContextFactory.safetyContext(ticker, symbolRules)
+
+            safetyGate.enforceSafetyFloor(
+                verdict = runtime.safety.safetyFloor.evaluateClosePosition(command, context),
+                command = command,
+                ticker = ticker,
+                symbolRules = symbolRules,
+            )?.let { rejectedResult -> return@runCatching rejectedResult }
+
+            val simulationContext = runtime.paperSimulationContext(
+                symbol = TradingSymbol.BTC,
+                ticker = ticker,
+                rules = symbolRules,
+                includeOrderbook = true,
+                includeVolatilitySlippage = true,
+            )
+            val result = runtime.stores.ledgerRepository.executeRiskExit(
+                PaperRiskExitRequest(
+                    scope = PaperRiskExitScope.SameThesis(command.positionId),
+                    reasonJa = command.reasonJa,
+                    auditContext = command.auditContext,
+                    simulationContext = simulationContext,
+                    simulator = runtime.market.fillSimulator,
+                ),
+            ).getOrThrow()
+
+            result.toPaperTradeResult("full EXIT で同一 thesis の open risk を解消しました。")
+        }
+    }
+
     override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
         return runCatching {
             validateReason(command.reasonJa)
@@ -829,18 +867,20 @@ private class PaperBrokerReconcileDelegate(
         }
     }
 
-    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot?): Result<PaperTradeResult> {
         return runCatching {
-            val ticker = tickSnapshot.requireTicker()
-            val symbolRules = tickSnapshot.symbolRules ?: runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
-            val simulationContext = runtime.paperSimulationContext(
-                symbol = TradingSymbol.BTC,
-                ticker = ticker,
-                rules = symbolRules,
-                atr14Jpy = tickSnapshot.atr14Jpy?.toBigDecimalOrNull(),
-                includeOrderbook = true,
-                includeVolatilitySlippage = true,
-            )
+            val simulationContext = tickSnapshot?.let { snapshot ->
+                val ticker = snapshot.requireTicker()
+                val symbolRules = snapshot.symbolRules ?: runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
+                runtime.paperSimulationContext(
+                    symbol = TradingSymbol.BTC,
+                    ticker = ticker,
+                    rules = symbolRules,
+                    atr14Jpy = snapshot.atr14Jpy?.toBigDecimalOrNull(),
+                    includeOrderbook = true,
+                    includeVolatilitySlippage = true,
+                )
+            }
 
             safetyGate.sweepOpenRisk(
                 reason = reasonJa,
@@ -1048,49 +1088,19 @@ private class PaperBrokerSafetyGate(
     suspend fun sweepOpenRisk(
         reason: String,
         auditContext: PaperTradeAuditContext,
-        simulationContext: PaperSimulationContext,
+        simulationContext: PaperSimulationContext?,
     ): PaperTradeResult {
-        val cancelResults = runtime.stores.ledgerRepository.getOpenOrders()
-            .getOrThrow()
-            .filterNot { order -> order.isLinkedProtectiveStop() }
-            .map { order ->
-                runtime.stores.ledgerRepository.cancelOrder(
-                    CancelOrderCommand(
-                        commandId = UUID.randomUUID(),
-                        orderId = UUID.fromString(order.orderId),
-                        cancelReason = PaperOrderCancelReason.HARD_HALT,
-                        reasonJa = reason,
-                        auditContext = auditContext,
-                    ),
-                ).getOrThrow()
-            }
-        val closeResults = runtime.stores.ledgerRepository.getOpenPositions()
-            .getOrThrow()
-            .map { position ->
-                val fill = runtime.market.fillSimulator.marketFill(
-                    side = OrderSide.SELL,
-                    sizeBtc = position.sizeBtc.toBigDecimal(),
-                    context = simulationContext,
-                )
+        val result = runtime.stores.ledgerRepository.executeRiskExit(
+            PaperRiskExitRequest(
+                scope = PaperRiskExitScope.AllOpenRisk,
+                reasonJa = reason,
+                auditContext = auditContext,
+                simulationContext = simulationContext,
+                simulator = runtime.market.fillSimulator,
+            ),
+        ).getOrThrow()
 
-                runtime.stores.ledgerRepository.closePosition(
-                    command = ClosePositionCommand(
-                        commandId = UUID.randomUUID(),
-                        positionId = UUID.fromString(position.positionId),
-                        closeAll = false,
-                        reasonJa = reason,
-                        auditContext = auditContext,
-                    ),
-                    positionId = UUID.fromString(position.positionId),
-                    orderId = UUID.randomUUID(),
-                    fill = fill,
-                ).getOrThrow()
-            }
-
-        return mergeTradeResults(
-            results = cancelResults + closeResults,
-            messageJa = "HARD_HALT 掃引で open order を取消し、open position を close しました。",
-        )
+        return result.toPaperTradeResult("HARD_HALT cleanup で全 open risk を原子的に解消しました。")
     }
 
     suspend fun activateHardHaltIfAccountDrawdownReached() {
@@ -1646,6 +1656,26 @@ private fun mergeTradeResults(results: List<PaperTradeResult>, messageJa: String
     )
 }
 
+private fun PaperRiskExitResult.toPaperTradeResult(messageJa: String): PaperTradeResult {
+    val completed = completion == PaperRiskExitCompletion.SAFE
+    val status = if (executionIds.isNotEmpty()) {
+        OrderStatus.FILLED
+    } else if (canceledOrderIds.isNotEmpty()) {
+        OrderStatus.CANCELED
+    } else {
+        OrderStatus.OPEN
+    }
+
+    return PaperTradeResult(
+        accepted = completed,
+        status = status,
+        orderIds = closeOrderIds + canceledOrderIds,
+        positionIds = closedPositionIds,
+        executionIds = executionIds,
+        messageJa = if (completed) messageJa else "HARD_HALT cleanup は現在価格を取得できず UNKNOWN のままです。",
+    )
+}
+
 private fun resolveTradeGroupId(command: PlaceOrderCommand, positions: List<Position>): UUID {
     command.tradeGroupId?.let { tradeGroupId -> return tradeGroupId }
 
@@ -1708,10 +1738,6 @@ private fun Order.isActiveProtectionStop(): Boolean {
 
 private fun Order.isTakeProfitCandidate(): Boolean {
     return orderType == OrderType.LIMIT && side == OrderSide.SELL
-}
-
-private fun Order.isLinkedProtectiveStop(): Boolean {
-    return side == OrderSide.SELL && orderType == OrderType.STOP && positionId != null
 }
 
 /**

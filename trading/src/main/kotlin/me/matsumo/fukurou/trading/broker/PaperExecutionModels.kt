@@ -68,6 +68,7 @@ data class PaperTradeAuditContext(
  * @param timeStopAt LLM TradePlan が指定した entry の期限
  * @param reasonJa 判断理由
  * @param auditContext audit context
+ * @param canonicalThesisId in-memory ledger に投影する persisted intent の canonical thesis ID
  */
 data class PlaceOrderCommand(
     val commandId: UUID,
@@ -84,6 +85,7 @@ data class PlaceOrderCommand(
     val timeStopAt: Instant? = null,
     val reasonJa: String,
     val auditContext: PaperTradeAuditContext,
+    val canonicalThesisId: String? = null,
 )
 
 /**

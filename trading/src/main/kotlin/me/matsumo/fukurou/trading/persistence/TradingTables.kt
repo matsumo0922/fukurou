@@ -122,6 +122,11 @@ object RiskStateTable : Table("risk_state") {
      */
     val resumedReason = text("resumed_reason").nullable()
 
+    /** HARD_HALT cleanup の durable evidence。旧 reader 互換のため nullable。 */
+    val hardHaltCleanupState = varchar("hard_halt_cleanup_state", length = 16)
+        .nullable()
+        .default(null)
+
     /**
      * 最終更新時刻。epoch millis で保存する。
      */

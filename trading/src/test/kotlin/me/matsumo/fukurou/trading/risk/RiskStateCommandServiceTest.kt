@@ -30,6 +30,7 @@ class RiskStateCommandServiceTest {
         val event = eventLog.events().single()
 
         assertEquals(RiskHaltState.HARD_HALT, riskState.state)
+        assertEquals(HardHaltCleanupState.UNKNOWN, riskState.hardHaltCleanupState)
         assertEquals("max drawdown exceeded", riskState.haltReason)
         assertEquals(fixedInstant(), riskState.haltAt)
         assertEquals(CommandEventType.HARD_HALT_SET, event.eventType)
@@ -68,6 +69,7 @@ class RiskStateCommandServiceTest {
             reason = "max drawdown exceeded",
             decisionRunContext = createDecisionRunContext(),
         ).getOrThrow()
+        markCleanupSafe(riskStateRepository)
 
         val result = service.setSoftHalt(
             reason = "operator pause",
@@ -81,6 +83,44 @@ class RiskStateCommandServiceTest {
     }
 
     @Test
+    fun duplicate_hard_halt_preserves_safe_cleanup_evidence() = runBlocking {
+        val repository = InMemoryRiskStateRepository(clock = fixedClock())
+
+        repository.setHardHalt("first halt", fixedInstant()).getOrThrow()
+        markCleanupSafe(repository)
+        val duplicate = repository.setHardHalt("duplicate halt", fixedInstant()).getOrThrow()
+
+        assertEquals(RiskHaltState.HARD_HALT, duplicate.state)
+        assertEquals(HardHaltCleanupState.SAFE, duplicate.hardHaltCleanupState)
+    }
+
+    @Test
+    fun resume_rejects_unknown_cleanup_without_changing_hard_halt() = runBlocking {
+        val repository = InMemoryRiskStateRepository(clock = fixedClock())
+        repository.setHardHalt("halt", fixedInstant()).getOrThrow()
+
+        val result = repository.resume("resume", fixedInstant())
+
+        assertTrue(result.exceptionOrNull() is HardHaltCleanupIncompleteException)
+        assertEquals(RiskHaltState.HARD_HALT, repository.current().getOrThrow().state)
+        assertEquals(HardHaltCleanupState.UNKNOWN, repository.current().getOrThrow().hardHaltCleanupState)
+    }
+
+    @Test
+    fun resume_rejects_stale_safe_and_downgrades_evidence_to_unknown() = runBlocking {
+        val boundary = InMemoryAccountStateBoundary()
+        val repository = InMemoryRiskStateRepository(clock = fixedClock(), accountStateBoundary = boundary)
+        repository.setHardHalt("halt", fixedInstant()).getOrThrow()
+        markCleanupSafe(repository)
+        boundary.registerOpenRiskReader { true }
+
+        val result = repository.resume("resume", fixedInstant())
+
+        assertTrue(result.exceptionOrNull() is HardHaltCleanupIncompleteException)
+        assertEquals(HardHaltCleanupState.UNKNOWN, repository.current().getOrThrow().hardHaltCleanupState)
+    }
+
+    @Test
     fun resume_updates_state_and_logs_audit_event() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock())
@@ -90,6 +130,7 @@ class RiskStateCommandServiceTest {
             reason = "max drawdown exceeded",
             decisionRunContext = createDecisionRunContext(),
         ).getOrThrow()
+        markCleanupSafe(riskStateRepository)
 
         val riskState = service.resume(
             reason = "operator confirmed recovery",
@@ -114,6 +155,7 @@ class RiskStateCommandServiceTest {
         val service = createService(FailingCommandEventLog, riskStateRepository)
 
         riskStateRepository.setHardHalt("max drawdown exceeded", fixedInstant()).getOrThrow()
+        markCleanupSafe(riskStateRepository)
 
         val result = service.resume(
             reason = "operator confirmed recovery",
@@ -124,6 +166,12 @@ class RiskStateCommandServiceTest {
         assertTrue(result.isFailure)
         assertEquals(RiskHaltState.HARD_HALT, riskState.state)
         assertEquals("max drawdown exceeded", riskState.haltReason)
+    }
+}
+
+private fun markCleanupSafe(repository: InMemoryRiskStateRepository) {
+    repository.accountStateBoundary.updateRiskState { state ->
+        state.copy(hardHaltCleanupState = HardHaltCleanupState.SAFE)
     }
 }
 

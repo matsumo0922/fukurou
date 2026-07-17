@@ -24,6 +24,17 @@ enum class RiskHaltState {
 }
 
 /**
+ * sticky HARD_HALT 中の open risk cleanup 証跡。
+ */
+enum class HardHaltCleanupState {
+    /** open risk の有無または cleanup transaction の結果を確定できていない。 */
+    UNKNOWN,
+
+    /** 同一 transaction の readback で open risk が 0 と確認された。 */
+    SAFE,
+}
+
+/**
  * risk_state single row が保持する DB 上の安全状態。
  *
  * @param state 現在の取引停止状態
@@ -33,6 +44,7 @@ enum class RiskHaltState {
  * @param haltAt halt 化した時刻
  * @param resumedAt 手動再開した時刻
  * @param resumedReason 手動再開理由
+ * @param hardHaltCleanupState HARD_HALT cleanup の durable evidence
  * @param updatedAt 最終更新時刻
  */
 data class RiskState(
@@ -43,6 +55,7 @@ data class RiskState(
     val haltAt: Instant? = null,
     val resumedAt: Instant? = null,
     val resumedReason: String? = null,
+    val hardHaltCleanupState: HardHaltCleanupState? = null,
     val updatedAt: Instant,
 )
 
@@ -58,4 +71,9 @@ class HardHaltTradingRejectedException(
  */
 class SoftHaltDowngradeRejectedException(
     message: String = "SOFT_HALT cannot downgrade HARD_HALT.",
+) : RuntimeException(message)
+
+/** HARD_HALT cleanup が SAFE でないため手動再開を拒否したことを表す例外。 */
+class HardHaltCleanupIncompleteException(
+    message: String = "HARD_HALT cleanup must be SAFE with zero open risk before manual resume.",
 ) : RuntimeException(message)

@@ -110,7 +110,7 @@ internal class DecisionExecutionLifecycle(
     }
 
     /**
-     * EXIT decision を close_position または cancel_order に写像する。
+     * EXIT decision を SAME_THESIS atomic risk exit または order-only cancel に写像する。
      */
     suspend fun executeExitDecision(
         context: DecisionRunContext,
@@ -135,12 +135,10 @@ internal class DecisionExecutionLifecycle(
 
         val result = runCatching {
             when (target) {
-                is ExitExecutionTarget.ClosePosition -> closePosition(
+                is ExitExecutionTarget.ClosePosition -> exitPosition(
                     context = context,
                     position = target.position,
                     decision = decision,
-                    closeRatio = BigDecimal.ONE,
-                    reason = "exit_decision_close_position",
                 )
                 is ExitExecutionTarget.CancelEntryOrder -> cancelOrder(
                     context = context,
@@ -509,6 +507,38 @@ internal class DecisionExecutionLifecycle(
         }.getOrThrow()
     }
 
+    private suspend fun exitPosition(
+        context: DecisionRunContext,
+        position: Position,
+        decision: DecisionSubmissionResult,
+    ): PaperTradeResult {
+        val action = decision.decision.submission.action
+        val call = guardedTradeCall(
+            toolName = "atomic_risk_exit",
+            clientRequestId = "runner-exit-${position.positionId}",
+            context = context,
+            payload = buildJsonObject {
+                put("decisionId", decision.decision.decisionId.toString())
+                put("action", action.name)
+                put("positionId", position.positionId)
+                put("scope", "SAME_THESIS")
+                put("source", "one_shot_runner")
+            }.toString(),
+        )
+        val command = ClosePositionCommand(
+            commandId = idGenerator(),
+            positionId = UUID.fromString(position.positionId),
+            closeAll = false,
+            closeRatio = BigDecimal.ONE,
+            reasonJa = "EXIT decision による同一 thesis atomic risk exit。",
+            auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+        )
+
+        return tradingRuntime.toolCallGuard.runRiskReducingTradeTool(call) {
+            tradingRuntime.broker.exitPosition(command).getOrThrow()
+        }.getOrThrow()
+    }
+
     private suspend fun cancelOrder(
         context: DecisionRunContext,
         order: Order,
@@ -723,7 +753,7 @@ private sealed interface ExitExecutionTarget {
     data class ClosePosition(
         val position: Position,
     ) : ExitExecutionTarget {
-        override val operationName: String = "close_position"
+        override val operationName: String = "atomic_risk_exit"
     }
 
     /**

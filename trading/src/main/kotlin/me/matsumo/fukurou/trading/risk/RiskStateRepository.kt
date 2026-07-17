@@ -22,7 +22,7 @@ interface RiskStateRepository {
     suspend fun setSoftHalt(reason: String, at: Instant): Result<RiskState>
 
     /**
-     * 手動再開を reason 付きで記録する。
+     * cleanup SAFE と zero-open-risk を確認して手動再開を reason 付きで記録する。
      */
     suspend fun resume(reason: String, at: Instant): Result<RiskState>
 }

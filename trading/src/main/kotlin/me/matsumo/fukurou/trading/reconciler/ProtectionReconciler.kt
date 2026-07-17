@@ -200,9 +200,12 @@ class ProtectionReconciler(
 
     private suspend fun runMarketEventLoop(maintenanceInterval: Duration) {
         val reconnectBackoff = requireNotNull(marketEventStream).reconnectBackoff
+        runBoundedHardHaltCleanupAttempt()
+
         while (currentCoroutineContext().isActive) {
             val session = marketEventStream.connect().getOrElse { throwable ->
                 logPassFailure(ReconcilePassKind.LOOP, throwable)
+                runBoundedHardHaltCleanupAttempt()
                 delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
                 continue
             }
@@ -211,6 +214,7 @@ class ProtectionReconciler(
             if (beginResult.isFailure) {
                 session.close()
                 beginResult.exceptionOrNull()?.let { throwable -> logPassFailure(ReconcilePassKind.LOOP, throwable) }
+                runBoundedHardHaltCleanupAttempt()
                 delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
                 continue
             }
@@ -222,7 +226,22 @@ class ProtectionReconciler(
                 session.close()
             }
 
+            runBoundedHardHaltCleanupAttempt()
             delay(reconnectBackoff.toMillis().toDuration(DurationUnit.MILLISECONDS))
+        }
+    }
+
+    private suspend fun runBoundedHardHaltCleanupAttempt(): Result<Unit> {
+        return try {
+            tradingLock.withLock(MARKET_EVENT_LOCK_OWNER) {
+                enforceHardHaltSweepIfNeeded()
+            }
+            Result.success(Unit)
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            logPassFailure(ReconcilePassKind.LOOP, throwable)
+            Result.failure(throwable)
         }
     }
 
@@ -445,12 +464,16 @@ class ProtectionReconciler(
     }
 
     private suspend fun runPeriodicSafetyMaintenanceLocked() {
-        val tickSnapshot = readTickSnapshot()
-        if (tickSnapshot != null) {
-            broker?.maintainProtections(tickSnapshot)?.getOrThrow()
-            val swept = enforceHardHaltSweepIfNeeded(tickSnapshot)
-            if (!swept) {
-                killCriterionEvaluator?.evaluate(tickSnapshot)?.getOrThrow()
+        val sweptBeforeMaintenance = enforceHardHaltSweepIfNeeded()
+
+        if (!sweptBeforeMaintenance) {
+            val tickSnapshot = readTickSnapshot()
+            if (tickSnapshot != null) {
+                broker?.maintainProtections(tickSnapshot)?.getOrThrow()
+                val sweptAfterMaintenance = enforceHardHaltSweepIfNeeded(tickSnapshot)
+                if (!sweptAfterMaintenance) {
+                    killCriterionEvaluator?.evaluate(tickSnapshot)?.getOrThrow()
+                }
             }
         }
         equitySnapshotRecorder?.recordDailyIfNeeded()
@@ -516,24 +539,20 @@ class ProtectionReconciler(
     private suspend fun reconcileWithTransitionAudit(passKind: ReconcilePassKind): Result<Unit> {
         val passResult = runCatching {
             val reconciledAt = Instant.now(clock)
-
-            val tickSnapshot = readTickSnapshot()
+            val sweptBeforeReconcile = enforceHardHaltSweepIfNeeded()
+            val tickSnapshot = if (sweptBeforeReconcile) null else readTickSnapshot()
             var divergenceMemos = emptyList<PaperExecutionDivergenceMemo>()
 
             if (tickSnapshot != null) {
-                val sweptBeforeReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
+                divergenceMemos = broker
+                    ?.reconcile(tickSnapshot)
+                    ?.getOrThrow()
+                    ?.divergenceMemos
+                    .orEmpty()
+                val sweptAfterReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
 
-                if (!sweptBeforeReconcile) {
-                    divergenceMemos = broker
-                        ?.reconcile(tickSnapshot)
-                        ?.getOrThrow()
-                        ?.divergenceMemos
-                        .orEmpty()
-                    val sweptAfterReconcile = enforceHardHaltSweepIfNeeded(tickSnapshot)
-
-                    if (!sweptAfterReconcile) {
-                        killCriterionEvaluator?.evaluate(tickSnapshot)?.getOrThrow()
-                    }
+                if (!sweptAfterReconcile) {
+                    killCriterionEvaluator?.evaluate(tickSnapshot)?.getOrThrow()
                 }
             }
 
@@ -576,7 +595,7 @@ class ProtectionReconciler(
         return tickResult.getOrNull()
     }
 
-    private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot): Boolean {
+    private suspend fun enforceHardHaltSweepIfNeeded(tickSnapshot: TickSnapshot? = null): Boolean {
         val currentRiskState = riskStateRepository.current().getOrThrow()
         val hardHaltReached = maxDrawdownPolicy.isHardHalt(currentRiskState.drawdownRatio)
         val hardHaltEnabled = currentRiskState.state == RiskHaltState.HARD_HALT
@@ -596,7 +615,11 @@ class ProtectionReconciler(
             }
         }
 
-        broker?.sweepHardHalt(reason, tickSnapshot)?.getOrThrow()
+        val readback = broker?.sweepHardHalt(reason)?.getOrThrow()
+        if (readback?.accepted == true) return true
+
+        val executableTick = tickSnapshot ?: readTickSnapshot()
+        if (executableTick != null) broker?.sweepHardHalt(reason, executableTick)?.getOrThrow()
 
         return true
     }

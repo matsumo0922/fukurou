@@ -30,7 +30,7 @@ interface RiskStateCommandService {
     ): Result<RiskState>
 
     /**
-     * 手動再開を reason 付きで記録し、audit log に残す。
+     * cleanup SAFE と zero-open-risk を確認して手動再開を reason 付きで記録し、audit log に残す。
      */
     suspend fun resume(
         reason: String,
