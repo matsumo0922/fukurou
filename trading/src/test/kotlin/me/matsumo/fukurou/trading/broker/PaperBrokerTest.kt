@@ -41,6 +41,9 @@ import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.reconciler.TickSnapshotSource
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
+import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -56,6 +59,7 @@ import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
 import java.util.logging.Handler
@@ -1170,6 +1174,20 @@ class PaperBrokerTest {
 
         assertTrue(result.accepted)
         assertEquals("0.007500000000", broker.getPositions().getOrThrow().single().sizeBtc)
+    }
+
+    @Test
+    fun sweep_hard_halt_revalidates_rest_source_after_delayed_orderbook_before_mutation() = runBlocking {
+        assertDelayedOrderbookMakesRestTickerStale(
+            orderbookResult = Result.success(orderbookWithAsk("10000000")),
+        )
+    }
+
+    @Test
+    fun sweep_hard_halt_revalidates_rest_source_after_orderbook_failure_before_ticker_fallback() = runBlocking {
+        assertDelayedOrderbookMakesRestTickerStale(
+            orderbookResult = Result.failure(IllegalStateException("orderbook unavailable")),
+        )
     }
 
     @Test
@@ -2311,6 +2329,20 @@ private fun watermarkTickSnapshot(
     )
 }
 
+private fun restHardHaltTickSnapshot(sourceTimestamp: Instant): TickSnapshot {
+    return TickSnapshot(
+        symbol = "BTC",
+        observedAt = fixedInstant(),
+        lastPrice = "10000000",
+        bidPrice = "9990000",
+        askPrice = "10000000",
+        symbolRules = defaultSymbolRules(),
+        atr14Jpy = "0",
+        sourceTimestamp = sourceTimestamp,
+        source = TickSnapshotSource.GMO_PUBLIC_REST,
+    )
+}
+
 private fun orderbookWithAsk(price: String, size: String = "0.0100"): Orderbook {
     return Orderbook(
         symbol = "BTC",
@@ -2428,6 +2460,27 @@ private class MutableOrderbookMarketDataSource(
 ) : MarketDataSource by FakeMarketDataSource {
     override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
         return Result.success(orderbook)
+    }
+}
+
+/**
+ * orderbook lookup 中に wall clock を進める fake market data。
+ *
+ * @param clock lookup latency を反映する test clock
+ * @param orderbookResult lookup 後に返す成功または通常失敗
+ */
+private class DelayedOrderbookMarketDataSource(
+    private val clock: AdvancingTestClock,
+    private val orderbookResult: Result<Orderbook>,
+) : MarketDataSource by FakeMarketDataSource {
+    var orderbookAttemptCount: Int = 0
+        private set
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        orderbookAttemptCount += 1
+        clock.advanceBy(Duration.ofSeconds(2))
+
+        return orderbookResult
     }
 }
 
@@ -2724,6 +2777,68 @@ private fun safetyBroker(
         marketDataSource = marketDataSource,
         clock = fixedClock(),
     )
+}
+
+private suspend fun assertDelayedOrderbookMakesRestTickerStale(orderbookResult: Result<Orderbook>) {
+    val clock = AdvancingTestClock(fixedInstant())
+    val accountStateBoundary = InMemoryAccountStateBoundary()
+    val riskStateRepository = InMemoryRiskStateRepository(
+        clock = clock,
+        initialState = RiskState(
+            state = RiskHaltState.HARD_HALT,
+            haltReason = "test hard halt",
+            haltAt = fixedInstant(),
+            hardHaltCleanupState = HardHaltCleanupState.UNKNOWN,
+            updatedAt = fixedInstant(),
+        ),
+        accountStateBoundary = accountStateBoundary,
+    )
+    val repository = InMemoryPaperLedgerRepository(
+        accountSnapshot = accountSnapshotWithBtc(),
+        positions = listOf(protectedPosition().copy(sizeBtc = "0.005000000000")),
+        openOrders = listOf(linkedStopOrder()),
+        clock = clock,
+        accountStateBoundary = accountStateBoundary,
+    )
+    val marketDataSource = DelayedOrderbookMarketDataSource(clock, orderbookResult)
+    val broker = PaperBroker(
+        ledgerRepository = repository,
+        riskStateRepository = riskStateRepository,
+        marketDataSource = marketDataSource,
+        clock = clock,
+    )
+    val accountBefore = repository.getAccountSnapshot().getOrThrow()
+    val sourceTimestamp = fixedInstant().minusMillis(4_900)
+
+    val result = broker.sweepHardHalt(
+        reasonJa = "reject stale execution authority",
+        tickSnapshot = restHardHaltTickSnapshot(sourceTimestamp),
+    )
+
+    assertEquals(accountBefore, repository.getAccountSnapshot().getOrThrow())
+    assertEquals(1, repository.getOpenPositions().getOrThrow().size)
+    assertEquals(1, repository.getOpenOrders().getOrThrow().size)
+    assertTrue(repository.getExecutions().getOrThrow().isEmpty())
+    assertEquals(RiskHaltState.HARD_HALT, riskStateRepository.current().getOrThrow().state)
+    assertEquals(HardHaltCleanupState.UNKNOWN, riskStateRepository.current().getOrThrow().hardHaltCleanupState)
+    assertEquals(1, marketDataSource.orderbookAttemptCount)
+    assertTrue(result.isFailure)
+    assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("source timestamp is stale"))
+}
+
+/** wall clock を明示的に進める test clock。 */
+private class AdvancingTestClock(
+    private var currentInstant: Instant,
+) : Clock() {
+    override fun instant(): Instant = currentInstant
+
+    override fun getZone(): ZoneId = ZoneOffset.UTC
+
+    override fun withZone(zone: ZoneId): Clock = Clock.fixed(currentInstant, zone)
+
+    fun advanceBy(duration: Duration) {
+        currentInstant = currentInstant.plus(duration)
+    }
 }
 
 /**

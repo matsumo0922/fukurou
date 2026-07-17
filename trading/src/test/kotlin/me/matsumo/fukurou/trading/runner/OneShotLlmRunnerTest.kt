@@ -75,6 +75,7 @@ import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialProjectionContext
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
+import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
@@ -129,7 +130,6 @@ import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
-import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
@@ -1193,7 +1193,7 @@ class OneShotLlmRunnerTest {
         val result = fixture.runOneShot(defaultRequest()).getOrThrow()
         val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
         val closeEvents = fixture.eventLog.events().filter { event ->
-            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "atomic_risk_exit"
         }
         val violations = (fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository).violations()
 
@@ -1314,12 +1314,12 @@ class OneShotLlmRunnerTest {
         val openPositions = fixture.runtime.broker.getPositions().getOrThrow()
         val openOrders = fixture.runtime.broker.getOpenOrders().getOrThrow()
         val closeEvents = fixture.eventLog.events().filter { event ->
-            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "close_position"
+            event.eventType == CommandEventType.TOOL_CALL_COMPLETED && event.toolName == "atomic_risk_exit"
         }
 
         assertEquals(OneShotRunnerStatus.PAPER_EXIT_EXECUTED, result.status)
         assertEquals(0, openPositions.size)
-        assertEquals(1, openOrders.size)
+        assertEquals(0, openOrders.size)
         assertEquals(1, closeEvents.size)
     }
 
@@ -3126,15 +3126,14 @@ private fun addLongRunnerFixture(
 
 private fun TradingRuntime.withHardHaltDrawdown(config: TradingBotConfig): TradingRuntime {
     val baseBroker = broker as PaperBroker
-    val drawdownRiskStateRepository = InMemoryRiskStateRepository(
-        clock = fixedClock(),
-        initialState = RiskState(
-            state = RiskHaltState.RUNNING,
+    val drawdownRiskStateRepository = requireNotNull(riskStateRepository as? InMemoryRiskStateRepository)
+    drawdownRiskStateRepository.accountStateBoundary.updateRiskState { state ->
+        state.copy(
             drawdownRatio = BigDecimal("-0.1500000000"),
             equityPeak = BigDecimal("100000.0000"),
             updatedAt = fixedInstant(),
-        ),
-    )
+        )
+    }
     val drawdownRiskStateCommandService = InMemoryRiskStateCommandService(
         riskStateRepository = drawdownRiskStateRepository,
         commandEventLog = commandEventLog,
@@ -3811,6 +3810,7 @@ private fun TradeIntentRecord.toSeedPlaceOrderCommand(tradeGroupId: UUID? = null
         estimatedWinProbability = estimatedWinProbability,
         reasonJa = "runner seed paper entry",
         auditContext = PaperTradeAuditContext.EMPTY,
+        canonicalThesisId = identity?.thesisId ?: DecisionIdentityGenerator.thesisId(tradePlanDraft()),
     )
 }
 

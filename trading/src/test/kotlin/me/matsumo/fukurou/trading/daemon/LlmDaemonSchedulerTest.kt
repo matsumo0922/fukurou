@@ -28,6 +28,7 @@ import me.matsumo.fukurou.trading.domain.PositionSide
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
@@ -973,6 +974,9 @@ class LlmDaemonSchedulerTest {
 
         fixture.riskStateRepository.setHardHalt("test halt", fixedInstant()).getOrThrow()
         val haltedResult = fixture.scheduler.tick()
+        fixture.riskStateRepository.accountStateBoundary.updateRiskState { state ->
+            state.copy(hardHaltCleanupState = HardHaltCleanupState.SAFE)
+        }
         fixture.riskStateRepository.resume("operator confirmed recovery", fixedInstant()).getOrThrow()
         val resumedResult = fixture.scheduler.tick()
 

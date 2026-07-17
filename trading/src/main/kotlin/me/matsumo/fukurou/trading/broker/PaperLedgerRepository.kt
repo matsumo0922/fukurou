@@ -239,6 +239,11 @@ interface PaperLedgerMutationRepository {
     suspend fun cancelOrder(command: CancelOrderCommand): Result<PaperTradeResult>
 
     /**
+     * lock 後の ledger state から対象を解決し、risk-increasing order 取消と position 全量 close を原子的に行う。
+     */
+    suspend fun executeRiskExit(request: PaperRiskExitRequest): Result<PaperRiskExitResult>
+
+    /**
      * tick をもとに paper ledger を保守する。
      *
      * [reconcileScope] が [PaperLedgerReconcileScope.PERIODIC_MAINTENANCE] の場合、REST tick は
@@ -259,6 +264,61 @@ interface PaperLedgerMutationRepository {
         event: PaperMarketTradeEvent,
         simulator: PaperExecutionSimulator,
     ): Result<PaperReconcileResult>
+}
+
+/** atomic paper risk-exit の対象範囲。 */
+sealed interface PaperRiskExitScope {
+    /** target position の canonical thesis に属する全 open risk。 */
+    data class SameThesis(val targetPositionId: UUID) : PaperRiskExitScope
+
+    /** sticky HARD_HALT 中の全 open risk。 */
+    data object AllOpenRisk : PaperRiskExitScope
+}
+
+/** atomic paper risk-exit の入力。 */
+data class PaperRiskExitRequest(
+    val scope: PaperRiskExitScope,
+    val reasonJa: String,
+    val auditContext: PaperTradeAuditContext,
+    val simulationContext: PaperSimulationContext?,
+    val simulator: PaperExecutionSimulator,
+)
+
+/** atomic paper risk-exit の終端状態。 */
+enum class PaperRiskExitCompletion {
+    /** 対象 open risk が 0 であることを同一 critical section で確認した。 */
+    SAFE,
+
+    /** trustworthy な現在価格がなく、position close を実行できない。 */
+    INCOMPLETE,
+}
+
+/** atomic paper risk-exit の結果。 */
+data class PaperRiskExitResult(
+    val completion: PaperRiskExitCompletion,
+    val canceledOrderIds: List<String>,
+    val closeOrderIds: List<String>,
+    val closedPositionIds: List<String>,
+    val executionIds: List<String>,
+)
+
+/** atomic paper risk-exit の typed failure。 */
+sealed class PaperRiskExitException(message: String) : RuntimeException(message) {
+    /** caller が選んだ position が lock 後には open でない。 */
+    class StaleTarget(targetPositionId: UUID) :
+        PaperRiskExitException("risk-exit target is stale: $targetPositionId")
+
+    /** persisted canonical thesis linkage を一意に解決できない。 */
+    class AmbiguousLinkage(detail: String) :
+        PaperRiskExitException("risk-exit thesis linkage is ambiguous: $detail")
+
+    /** open position close に使える causal market context がない。 */
+    class MarketContextUnavailable :
+        PaperRiskExitException("risk-exit requires trustworthy current market context for open positions.")
+
+    /** ALL_OPEN_RISK が sticky HARD_HALT 外から呼ばれた。 */
+    class HardHaltRequired :
+        PaperRiskExitException("ALL_OPEN_RISK requires sticky HARD_HALT.")
 }
 
 /**

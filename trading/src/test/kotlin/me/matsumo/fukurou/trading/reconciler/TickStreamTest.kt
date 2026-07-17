@@ -18,6 +18,7 @@ import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 
 /**
  * TickStream の REST polling contract を検証するテスト。
@@ -26,7 +27,8 @@ class TickStreamTest {
 
     @Test
     fun rest_polling_tick_stream_reads_ticker_and_recent_trades() = runBlocking {
-        val marketDataSource = RecordingMarketDataSource()
+        val tickerSourceTimestamp = fixedInstant().minusSeconds(2)
+        val marketDataSource = RecordingMarketDataSource(tickerSourceTimestamp.toString())
         val latestMarketQuoteStore = LatestMarketQuoteStore()
         val tickStream = RestPollingTickStream(
             marketDataSource = marketDataSource,
@@ -43,10 +45,29 @@ class TickStreamTest {
         assertEquals("100", tickSnapshot.lastPrice)
         assertEquals(2, tickSnapshot.recentTradeCount)
         assertEquals(fixedInstant(), tickSnapshot.observedAt)
+        assertEquals(tickerSourceTimestamp, tickSnapshot.sourceTimestamp)
+        assertEquals(TickSnapshotSource.GMO_PUBLIC_REST, tickSnapshot.source)
         val latestQuote = requireNotNull(latestMarketQuoteStore.snapshot())
         assertEquals("99", latestQuote.bidPriceJpy.toPlainString())
         assertEquals("101", latestQuote.askPriceJpy.toPlainString())
-        assertEquals(fixedInstant(), latestQuote.observedAt)
+        assertEquals(tickerSourceTimestamp, latestQuote.observedAt)
+    }
+
+    @Test
+    fun rest_polling_tick_stream_keepsInvalidSourceTimestampUntrusted() = runBlocking {
+        val latestMarketQuoteStore = LatestMarketQuoteStore()
+        val tickStream = RestPollingTickStream(
+            marketDataSource = RecordingMarketDataSource("invalid-timestamp"),
+            latestMarketQuoteStore = latestMarketQuoteStore,
+            clock = fixedClock(),
+        )
+
+        val tickSnapshot = requireNotNull(tickStream.latestTick().getOrThrow())
+
+        assertEquals(fixedInstant(), tickSnapshot.observedAt)
+        assertNull(tickSnapshot.sourceTimestamp)
+        assertEquals(TickSnapshotSource.GMO_PUBLIC_REST, tickSnapshot.source)
+        assertNull(latestMarketQuoteStore.snapshot())
     }
 
     @Test
@@ -75,7 +96,9 @@ private class AuditFailingAtrMarketDataSource : RecordingMarketDataSource() {
 /**
  * 呼び出し回数を記録する market data source。
  */
-private open class RecordingMarketDataSource : MarketDataSource {
+private open class RecordingMarketDataSource(
+    private val tickerTimestamp: String = fixedInstant().toString(),
+) : MarketDataSource {
 
     /**
      * ticker 呼び出し回数。
@@ -101,7 +124,7 @@ private open class RecordingMarketDataSource : MarketDataSource {
                 high = "110",
                 low = "90",
                 volume = "1.0",
-                timestamp = "2026-07-02T00:00:00Z",
+                timestamp = tickerTimestamp,
             ),
         )
     }

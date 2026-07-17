@@ -116,6 +116,9 @@ interface BrokerTradeBoundary {
      */
     suspend fun closePosition(command: ClosePositionCommand): Result<PaperTradeResult>
 
+    /** full EXIT と同一 thesis の pending BUY invalidation を原子的に実行する。 */
+    suspend fun exitPosition(command: ClosePositionCommand): Result<PaperTradeResult>
+
     /**
      * paper position の保護を更新する。
      */
@@ -161,7 +164,7 @@ interface BrokerReconcileBoundary {
     /**
      * HARD_HALT 到達時の内部掃引を実行する。
      */
-    suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult>
+    suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot? = null): Result<PaperTradeResult>
 }
 
 /**

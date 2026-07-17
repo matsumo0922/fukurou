@@ -1844,6 +1844,7 @@ private fun TradeIntentRecord.toPlaceOrderCommand(
         timeStopAt = timeStopAt,
         reasonJa = "Falsifier APPROVED 後の runner deterministic paper entry。",
         auditContext = PaperTradeAuditContext.fromGuardedToolCall(call),
+        canonicalThesisId = identity?.thesisId,
     )
 }
 

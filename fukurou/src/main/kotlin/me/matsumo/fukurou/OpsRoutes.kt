@@ -52,6 +52,7 @@ import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.DecisionJournalRecord
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupIncompleteException
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -1024,12 +1025,14 @@ private fun Route.registerOpsResumeRoute(dependencies: OpsRouteDependencies) {
         val request = call.receiveBodyOrBadRequest<OpsResumeRequest>() ?: return@post
         val reason = call.requireReason(request.reason) ?: return@post
         val commandService = call.requireRiskStateCommandService(riskStateCommandService) ?: return@post
-        val riskState = commandService.resume(reason, DecisionRunContext.EMPTY).getOrThrow()
+        val riskState = call.respondConflictOrThrow(
+            commandService.resume(reason, DecisionRunContext.EMPTY),
+        ) ?: return@post
 
         call.respond(riskState.toOpsRiskStateResponse())
     }.describe {
         summary = "取引停止状態を解除する"
-        description = "SOFT_HALT または HARD_HALT を RUNNING へ戻し、手動再開理由を監査イベントへ残します。"
+        description = "SOFT_HALT、または cleanup SAFE と zero-open-risk を確認した HARD_HALT を RUNNING へ戻し、手動再開理由を監査イベントへ残します。"
         tag(OPS_TAG)
         requestBody {
             description = "再開理由です。"
@@ -1043,6 +1046,10 @@ private fun Route.registerOpsResumeRoute(dependencies: OpsRouteDependencies) {
             }
             HttpStatusCode.BadRequest {
                 description = "request body または reason が不正です。"
+                schema = jsonSchema<ErrorResponse>()
+            }
+            HttpStatusCode.Conflict {
+                description = "HARD_HALT cleanup が SAFE でないか、open risk が残っています。"
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.ServiceUnavailable {
@@ -2078,7 +2085,7 @@ private suspend fun ApplicationCall.respondConflictOrThrow(result: Result<RiskSt
 
     val throwable = requireNotNull(result.exceptionOrNull())
 
-    if (throwable is SoftHaltDowngradeRejectedException) {
+    if (throwable is SoftHaltDowngradeRejectedException || throwable is HardHaltCleanupIncompleteException) {
         val errorMessage = requireNotNull(throwable.message)
 
         respond(HttpStatusCode.Conflict, ErrorResponse(errorMessage))

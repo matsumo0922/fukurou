@@ -58,6 +58,8 @@ import me.matsumo.fukurou.trading.market.MarketEventSession
 import me.matsumo.fukurou.trading.market.MarketEventSessionSignal
 import me.matsumo.fukurou.trading.market.MarketEventStream
 import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
+import me.matsumo.fukurou.trading.risk.InMemoryAccountStateBoundary
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -648,7 +650,7 @@ class ProtectionReconcilerTest {
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
             broker = broker,
-            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            tickStream = SwitchableTickStream(Result.success(restCleanupTickSnapshot(fixedInstant()))),
         )
 
         val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
@@ -659,6 +661,114 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(2, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun startup_hard_halt_cleanup_closesOpenPositionWithFreshRestSourceTimestamp() = runBlocking {
+        val fixture = createOpenPositionHardHaltFixture(
+            tickStream = SwitchableTickStream(Result.success(restCleanupTickSnapshot(fixedInstant()))),
+        )
+
+        val result = fixture.reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+
+        assertTrue(result.isSuccess)
+        assertTrue(fixture.broker.getPositions().getOrThrow().isEmpty())
+        assertTrue(fixture.broker.getOpenOrders().getOrThrow().isEmpty())
+        assertEquals(2, fixture.ledgerRepository.getExecutions().getOrThrow().size)
+        assertEquals(
+            HardHaltCleanupState.SAFE,
+            fixture.riskStateRepository.current().getOrThrow().hardHaltCleanupState,
+        )
+    }
+
+    @Test
+    fun startup_hard_halt_cleanup_rejectsUntrustedRestTimestampsWithoutMutation() = runBlocking {
+        val untrustedTimestamps = listOf(
+            "stale" to fixedInstant().minusMillis(5_001),
+            "missing-or-invalid" to null,
+            "excessive-future" to fixedInstant().plusMillis(5_001),
+        )
+
+        untrustedTimestamps.forEach { (caseName, sourceTimestamp) ->
+            val fixture = createOpenPositionHardHaltFixture(
+                tickStream = SwitchableTickStream(Result.success(restCleanupTickSnapshot(sourceTimestamp))),
+            )
+
+            val result = fixture.reconciler.reconcileOnce(ReconcilePassKind.STARTUP_FULL)
+
+            assertTrue(result.isFailure, caseName)
+            assertEquals(1, fixture.broker.getPositions().getOrThrow().size, caseName)
+            assertEquals(1, fixture.broker.getOpenOrders().getOrThrow().size, caseName)
+            assertEquals(1, fixture.ledgerRepository.getExecutions().getOrThrow().size, caseName)
+            val riskState = fixture.riskStateRepository.current().getOrThrow()
+            assertEquals(RiskHaltState.HARD_HALT, riskState.state, caseName)
+            assertEquals(HardHaltCleanupState.UNKNOWN, riskState.hardHaltCleanupState, caseName)
+        }
+    }
+
+    @Test
+    fun websocket_connect_failure_retriesOpenPositionCleanupWithFreshRestTimestamp() = runBlocking {
+        val tickStream = SequencedTickStream(
+            listOf(
+                restCleanupTickSnapshot(fixedInstant().minusMillis(5_001)),
+                restCleanupTickSnapshot(fixedInstant()),
+            ),
+        )
+        val marketEventStream = AlwaysFailingMarketEventStream()
+        val fixture = createOpenPositionHardHaltFixture(
+            tickStream = tickStream,
+            marketEventStream = marketEventStream,
+        )
+        val job = launch { fixture.reconciler.runLoop(Duration.ofMillis(10)) }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (fixture.broker.getPositions().getOrThrow().isNotEmpty()) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertTrue(marketEventStream.connectCount >= 1)
+        assertTrue(tickStream.callCount >= 2)
+        assertEquals(2, fixture.ledgerRepository.getExecutions().getOrThrow().size)
+        assertEquals(
+            HardHaltCleanupState.SAFE,
+            fixture.riskStateRepository.current().getOrThrow().hardHaltCleanupState,
+        )
+    }
+
+    @Test
+    fun websocket_connect_failure_keepsOpenPositionForUntrustedRestTimestamps() = runBlocking {
+        val untrustedTimestamps = listOf(
+            "stale" to fixedInstant().minusMillis(5_001),
+            "missing-or-invalid" to null,
+            "excessive-future" to fixedInstant().plusMillis(5_001),
+        )
+
+        untrustedTimestamps.forEach { (caseName, sourceTimestamp) ->
+            val marketEventStream = AlwaysFailingMarketEventStream()
+            val fixture = createOpenPositionHardHaltFixture(
+                tickStream = SwitchableTickStream(
+                    Result.success(restCleanupTickSnapshot(sourceTimestamp)),
+                ),
+                marketEventStream = marketEventStream,
+            )
+            val job = launch { fixture.reconciler.runLoop(Duration.ofMillis(10)) }
+
+            withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+                while (marketEventStream.connectCount < 2) {
+                    delay(1.toDuration(DurationUnit.MILLISECONDS))
+                }
+            }
+            job.cancelAndJoin()
+
+            assertEquals(1, fixture.broker.getPositions().getOrThrow().size, caseName)
+            assertEquals(1, fixture.broker.getOpenOrders().getOrThrow().size, caseName)
+            assertEquals(1, fixture.ledgerRepository.getExecutions().getOrThrow().size, caseName)
+            val riskState = fixture.riskStateRepository.current().getOrThrow()
+            assertEquals(RiskHaltState.HARD_HALT, riskState.state, caseName)
+            assertEquals(HardHaltCleanupState.UNKNOWN, riskState.hardHaltCleanupState, caseName)
+        }
     }
 
     @Test
@@ -713,10 +823,11 @@ class ProtectionReconcilerTest {
             ),
         ).getOrThrow()
         riskStateRepository.setHardHalt("test hard halt", fixedInstant()).getOrThrow()
+        val tickStream = CountingFailureTickStream()
         val reconciler = createReconciler(
             riskStateRepository = riskStateRepository,
             broker = broker,
-            tickStream = SwitchableTickStream(Result.success(neutralBtcTickSnapshot())),
+            tickStream = tickStream,
         )
 
         val result = reconciler.reconcileOnce(ReconcilePassKind.LOOP)
@@ -725,6 +836,7 @@ class ProtectionReconcilerTest {
         assertEquals(0, broker.getPositions().getOrThrow().size)
         assertEquals(0, broker.getOpenOrders().getOrThrow().size)
         assertEquals(0, repository.getExecutions().getOrThrow().size)
+        assertEquals(0, tickStream.callCount)
     }
 
     @Test
@@ -815,8 +927,8 @@ class ProtectionReconcilerTest {
 
         assertTrue(result.isSuccess)
         assertEquals(RiskHaltState.HARD_HALT, riskStateRepository.current().getOrThrow().state)
-        assertEquals(1, broker.sweptTicks.size)
-        assertEquals(neutralBtcTickSnapshot(), broker.sweptTicks.single())
+        assertEquals(listOf<TickSnapshot?>(null), broker.sweepCallTicks)
+        assertTrue(broker.sweptTicks.isEmpty())
     }
 
     @Test
@@ -1028,6 +1140,7 @@ class ProtectionReconcilerTest {
             afterApply = {
                 riskStateRepository.setHardHalt("event threshold reached", event.receivedAt).getOrThrow()
             },
+            rejectNullSweep = true,
         )
         val reconciler = ProtectionReconciler(
             riskStateRepository = riskStateRepository,
@@ -1055,9 +1168,107 @@ class ProtectionReconcilerTest {
         assertEquals(listOf(event), broker.appliedEvents)
         assertEquals(event.symbol.apiSymbol, sweptTick.symbol)
         assertEquals(event.receivedAt, sweptTick.observedAt)
+        assertEquals(event.exchangeAt, sweptTick.sourceTimestamp)
+        assertEquals(TickSnapshotSource.REALTIME_MARKET_EVENT, sweptTick.source)
         assertEquals(event.priceJpy.toPlainString(), sweptTick.lastPrice)
         assertEquals(event.priceJpy.toPlainString(), sweptTick.bidPrice)
         assertEquals(event.priceJpy.toPlainString(), sweptTick.askPrice)
+    }
+
+    @Test
+    fun websocket_hard_halt_cleanup_retriesFromStartupDuringPeriodicMaintenance() = runBlocking {
+        val boundary = InMemoryAccountStateBoundary()
+        val ledgerRepository = InMemoryPaperLedgerRepository(accountStateBoundary = boundary)
+        val riskStateRepository = InMemoryRiskStateRepository(
+            clock = fixedClock(),
+            accountStateBoundary = boundary,
+        )
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val delegate = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = riskStateRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = ReconcilerFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        delegate.placeOrder(
+            approvedReconcilerEntryCommand(
+                repository = decisionRepository,
+                command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+            ),
+        ).getOrThrow()
+        riskStateRepository.setHardHalt("startup retry hard halt", fixedInstant()).getOrThrow()
+        val broker = RejectFirstExecutableSweepBroker(delegate)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000189")
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = SwitchableTickStream(Result.success(restCleanupTickSnapshot(fixedInstant()))),
+            marketEventStream = SingleSessionMarketEventStream(
+                session = BurstThenIdleMarketEventSession(sessionId, fixedInstant(), emptyList()),
+                transportLivenessTimeout = Duration.ofSeconds(1),
+            ),
+            marketDataIntegrityRepository = RetryableMarketDataIntegrityRepository(0),
+            broker = broker,
+            clock = fixedClock(),
+        )
+        val job = launch { reconciler.runLoop(Duration.ofMillis(10)) }
+
+        withTimeout(1_000.toDuration(DurationUnit.MILLISECONDS)) {
+            while (ledgerRepository.getOpenPositions().getOrThrow().isNotEmpty()) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertTrue(broker.sweepCallTicks.first() == null)
+        assertTrue(broker.sweepCallTicks.count { tick -> tick == null } >= 2)
+        assertTrue(broker.executableSweepAttemptCount >= 2)
+        assertEquals(2, ledgerRepository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun websocket_connect_failure_retries_hard_halt_cleanup_evenAfterSafeEvidence() = runBlocking {
+        val boundary = InMemoryAccountStateBoundary()
+        val riskStateRepository = InMemoryRiskStateRepository(
+            clock = fixedClock(),
+            accountStateBoundary = boundary,
+        )
+        riskStateRepository.setHardHalt("connect failure hard halt", fixedInstant()).getOrThrow()
+        val broker = RecordingBroker(
+            PaperBroker(
+                ledgerRepository = InMemoryPaperLedgerRepository(accountStateBoundary = boundary),
+                riskStateRepository = riskStateRepository,
+                decisionRepository = InMemoryDecisionRepository(fixedClock()),
+                marketDataSource = ReconcilerFakeMarketDataSource,
+                clock = fixedClock(),
+            ),
+        )
+        val stream = AlwaysFailingMarketEventStream()
+        val tickStream = CountingFailureTickStream()
+        val reconciler = ProtectionReconciler(
+            riskStateRepository = riskStateRepository,
+            commandEventLog = InMemoryCommandEventLog(),
+            tradingLock = CountingTradingLock(fixedClock()),
+            tickStream = tickStream,
+            marketEventStream = stream,
+            marketDataIntegrityRepository = RetryableMarketDataIntegrityRepository(0),
+            broker = broker,
+            clock = fixedClock(),
+        )
+        val job = launch { reconciler.runLoop(Duration.ofMillis(10)) }
+
+        withTimeout(500.toDuration(DurationUnit.MILLISECONDS)) {
+            while (broker.sweepCallTicks.size < 2) {
+                delay(1.toDuration(DurationUnit.MILLISECONDS))
+            }
+        }
+        job.cancelAndJoin()
+
+        assertTrue(stream.connectCount >= 1)
+        assertEquals(listOf(null, null), broker.sweepCallTicks.take(2))
+        assertEquals(0, tickStream.callCount)
     }
 
     @Test
@@ -1350,11 +1561,13 @@ private class CountingTradingLock(
 private class RecordingBroker(
     private val delegate: Broker,
     private val afterApply: suspend (PaperMarketTradeEvent) -> Unit = {},
+    private val rejectNullSweep: Boolean = false,
 ) : Broker by delegate {
     val appliedEvents = mutableListOf<PaperMarketTradeEvent>()
     var maintenanceCount = 0
         private set
     val sweptTicks = mutableListOf<TickSnapshot>()
+    val sweepCallTicks = mutableListOf<TickSnapshot?>()
 
     override suspend fun applyMarketEvent(event: PaperMarketTradeEvent): Result<PaperReconcileResult> {
         val result = delegate.applyMarketEvent(event)
@@ -1371,10 +1584,56 @@ private class RecordingBroker(
         }
     }
 
-    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
-        return delegate.sweepHardHalt(reasonJa, tickSnapshot).also {
-            sweptTicks += tickSnapshot
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot?): Result<PaperTradeResult> {
+        if (tickSnapshot == null && rejectNullSweep) {
+            sweepCallTicks += null
+
+            return Result.success(
+                PaperTradeResult(
+                    accepted = false,
+                    status = OrderStatus.OPEN,
+                    orderIds = emptyList(),
+                    positionIds = emptyList(),
+                    executionIds = emptyList(),
+                    messageJa = "test readback remains incomplete",
+                ),
+            )
         }
+
+        return delegate.sweepHardHalt(reasonJa, tickSnapshot).also {
+            sweepCallTicks += tickSnapshot
+            if (tickSnapshot != null) sweptTicks += tickSnapshot
+        }
+    }
+}
+
+/** 最初の executable cleanup だけ未完了にして periodic retry を観測する broker。 */
+private class RejectFirstExecutableSweepBroker(
+    private val delegate: Broker,
+) : Broker by delegate {
+    val sweepCallTicks = mutableListOf<TickSnapshot?>()
+    var executableSweepAttemptCount = 0
+        private set
+
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot?): Result<PaperTradeResult> {
+        sweepCallTicks += tickSnapshot
+        if (tickSnapshot != null) {
+            executableSweepAttemptCount += 1
+            if (executableSweepAttemptCount == 1) {
+                return Result.success(
+                    PaperTradeResult(
+                        accepted = false,
+                        status = OrderStatus.OPEN,
+                        orderIds = emptyList(),
+                        positionIds = emptyList(),
+                        executionIds = emptyList(),
+                        messageJa = "test executable cleanup remains incomplete",
+                    ),
+                )
+            }
+        }
+
+        return delegate.sweepHardHalt(reasonJa, tickSnapshot)
     }
 }
 
@@ -1411,6 +1670,20 @@ private class SingleSessionMarketEventStream(
         connectCount += 1
 
         return if (connectCount == 1) Result.success(session) else Result.failure(IllegalStateException("reconnect unavailable"))
+    }
+}
+
+/** 接続失敗だけを返す WebSocket stream。 */
+private class AlwaysFailingMarketEventStream : MarketEventStream {
+    override val reconnectBackoff: Duration = Duration.ofMillis(1)
+    override val transportLivenessTimeout: Duration = Duration.ofSeconds(1)
+    var connectCount = 0
+        private set
+
+    override suspend fun connect(): Result<MarketEventSession> {
+        connectCount += 1
+
+        return Result.failure(IllegalStateException("connect unavailable"))
     }
 }
 
@@ -1703,6 +1976,33 @@ private class SwitchableTickStream(
     }
 }
 
+/** 指定した tick を順に返し、末尾到達後は最後の tick を返す TickStream。 */
+private class SequencedTickStream(
+    private val snapshots: List<TickSnapshot>,
+) : TickStream {
+    var callCount = 0
+        private set
+
+    override suspend fun latestTick(): Result<TickSnapshot?> {
+        val snapshot = snapshots.getOrElse(callCount) { snapshots.last() }
+        callCount += 1
+
+        return Result.success(snapshot)
+    }
+}
+
+/** 呼び出された場合に失敗し、呼び出し回数を記録する TickStream。 */
+private class CountingFailureTickStream : TickStream {
+    var callCount = 0
+        private set
+
+    override suspend fun latestTick(): Result<TickSnapshot?> {
+        callCount += 1
+
+        return Result.failure(IllegalStateException("tick must not be read"))
+    }
+}
+
 /**
  * 固定時刻の tick snapshot を返す。
  */
@@ -1749,6 +2049,13 @@ private fun neutralBtcTickSnapshot(): TickSnapshot {
     )
 }
 
+private fun restCleanupTickSnapshot(sourceTimestamp: Instant?): TickSnapshot {
+    return neutralBtcTickSnapshot().copy(
+        sourceTimestamp = sourceTimestamp,
+        source = TickSnapshotSource.GMO_PUBLIC_REST,
+    )
+}
+
 private fun limitReachTickSnapshot(): TickSnapshot {
     return TickSnapshot(
         symbol = "BTC",
@@ -1768,6 +2075,58 @@ private fun drawdownHaltTickSnapshot(): TickSnapshot {
         bidPrice = "5990000",
         askPrice = "6000000",
         symbolRules = reconcilerSymbolRules(),
+    )
+}
+
+/** open position を持つ sticky HARD_HALT cleanup の production-path test fixture。 */
+private data class OpenPositionHardHaltFixture(
+    val ledgerRepository: InMemoryPaperLedgerRepository,
+    val riskStateRepository: InMemoryRiskStateRepository,
+    val broker: PaperBroker,
+    val reconciler: ProtectionReconciler,
+)
+
+private suspend fun createOpenPositionHardHaltFixture(
+    tickStream: TickStream,
+    marketEventStream: MarketEventStream? = null,
+): OpenPositionHardHaltFixture {
+    val boundary = InMemoryAccountStateBoundary()
+    val ledgerRepository = InMemoryPaperLedgerRepository(accountStateBoundary = boundary)
+    val riskStateRepository = InMemoryRiskStateRepository(
+        clock = fixedClock(),
+        accountStateBoundary = boundary,
+    )
+    val decisionRepository = InMemoryDecisionRepository(fixedClock())
+    val broker = PaperBroker(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = riskStateRepository,
+        decisionRepository = decisionRepository,
+        marketDataSource = ReconcilerFakeMarketDataSource,
+        clock = fixedClock(),
+    )
+    broker.placeOrder(
+        approvedReconcilerEntryCommand(
+            repository = decisionRepository,
+            command = reconcilerEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+        ),
+    ).getOrThrow()
+    riskStateRepository.setHardHalt("REST freshness test hard halt", fixedInstant()).getOrThrow()
+    val reconciler = ProtectionReconciler(
+        riskStateRepository = riskStateRepository,
+        commandEventLog = InMemoryCommandEventLog(),
+        tradingLock = CountingTradingLock(fixedClock()),
+        tickStream = tickStream,
+        marketEventStream = marketEventStream,
+        marketDataIntegrityRepository = RetryableMarketDataIntegrityRepository(0),
+        broker = broker,
+        clock = fixedClock(),
+    )
+
+    return OpenPositionHardHaltFixture(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = riskStateRepository,
+        broker = broker,
+        reconciler = reconciler,
     )
 }
 

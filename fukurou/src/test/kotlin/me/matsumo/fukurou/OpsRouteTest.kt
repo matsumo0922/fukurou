@@ -180,6 +180,10 @@ class OpsRouteTest {
             setBody("""{"level":"SOFT","reason":"operator pause"}""")
         }
         val stateResponse = client.get("/ops/risk-state")
+        val softResumeResponse = client.post("/ops/resume") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"reason":"operator resumed soft halt"}""")
+        }
         val hardResponse = client.post("/ops/halt") {
             contentType(ContentType.Application.Json)
             setBody("""{"level":"HARD","reason":"max drawdown"}""")
@@ -192,7 +196,6 @@ class OpsRouteTest {
             contentType(ContentType.Application.Json)
             setBody("""{"reason":"operator confirmed recovery"}""")
         }
-        val resumeResponseBody = resumeResponse.bodyAsText()
         val events = eventLog.events()
         val eventTypes = events.map { event -> event.eventType }
 
@@ -200,21 +203,22 @@ class OpsRouteTest {
         assertTrue(softResponse.bodyAsText().contains(""""state":"SOFT_HALT""""))
         assertEquals(HttpStatusCode.OK, stateResponse.status)
         assertTrue(stateResponse.bodyAsText().contains("operator pause"))
+        assertEquals(HttpStatusCode.OK, softResumeResponse.status)
+        assertTrue(softResumeResponse.bodyAsText().contains(""""state":"RUNNING""""))
         assertEquals(HttpStatusCode.OK, hardResponse.status)
         assertTrue(hardResponse.bodyAsText().contains(""""state":"HARD_HALT""""))
         assertEquals(HttpStatusCode.Conflict, conflictResponse.status)
-        assertEquals(HttpStatusCode.OK, resumeResponse.status)
-        assertTrue(resumeResponseBody.contains(""""state":"RUNNING""""))
-        assertTrue(resumeResponseBody.contains("operator confirmed recovery"))
+        assertEquals(HttpStatusCode.Conflict, resumeResponse.status)
+        assertTrue(resumeResponse.bodyAsText().contains("must be SAFE"))
         assertEquals(
             listOf(
                 CommandEventType.SOFT_HALT_SET,
-                CommandEventType.HARD_HALT_SET,
                 CommandEventType.MANUAL_RESUME_REQUESTED,
+                CommandEventType.HARD_HALT_SET,
             ),
             eventTypes,
         )
-        assertTrue(events.last().payload.contains("HARD_HALT"))
+        assertTrue(events[1].payload.contains("SOFT_HALT"))
     }
 
     @Test

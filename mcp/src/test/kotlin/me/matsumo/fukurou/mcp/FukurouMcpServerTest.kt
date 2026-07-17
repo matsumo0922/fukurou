@@ -3090,6 +3090,10 @@ private class SnapshotOnlyBroker(
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
+    override suspend fun exitPosition(command: ClosePositionCommand): Result<PaperTradeResult> {
+        return Result.failure(UnsupportedOperationException("not used"))
+    }
+
     override suspend fun updateProtection(command: UpdateProtectionCommand): Result<PaperTradeResult> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
@@ -3102,7 +3106,7 @@ private class SnapshotOnlyBroker(
         return Result.failure(UnsupportedOperationException("not used"))
     }
 
-    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot): Result<PaperTradeResult> {
+    override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot?): Result<PaperTradeResult> {
         return Result.failure(UnsupportedOperationException("not used"))
     }
 }

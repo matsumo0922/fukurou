@@ -2,6 +2,8 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupIncompleteException
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -25,6 +27,7 @@ private const val SELECT_RISK_STATE_SQL = """
         halt_at,
         resumed_at,
         resumed_reason,
+        hard_halt_cleanup_state,
         updated_at
     FROM risk_state
     WHERE id = ?
@@ -45,6 +48,10 @@ private const val UPDATE_HARD_HALT_SQL = """
         hard_halt = ?,
         halt_reason = ?,
         halt_at = ?,
+        hard_halt_cleanup_state = CASE
+            WHEN state = 'HARD_HALT' THEN hard_halt_cleanup_state
+            ELSE 'UNKNOWN'
+        END,
         updated_at = ?
     WHERE id = ?
 """
@@ -59,6 +66,7 @@ private const val UPDATE_SOFT_HALT_SQL = """
         hard_halt = ?,
         halt_reason = ?,
         halt_at = ?,
+        hard_halt_cleanup_state = NULL,
         updated_at = ?
     WHERE id = ?
 """
@@ -73,6 +81,7 @@ private const val UPDATE_RESUME_SQL = """
         hard_halt = ?,
         resumed_at = ?,
         resumed_reason = ?,
+        hard_halt_cleanup_state = NULL,
         updated_at = ?
     WHERE id = ?
 """
@@ -138,9 +147,26 @@ class ExposedRiskStateRepository(
 
                 exposedTransaction(database) {
                     ensureRiskStateRow(at)
-                    selectRiskState(forUpdate = true)
+                    val currentState = selectRiskState(forUpdate = true)
+                    val hasOpenRisk = hasOpenPaperRisk()
+
+                    if (currentState.state == RiskHaltState.HARD_HALT) {
+                        val cleanupIsSafe = currentState.hardHaltCleanupState == HardHaltCleanupState.SAFE
+
+                        if (!cleanupIsSafe || hasOpenRisk) {
+                            if (cleanupIsSafe && hasOpenRisk) updateHardHaltCleanupState(HardHaltCleanupState.UNKNOWN)
+
+                            return@exposedTransaction ResumeRiskStateResult.Rejected
+                        }
+                    }
+
                     updateResume(reason, at)
-                    selectRiskState(forUpdate = true)
+                    ResumeRiskStateResult.Resumed(selectRiskState(forUpdate = true))
+                }.let { result ->
+                    when (result) {
+                        is ResumeRiskStateResult.Resumed -> result.state
+                        ResumeRiskStateResult.Rejected -> throw HardHaltCleanupIncompleteException()
+                    }
                 }
             }
         }
@@ -212,16 +238,53 @@ internal fun JdbcTransaction.updateResume(reason: String, at: Instant) {
  * ResultSet の現在行を RiskState へ変換する。
  */
 private fun ResultSet.toRiskState(): RiskState {
+    val state = RiskHaltState.valueOf(getString("state"))
+    val cleanupState = getString("hard_halt_cleanup_state")
+        ?.let(HardHaltCleanupState::valueOf)
+        ?: HardHaltCleanupState.UNKNOWN.takeIf { state == RiskHaltState.HARD_HALT }
+
     return RiskState(
-        state = RiskHaltState.valueOf(getString("state")),
+        state = state,
         drawdownRatio = getBigDecimal("drawdown_ratio") ?: BigDecimal.ZERO,
         equityPeak = getBigDecimal("equity_peak") ?: BigDecimal.ZERO,
         haltReason = getString("halt_reason"),
         haltAt = nullableInstant("halt_at"),
         resumedAt = nullableInstant("resumed_at"),
         resumedReason = getString("resumed_reason"),
+        hardHaltCleanupState = cleanupState,
         updatedAt = Instant.ofEpochMilli(getLong("updated_at")),
     )
+}
+
+internal fun JdbcTransaction.hasOpenPaperRisk(): Boolean {
+    return prepare(
+        """
+            SELECT EXISTS (
+                SELECT 1 FROM positions WHERE status = 'OPEN'
+                UNION ALL
+                SELECT 1 FROM orders
+                WHERE status IN ('OPEN', 'PENDING_CANCEL') AND side = 'BUY'
+            )
+        """,
+    ).use { statement ->
+        statement.executeQuery().use { rows ->
+            check(rows.next())
+            rows.getBoolean(1)
+        }
+    }
+}
+
+internal fun JdbcTransaction.updateHardHaltCleanupState(state: HardHaltCleanupState?) {
+    prepare("UPDATE risk_state SET hard_halt_cleanup_state = ? WHERE id = ?").use { statement ->
+        statement.setString(1, state?.name)
+        statement.setInt(2, RISK_STATE_SINGLE_ROW_ID)
+        check(statement.executeUpdate() == 1)
+    }
+}
+
+private sealed interface ResumeRiskStateResult {
+    data class Resumed(val state: RiskState) : ResumeRiskStateResult
+    data object Rejected : ResumeRiskStateResult
 }
 
 /**

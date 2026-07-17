@@ -6,10 +6,40 @@ import java.time.Instant
 /** in-memory risk と paper ledger writer が共有する同期境界。 */
 class InMemoryAccountStateBoundary {
     private val lock = Any()
+    private var riskState: RiskState? = null
+    private var openRiskReader: (() -> Boolean)? = null
 
     fun <T> read(block: () -> T): T = synchronized(lock, block)
 
     fun <T> write(block: () -> T): T = synchronized(lock, block)
+
+    internal fun initializeRiskState(initialState: RiskState) {
+        write {
+            if (riskState == null) riskState = initialState
+        }
+    }
+
+    internal fun currentRiskState(): RiskState = read {
+        requireNotNull(riskState) { "in-memory risk_state was not initialized." }
+    }
+
+    internal fun currentRiskStateOrNull(): RiskState? = read { riskState }
+
+    internal fun updateRiskState(mutation: (RiskState) -> RiskState): RiskState = write {
+        val updated = mutation(currentRiskState())
+        riskState = updated
+        updated
+    }
+
+    internal fun updateRiskStateIfPresent(mutation: (RiskState) -> RiskState): RiskState? = write {
+        riskState?.let(mutation)?.also { updated -> riskState = updated }
+    }
+
+    internal fun registerOpenRiskReader(reader: () -> Boolean) {
+        write { openRiskReader = reader }
+    }
+
+    internal fun hasOpenRisk(): Boolean = read { openRiskReader?.invoke() == true }
 }
 
 /**
@@ -23,27 +53,37 @@ class InMemoryRiskStateRepository(
     initialState: RiskState = RiskState(updatedAt = Instant.now(clock)),
     internal val accountStateBoundary: InMemoryAccountStateBoundary = InMemoryAccountStateBoundary(),
 ) : RiskStateRepository {
-    private var storedState = initialState
-
-    override suspend fun current(): Result<RiskState> {
-        return accountStateBoundary.read { Result.success(storedState) }
+    init {
+        accountStateBoundary.initializeRiskState(initialState)
     }
 
-    internal fun currentSnapshot(): RiskState = accountStateBoundary.read { storedState }
+    override suspend fun current(): Result<RiskState> {
+        return accountStateBoundary.read { Result.success(accountStateBoundary.currentRiskState()) }
+    }
+
+    internal fun currentSnapshot(): RiskState = accountStateBoundary.currentRiskState()
 
     override suspend fun setHardHalt(reason: String, at: Instant): Result<RiskState> {
         return accountStateBoundary.write {
             runCatching {
                 require(reason.isNotBlank()) { "HARD_HALT reason is required." }
 
-                storedState = storedState.copy(
-                    state = RiskHaltState.HARD_HALT,
-                    haltReason = reason,
-                    haltAt = at,
-                    updatedAt = at,
-                )
+                val previousState = accountStateBoundary.currentRiskState()
+                accountStateBoundary.updateRiskState { currentState ->
+                    currentState.copy(
+                        state = RiskHaltState.HARD_HALT,
+                        haltReason = reason,
+                        haltAt = at,
+                        hardHaltCleanupState = if (previousState.state == RiskHaltState.HARD_HALT) {
+                            previousState.hardHaltCleanupState
+                        } else {
+                            HardHaltCleanupState.UNKNOWN
+                        },
+                        updatedAt = at,
+                    )
+                }
 
-                storedState
+                accountStateBoundary.currentRiskState()
             }
         }
     }
@@ -53,18 +93,21 @@ class InMemoryRiskStateRepository(
             runCatching {
                 require(reason.isNotBlank()) { "SOFT_HALT reason is required." }
 
-                if (storedState.state == RiskHaltState.HARD_HALT) {
+                if (accountStateBoundary.currentRiskState().state == RiskHaltState.HARD_HALT) {
                     throw SoftHaltDowngradeRejectedException()
                 }
 
-                storedState = storedState.copy(
-                    state = RiskHaltState.SOFT_HALT,
-                    haltReason = reason,
-                    haltAt = at,
-                    updatedAt = at,
-                )
+                accountStateBoundary.updateRiskState { currentState ->
+                    currentState.copy(
+                        state = RiskHaltState.SOFT_HALT,
+                        haltReason = reason,
+                        haltAt = at,
+                        hardHaltCleanupState = null,
+                        updatedAt = at,
+                    )
+                }
 
-                storedState
+                accountStateBoundary.currentRiskState()
             }
         }
     }
@@ -74,14 +117,34 @@ class InMemoryRiskStateRepository(
             runCatching {
                 require(reason.isNotBlank()) { "manual resume reason is required." }
 
-                storedState = storedState.copy(
-                    state = RiskHaltState.RUNNING,
-                    resumedAt = at,
-                    resumedReason = reason,
-                    updatedAt = at,
-                )
+                val currentState = accountStateBoundary.currentRiskState()
+                val hasOpenRisk = accountStateBoundary.hasOpenRisk()
 
-                storedState
+                if (currentState.state == RiskHaltState.HARD_HALT) {
+                    val cleanupIsSafe = currentState.hardHaltCleanupState == HardHaltCleanupState.SAFE
+
+                    if (!cleanupIsSafe || hasOpenRisk) {
+                        if (cleanupIsSafe && hasOpenRisk) {
+                            accountStateBoundary.updateRiskState { state ->
+                                state.copy(hardHaltCleanupState = HardHaltCleanupState.UNKNOWN)
+                            }
+                        }
+
+                        throw HardHaltCleanupIncompleteException()
+                    }
+                }
+
+                accountStateBoundary.updateRiskState { state ->
+                    state.copy(
+                        state = RiskHaltState.RUNNING,
+                        resumedAt = at,
+                        resumedReason = reason,
+                        hardHaltCleanupState = null,
+                        updatedAt = at,
+                    )
+                }
+
+                accountStateBoundary.currentRiskState()
             }
         }
     }
@@ -92,7 +155,8 @@ class InMemoryRiskStateRepository(
     suspend fun restore(state: RiskState): Result<Unit> {
         return accountStateBoundary.write {
             runCatching {
-                storedState = state
+                accountStateBoundary.updateRiskState { state }
+                Unit
             }
         }
     }

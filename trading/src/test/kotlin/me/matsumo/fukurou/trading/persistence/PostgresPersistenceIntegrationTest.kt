@@ -42,10 +42,16 @@ import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
 import me.matsumo.fukurou.trading.broker.InMemoryPaperLedgerRepository
+import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
+import me.matsumo.fukurou.trading.broker.IntentConsumingRestingEntryOrderRequest
+import me.matsumo.fukurou.trading.broker.MarketEntryFillRequest
 import me.matsumo.fukurou.trading.broker.PaperBroker
+import me.matsumo.fukurou.trading.broker.PaperRiskExitException
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
+import me.matsumo.fukurou.trading.broker.SimulatedFill
+import me.matsumo.fukurou.trading.broker.TradeIntentConsumptionRequest
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
@@ -104,6 +110,7 @@ import me.matsumo.fukurou.trading.decision.identity.MaterialMissingSource
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
@@ -145,6 +152,8 @@ import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
 import me.matsumo.fukurou.trading.retryTransientTestPostgresConnection
+import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
+import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -229,6 +238,9 @@ private const val DELETE_OPEN_STOP_ORDER_SQL = """
  * risk_state の state column を削除する SQL。
  */
 private const val DROP_RISK_STATE_STATE_COLUMN_SQL = "ALTER TABLE risk_state DROP COLUMN state"
+
+private const val DROP_HARD_HALT_CLEANUP_STATE_COLUMN_SQL =
+    "ALTER TABLE risk_state DROP COLUMN hard_halt_cleanup_state"
 
 /**
  * risk_state の rollback 互換列を意図的に古い状態へ戻す SQL。
@@ -2133,6 +2145,36 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(RiskHaltState.HARD_HALT, columns.state)
         assertEquals(true, columns.hardHalt)
+        assertEquals(
+            HardHaltCleanupState.UNKNOWN,
+            ExposedRiskStateRepository(database).current().getOrThrow().hardHaltCleanupState,
+        )
+    }
+
+    @Test
+    fun bootstrap_adds_nullable_hard_halt_cleanup_state_for_fresh_and_upgrade_schema() = runPostgresTest {
+        val bootstrap = TradingPersistenceBootstrap(database, fixedClock())
+
+        bootstrap.ensureSchema().getOrThrow()
+        assertTrue(hasHardHaltCleanupStateColumn(database))
+        assertEquals(null, ExposedRiskStateRepository(database).current().getOrThrow().hardHaltCleanupState)
+
+        dropHardHaltCleanupStateColumn(database)
+        bootstrap.ensureSchema().getOrThrow()
+
+        assertTrue(hasHardHaltCleanupStateColumn(database))
+        assertEquals(null, ExposedRiskStateRepository(database).current().getOrThrow().hardHaltCleanupState)
+    }
+
+    @Test
+    fun additive_cleanup_column_keeps_old_reader_projection_usable() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        ExposedRiskStateRepository(database).setHardHalt("halt", fixedInstant()).getOrThrow()
+
+        val oldReaderColumns = selectRiskStateColumns(database)
+
+        assertEquals(RiskHaltState.HARD_HALT, oldReaderColumns.state)
+        assertTrue(oldReaderColumns.hardHalt)
     }
 
     @Test
@@ -2157,6 +2199,7 @@ class PostgresPersistenceIntegrationTest {
             actual = selectRiskStateColumns(database),
         )
 
+        setHardHaltCleanupState(database, HardHaltCleanupState.SAFE)
         service.resume("operator confirmed recovery", DecisionRunContext.EMPTY).getOrThrow()
         assertEquals(
             expected = RiskStateColumns(RiskHaltState.RUNNING, hardHalt = false),
@@ -7970,9 +8013,10 @@ class PostgresPersistenceIntegrationTest {
 
         val repository = ExposedPaperLedgerRepository(database)
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val riskStateRepository = ExposedRiskStateRepository(database)
         val broker = PaperBroker(
             ledgerRepository = repository,
-            riskStateRepository = ExposedRiskStateRepository(database),
+            riskStateRepository = riskStateRepository,
             decisionRepository = decisionRepository,
             marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
@@ -7984,6 +8028,7 @@ class PostgresPersistenceIntegrationTest {
 
         broker.placeOrder(command).getOrThrow()
         val positionId = UUID.fromString(broker.getPositions().getOrThrow().single().positionId)
+        riskStateRepository.setHardHalt("integration hard halt", fixedInstant()).getOrThrow()
 
         broker.sweepHardHalt(
             reasonJa = "integration hard halt",
@@ -8348,7 +8393,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun restingFillDrawdownHaltUsesHardHaltOuterReasonAndTypedDetail() = runPostgresTest {
+    fun hardHaltCleanupCancelsRestingOrderWithHardHaltReason() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000189")
         ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
@@ -8384,29 +8429,19 @@ class PostgresPersistenceIntegrationTest {
         val orderId = broker.placeOrder(command).getOrThrow().orderIds.single()
         val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
         riskStateRepository.setHardHalt("maximum drawdown reached", fixedInstant()).getOrThrow()
-        updateRiskStateDrawdownRatio(database, BigDecimal("-0.2000000000"))
 
-        val result = broker.applyMarketEvent(
-            paperTradeEvent(
-                sessionId = sessionId,
-                sequence = 2,
-                sizeBtc = "0.0100",
-                receivedAt = fixedInstant().plusSeconds(2),
-            ),
-        ).getOrThrow()
+        val result = broker.sweepHardHalt("maximum drawdown reached", null).getOrThrow()
         val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
-        val persisted = selectFillInvariantCancellation(database, orderId)
 
-        assertEquals(listOf(orderId), result.canceledOrderIds)
+        assertTrue(result.accepted, result.messageJa)
+        assertEquals(listOf(orderId), result.orderIds)
         assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
         assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
         assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
         assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
-        assertEquals(OrderStatus.CANCELED.name, persisted.status)
-        assertEquals(PaperOrderCancelReason.HARD_HALT, PaperOrderCancelReason.fromWireCode(persisted.outerReason))
-        assertEquals("FILL_INVARIANT_VIOLATION", persisted.kind)
-        assertEquals(SafetyFloorRule.MAX_DRAWDOWN_HALT.name, persisted.code)
-        assertEquals(1, persisted.violationCount)
+        assertEquals(PaperOrderCancelReason.HARD_HALT, selectOrderCancelReason(database, orderId))
+        assertEquals(HardHaltCleanupState.SAFE, riskStateRepository.current().getOrThrow().hardHaltCleanupState)
     }
 
     @Test
@@ -8485,99 +8520,422 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun parallelRestingFillAndExitUseCommonLockOrderWithoutDuplicateMutation() = runPostgresTest {
+    fun atomicRiskExitCancelsSameThesisAndPreservesUnrelatedThesisInPostgres() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
-        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000188")
-        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
         val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
-        val marketDataSource = MutablePostgresOrderbookMarketDataSource(
-            Orderbook(
-                symbol = "BTC",
-                bids = listOf(OrderbookLevel(price = "10000000", size = "0.0010")),
-                asks = listOf(OrderbookLevel(price = "10100000", size = "1.0000")),
-            ),
-        )
         val broker = PaperBroker(
             ledgerRepository = ledgerRepository,
             riskStateRepository = ExposedRiskStateRepository(database),
             decisionRepository = decisionRepository,
-            marketDataSource = marketDataSource,
-            reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
-            requireRealtimeIntegrityForRestingOrders = true,
+            marketDataSource = PostgresFakeMarketDataSource,
             clock = fixedClock(),
         )
-        broker.applyMarketEvent(
-            paperTradeEvent(
-                sessionId = sessionId,
-                sequence = 1,
-                sizeBtc = "0.0010",
-                priceJpy = "10100000",
-                receivedAt = fixedInstant(),
-            ),
-        ).getOrThrow()
-        val initialEntry = approvedPostgresEntryCommand(
+        val entry = approvedPostgresEntryCommand(
             decisionRepository,
-            postgresEntryCommand(
-                sizeBtc = BigDecimal("0.0010"),
-                takeProfitPriceJpy = BigDecimal("12000000"),
-            ),
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
         )
-        broker.placeOrder(initialEntry).getOrThrow()
-        broker.maintainProtections(watermarkTickSnapshot("11000000")).getOrThrow()
-        marketDataSource.orderbook = Orderbook(
-            symbol = "BTC",
-            bids = listOf(OrderbookLevel(price = "10600000", size = "0.0010")),
-            asks = listOf(OrderbookLevel(price = "11000000", size = "1.0000")),
-        )
-        val restingEntry = approvedPostgresEntryCommand(
+        setTradeIntentThesis(database, requireNotNull(entry.intentId), "ths-atomic-target")
+        broker.placeOrder(entry).getOrThrow()
+        val positionId = UUID.fromString(ledgerRepository.getOpenPositions().getOrThrow().single().positionId)
+
+        val sameThesisOrder = approvedPostgresEntryCommand(
             decisionRepository,
             postgresEntryCommand(
                 orderType = OrderType.LIMIT,
-                priceJpy = BigDecimal("10600000"),
+                priceJpy = BigDecimal("9900000"),
                 sizeBtc = BigDecimal("0.0002"),
-                takeProfitPriceJpy = BigDecimal("11500000"),
+                takeProfitPriceJpy = BigDecimal("12000000"),
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        setTradeIntentThesis(database, requireNotNull(sameThesisOrder.intentId), "ths-atomic-target")
+        val sameThesisOrderId = broker.placeOrder(sameThesisOrder).getOrThrow().orderIds.single()
+
+        val unrelatedOrder = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9800000"),
+                sizeBtc = BigDecimal("0.0002"),
+                takeProfitPriceJpy = BigDecimal("12000000"),
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        setTradeIntentThesis(database, requireNotNull(unrelatedOrder.intentId), "ths-atomic-unrelated")
+        val unrelatedOrderId = broker.placeOrder(unrelatedOrder).getOrThrow().orderIds.single()
+
+        val result = broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "atomic same thesis integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val openOrderIds = ledgerRepository.getOpenOrders().getOrThrow().map { order -> order.orderId }
+
+        assertTrue(result.accepted, result.messageJa)
+        assertTrue(sameThesisOrderId in result.orderIds)
+        assertEquals(listOf(unrelatedOrderId), openOrderIds)
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(1, ledgerRepository.getExecutions().getOrThrow().count { execution -> execution.side == OrderSide.SELL })
+    }
+
+    @Test
+    fun atomicRiskExitLinkageFailuresAndStaleTargetLeavePostgresLedgerUnchanged() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val entry = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+        )
+        broker.placeOrder(entry).getOrThrow()
+        val positionId = UUID.fromString(ledgerRepository.getOpenPositions().getOrThrow().single().positionId)
+        val beforeAccount = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val beforeOrders = ledgerRepository.getOpenOrders().getOrThrow()
+        val beforeExecutionCount = ledgerRepository.getExecutions().getOrThrow().size
+
+        val missingLinkage = broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "missing linkage integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
             ),
         )
-        val restingResult = broker.placeOrder(restingEntry).getOrThrow()
-        assertTrue(restingResult.accepted, restingResult.messageJa)
-        val restingOrderId = restingResult.orderIds.single()
-        val initialPositionId = UUID.fromString(ledgerRepository.getOpenPositions().getOrThrow().single().positionId)
 
-        val results = coroutineScope {
-            val exitResult = async(Dispatchers.IO) {
-                broker.closePosition(
-                    ClosePositionCommand(
-                        commandId = UUID.randomUUID(),
-                        positionId = initialPositionId,
-                        closeAll = true,
-                        reasonJa = "parallel EXIT integration",
-                        auditContext = PaperTradeAuditContext.EMPTY,
-                    ),
-                )
-            }
-            val fillResult = async(Dispatchers.IO) {
-                broker.applyMarketEvent(
-                    paperTradeEvent(
-                        sessionId = sessionId,
-                        sequence = 2,
-                        sizeBtc = "0.0100",
-                        priceJpy = "10600000",
-                        receivedAt = fixedInstant().plusSeconds(2),
-                    ),
-                )
-            }
+        assertIs<PaperRiskExitException.AmbiguousLinkage>(missingLinkage.exceptionOrNull())
+        assertEquals(beforeAccount, ledgerRepository.getAccountSnapshot().getOrThrow())
+        assertEquals(beforeOrders, ledgerRepository.getOpenOrders().getOrThrow())
+        assertEquals(beforeExecutionCount, ledgerRepository.getExecutions().getOrThrow().size)
 
-            listOf(exitResult.await(), fillResult.await())
+        setTradeIntentThesis(database, requireNotNull(entry.intentId), "ths-target")
+        val pendingWithNullThesis = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                sizeBtc = BigDecimal("0.0002"),
+                takeProfitPriceJpy = BigDecimal("12000000"),
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val pendingOrderId = broker.placeOrder(pendingWithNullThesis).getOrThrow().orderIds.single()
+        val beforePendingLinkageFailure = ledgerRepository.getOpenOrders().getOrThrow()
+
+        val pendingLinkageFailure = broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "pending null linkage integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        )
+
+        assertIs<PaperRiskExitException.AmbiguousLinkage>(pendingLinkageFailure.exceptionOrNull())
+        assertEquals(beforeAccount, ledgerRepository.getAccountSnapshot().getOrThrow())
+        assertEquals(beforePendingLinkageFailure, ledgerRepository.getOpenOrders().getOrThrow())
+        assertEquals(beforeExecutionCount, ledgerRepository.getExecutions().getOrThrow().size)
+
+        setTradeIntentThesis(database, requireNotNull(pendingWithNullThesis.intentId), "ths-unrelated")
+        setTradeIntentThesis(database, requireNotNull(entry.intentId), "ths-contradictory-a")
+        val protectiveStop = ledgerRepository.getOpenOrders().getOrThrow().single { order ->
+            order.side == OrderSide.SELL && order.positionId == positionId.toString()
         }
+        val contradictory = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                sizeBtc = BigDecimal("0.0002"),
+                takeProfitPriceJpy = BigDecimal("12000000"),
+            ).copy(tradeGroupId = UUID.fromString(requireNotNull(protectiveStop.tradeGroupId))),
+        )
+        setTradeIntentThesis(database, requireNotNull(contradictory.intentId), "ths-contradictory-b")
+        makeOpenOrderContradictory(
+            database = database,
+            orderId = UUID.fromString(protectiveStop.orderId),
+            intentId = requireNotNull(contradictory.intentId),
+        )
+        val beforeContradictoryOrders = ledgerRepository.getOpenOrders().getOrThrow()
 
-        results.forEach { result -> assertTrue(result.isSuccess, result.exceptionOrNull()?.message) }
-        val executions = ledgerRepository.getExecutions().getOrThrow()
+        assertTrue(beforeContradictoryOrders.any { order -> order.orderId == pendingOrderId })
 
-        assertEquals(2, executions.count { execution -> execution.side == OrderSide.BUY })
-        assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+        val contradictoryLinkage = broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = positionId,
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "contradictory linkage integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        )
+
+        assertIs<PaperRiskExitException.AmbiguousLinkage>(contradictoryLinkage.exceptionOrNull())
+        assertEquals(beforeContradictoryOrders, ledgerRepository.getOpenOrders().getOrThrow())
+        assertEquals(beforeExecutionCount, ledgerRepository.getExecutions().getOrThrow().size)
+
+        val staleTarget = broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = UUID.randomUUID(),
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "stale target integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        )
+
+        assertIs<PaperRiskExitException.StaleTarget>(staleTarget.exceptionOrNull())
+        assertEquals(beforeContradictoryOrders, ledgerRepository.getOpenOrders().getOrThrow())
+        assertEquals(beforeExecutionCount, ledgerRepository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun hardHaltCleanupPersistsUnknownRetriesToSafeAndResumesAtomicallyInPostgres() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val riskRepository = ExposedRiskStateRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = riskRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val entry = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+        )
+        broker.placeOrder(entry).getOrThrow()
+        riskRepository.setHardHalt("atomic hard halt", fixedInstant()).getOrThrow()
+
+        assertEquals(HardHaltCleanupState.UNKNOWN, riskRepository.current().getOrThrow().hardHaltCleanupState)
+        setHardHaltCleanupState(database, HardHaltCleanupState.SAFE)
+        val staleResume = ExposedRiskStateCommandService(database, fixedClock()).resume(
+            reason = "stale safe resume",
+            decisionRunContext = DecisionRunContext.EMPTY,
+        )
+        assertTrue(staleResume.isFailure)
+        assertEquals(HardHaltCleanupState.UNKNOWN, riskRepository.current().getOrThrow().hardHaltCleanupState)
+
+        val incomplete = broker.sweepHardHalt("cleanup without tick", null).getOrThrow()
+        assertFalse(incomplete.accepted)
+        assertEquals(HardHaltCleanupState.UNKNOWN, riskRepository.current().getOrThrow().hardHaltCleanupState)
         assertEquals(1, ledgerRepository.getOpenPositions().getOrThrow().size)
-        assertEquals(1, executions.count { execution -> execution.orderId == restingOrderId })
+
+        val completed = broker.sweepHardHalt("cleanup with tick", watermarkTickSnapshot("10000000")).getOrThrow()
+        val executionCount = ledgerRepository.getExecutions().getOrThrow().size
+        val retry = broker.sweepHardHalt("response-loss retry", null).getOrThrow()
+
+        assertTrue(completed.accepted, completed.messageJa)
+        assertTrue(retry.accepted, retry.messageJa)
+        assertEquals(HardHaltCleanupState.SAFE, riskRepository.current().getOrThrow().hardHaltCleanupState)
+        assertEquals(executionCount, ledgerRepository.getExecutions().getOrThrow().size)
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(
+            RiskHaltState.RUNNING,
+            ExposedRiskStateCommandService(database, fixedClock())
+                .resume("verified cleanup resume", DecisionRunContext.EMPTY)
+                .getOrThrow()
+                .state,
+        )
+    }
+
+    @Test
+    fun hardHaltCleanupRollsBackBeforeCommitAndConvergesAfterCommitResponseLossInPostgres() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val faultController = RiskExitCommitFaultController()
+        val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+        val ledgerRepository = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+        val riskRepository = ExposedRiskStateRepository(faultDatabase)
+        val decisionRepository = ExposedDecisionRepository(faultDatabase, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = riskRepository,
+            decisionRepository = decisionRepository,
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val entry = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("12000000")),
+        )
+        broker.placeOrder(entry).getOrThrow()
+        riskRepository.setHardHalt("fault boundary hard halt", fixedInstant()).getOrThrow()
+        val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val executionsBefore = ledgerRepository.getExecutions().getOrThrow().size
+
+        faultController.armPreCommitFailure()
+        val preCommitFailure = broker.sweepHardHalt(
+            "cleanup fails before commit",
+            watermarkTickSnapshot("10000000"),
+        )
+
+        assertTrue(preCommitFailure.isFailure)
+        assertEquals(HardHaltCleanupState.UNKNOWN, riskRepository.current().getOrThrow().hardHaltCleanupState)
+        assertEquals(accountBefore, ledgerRepository.getAccountSnapshot().getOrThrow())
+        assertEquals(1, ledgerRepository.getOpenPositions().getOrThrow().size)
+        assertEquals(executionsBefore, ledgerRepository.getExecutions().getOrThrow().size)
+
+        faultController.armCommitResponseLoss()
+        val responseLoss = broker.sweepHardHalt(
+            "cleanup commits before response loss",
+            watermarkTickSnapshot("10000000"),
+        )
+
+        assertTrue(responseLoss.isFailure)
+        assertEquals(HardHaltCleanupState.SAFE, riskRepository.current().getOrThrow().hardHaltCleanupState)
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertEquals(executionsBefore + 1, ledgerRepository.getExecutions().getOrThrow().size)
+
+        val retry = broker.sweepHardHalt("response-loss retry", null).getOrThrow()
+
+        assertTrue(retry.accepted, retry.messageJa)
+        assertEquals(executionsBefore + 1, ledgerRepository.getExecutions().getOrThrow().size)
+        assertEquals(HardHaltCleanupState.SAFE, riskRepository.current().getOrThrow().hardHaltCleanupState)
+    }
+
+    @Test
+    fun flatHardHaltCleanupPersistsSafeWithoutTickInPostgres() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val riskRepository = ExposedRiskStateRepository(database)
+        val broker = PaperBroker(
+            ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock()),
+            riskStateRepository = riskRepository,
+            decisionRepository = ExposedDecisionRepository(database, fixedClock()),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        riskRepository.setHardHalt("flat hard halt", fixedInstant()).getOrThrow()
+
+        val result = broker.sweepHardHalt("flat readback", null).getOrThrow()
+
+        assertTrue(result.accepted, result.messageJa)
+        assertEquals(HardHaltCleanupState.SAFE, riskRepository.current().getOrThrow().hardHaltCleanupState)
+        assertTrue(result.executionIds.isEmpty())
+        assertTrue(result.orderIds.isEmpty())
+    }
+
+    @Test
+    fun atomicRiskExitWinsBarrierBeforeRestingFillWithoutDuplicateExecution() = runPostgresTest {
+        runAtomicRiskExitFillBarrierRace(exitFirst = true)
+    }
+
+    @Test
+    fun restingFillWinsBarrierBeforeAtomicRiskExitWithoutDuplicateExecution() = runPostgresTest {
+        runAtomicRiskExitFillBarrierRace(exitFirst = false)
+    }
+
+    @Test
+    fun hardHaltCleanupWinsBarrierBeforeRestingFillWithoutRiskIncrease() = runPostgresTest {
+        runHardHaltCleanupFillBarrierRace(cleanupFirst = true)
+    }
+
+    @Test
+    fun restingFillWinsBarrierAfterHardHaltWithoutRiskIncrease() = runPostgresTest {
+        runHardHaltCleanupFillBarrierRace(cleanupFirst = false)
+    }
+
+    @Test
+    fun hardHaltWinsBarrierBeforeDirectMarketEntryWithoutRiskIncrease() = runPostgresTest {
+        runDirectEntryHardHaltBarrierRace(
+            mutationKind = DirectEntryMutationKind.MARKET,
+            haltFirst = true,
+        )
+    }
+
+    @Test
+    fun directMarketEntryWinsBarrierBeforeHardHalt() = runPostgresTest {
+        runDirectEntryHardHaltBarrierRace(
+            mutationKind = DirectEntryMutationKind.MARKET,
+            haltFirst = false,
+        )
+    }
+
+    @Test
+    fun hardHaltWinsBarrierBeforeDirectRestingEntryWithoutRiskIncrease() = runPostgresTest {
+        runDirectEntryHardHaltBarrierRace(
+            mutationKind = DirectEntryMutationKind.RESTING,
+            haltFirst = true,
+        )
+    }
+
+    @Test
+    fun directRestingEntryWinsBarrierBeforeHardHalt() = runPostgresTest {
+        runDirectEntryHardHaltBarrierRace(
+            mutationKind = DirectEntryMutationKind.RESTING,
+            haltFirst = false,
+        )
+    }
+
+    @Test
+    fun hardHaltRejectsIntentConsumingDirectEntriesWithoutConsumingIntent() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val marketCommand = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(takeProfitPriceJpy = BigDecimal("11000000")),
+        )
+        val restingCommand = approvedPostgresEntryCommand(
+            decisionRepository,
+            postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+            ),
+        )
+        ExposedRiskStateRepository(database)
+            .setHardHalt("intent-consuming direct entry hard halt", fixedInstant())
+            .getOrThrow()
+
+        val marketResult = ledgerRepository.fillMarketEntryAndConsumeIntent(
+            IntentConsumingMarketEntryFillRequest(
+                entry = directPostgresMarketEntryRequest(marketCommand),
+                consumption = TradeIntentConsumptionRequest(
+                    intentId = requireNotNull(marketCommand.intentId),
+                    consumedAt = fixedInstant(),
+                ),
+            ),
+        )
+        val restingResult = ledgerRepository.createRestingEntryOrderAndConsumeIntent(
+            IntentConsumingRestingEntryOrderRequest(
+                order = directPostgresRestingEntryRequest(restingCommand),
+                consumption = TradeIntentConsumptionRequest(
+                    intentId = requireNotNull(restingCommand.intentId),
+                    consumedAt = fixedInstant(),
+                ),
+            ),
+        )
+
+        assertIs<HardHaltTradingRejectedException>(marketResult.exceptionOrNull())
+        assertIs<HardHaltTradingRejectedException>(restingResult.exceptionOrNull())
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        exposedTransaction(database) {
+            prepare("SELECT COUNT(*) FROM trade_intent_consumptions").use { statement ->
+                statement.executeQuery().use { resultSet ->
+                    assertTrue(resultSet.next())
+                    assertEquals(0, resultSet.getInt(1))
+                }
+            }
+        }
     }
 
     @Test
@@ -8954,6 +9312,7 @@ class PostgresPersistenceIntegrationTest {
 
         val repository = ExposedRiskStateRepository(database)
         repository.setHardHalt("manual halt", fixedInstant()).getOrThrow()
+        setHardHaltCleanupState(database, HardHaltCleanupState.SAFE)
         dropCommandEventLogTable(database)
 
         val resumeResult = ExposedRiskStateCommandService(database, fixedClock()).resume(
@@ -10042,6 +10401,378 @@ private suspend fun approvedPostgresEntryCommand(
     )
 }
 
+private fun setTradeIntentThesis(
+    database: ExposedDatabase,
+    intentId: UUID,
+    thesisId: String?,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement("UPDATE trade_intents SET thesis_id = ? WHERE id = ?").use { statement ->
+            statement.setString(1, thesisId)
+            statement.setObject(2, intentId)
+            require(statement.executeUpdate() == 1) { "trade intent was not found." }
+        }
+    }
+}
+
+private fun makeOpenOrderContradictory(
+    database: ExposedDatabase,
+    orderId: UUID,
+    intentId: UUID,
+) {
+    exposedTransaction(database) {
+        jdbcConnection().prepareStatement(
+            "UPDATE orders SET intent_id = ?, side = 'BUY', order_type = 'LIMIT', " +
+                "limit_price_jpy = 9900000, trigger_price_jpy = NULL WHERE id = ?",
+        ).use { statement ->
+            statement.setObject(1, intentId)
+            statement.setObject(2, orderId)
+            require(statement.executeUpdate() == 1) { "open order was not found." }
+        }
+    }
+}
+
+private suspend fun PostgresTestContext.runAtomicRiskExitFillBarrierRace(exitFirst: Boolean) {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000188")
+    ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+    val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+    val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+    val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+        Orderbook(
+            symbol = "BTC",
+            bids = listOf(OrderbookLevel(price = "10000000", size = "0.0010")),
+            asks = listOf(OrderbookLevel(price = "10100000", size = "1.0000")),
+        ),
+    )
+    val broker = PaperBroker(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = ExposedRiskStateRepository(database),
+        decisionRepository = decisionRepository,
+        marketDataSource = marketDataSource,
+        reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+        requireRealtimeIntegrityForRestingOrders = true,
+        clock = fixedClock(),
+    )
+    broker.applyMarketEvent(
+        paperTradeEvent(
+            sessionId = sessionId,
+            sequence = 1,
+            sizeBtc = "0.0010",
+            priceJpy = "10100000",
+            receivedAt = fixedInstant(),
+        ),
+    ).getOrThrow()
+    val initialEntry = approvedPostgresEntryCommand(
+        decisionRepository,
+        postgresEntryCommand(
+            sizeBtc = BigDecimal("0.0010"),
+            takeProfitPriceJpy = BigDecimal("12000000"),
+        ),
+    )
+    setTradeIntentThesis(database, requireNotNull(initialEntry.intentId), "ths-barrier-race")
+    broker.placeOrder(initialEntry).getOrThrow()
+    broker.maintainProtections(watermarkTickSnapshot("11000000")).getOrThrow()
+    val initialPosition = ledgerRepository.getOpenPositions().getOrThrow().single()
+    marketDataSource.orderbook = Orderbook(
+        symbol = "BTC",
+        bids = listOf(OrderbookLevel(price = "10600000", size = "0.0010")),
+        asks = listOf(OrderbookLevel(price = "11000000", size = "1.0000")),
+    )
+    val restingEntry = approvedPostgresEntryCommand(
+        decisionRepository,
+        postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("10600000"),
+            sizeBtc = BigDecimal("0.0002"),
+            takeProfitPriceJpy = BigDecimal("11500000"),
+        ).copy(tradeGroupId = UUID.fromString(initialPosition.tradeGroupId)),
+    )
+    setTradeIntentThesis(database, requireNotNull(restingEntry.intentId), "ths-barrier-race")
+    val restingResult = broker.placeOrder(restingEntry).getOrThrow()
+    assertTrue(restingResult.accepted, restingResult.messageJa)
+    val restingOrderId = restingResult.orderIds.single()
+    val initialPositionId = UUID.fromString(initialPosition.positionId)
+    val exitAction: suspend () -> Unit = {
+        broker.exitPosition(
+            ClosePositionCommand(
+                commandId = UUID.randomUUID(),
+                positionId = initialPositionId,
+                closeAll = false,
+                closeRatio = BigDecimal.ONE,
+                reasonJa = "atomic barrier EXIT integration",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+    }
+    val fillAction: suspend () -> Unit = {
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0100",
+                priceJpy = "10600000",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+    }
+    val riskLockConnection = dataSource.connection
+    riskLockConnection.autoCommit = false
+    riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+        statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+    }
+
+    try {
+        coroutineScope {
+            val first = async(Dispatchers.IO) { if (exitFirst) exitAction() else fillAction() }
+            awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
+            val second = async(Dispatchers.IO) { if (exitFirst) fillAction() else exitAction() }
+            try {
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+            } finally {
+                riskLockConnection.commit()
+                riskLockConnection.close()
+            }
+            first.await()
+            second.await()
+        }
+    } finally {
+        if (!riskLockConnection.isClosed) riskLockConnection.close()
+    }
+
+    val executions = ledgerRepository.getExecutions().getOrThrow()
+    val restingFillCount = executions.count { execution -> execution.orderId == restingOrderId }
+
+    assertEquals(if (exitFirst) 1 else 2, executions.count { execution -> execution.side == OrderSide.BUY })
+    assertEquals(if (exitFirst) 0 else 1, restingFillCount)
+    assertEquals(1, executions.count { execution -> execution.side == OrderSide.SELL })
+    assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+    assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
+}
+
+private suspend fun PostgresTestContext.runHardHaltCleanupFillBarrierRace(cleanupFirst: Boolean) {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000191")
+    ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+    val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+    val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+    val riskRepository = ExposedRiskStateRepository(database)
+    val marketDataSource = MutablePostgresOrderbookMarketDataSource(
+        Orderbook(
+            symbol = "BTC",
+            bids = listOf(OrderbookLevel(price = "9990000", size = "0.0010")),
+            asks = listOf(OrderbookLevel(price = "10000000", size = "1.0000")),
+        ),
+    )
+    val broker = PaperBroker(
+        ledgerRepository = ledgerRepository,
+        riskStateRepository = riskRepository,
+        decisionRepository = decisionRepository,
+        marketDataSource = marketDataSource,
+        reconcilerStatusProvider = ExposedReconcilerStatusProvider(database),
+        requireRealtimeIntegrityForRestingOrders = true,
+        clock = fixedClock(),
+    )
+    broker.applyMarketEvent(
+        paperTradeEvent(
+            sessionId = sessionId,
+            sequence = 1,
+            sizeBtc = "0.0010",
+            priceJpy = "10000000",
+            receivedAt = fixedInstant(),
+        ),
+    ).getOrThrow()
+    val restingEntry = approvedPostgresEntryCommand(
+        decisionRepository,
+        postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9990000"),
+            sizeBtc = BigDecimal("0.0002"),
+            takeProfitPriceJpy = BigDecimal("11000000"),
+        ),
+    )
+    broker.placeOrder(restingEntry).getOrThrow()
+    riskRepository.setHardHalt("barrier race hard halt", fixedInstant()).getOrThrow()
+
+    val cleanupAction: suspend () -> Unit = {
+        broker.sweepHardHalt("barrier race cleanup", null).getOrThrow()
+    }
+    val fillAction: suspend () -> Unit = {
+        broker.applyMarketEvent(
+            paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 2,
+                sizeBtc = "0.0100",
+                priceJpy = "9990000",
+                receivedAt = fixedInstant().plusSeconds(2),
+            ),
+        ).getOrThrow()
+    }
+    val riskLockConnection = dataSource.connection
+    riskLockConnection.autoCommit = false
+    riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+        statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+    }
+
+    try {
+        coroutineScope {
+            val first = async(Dispatchers.IO) { if (cleanupFirst) cleanupAction() else fillAction() }
+            awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
+            val second = async(Dispatchers.IO) { if (cleanupFirst) fillAction() else cleanupAction() }
+            try {
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+            } finally {
+                riskLockConnection.commit()
+                riskLockConnection.close()
+            }
+            first.await()
+            second.await()
+        }
+    } finally {
+        if (!riskLockConnection.isClosed) riskLockConnection.close()
+    }
+
+    assertTrue(ledgerRepository.getOpenOrders().getOrThrow().isEmpty())
+    assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+    assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+    assertEquals(HardHaltCleanupState.SAFE, riskRepository.current().getOrThrow().hardHaltCleanupState)
+}
+
+/** direct entry mutation の種類。 */
+private enum class DirectEntryMutationKind {
+    MARKET,
+    RESTING,
+}
+
+private fun directPostgresMarketEntryRequest(
+    command: PlaceOrderCommand,
+    tradeGroupId: UUID = UUID.randomUUID(),
+): MarketEntryFillRequest {
+    return MarketEntryFillRequest(
+        command = command,
+        fill = SimulatedFill(
+            executionId = UUID.randomUUID(),
+            priceJpy = BigDecimal("10000000"),
+            sizeBtc = command.sizeBtc,
+            feeJpy = BigDecimal.ZERO,
+            realizedPnlJpy = BigDecimal.ZERO,
+            liquidity = ExecutionLiquidity.TAKER,
+            executedAt = fixedInstant(),
+        ),
+        positionId = UUID.randomUUID(),
+        tradeGroupId = tradeGroupId,
+        stopOrderId = UUID.randomUUID(),
+    )
+}
+
+private fun directPostgresRestingEntryRequest(
+    command: PlaceOrderCommand,
+    tradeGroupId: UUID = UUID.randomUUID(),
+): RestingEntryOrderRequest {
+    return RestingEntryOrderRequest(
+        command = command,
+        orderId = command.commandId,
+        tradeGroupId = tradeGroupId,
+        createdAt = fixedInstant(),
+        expiresAt = fixedInstant().plusSeconds(300),
+        expirySource = OrderExpirySource.SYSTEM_TTL,
+        effectiveTtlSeconds = 300,
+    )
+}
+
+private suspend fun PostgresTestContext.runDirectEntryHardHaltBarrierRace(
+    mutationKind: DirectEntryMutationKind,
+    haltFirst: Boolean,
+) {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    val writer = ExposedPaperLedgerWriter(database, postgresSymbolRules(), fixedClock())
+    val ledgerRepository = ExposedPaperLedgerRepository(database, clock = fixedClock())
+    val riskRepository = ExposedRiskStateRepository(database)
+    val command = postgresEntryCommand(
+        orderType = if (mutationKind == DirectEntryMutationKind.MARKET) OrderType.MARKET else OrderType.LIMIT,
+        priceJpy = BigDecimal("9990000").takeIf { mutationKind == DirectEntryMutationKind.RESTING },
+        sizeBtc = BigDecimal("0.0010"),
+        takeProfitPriceJpy = BigDecimal("11000000"),
+    )
+    val tradeGroupId = UUID.randomUUID()
+    val writerAction: suspend () -> Result<*> = when (mutationKind) {
+        DirectEntryMutationKind.MARKET -> {
+            {
+                writer.fillMarketEntry(directPostgresMarketEntryRequest(command, tradeGroupId))
+            }
+        }
+
+        DirectEntryMutationKind.RESTING -> {
+            {
+                writer.createRestingEntryOrder(directPostgresRestingEntryRequest(command, tradeGroupId))
+            }
+        }
+    }
+    val writerResult = CompletableDeferred<Result<*>>()
+    val riskLockConnection = dataSource.connection
+    riskLockConnection.autoCommit = false
+    riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+        statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+    }
+
+    try {
+        coroutineScope {
+            val first = async(Dispatchers.IO) {
+                if (haltFirst) {
+                    riskRepository.setHardHalt("direct entry barrier hard halt", fixedInstant()).getOrThrow()
+                } else {
+                    writerResult.complete(writerAction())
+                }
+            }
+            awaitDatabaseLockWaiters(dataSource, expectedCount = 1)
+            val second = async(Dispatchers.IO) {
+                if (haltFirst) {
+                    writerResult.complete(writerAction())
+                } else {
+                    riskRepository.setHardHalt("direct entry barrier hard halt", fixedInstant()).getOrThrow()
+                }
+            }
+            try {
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+            } finally {
+                riskLockConnection.commit()
+                riskLockConnection.close()
+            }
+            first.await()
+            second.await()
+        }
+    } finally {
+        if (!riskLockConnection.isClosed) riskLockConnection.close()
+    }
+
+    val result = writerResult.await()
+    val openPositions = ledgerRepository.getOpenPositions().getOrThrow()
+    val openOrders = ledgerRepository.getOpenOrders().getOrThrow()
+    val executions = ledgerRepository.getExecutions().getOrThrow()
+
+    assertEquals(RiskHaltState.HARD_HALT, riskRepository.current().getOrThrow().state)
+    if (haltFirst) {
+        assertIs<HardHaltTradingRejectedException>(result.exceptionOrNull())
+        assertTrue(openPositions.isEmpty())
+        assertTrue(openOrders.isEmpty())
+        assertTrue(executions.isEmpty())
+    } else {
+        assertTrue(result.isSuccess)
+        when (mutationKind) {
+            DirectEntryMutationKind.MARKET -> {
+                assertEquals(1, openPositions.size)
+                assertEquals(1, executions.count { execution -> execution.side == OrderSide.BUY })
+            }
+
+            DirectEntryMutationKind.RESTING -> {
+                assertTrue(openPositions.isEmpty())
+                assertEquals(1, openOrders.count { order -> order.side == OrderSide.BUY })
+                assertTrue(executions.isEmpty())
+            }
+        }
+    }
+}
+
 private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
     return DecisionSubmission(
         invocationId = "run-entry-${command.commandId}",
@@ -10719,6 +11450,56 @@ private class RecoveryCommitFaultDataSource(
     }
 }
 
+private class RiskExitCommitFaultDataSource(
+    private val delegate: DataSource,
+    private val controller: RiskExitCommitFaultController,
+) : DataSource by delegate {
+    override fun getConnection(): Connection = delegate.connection.withRiskExitCommitFault(controller)
+
+    override fun getConnection(username: String, password: String): Connection {
+        return delegate.getConnection(username, password).withRiskExitCommitFault(controller)
+    }
+}
+
+private class RiskExitCommitFaultController {
+    private val preCommitFailureArmed = AtomicBoolean(false)
+    private val commitResponseLossArmed = AtomicBoolean(false)
+
+    fun armPreCommitFailure() {
+        preCommitFailureArmed.set(true)
+    }
+
+    fun armCommitResponseLoss() {
+        commitResponseLossArmed.set(true)
+    }
+
+    fun shouldFailBeforeCommit(): Boolean = preCommitFailureArmed.compareAndSet(true, false)
+
+    fun shouldLoseCommitResponse(): Boolean = commitResponseLossArmed.compareAndSet(true, false)
+}
+
+private fun Connection.withRiskExitCommitFault(controller: RiskExitCommitFaultController): Connection {
+    val delegate = this
+    return Proxy.newProxyInstance(
+        Connection::class.java.classLoader,
+        arrayOf(Connection::class.java),
+    ) { _, method, arguments ->
+        try {
+            if (method.name != "commit") return@newProxyInstance method.invoke(delegate, *(arguments ?: emptyArray()))
+            if (controller.shouldFailBeforeCommit()) error("risk-exit failed before commit")
+
+            val result = method.invoke(delegate, *(arguments ?: emptyArray()))
+            if (controller.shouldLoseCommitResponse()) {
+                error("risk-exit commit response was lost")
+            }
+
+            result
+        } catch (failure: InvocationTargetException) {
+            throw failure.targetException
+        }
+    } as Connection
+}
+
 private class RecoveryCommitFaultController {
     private val commitResponseLossArmed = AtomicBoolean(false)
     private val readbackFailureArmed = AtomicBoolean(false)
@@ -11167,6 +11948,31 @@ private fun dropRiskStateStateColumn(database: ExposedDatabase) {
     exposedTransaction(database) {
         jdbcConnection().prepareStatement(DROP_RISK_STATE_STATE_COLUMN_SQL).use { statement ->
             statement.executeUpdate()
+        }
+    }
+}
+
+private fun dropHardHaltCleanupStateColumn(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        prepare(DROP_HARD_HALT_CLEANUP_STATE_COLUMN_SQL).use { statement -> statement.executeUpdate() }
+    }
+}
+
+private fun hasHardHaltCleanupStateColumn(database: ExposedDatabase): Boolean {
+    return exposedTransaction(database) {
+        prepare(
+            "SELECT 1 FROM information_schema.columns " +
+                "WHERE table_schema='public' AND table_name='risk_state' AND column_name='hard_halt_cleanup_state'",
+        ).use { statement -> statement.executeQuery().use { rows -> rows.next() } }
+    }
+}
+
+private fun setHardHaltCleanupState(database: ExposedDatabase, state: HardHaltCleanupState) {
+    exposedTransaction(database) {
+        prepare("UPDATE risk_state SET hard_halt_cleanup_state = ? WHERE id = ?").use { statement ->
+            statement.setString(1, state.name)
+            statement.setInt(2, RISK_STATE_SINGLE_ROW_ID)
+            check(statement.executeUpdate() == 1)
         }
     }
 }
@@ -12585,12 +13391,15 @@ private fun selectFillInvariantCancellation(database: ExposedDatabase, orderId: 
     }
 }
 
-private fun updateRiskStateDrawdownRatio(database: ExposedDatabase, drawdownRatio: BigDecimal) {
-    exposedTransaction(database) {
-        prepare("UPDATE risk_state SET drawdown_ratio = ? WHERE id = ?").use { statement ->
-            statement.setBigDecimal(1, drawdownRatio)
-            statement.setInt(2, RISK_STATE_SINGLE_ROW_ID)
-            check(statement.executeUpdate() == 1) { "Expected risk_state drawdown ratio to be updated." }
+private fun selectOrderCancelReason(database: ExposedDatabase, orderId: String): PaperOrderCancelReason {
+    return exposedTransaction(database) {
+        prepare("SELECT cancel_reason FROM orders WHERE id = ? AND status = 'CANCELED'").use { statement ->
+            statement.setObject(1, UUID.fromString(orderId))
+            statement.executeQuery().use { resultSet ->
+                require(resultSet.next()) { "canceled order was not found." }
+
+                PaperOrderCancelReason.fromWireCode(resultSet.getString("cancel_reason"))
+            }
         }
     }
 }
