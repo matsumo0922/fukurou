@@ -1,12 +1,12 @@
 ## 1. Workflow contract
 
-- [ ] 1.1 Add a failing file-level contract test for resolved-SHA output, exact-ref quality checkout, test/detekt/clean-tree commands, least privilege, and build dependencies.
+- [ ] 1.1 Add a failing file-level contract test for resolved-SHA/quality-required outputs, exact-ref quality/build checkouts, test/detekt/clean-tree commands, least privilege, and closed build dependencies.
 
 ## 2. Quality gate implementation
 
-- [ ] 2.1 Split target resolution into a GitHub-hosted read-only job that exports the normalized main-reachable SHA.
+- [ ] 2.1 Split target resolution into a GitHub-hosted read-only job that exports the normalized main-reachable SHA and whether the target requires quality.
 - [ ] 2.2 Add a GitHub-hosted read-only quality job that verifies exact HEAD, configures Java/Gradle cache, runs `make test` and `make detekt`, and rejects tracked auto-corrections.
-- [ ] 2.3 Make image build depend on resolution and quality while preserving existing tags, signed bundle, permissions, artifact, deploy serialization, and root executor invocation.
+- [ ] 2.3 Make image build verify exact HEAD and depend on resolution plus either successful required quality or an explicitly historical manual target with skipped quality, while preserving existing tags, bundle, permissions, artifact, deploy serialization, and root executor invocation.
 
 ## 3. Documentation and validation
 

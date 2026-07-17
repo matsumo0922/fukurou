@@ -7,8 +7,9 @@ Issue #190 の CI DoD として、production image は対象 commit の JVM test
 - （ユーザー確認済み）Issue #190 を5 PRへ分割し、この stage は OpenSpec 一式と exact-SHA test/detekt gate だけを扱う。
 - deploy workflow で対象 SHA を一度解決し、quality、image build、production deploy の全 job が同じ immutable SHA を入力に使う。
 - `make test` と `make detekt` の両方が成功するまで GHCR login、image build/push、signed deploy bundle 作成、NAS deploy を開始しない。
+- 既存の historical `workflow_dispatch` rollback はこのstageでは品質ゲート対象外として維持し、PR-2のsigned `AUTHORIZED_ROLLBACK` intent導入まで回復経路を塞がない。
 - workflow の production call path を file-level contract test で固定し、運用ドキュメントを現在仕様へ更新する。
-- SHA 単調性、authorized rollback、migration compatibility、backup/restore、monitoring/alert は後続の独立 OpenSpec change/PRへ残す。
+- SHA 単調性、historical rollbackの明示認可と品質証跡、migration compatibility、backup/restore、monitoring/alert は後続の独立 OpenSpec change/PRへ残す。
 
 ## Capabilities
 
