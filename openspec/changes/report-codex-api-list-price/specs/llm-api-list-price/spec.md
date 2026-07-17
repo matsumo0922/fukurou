@@ -13,7 +13,7 @@ Issue #189 Codex cost DoD: The evaluation service MUST calculate an API list-pri
 
 #### Scenario: Provider-reported cost already exists
 - **WHEN** a phase contains provider-reported monetary cost and also matches a static catalog entry
-- **THEN** the API list-price equivalent uses the provider-reported cost and does not add a second catalog estimate
+- **THEN** provider-reported cost remains in `knownCostUsd` while the independent catalog conversion remains in `apiListPriceEquivalentUsd`, and no field combines the two bases
 
 ### Requirement: Unprovable estimates remain unpriced
 The evaluation service MUST NOT invent a model, coerce incomplete usage to zero, or return a catalog estimate for inconsistent token facts.
