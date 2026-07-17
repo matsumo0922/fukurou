@@ -11,7 +11,6 @@ import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
@@ -98,7 +97,7 @@ private fun isDockerAvailable(): Boolean {
     return runCatching { DockerClientFactory.instance().isDockerAvailable }.getOrDefault(false)
 }
 
-private class ProductionPoolPostgresContainer : PostgreSQLContainer<ProductionPoolPostgresContainer>(
+private class ProductionPoolPostgresContainer : BoundedTestPostgresContainer<ProductionPoolPostgresContainer>(
     "postgres:16-alpine",
 )
 

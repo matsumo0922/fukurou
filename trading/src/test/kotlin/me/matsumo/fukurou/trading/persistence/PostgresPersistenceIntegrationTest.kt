@@ -8,6 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
@@ -143,6 +144,7 @@ import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
+import me.matsumo.fukurou.trading.retryTransientTestPostgresConnection
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -165,7 +167,6 @@ import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.math.BigDecimal
@@ -10863,7 +10864,8 @@ private fun applyRecoveryStatementFault(
 /** recovery fault proxyが識別するJDBC statement種別。 */
 private enum class RecoveryFaultStatementKind { MUTATION, READBACK, SCAN, OTHER }
 
-private class FukurouPostgresContainer : PostgreSQLContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
+private class FukurouPostgresContainer :
+    BoundedTestPostgresContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 /**
  * Docker が利用できる場合だけ Postgres integration test を実行する。
@@ -10878,7 +10880,7 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
     container.start()
 
     try {
-        createDataSource(container).use { dataSource ->
+        retryTransientTestPostgresConnection { createDataSource(container) }.use { dataSource ->
             val database = ExposedDatabase.connect(dataSource)
             val context = PostgresTestContext(
                 container = container,

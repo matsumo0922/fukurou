@@ -1,0 +1,1 @@
+../../../.codex/skills/openspec-sync-specs/SKILL.md

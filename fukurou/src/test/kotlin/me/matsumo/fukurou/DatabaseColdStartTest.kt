@@ -5,7 +5,6 @@ import io.ktor.client.request.get
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketAddress
@@ -153,7 +152,8 @@ private fun String.withSocketFactory(factoryName: String): String {
     return "$this${separator}socketFactory=$factoryName"
 }
 
-private class ColdStartPostgresContainer : PostgreSQLContainer<ColdStartPostgresContainer>("postgres:16-alpine")
+private class ColdStartPostgresContainer :
+    BoundedTestPostgresContainer<ColdStartPostgresContainer>("postgres:16-alpine")
 
 private const val COLD_START_REVISION = "cold-start-composition"
 private const val COLD_CONNECT_DELAY_MILLIS = 750L

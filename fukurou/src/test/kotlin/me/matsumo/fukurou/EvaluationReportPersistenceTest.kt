@@ -13,7 +13,6 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.PostgreSQLContainer
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -114,7 +113,8 @@ private fun testJob(jobId: String) = EvaluationReportJobResponse(
     stage = "ADMITTED",
 )
 
-private class ReportPostgresContainer : PostgreSQLContainer<ReportPostgresContainer>("postgres:16-alpine")
+private class ReportPostgresContainer :
+    BoundedTestPostgresContainer<ReportPostgresContainer>("postgres:16-alpine")
 
 private fun reportDockerAvailable(): Boolean = runCatching {
     DockerClientFactory.instance().client().pingCmd().exec()
