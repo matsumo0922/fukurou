@@ -28,9 +28,8 @@ Production root inventory is fixed by `DurableReceiptEligibilityWiringTest`: `Tr
 
 Validated HEAD: `0e0ea11c53a87c99ee4086119027d15bde44c187`
 
-All Gradle validation used the machine-wide validation lease and the isolated
-`GRADLE_USER_HOME=/private/tmp/fukurou-187-c-gradle-user-home` with
-`GRADLE_OPTS=-Dorg.gradle.daemon=false`.
+All Gradle validation used the machine-wide validation lease, an isolated
+temporary `GRADLE_USER_HOME`, and `GRADLE_OPTS=-Dorg.gradle.daemon=false`.
 
 | Command and scope | Result | Lease wait | Wall time |
 |---|---|---|---|
