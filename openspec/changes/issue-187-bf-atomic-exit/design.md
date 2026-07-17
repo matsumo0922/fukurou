@@ -41,7 +41,7 @@ Exposed実装は一回のDB transaction、in-memory実装は一回のmutex criti
 
 （agent 仮決め）brokerは一つのcausal `TickSnapshot`/simulation contextと純粋なpaper fill simulatorをrequestへ渡す。repositoryはlock取得後にsame-thesisまたはall-riskの最新open position集合と各full sizeを確定し、そのsizeからSELL fillを計算する。
 
-market/orderbook I/OをDB transaction内へ持ち込まず、事前に固定した同一market observationだけを計算へ使う。同時fillが先にcommitしてposition sizeやsame-thesis position集合を変えても、EXITは古いsizeを適用せずlocked state全体をcloseする。REST `TickSnapshot` は app の観測時刻と exchange source timestamp を分離し、source timestamp を parse できて現在時刻から5秒以内、未来方向の clock skew も5秒以内の場合だけ HARD_HALT close の execution authority にする。realtime trade event は causal event そのものを authority とするため REST freshness gate の対象外にする。HARD_HALTでtrustworthyなtickを得られない場合はcleanupを実行せずsticky haltとUNKNOWNを残す。後から取得したhistorical priceによる埋め合わせはしない。
+market/orderbook I/OをDB transaction内へ持ち込まず、事前に固定した同一market observationだけを計算へ使う。同時fillが先にcommitしてposition sizeやsame-thesis position集合を変えても、EXITは古いsizeを適用せずlocked state全体をcloseする。REST `TickSnapshot` は app の観測時刻と exchange source timestamp を分離し、source timestamp を parse できて現在時刻から5秒以内、未来方向の clock skew も5秒以内の場合だけ HARD_HALT close の execution authority にする。simulation context の orderbook I/O 後、ledger mutation の直前に同じ source timestamp を現在 clock で再検査し、初回検査後に stale へ遷移した authority を拒否する。realtime trade event は causal event そのものを authority とするため REST freshness gate の対象外にする。HARD_HALTでtrustworthyなtickを得られない場合はcleanupを実行せずsticky haltとUNKNOWNを残す。後から取得したhistorical priceによる埋め合わせはしない。
 
 ### 3. canonical thesis linkageはDB内で完全に解決する
 

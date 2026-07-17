@@ -72,6 +72,10 @@ Issue #187 DoD (f): While HARD_HALT is durable and sticky, the system SHALL atom
 - **WHEN** HARD_HALT cleanup is UNKNOWN and the market-event WebSocket repeatedly fails to connect
 - **THEN** each bounded connection-loop retry may use a REST tick only when its parsed exchange source timestamp is no more than 5 seconds old and no more than 5 seconds in the future, and uses it only for cleanup rather than entry fill or protective execution
 
+#### Scenario: REST ticker becomes stale while execution context is built
+- **WHEN** a REST ticker passes the initial freshness check but an external orderbook lookup completes after its exchange source timestamp becomes more than 5 seconds old
+- **THEN** the system revalidates the same source timestamp immediately before ledger mutation, creates no execution or other ledger mutation, and keeps HARD_HALT cleanup UNKNOWN with open risk intact
+
 #### Scenario: Realtime event provides causal cleanup authority
 - **WHEN** a realtime market trade event reaches the ledger while HARD_HALT cleanup still has an open position
 - **THEN** cleanup uses that same event price and its exchange timestamp without applying the independent REST polling freshness gate

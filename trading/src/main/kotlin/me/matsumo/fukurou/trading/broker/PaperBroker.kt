@@ -883,6 +883,9 @@ private class PaperBrokerReconcileDelegate(
                 )
             }
 
+            // orderbook I/O 後に REST execution authority が stale 化していないことを mutation 直前に再検証する。
+            tickSnapshot?.requireExecutionTicker(runtime.time.clock)
+
             safetyGate.sweepOpenRisk(
                 reason = reasonJa,
                 auditContext = PaperTradeAuditContext.EMPTY,
