@@ -1351,7 +1351,14 @@ LLM usage、run rate、decision/action、exclusion などの non-trade populatio
 
 LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude 2.1.199 / Codex 0.142.5 の versioned adapter が structured output から usage と provider-observed model を抽出する。model 未指定は名前を推測せず `CLI_DEFAULT` とし、session file は探索しない。保存済み `details.usage` がない過去の Claude 行は redacted `details.stdout` から best-effort で fallback parse する。cleanup 失敗時も process status、exit code、usage を保持し、呼び出しを fail closed にする。
 
-`/evaluation/costs` は usage 欠落の `missingUsagePhaseCount`、monetary cost 未取得の `unpricedPhaseCount`、token を model に帰属できない `unattributedTokenPhaseCount` を分けて返す。`unpricedPhaseCount` は usage 自体を取得できず cost も不明な phase を含み、Web UI は `missingUsagePhaseCount` をその内数として表示する。取得済み金額だけを nullable な `knownCostUsd` として合計し、全 phase で cost 未取得なら null とする。Web UI と Reflection report は未知の cost を `$0` や完全な total として表示しない。取得は既定 20,000 行で bounded にし、超過時は `truncated` で示す。
+`/evaluation/costs` は usage 欠落の `missingUsagePhaseCount`、provider 申告 monetary cost 未取得の `unpricedPhaseCount`、token を model に帰属できない `unattributedTokenPhaseCount` を分けて返す。
+`knownCostUsd` は provider 申告 cost だけを合計する。
+Codex の exact `gpt-5.5` と整合した token usage は、versioned static catalog により `apiListPriceEquivalentUsd` へ独立して換算する。
+換算は phase 合計 input が 272,000 未満の場合だけ standard API の uncached input、cached input、output 単価を適用し、reasoning output は output の内数として二重加算しない。
+model、token 整合性、価格帯を証明できない Codex usage は専用の `apiListPriceUnpricedPhaseCount` に残す。
+ChatGPT/Codex subscription の実請求額は観測できないため `subscriptionActualCostUsd` は null であり、provider cost と API list-price 相当額を合算する field は持たない。
+Web UI と Reflection report は従来どおり `knownCostUsd` を使い、未知の cost を `$0` や完全な total として表示しない。
+取得は既定 20,000 行で bounded にし、超過時は `truncated` で示す。
 
 ## 6. 発火エンジンと呼び出しモデル（A-7）
 

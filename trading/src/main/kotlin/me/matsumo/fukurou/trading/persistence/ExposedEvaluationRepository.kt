@@ -1546,6 +1546,7 @@ private fun ResultSet.toLlmPhaseUsageFact(): LlmPhaseUsageFact {
         decisionRunId = getNullableString("decision_run_id"),
         provider = getNullableString("llm_provider"),
         phase = phase,
+        configuredModel = details?.get("configuredModel")?.jsonPrimitive?.contentOrNull,
         occurredAt = getInstant("ts"),
         usage = usage,
         populationStatus = EvaluationPopulationStatus.valueOf(getString("population_status")),

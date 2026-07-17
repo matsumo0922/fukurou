@@ -491,7 +491,7 @@ export interface paths {
         };
         /**
          * LLM cost と usage を取得する
-         * @description runner phase audit に保存された provider usage と取得済み cost を集計し、usage・cost・model attribution の coverage を返します。
+         * @description runner phase audit の provider cost と Codex API list-price 相当額を別々に集計します。subscription 実費は観測できないため null です。
          */
         get: {
             parameters: {
@@ -1350,7 +1350,7 @@ export interface paths {
         put?: never;
         /**
          * 取引停止状態を解除する
-         * @description SOFT_HALT または HARD_HALT を RUNNING へ戻し、手動再開理由を監査イベントへ残します。
+         * @description SOFT_HALT、または cleanup SAFE と zero-open-risk を確認した HARD_HALT を RUNNING へ戻し、手動再開理由を監査イベントへ残します。
          */
         post: {
             parameters: {
@@ -1377,6 +1377,15 @@ export interface paths {
                 };
                 /** @description request body または reason が不正です。 */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description HARD_HALT cleanup が SAFE でないか、open risk が残っています。 */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -2536,10 +2545,20 @@ export interface components {
             returns?: components["schemas"]["EvaluationBenchmarkReturnResponse"] | null;
             state: string;
         };
+        /** EvaluationPricingCatalogResponse */
+        EvaluationPricingCatalogResponse: {
+            version: string;
+            asOf: string;
+            basis: string;
+            sourceUrl: string;
+        };
         /** EvaluationProviderCostResponse */
         EvaluationProviderCostResponse: {
             provider: string;
             knownCostUsd?: string | null;
+            apiListPriceEquivalentUsd?: string | null;
+            apiListPriceCoveredPhaseCount: number;
+            apiListPriceUnpricedPhaseCount: number;
             phaseCount: number;
             missingUsagePhaseCount: number;
             unpricedPhaseCount: number;
@@ -2553,6 +2572,7 @@ export interface components {
             reasoningOutputTokens: number;
             cacheCreationInputTokens: number;
             cacheReadInputTokens: number;
+            apiListPriceEquivalentUsd?: string | null;
         };
         /** EvaluationCostsResponse */
         EvaluationCostsResponse: {
@@ -2564,6 +2584,11 @@ export interface components {
             unpricedPhaseCount: number;
             unattributedTokenPhaseCount: number;
             knownCostUsd?: string | null;
+            apiListPriceEquivalentUsd?: string | null;
+            apiListPriceCoveredPhaseCount: number;
+            apiListPriceUnpricedPhaseCount: number;
+            subscriptionActualCostUsd?: string | null;
+            pricingCatalog: components["schemas"]["EvaluationPricingCatalogResponse"];
             byProvider: components["schemas"]["EvaluationProviderCostResponse"][];
             byModel: components["schemas"]["EvaluationModelTokenResponse"][];
         };
