@@ -74,6 +74,8 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.decision.DecisionAction
+import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
@@ -115,7 +117,11 @@ import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.runner.CANONICAL_FALSIFIER_MCP_TOOL_NAMES
 import me.matsumo.fukurou.trading.runner.CANONICAL_PROPOSER_MCP_TOOL_NAMES
+import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_UNKNOWN_CODE
 import me.matsumo.fukurou.trading.runner.DEFAULT_RUNNER_MCP_SERVER_NAME
+import me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway
+import me.matsumo.fukurou.trading.runner.LlmSubmissionGatewayCodec
+import me.matsumo.fukurou.trading.runner.OPERATION_SUBMIT_DECISION
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import me.matsumo.fukurou.trading.runner.defaultFalsifierAllowedTools
 import me.matsumo.fukurou.trading.runner.defaultProposerAllowedTools
@@ -131,6 +137,10 @@ import org.testcontainers.containers.PostgreSQLContainer
 import org.testcontainers.utility.MountableFile
 import java.math.BigDecimal
 import java.net.InetSocketAddress
+import java.net.StandardProtocolFamily
+import java.net.UnixDomainSocketAddress
+import java.nio.channels.ServerSocketChannel
+import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.DriverManager
@@ -140,6 +150,8 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -703,6 +715,145 @@ class FukurouMcpServerTest {
     }
 
     @Test
+    fun submitDecisionTool_usesServerIdentityAndRequiresGatewayForProductionPhase() = runBlocking {
+        val context = decisionSubmissionContext("server-owned-run")
+        val phaseLessRuntime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val phaseLessServer = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = phaseLessRuntime,
+            decisionRunContext = context,
+        ).createServer()
+
+        val accepted = callTool(phaseLessServer, "submit_decision", noTradeDecisionArguments())
+        val spoofed = callTool(
+            phaseLessServer,
+            "submit_decision",
+            noTradeDecisionArguments(invocationId = "caller-spoof"),
+        )
+        val phaseLessRepository = phaseLessRuntime.decisionRepository as InMemoryDecisionRepository
+
+        assertTrue(accepted.isError != true)
+        assertEquals("server-owned-run", phaseLessRepository.snapshots.decisions().single().submission.invocationId)
+        assertEquals(true, spoofed.isError)
+        assertEquals(
+            "invalid_request",
+            assertNotNull(spoofed.structuredContent).getValue("type").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(1, phaseLessRepository.snapshots.decisions().size)
+
+        val productionRuntime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val productionServer = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.PROPOSER,
+            marketDataSource = FakeMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = productionRuntime,
+            decisionRunContext = context,
+            invocationPhase = LlmInvocationPhase.PROPOSER,
+            submissionGatewayClient = null,
+        ).createServer()
+        val missingGateway = callTool(productionServer, "submit_decision", noTradeDecisionArguments())
+
+        assertEquals(true, missingGateway.isError)
+        assertTrue((productionRuntime.decisionRepository as InMemoryDecisionRepository).snapshots.decisions().isEmpty())
+    }
+
+    @Test
+    fun submitDecisionTool_responseLossRetryUsesGatewayOnlyAndReturnsTypedConflict() = runBlocking {
+        val invocationId = "mcp-response-loss-run"
+        val context = decisionSubmissionContext(invocationId)
+        val appRepository = InMemoryDecisionRepository(fixedClock())
+        val directRuntime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val submission = noTradeDecisionSubmissionFixture(context)
+        val lostPath = Path.of("/tmp/fukurou-mcp-response-loss-${System.nanoTime()}.sock")
+        val lostGateway = startDecisionGateway(lostPath, appRepository, invocationId)
+        SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
+            channel.connect(UnixDomainSocketAddress.of(lostPath))
+            LlmSubmissionGatewayCodec.writeFrame(
+                channel,
+                decisionGatewayRequest(invocationId, submission),
+            )
+        }
+        lostGateway.awaitCompletion()
+        lostGateway.close()
+        val committedId = appRepository.snapshots.decisions().single().decisionId
+
+        val retryFixture = startMcpDecisionGateway(appRepository, invocationId)
+        val retryServer = productionDecisionServer(directRuntime, context, retryFixture.client)
+        val retry = callTool(retryServer, "submit_decision", noTradeDecisionArguments())
+
+        assertEquals(
+            committedId.toString(),
+            assertNotNull(retry.structuredContent).getValue("decision_id").jsonPrimitive.contentOrNull,
+        )
+        retryFixture.close()
+
+        val conflictFixture = startMcpDecisionGateway(appRepository, invocationId)
+        val conflictServer = productionDecisionServer(directRuntime, context, conflictFixture.client)
+        val changedArguments = JsonObject(
+            noTradeDecisionArguments().toMutableMap().also { arguments ->
+                arguments["reason_ja"] = JsonPrimitive("changed after commit")
+            },
+        )
+        val conflict = callTool(conflictServer, "submit_decision", changedArguments)
+
+        assertEquals(true, conflict.isError)
+        assertEquals(
+            "decision_submission_conflict",
+            assertNotNull(conflict.structuredContent).getValue("type").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(1, appRepository.snapshots.decisions().size)
+        assertTrue((directRuntime.decisionRepository as InMemoryDecisionRepository).snapshots.decisions().isEmpty())
+        conflictFixture.close()
+    }
+
+    @Test
+    fun submitDecisionTool_preservesUnknownAndDoesNotGateRiskReducingActTools() = runBlocking {
+        val invocationId = "mcp-unknown-run"
+        val context = decisionSubmissionContext(invocationId)
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = fixedClock(),
+            marketDataSource = PreviewMarketDataSource,
+        )
+        val setupServer = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.UNSPECIFIED,
+            marketDataSource = PreviewMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+        ).createServer()
+        val intentId = submitApprovedEnterIntent(setupServer)
+        callTool(setupServer, "place_order", placeOrderArguments(intentId))
+        val positionId = runtime.broker.getPositions().getOrThrow().single().positionId
+        val unknownFixture = startTypedErrorGateway(invocationId, DECISION_SUBMISSION_UNKNOWN_CODE)
+        val productionServer = FukurouMcpServer(
+            clientRole = GmoPublicClientRole.PROPOSER,
+            marketDataSource = PreviewMarketDataSource,
+            clock = fixedClock(),
+            tradingRuntime = runtime,
+            decisionRunContext = context,
+            invocationPhase = LlmInvocationPhase.RISK_REDUCTION_ONLY,
+            submissionGatewayClient = unknownFixture.client,
+        ).createServer()
+
+        val unknown = callTool(productionServer, "submit_decision", noTradeDecisionArguments())
+        val close = callTool(
+            productionServer,
+            "close_position",
+            closePositionArguments(positionId = positionId, closeRatio = "0.50"),
+        )
+
+        assertEquals(true, unknown.isError)
+        assertEquals(
+            "decision_submission_unknown",
+            assertNotNull(unknown.structuredContent).getValue("type").jsonPrimitive.contentOrNull,
+        )
+        assertTrue(close.isError != true)
+        assertEquals("0.002500000000", runtime.broker.getPositions().getOrThrow().single().sizeBtc)
+        unknownFixture.close()
+    }
+
+    @Test
     fun submitDecisionTool_rejectsMissingExpectedRMultiple() = runBlocking {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
@@ -985,18 +1136,15 @@ class FukurouMcpServerTest {
         val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
         val longInvocationId = "recent-run-" + "x".repeat(140)
         insertFailedLlmRun(runtime.llmRunRepository, longInvocationId)
+        runtime.decisionRepository.submitDecision(
+            noTradeDecisionSubmissionFixture(decisionSubmissionContext(longInvocationId)),
+        ).getOrThrow()
         val server = FukurouMcpServer(
             clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
         ).createServer()
-
-        callTool(
-            server = server,
-            toolName = "submit_decision",
-            arguments = noTradeDecisionArguments(invocationId = longInvocationId),
-        )
 
         val result = callTool(
             server = server,
@@ -1281,6 +1429,7 @@ class FukurouMcpServerTest {
             marketDataSource = FakeMarketDataSource,
             clock = fixedClock(),
             tradingRuntime = runtime,
+            decisionRunContext = decisionSubmissionContext("similar-run"),
         ).createServer()
 
         val decisionResult = callTool(
@@ -2001,6 +2150,7 @@ class McpLaunchBootstrapPolicyTest {
                 canonical.copy(runtimeEnvironment = emptyMap()),
                 canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
                 canonical.copy(systemPromptVersion = ""),
+                canonical.copy(decisionRunId = "different-decision-run"),
             ).forEach { rejected ->
                 assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
             }
@@ -2260,6 +2410,147 @@ private class GatewayFixture(
     }
 }
 
+private class TypedErrorGatewayFixture(
+    val client: LlmDecisionSubmissionGatewayClient,
+    private val server: ServerSocketChannel,
+    private val executor: java.util.concurrent.ExecutorService,
+    private val response: java.util.concurrent.Future<*>,
+    private val path: Path,
+) : AutoCloseable {
+    override fun close() {
+        client.close()
+        response.get(5, TimeUnit.SECONDS)
+        server.close()
+        executor.shutdownNow()
+        Files.deleteIfExists(path)
+    }
+}
+
+private fun decisionSubmissionContext(invocationId: String): DecisionRunContext = DecisionRunContext(
+    decisionRunId = invocationId,
+    llmProvider = "fixture",
+    promptHash = "fixture",
+    systemPromptVersion = "fixture-v1",
+    marketSnapshotId = "fixture",
+)
+
+private fun noTradeDecisionSubmissionFixture(context: DecisionRunContext): DecisionSubmission = DecisionSubmission(
+    invocationId = context.decisionRunId,
+    llmProvider = context.llmProvider,
+    promptHash = context.promptHash,
+    systemPromptVersion = context.systemPromptVersion,
+    marketSnapshotId = context.marketSnapshotId,
+    action = DecisionAction.NO_TRADE,
+    setupTags = emptyList(),
+    estimatedWinProbability = BigDecimal("0.12"),
+    expectedRMultiple = BigDecimal.ZERO,
+    roundTripCostR = null,
+    toolEvidenceIds = listOf("tool-1"),
+    factCheckJson = """{"ticker":true}""",
+    selfReviewJson = """{"reasonsNotToTrade":["出来高不足"]}""",
+    reasonJa = "材料不足のため見送ります。",
+    missingDataJa = listOf("orderbook"),
+    noTradeConditionsJa = listOf("出来高が戻るまで待つ"),
+    entryIntent = null,
+    tradePlan = null,
+)
+
+private fun startDecisionGateway(
+    path: Path,
+    repository: InMemoryDecisionRepository,
+    invocationId: String,
+    phase: LlmInvocationPhase = LlmInvocationPhase.PROPOSER,
+): LlmDecisionSubmissionGateway = LlmDecisionSubmissionGateway.start(
+    socketPath = path,
+    repository = repository,
+    invocationId = invocationId,
+    phase = phase,
+    phaseManifestId = "$invocationId:${phase.name}",
+    effectiveInvocationHash = MCP_DECISION_GATEWAY_HASH,
+)
+
+private fun decisionGatewayRequest(invocationId: String, submission: DecisionSubmission): JsonObject {
+    return LlmSubmissionGatewayCodec.request(
+        operation = OPERATION_SUBMIT_DECISION,
+        invocationId = invocationId,
+        phase = LlmInvocationPhase.PROPOSER,
+        phaseManifestId = "$invocationId:${LlmInvocationPhase.PROPOSER.name}",
+        effectiveInvocationHash = MCP_DECISION_GATEWAY_HASH,
+        payload = LlmSubmissionGatewayCodec.encodeDecision(submission),
+    )
+}
+
+private fun startMcpDecisionGateway(repository: InMemoryDecisionRepository, invocationId: String): GatewayFixture {
+    val phase = LlmInvocationPhase.PROPOSER
+    val path = Path.of("/tmp/fukurou-mcp-idempotency-${System.nanoTime()}.sock")
+    val gateway = startDecisionGateway(path, repository, invocationId, phase)
+    val channel = SocketChannel.open(StandardProtocolFamily.UNIX).apply {
+        connect(UnixDomainSocketAddress.of(path))
+    }
+    val client = LlmDecisionSubmissionGatewayClient.fromChannel(
+        channel,
+        McpSubmissionGatewayBinding(
+            invocationId = invocationId,
+            phase = phase,
+            phaseManifestId = "$invocationId:${phase.name}",
+            effectiveInvocationHash = MCP_DECISION_GATEWAY_HASH,
+        ),
+    )
+
+    return GatewayFixture(client, gateway)
+}
+
+private fun productionDecisionServer(
+    runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime,
+    context: DecisionRunContext,
+    client: LlmDecisionSubmissionGatewayClient,
+): io.modelcontextprotocol.kotlin.sdk.server.Server {
+    return FukurouMcpServer(
+        clientRole = GmoPublicClientRole.PROPOSER,
+        marketDataSource = FakeMarketDataSource,
+        clock = fixedClock(),
+        tradingRuntime = runtime,
+        decisionRunContext = context,
+        invocationPhase = LlmInvocationPhase.PROPOSER,
+        submissionGatewayClient = client,
+    ).createServer()
+}
+
+private fun startTypedErrorGateway(invocationId: String, errorCode: String): TypedErrorGatewayFixture {
+    val path = Path.of("/tmp/fukurou-mcp-typed-error-${System.nanoTime()}.sock")
+    val server = ServerSocketChannel.open(StandardProtocolFamily.UNIX).apply {
+        bind(UnixDomainSocketAddress.of(path))
+    }
+    val executor = Executors.newSingleThreadExecutor()
+    val response = executor.submit {
+        server.accept().use { accepted ->
+            LlmSubmissionGatewayCodec.readFrame(accepted)
+            LlmSubmissionGatewayCodec.writeFrame(
+                accepted,
+                buildJsonObject {
+                    put("accepted", false)
+                    put("error", errorCode)
+                },
+            )
+        }
+    }
+    val channel = SocketChannel.open(StandardProtocolFamily.UNIX).apply {
+        connect(UnixDomainSocketAddress.of(path))
+    }
+    val phase = LlmInvocationPhase.RISK_REDUCTION_ONLY
+    val client = LlmDecisionSubmissionGatewayClient.fromChannel(
+        channel,
+        McpSubmissionGatewayBinding(
+            invocationId = invocationId,
+            phase = phase,
+            phaseManifestId = "$invocationId:${phase.name}",
+            effectiveInvocationHash = MCP_DECISION_GATEWAY_HASH,
+        ),
+    )
+
+    return TypedErrorGatewayFixture(client, server, executor, response, path)
+}
+
 private fun gatewayFixture(
     repository: me.matsumo.fukurou.trading.decision.DecisionRepository,
     bootstrap: McpBootstrapConfig,
@@ -2283,6 +2574,9 @@ private fun gatewayFixture(
         gateway = gateway,
     )
 }
+
+private const val MCP_DECISION_GATEWAY_HASH =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
     DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->

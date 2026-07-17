@@ -3,11 +3,13 @@ package me.matsumo.fukurou.trading.runner
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.requiresCompleteTerminalEvidence
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
+import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -245,6 +247,7 @@ class LlmDecisionSubmissionGatewayTest {
         val release = CountDownLatch(1)
         val repository = object : DecisionRepository by delegate {
             override suspend fun submitDecision(
+                authority: DecisionSubmissionAuthority,
                 submission: DecisionSubmission,
             ): Result<me.matsumo.fukurou.trading.decision.DecisionSubmissionResult> {
                 entered.countDown()
@@ -255,7 +258,7 @@ class LlmDecisionSubmissionGatewayTest {
                         // A blocking repository transaction can outlive gateway shutdown interruption.
                     }
                 }
-                return delegate.submitDecision(submission)
+                return delegate.submitDecision(authority, submission)
             }
         }
         val path = Path.of("/tmp/fukurou-gateway-race-${System.nanoTime()}.sock")
@@ -286,9 +289,10 @@ class LlmDecisionSubmissionGatewayTest {
         val delegate = InMemoryDecisionRepository()
         val repository = object : DecisionRepository by delegate {
             override suspend fun submitDecision(
+                authority: DecisionSubmissionAuthority,
                 submission: DecisionSubmission,
             ): Result<me.matsumo.fukurou.trading.decision.DecisionSubmissionResult> {
-                delegate.submitDecision(submission).getOrThrow()
+                delegate.submitDecision(authority, submission).getOrThrow()
 
                 return Result.failure(IOException("repository completion was lost"))
             }
@@ -337,6 +341,30 @@ class LlmDecisionSubmissionGatewayTest {
         assertEquals("false", response.getValue("accepted").toString())
         assertEquals(null, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow())
         gateway.close()
+    }
+
+    @Test
+    fun `gateway preserves idempotent result and typed conflict unknown codes`() = runBlocking {
+        val repository = InMemoryDecisionRepository()
+        val submission = decision(DecisionAction.NO_TRADE)
+
+        val first = exchangeDecision(repository, submission)
+        val retry = exchangeDecision(repository, submission)
+        val conflict = exchangeDecision(repository, submission.copy(reasonJa = "changed"))
+
+        assertEquals(first.getValue("decision_id"), retry.getValue("decision_id"))
+        assertEquals(DECISION_SUBMISSION_CONFLICT_CODE, conflict.getValue("error").jsonPrimitive.content)
+        assertEquals(1, repository.snapshots.decisions().size)
+
+        val incompleteRepository = InMemoryDecisionRepository()
+        incompleteRepository.seedIncompleteDecisionSubmissionAuthority(
+            DecisionSubmissionAuthority(INVOCATION_ID, LlmInvocationPhase.PROPOSER),
+            submission,
+        )
+        val unknown = exchangeDecision(incompleteRepository, submission)
+
+        assertEquals(DECISION_SUBMISSION_UNKNOWN_CODE, unknown.getValue("error").jsonPrimitive.content)
+        assertTrue(incompleteRepository.snapshots.decisions().isEmpty())
     }
 
     @Test
@@ -408,6 +436,18 @@ class LlmDecisionSubmissionGatewayTest {
             effectiveInvocationHash = EFFECTIVE_HASH,
             hooks = hooks,
         )
+
+    private fun exchangeDecision(repository: InMemoryDecisionRepository, submission: DecisionSubmission): JsonObject {
+        val path = Path.of("/tmp/fukurou-gateway-idempotency-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val response = connect(path).use { channel ->
+            LlmSubmissionGatewayCodec.writeFrame(channel, request(LlmInvocationPhase.PROPOSER, submission))
+            LlmSubmissionGatewayCodec.readFrame(channel)
+        }
+        gateway.close()
+
+        return response
+    }
 
     private fun request(
         phase: LlmInvocationPhase,

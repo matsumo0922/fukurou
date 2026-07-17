@@ -1393,6 +1393,22 @@ object DecisionsTable : Table("decisions") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** server-owned invocation / phase ごとの strict decision submission authority。 */
+object DecisionSubmissionAuthoritiesTable : Table("decision_submission_authorities") {
+    val invocationId = varchar("invocation_id", length = 128)
+    val phase = varchar("phase", length = 32)
+    val payloadSchemaVersion = integer("payload_schema_version")
+    val payloadHash = varchar("payload_hash", length = 64)
+    val state = varchar("state", length = 16)
+    val decisionId = uuid("decision_id").nullable()
+    val tradePlanId = uuid("trade_plan_id").nullable()
+    val tradeIntentId = uuid("trade_intent_id").nullable()
+    val createdAt = long("created_at")
+    val completedAt = long("completed_at").nullable()
+
+    override val primaryKey = PrimaryKey(invocationId, phase)
+}
+
 /**
  * TradePlan を append-only で保存する Exposed table。
  */

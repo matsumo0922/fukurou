@@ -1184,6 +1184,23 @@ private const val VERIFY_DECISIONS_SCHEMA_SQL = """
     LIMIT 0
 """
 
+/** strict decision submission authority schema の存在を確認する SQL。 */
+private const val VERIFY_DECISION_SUBMISSION_AUTHORITIES_SCHEMA_SQL = """
+    SELECT
+        invocation_id,
+        phase,
+        payload_schema_version,
+        payload_hash,
+        state,
+        decision_id,
+        trade_plan_id,
+        trade_intent_id,
+        created_at,
+        completed_at
+    FROM decision_submission_authorities
+    LIMIT 0
+"""
+
 /**
  * trade_plans schema の存在を確認する SQL。
  */
@@ -1340,6 +1357,7 @@ class TradingPersistenceBootstrap(
                     DedupeShadowObservationsTable,
                     DedupeShadowResolutionsTable,
                     DecisionsTable,
+                    DecisionSubmissionAuthoritiesTable,
                     TradePlansTable,
                     TradeIntentsTable,
                     FalsificationsTable,
@@ -1887,6 +1905,10 @@ private fun JdbcTransaction.verifyDecisionRuntimeSchemaObjects() {
     verifyExistsBySql(
         sql = VERIFY_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL,
         missingMessage = "decisions invocation_id/created_at index was not initialized.",
+    )
+    verifySchemaBySql(
+        sql = VERIFY_DECISION_SUBMISSION_AUTHORITIES_SCHEMA_SQL,
+        missingMessage = "decision_submission_authorities schema was not initialized.",
     )
     verifySchemaBySql(
         sql = VERIFY_TRADE_PLANS_SCHEMA_SQL,

@@ -121,6 +121,9 @@ class McpLaunchManifestWriter(
     ): McpLaunchCapability {
         require(allowedTools.isNotEmpty()) { "MCP manifest allowedTools must not be empty." }
         require(databaseUrl.isNotBlank() && databaseUser.isNotBlank()) { "MCP database identity is required." }
+        require(invocationId == context.decisionRunId) {
+            "MCP manifest invocation must match decision run identity."
+        }
 
         Files.createDirectories(directory)
         Files.setPosixFilePermissions(directory, PRIVATE_DIRECTORY_PERMISSIONS)

@@ -10,6 +10,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
@@ -55,6 +56,38 @@ class McpLaunchManifestTest {
         assertFalse(capability.terminalEvidenceCaptureEnabled)
         assertFalse(manifest.terminalEvidenceCaptureEnabled)
         Files.deleteIfExists(capability.path)
+        Files.deleteIfExists(directory)
+    }
+
+    @Test
+    fun write_rejectsManifestAndDecisionRunIdentityMismatch() {
+        val directory = Files.createTempDirectory("fukurou-manifest-mismatch-test-")
+        val writer = McpLaunchManifestWriter(directory = directory, clock = Clock.systemUTC())
+
+        assertFailsWith<IllegalArgumentException> {
+            writer.write(
+                invocationId = "manifest-invocation",
+                phase = LlmInvocationPhase.PROPOSER,
+                context = DecisionRunContext(
+                    decisionRunId = "different-decision-run",
+                    llmProvider = "claude",
+                    promptHash = "hash",
+                    systemPromptVersion = "v1",
+                    marketSnapshotId = "snapshot",
+                ),
+                allowedTools = listOf("mcp__fukurou-mcp__submit_decision"),
+                databaseUrl = "jdbc:postgresql://postgres/fukurou",
+                databaseUser = "fukurou_mcp",
+                gmoPublicBaseUrl = "http://127.0.0.1:1",
+                runtimeEnvironment = me.matsumo.fukurou.trading.config.RuntimeConfigCatalog.runtimeEnvironment(
+                    me.matsumo.fukurou.trading.config.TradingBotConfig(),
+                ),
+                timeout = Duration.ofMinutes(1),
+                totalToolCallLimit = 48,
+                actToolCallLimit = 3,
+            )
+        }
+        assertTrue(Files.list(directory).use { entries -> entries.findAny().isEmpty })
         Files.deleteIfExists(directory)
     }
 

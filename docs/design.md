@@ -1497,6 +1497,12 @@ current-process recoveryはentityごとに固定attempt UUIDを割り当て、re
 
 [確定] terminal tool evidenceはcode-owned activationを正本とし、既存FD 5 terminal requestの単一frameへversion 2 bundleとして同梱する。launch manifest、capability、runner、MCP bootstrap、gateway、DB boundaryは同じactivationを投影し、起動transactionがschema version 1のactivation boundaryを一度だけ作る。activationを明示的に無効化した互換fixtureはversion 1のfield setとserialized bytesを維持する。完全bundleはevidence / link / coverageをdecisionまたはfalsificationと同じtransactionで保存し、不完全bundleはrisk-reduction decisionとREJECTED falsificationだけをtyped coverage付きで保存する。ENTER / ADD_LONGとAPPROVED falsificationは完全bundleがなければentity自体を保存しない。tool schema、prompt、callerが申告する`tool_evidence_ids`の順序・重複・意味は変えず、server-owned evidence UUIDは別link tableだけで扱う。
 
+[確定] production の `submit_decision` は app-owned gateway が束縛する server-owned `(invocationId, phase)` を提出 authority とする。caller の `invocation_id` は省略するか `DecisionRunContext.decisionRunId` と一致しなければならず、保存値の選択には使わない。phase を持つ production 呼び出しは gateway 不在時に拒否し、MCP process の direct repository write へ fallback しない。phase-less direct repository path は互換 test fixture にだけ残す。launch manifest、gateway request、`DecisionRunContext` の invocation が一致しない場合は authority 作成前に拒否する。
+
+[確定] `decision_submission_authorities` は `(invocation_id, phase)` を主キーとし、schema-v1 canonical business payload hash、処理状態、確定した decision / TradePlan / TradeIntent ID を保持する。canonical payload は永続化する decision / TradePlan / TradeIntent の business field を型付きで投影し、JSON object key と decimal scale を正規化する一方、server-owned key metadata、secret、filesystem path、raw log、raw exception は含めない。authority claim、decision protocol entity、terminal evidence association、完了参照は同一transactionで確定する。同じpayloadのretryは副作用より前に確定済みIDを復元して返し、変更payloadは`decision_submission_conflict`、PENDINGまたは参照不整合は自動修復・再実行せず`decision_submission_unknown`とする。commit後のgateway response lossでもretryはdecision、plan、intent、evidence/link/coverage、opportunity episode、identity failure、dedupe shadowを増やさない。
+
+[確定] schema bootstrap は空のauthority tableを加えるだけで、legacy `decisions` をdedupe、phase推定、backfillしない。authority-aware imageから旧readerへrollbackする場合もtableとrowを保持し、decision-capable LLM launch gateを無効化して実行中phaseをdrainしてから切り替える。gateway-aware imageのcanaryが成功するまでLLM取引を再開しない。
+
 ```kotlin
 package me.matsumo.fukurou.trading.llm
 
