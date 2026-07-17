@@ -14,16 +14,32 @@ import java.time.Clock
 import java.time.Instant
 
 /**
+ * TickSnapshot を生成した market input の種類。
+ */
+enum class TickSnapshotSource {
+    /** GMO Public REST ticker polling。 */
+    GMO_PUBLIC_REST,
+
+    /** GMO Public WebSocket の causal trade event。 */
+    REALTIME_MARKET_EVENT,
+
+    /** repository 内部処理や明示的な local injection。 */
+    INTERNAL,
+}
+
+/**
  * Reconciler が参照する直近 tick snapshot。
  *
  * @param symbol 取引対象 symbol
- * @param observedAt tick 観測時刻
+ * @param observedAt app が tick を観測した時刻
  * @param lastPrice ticker が返した直近価格
  * @param bidPrice 最良買気配
  * @param askPrice 最良売気配
  * @param recentTradeCount 同じ polling pass で取得した直近約定数
  * @param symbolRules 取引所数量・価格・手数料ルール
  * @param atr14Jpy 5分足 ATR(14)
+ * @param sourceTimestamp 取引所が宣言した source 時刻。parse 不能または未提供の場合は null
+ * @param source snapshot を生成した market input の種類
  */
 data class TickSnapshot(
     val symbol: String,
@@ -34,6 +50,8 @@ data class TickSnapshot(
     val recentTradeCount: Int = 0,
     val symbolRules: SymbolRules? = null,
     val atr14Jpy: String? = null,
+    val sourceTimestamp: Instant? = null,
+    val source: TickSnapshotSource = TickSnapshotSource.INTERNAL,
 )
 
 /**
@@ -94,6 +112,8 @@ class RestPollingTickStream(
                 recentTradeCount = recentTrades.size,
                 symbolRules = symbolRules,
                 atr14Jpy = atr14Jpy,
+                sourceTimestamp = tickerObservedAt,
+                source = TickSnapshotSource.GMO_PUBLIC_REST,
             )
         }
     }

@@ -34,6 +34,7 @@ import me.matsumo.fukurou.trading.reconciler.NoReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatusProvider
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
+import me.matsumo.fukurou.trading.reconciler.requireExecutionTicker
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
@@ -870,7 +871,7 @@ private class PaperBrokerReconcileDelegate(
     override suspend fun sweepHardHalt(reasonJa: String, tickSnapshot: TickSnapshot?): Result<PaperTradeResult> {
         return runCatching {
             val simulationContext = tickSnapshot?.let { snapshot ->
-                val ticker = snapshot.requireTicker()
+                val ticker = snapshot.requireExecutionTicker(runtime.time.clock)
                 val symbolRules = snapshot.symbolRules ?: runtime.symbolRulesFor(TradingSymbol.BTC).getOrThrow()
                 runtime.paperSimulationContext(
                     symbol = TradingSymbol.BTC,

@@ -99,6 +99,11 @@ object FreshnessDefaults {
     val tickerStaleAfter: Duration = Duration.ofSeconds(5)
 
     /**
+     * ticker source timestamp に許容する最大の未来方向 clock skew。
+     */
+    val tickerMaxFutureSkew: Duration = Duration.ofSeconds(5)
+
+    /**
      * orderbook の既定鮮度しきい値。
      */
     val orderbookStaleAfter: Duration = Duration.ofSeconds(3)

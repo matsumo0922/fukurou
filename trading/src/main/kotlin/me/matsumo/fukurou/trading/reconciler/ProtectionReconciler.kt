@@ -633,6 +633,8 @@ class ProtectionReconciler(
             lastPrice = price,
             bidPrice = price,
             askPrice = price,
+            sourceTimestamp = exchangeAt,
+            source = TickSnapshotSource.REALTIME_MARKET_EVENT,
         )
     }
 

@@ -57,16 +57,24 @@ Issue #187 DoD (f): While HARD_HALT is durable and sticky, the system SHALL atom
 - **THEN** a later pass revalidates SAFE against an atomic zero-open-risk readback and completes idempotently without duplicate close executions or account mutations
 
 #### Scenario: Cleanup cannot obtain trustworthy execution input
-- **WHEN** market context or another required fact is missing or ambiguous
+- **WHEN** market context or another required fact is missing or ambiguous, including a REST ticker source timestamp that is missing, malformed, more than 5 seconds old, or more than 5 seconds in the future
 - **THEN** the system creates no inferred or retrospective execution, keeps HARD_HALT active, and reports cleanup as incomplete or unknown
 
 #### Scenario: Flat halted account has no market input
 - **WHEN** HARD_HALT cleanup is UNKNOWN, no open position or risk-increasing order exists, and no trustworthy market tick is available
 - **THEN** the atomic readback stores SAFE without requiring a synthetic execution price
 
+#### Scenario: Order-only halted account has no market input
+- **WHEN** HARD_HALT cleanup is UNKNOWN, risk-increasing orders exist without an open position, and no trustworthy market tick is available
+- **THEN** the atomic transaction cancels those orders, proves zero open risk, and stores SAFE without requesting a ticker or creating an execution
+
 #### Scenario: WebSocket connection remains unavailable
 - **WHEN** HARD_HALT cleanup is UNKNOWN and the market-event WebSocket repeatedly fails to connect
-- **THEN** each bounded connection-loop retry may use a trustworthy current REST tick only for cleanup and never for entry fill or protective execution
+- **THEN** each bounded connection-loop retry may use a REST tick only when its parsed exchange source timestamp is no more than 5 seconds old and no more than 5 seconds in the future, and uses it only for cleanup rather than entry fill or protective execution
+
+#### Scenario: Realtime event provides causal cleanup authority
+- **WHEN** a realtime market trade event reaches the ledger while HARD_HALT cleanup still has an open position
+- **THEN** cleanup uses that same event price and its exchange timestamp without applying the independent REST polling freshness gate
 
 #### Scenario: Manual resume is requested before cleanup is safe
 - **WHEN** an operator requests resume while HARD_HALT cleanup state is UNKNOWN
