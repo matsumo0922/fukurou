@@ -12,4 +12,4 @@
 
 - [x] 3.1 Update `docs/deploy.md` and grep README/docs for stale build/deploy descriptions.
 - [x] 3.2 Validate the OpenSpec change and run targeted workflow contract tests.
-- [ ] 3.3 Run final `make test`, `make detekt`, and `make build` at one exact HEAD and record evidence for the PR.
+- [x] 3.3 Run final `make test`, `make detekt`, and `make build` at one exact HEAD and record evidence for the PR.
