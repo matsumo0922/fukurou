@@ -182,7 +182,6 @@ class LlmDecisionSubmissionGateway private constructor(
             try {
                 runCatching {
                     server.accept().use { channel ->
-                        submissionState.set(LlmSemanticSubmissionState.IN_FLIGHT)
                         val response = runCatching {
                             val request = LlmSubmissionGatewayCodec.readFrame(channel)
                             runBlocking {
@@ -194,12 +193,16 @@ class LlmDecisionSubmissionGateway private constructor(
                                     phaseManifestId = phaseManifestId,
                                     effectiveInvocationHash = effectiveInvocationHash,
                                     terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
+                                    submissionState = submissionState,
                                 )
                             }
                         }.onSuccess {
                             submissionState.set(LlmSemanticSubmissionState.COMMITTED)
                         }.getOrElse {
-                            submissionState.set(LlmSemanticSubmissionState.REJECTED)
+                            submissionState.compareAndSet(
+                                LlmSemanticSubmissionState.NOT_ATTEMPTED,
+                                LlmSemanticSubmissionState.REJECTED,
+                            )
                             buildJsonObject {
                                 put("accepted", false)
                                 put("error", "SUBMISSION_REJECTED")
@@ -246,6 +249,7 @@ class LlmDecisionSubmissionGateway private constructor(
             phaseManifestId: String,
             effectiveInvocationHash: String,
             terminalEvidenceCaptureEnabled: Boolean,
+            submissionState: AtomicReference<LlmSemanticSubmissionState>,
         ): JsonObject {
             val terminalEvidence = decodeTerminalEvidenceBundle(request, terminalEvidenceCaptureEnabled)
             require(request.requiredString("invocationId") == invocationId) { "Gateway invocation binding mismatch." }
@@ -276,22 +280,36 @@ class LlmDecisionSubmissionGateway private constructor(
                         }
                     }
                     LlmSubmissionGatewayCodec.decisionResult(
-                        repository.submitTerminalDecision(submission, trustedTerminalEvidence).getOrThrow(),
+                        submitRepositoryRequest(submissionState) {
+                            repository.submitTerminalDecision(submission, trustedTerminalEvidence)
+                        },
                     )
                 }
                 OPERATION_SUBMIT_FALSIFICATION -> {
                     require(phase == LlmInvocationPhase.FALSIFIER) {
                         "submit_falsification is not authorized for this phase."
                     }
+                    val submission = LlmSubmissionGatewayCodec.decodeFalsification(payload)
                     LlmSubmissionGatewayCodec.falsificationResult(
-                        repository.submitTerminalFalsification(
-                            LlmSubmissionGatewayCodec.decodeFalsification(payload),
-                            trustedTerminalEvidence,
-                        ).getOrThrow(),
+                        submitRepositoryRequest(submissionState) {
+                            repository.submitTerminalFalsification(
+                                submission,
+                                trustedTerminalEvidence,
+                            )
+                        },
                     )
                 }
                 else -> error("Unknown submission gateway operation.")
             }
+        }
+
+        private suspend fun <T> submitRepositoryRequest(
+            submissionState: AtomicReference<LlmSemanticSubmissionState>,
+            request: suspend () -> Result<T>,
+        ): T {
+            submissionState.set(LlmSemanticSubmissionState.IN_FLIGHT)
+
+            return request().getOrThrow()
         }
     }
 }

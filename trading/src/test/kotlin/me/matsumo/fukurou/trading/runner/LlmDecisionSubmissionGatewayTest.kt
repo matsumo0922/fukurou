@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
+import java.io.IOException
 import java.math.BigDecimal
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
@@ -278,6 +279,45 @@ class LlmDecisionSubmissionGatewayTest {
         assertEquals(LlmSemanticSubmissionState.IN_FLIGHT, gateway.semanticSubmissionState())
         release.countDown()
         channel.close()
+    }
+
+    @Test
+    fun `repository completion failure after commit remains unknown`() = runBlocking {
+        val delegate = InMemoryDecisionRepository()
+        val repository = object : DecisionRepository by delegate {
+            override suspend fun submitDecision(
+                submission: DecisionSubmission,
+            ): Result<me.matsumo.fukurou.trading.decision.DecisionSubmissionResult> {
+                delegate.submitDecision(submission).getOrThrow()
+
+                return Result.failure(IOException("repository completion was lost"))
+            }
+        }
+        val path = Path.of("/tmp/fukurou-gateway-ambiguous-${System.nanoTime()}.sock")
+        val gateway = LlmDecisionSubmissionGateway.start(
+            socketPath = path,
+            repository = repository,
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+        )
+
+        val response = connect(path).use { channel ->
+            LlmSubmissionGatewayCodec.writeFrame(
+                channel,
+                request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)),
+            )
+            LlmSubmissionGatewayCodec.readFrame(channel)
+        }
+
+        assertEquals("false", response.getValue("accepted").toString())
+        assertEquals(
+            DecisionAction.NO_TRADE,
+            delegate.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action,
+        )
+        assertEquals(LlmSemanticSubmissionState.IN_FLIGHT, gateway.semanticSubmissionState())
+        gateway.close()
     }
 
     @Test
