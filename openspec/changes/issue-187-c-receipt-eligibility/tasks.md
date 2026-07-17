@@ -21,7 +21,8 @@
 - [x] 4.1 Cover listener receipt propagation, duplicate identity reuse, and persistence/conflict publish-zero behavior
 - [x] 4.2 Add deterministic PostgreSQL receipt-first/order-second and order-first/receipt-second barrier tests, including at least 1,000 pre-boundary iterations with constant-bounded open rows and zero fills/executions
 - [x] 4.3 Cover missing/null/session/payload/timestamp evidence, legacy rows, wall-clock disagreement, authenticated HARD_HALT rollback with cleanup-SAFE plus zero-open-risk/zero-row agreement, and risk-reducing position protection
-- [ ] 4.4 Close both production inventories: the `TradingRuntimeFactory.connectedPostgres` order-authority root and the `ProtectionReconcilerWorker` durable event-consumer root; record each OpenSpec Scenario's proving test and SHA
+- [x] 4.4 Close both production inventories: the `TradingRuntimeFactory.connectedPostgres` order-authority root and the `ProtectionReconcilerWorker` durable event-consumer root; record each OpenSpec Scenario's proving test and SHA
+  - Evidence: `implementation-evidence.md` at implementation SHA `93cee76d3156c2239a6df2431d9b523da44c095c`
 
 ## 5. Documentation and validation
 
