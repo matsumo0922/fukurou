@@ -36,5 +36,5 @@
 
 - [x] 6.1 Pass strict OpenSpec validation, `bash -n`, deterministic backup/restore selftests, JSON schema/profile validation, and Docker integration selftest.
 - [x] 6.2 Through the shared validation lease, pass `make test`, `make detekt`, and `make build` at one exact HEAD and confirm a clean worktree apart from intended changes.
-- [x] 6.3 Pass clean-context design falsification and final G1-G5 implementation review, resolving every blocking finding before PR approval.
+- [ ] 6.3 Pass clean-context design falsification and final G1-G5 implementation review, resolving every blocking finding before PR approval.
 - [x] 6.4 Record the NAS root rollout as HANDOFF: install restic/artifacts, create and recoverably store the password, initialize repository, run first backup and exact-snapshot restore drill, verify modes/status/cleanup, then enable timers.

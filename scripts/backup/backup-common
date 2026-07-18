@@ -13,6 +13,7 @@ readonly RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-/srv/fukurou/backups/postgres}"
 readonly RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE:-/srv/fukurou/secrets/restic-password}"
 readonly BACKUP_HOST="${FUKUROU_BACKUP_HOST:-fukurou-production}"
 readonly BACKUP_STDIN_PATH="${FUKUROU_BACKUP_STDIN_PATH:-/postgres.dump}"
+readonly SERVICE_BOOT_ID_FILE="${FUKUROU_SERVICE_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 readonly STATUS_FILE="${BACKUP_STATUS_FILE}"
 
 backup_now() {
@@ -65,9 +66,13 @@ backup_validate_status_json() {
     def timestamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
     def exact_keys($allowed): (keys - $allowed | length) == 0;
     def attempt:
-      type == "object" and exact_keys(["attemptedAt","resultCode","durationSeconds","snapshotId","interruptedCandidateCount","retentionSucceeded"]) and
+      type == "object" and exact_keys(["attemptedAt","resultCode","durationSeconds","serviceInvocationId","serviceBootId","snapshotId","interruptedCandidateCount","retentionSucceeded"]) and
+      has("serviceInvocationId") and has("serviceBootId") and
       (.attemptedAt | timestamp) and (.resultCode | type == "string") and
       (.durationSeconds | type == "number" and floor == . and . >= 0) and
+      (.serviceInvocationId == null or (.serviceInvocationId | type == "string" and test("^[0-9a-f]{32}$"))) and
+      (.serviceBootId == null or (.serviceBootId | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))) and
+      ((.serviceInvocationId == null) == (.serviceBootId == null)) and
       ((has("snapshotId") | not) or (.snapshotId | type == "string" and test("^[0-9a-f]{8,64}$"))) and
       ((has("interruptedCandidateCount") | not) or .interruptedCandidateCount == null or
         (.interruptedCandidateCount | type == "number" and floor == . and . >= 0)) and
@@ -103,9 +108,13 @@ backup_validate_status_schema_contract() {
     .properties.schemaVersion.const == 1 and
     (.required | sort) == (["schemaVersion","updatedAt","backup","restore"] | sort) and
     (.properties | keys | sort) == (["schemaVersion","updatedAt","backup","restore"] | sort) and
-    (."$defs".attempt.required | sort) == (["attemptedAt","resultCode","durationSeconds"] | sort) and
+    (."$defs".attempt.required | sort) == (["attemptedAt","resultCode","durationSeconds","serviceInvocationId","serviceBootId"] | sort) and
     (."$defs".attempt.properties | keys | sort) ==
-      (["attemptedAt","resultCode","durationSeconds","snapshotId","interruptedCandidateCount","retentionSucceeded"] | sort) and
+      (["attemptedAt","resultCode","durationSeconds","serviceInvocationId","serviceBootId","snapshotId","interruptedCandidateCount","retentionSucceeded"] | sort) and
+    ((."$defs".attempt.properties.serviceInvocationId.type | sort) == ["null","string"]) and
+    ((."$defs".attempt.properties.serviceBootId.type | sort) == ["null","string"]) and
+    (."$defs".attempt.properties.serviceInvocationId.pattern == "^[0-9a-f]{32}$") and
+    (."$defs".attempt.properties.serviceBootId.pattern == "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") and
     (."$defs".attempt.properties.snapshotId."$ref" == "#/$defs/snapshotId") and
     ((."$defs".attempt.properties.interruptedCandidateCount.anyOf | map(.type) | sort) == ["integer","null"]) and
     (."$defs".attempt.properties.interruptedCandidateCount.anyOf[] | select(.type == "integer") | .minimum == 0) and
@@ -167,23 +176,44 @@ backup_publish_status() {
 
 backup_merge_attempt() {
   local previous="$1" job="$2" attempted_at="$3" result_code="$4" duration="$5"
-  local interrupted_count="${6:-0}" retention="${7:-null}" success_json="${8:-null}"
+  local interrupted_count="${6:-0}" retention="${7:-null}" success_json="${8:-null}" service_evidence
   [[ "${job}" == "backup" || "${job}" == "restore" ]] || return 1
   backup_result_code_is_allowed "${result_code}" || return 1
   backup_validate_timestamp "${attempted_at}" || return 1
   [[ "${duration}" =~ ^[0-9]+$ ]] || return 1
   [[ "${interrupted_count}" == "null" || "${interrupted_count}" =~ ^[0-9]+$ ]] || return 1
   [[ "${retention}" == "true" || "${retention}" == "false" || "${retention}" == "null" ]] || return 1
+  service_evidence="$(backup_service_evidence_json)" || return 1
   jq -ce \
     --arg job "${job}" --arg now "$(backup_now)" --arg attempted "${attempted_at}" \
     --arg code "${result_code}" --argjson duration "${duration}" \
     --argjson interrupted "${interrupted_count}" --argjson retention "${retention}" \
+    --argjson service "${service_evidence}" \
     --argjson success "${success_json}" '
       .updatedAt=$now |
       .[$job].lastAttempt={attemptedAt:$attempted,resultCode:$code,durationSeconds:$duration,
+        serviceInvocationId:$service.serviceInvocationId,serviceBootId:$service.serviceBootId,
         interruptedCandidateCount:$interrupted,retentionSucceeded:$retention} |
       if $success == null then . else .[$job].lastSuccess=$success end
     ' <<<"${previous}"
+}
+
+backup_service_evidence_json() {
+  local invocation_id="${INVOCATION_ID:-}" boot_id
+
+  if [[ -z "${invocation_id}" ]]; then
+    printf '%s\n' '{"serviceInvocationId":null,"serviceBootId":null}'
+    return
+  fi
+  invocation_id="$(printf '%s' "${invocation_id}" | tr '[:upper:]' '[:lower:]')" || return 1
+  [[ "${invocation_id}" =~ ^[0-9a-f]{32}$ ]] || return 1
+  [[ -f "${SERVICE_BOOT_ID_FILE}" && ! -L "${SERVICE_BOOT_ID_FILE}" ]] || return 1
+  boot_id="$(<"${SERVICE_BOOT_ID_FILE}")" || return 1
+  boot_id="$(printf '%s' "${boot_id}" | tr '[:upper:]' '[:lower:]')" || return 1
+  [[ "${boot_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+
+  jq -cn --arg invocation_id "${invocation_id}" --arg boot_id "${boot_id}" \
+    '{serviceInvocationId:$invocation_id,serviceBootId:$boot_id}'
 }
 
 backup_acquire_shared_lock() {

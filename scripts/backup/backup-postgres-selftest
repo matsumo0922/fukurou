@@ -183,6 +183,7 @@ done
 
 phase=production-backup-entrypoint
 env \
+  INVOCATION_ID=0123456789abcdef0123456789abcdef \
   FUKUROU_POSTGRES_CONTAINER="${source_container}" \
   FUKUROU_APPLICATION_CONTAINER="${application_container}" \
   FUKUROU_BACKUP_SOURCE_REVISION="${source_revision}" \
@@ -208,6 +209,8 @@ fi
 snapshot_id="$(jq -er '.backup.lastSuccess.snapshotId' "${fixture_root}/run/backup-status.json")"
 [[ "$(jq -er '.backup.lastAttempt.resultCode' "${fixture_root}/run/backup-status.json")" == SUCCESS ]]
 [[ "$(jq -er '.backup.lastAttempt.retentionSucceeded' "${fixture_root}/run/backup-status.json")" == true ]]
+[[ "$(jq -er '.backup.lastAttempt.serviceInvocationId' "${fixture_root}/run/backup-status.json")" == 0123456789abcdef0123456789abcdef ]]
+[[ "$(jq -er '.backup.lastAttempt.serviceBootId' "${fixture_root}/run/backup-status.json")" == "$(</proc/sys/kernel/random/boot_id)" ]]
 snapshot_json="$(restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
   snapshots --json --host fukurou-production --path /postgres.dump \
   --tag fukurou-postgres,integrity-checked)"

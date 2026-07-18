@@ -5,6 +5,7 @@ readonly SELFTEST_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELFTEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT
 mkdir -p "${SELFTEST_ROOT}/status" "${SELFTEST_ROOT}/repo" "${SELFTEST_ROOT}/bin"
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"${SELFTEST_ROOT}/boot-id"
 
 export FUKUROU_BACKUP_STATUS_FILE="${SELFTEST_ROOT}/status/backup-status.json"
 export FUKUROU_BACKUP_LOCK_FILE="${SELFTEST_ROOT}/backup.lock"
@@ -12,6 +13,7 @@ export FUKUROU_DEPLOY_LOCK_FILE="${SELFTEST_ROOT}/deploy.lock"
 export RESTIC_REPOSITORY="${SELFTEST_ROOT}/repo/repository"
 export RESTIC_PASSWORD_FILE="${SELFTEST_ROOT}/restic-password"
 export FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1
+export FUKUROU_SERVICE_BOOT_ID_FILE="${SELFTEST_ROOT}/boot-id"
 # shellcheck source=backup-fukurou
 source "${SELFTEST_DIRECTORY}/backup-fukurou"
 
@@ -40,6 +42,14 @@ expect_failure null-attempt-snapshot backup_validate_status_json "$(jq -c '.back
 
 success='{"snapshotId":"aaaaaaaa","sourceRevision":"0123456789abcdef0123456789abcdef01234567","verifiedAt":"2026-07-18T00:01:00Z","durationSeconds":10,"verificationCount":1}'
 successful="$(backup_merge_attempt "${initial}" backup '2026-07-18T00:00:00Z' SUCCESS 10 0 true "${success}")"
+service_bound="$(INVOCATION_ID=0123456789ABCDEF0123456789ABCDEF \
+  backup_merge_attempt "${initial}" backup '2026-07-18T00:00:00Z' SUCCESS 10 0 true "${success}")"
+[[ "$(jq -r '.backup.lastAttempt.serviceInvocationId' <<<"${service_bound}")" == 0123456789abcdef0123456789abcdef ]] ||
+  fail_selftest "systemd invocation identity was not normalized and persisted"
+[[ "$(jq -r '.backup.lastAttempt.serviceBootId' <<<"${service_bound}")" == 01234567-89ab-cdef-0123-456789abcdef ]] ||
+  fail_selftest "current boot identity was not persisted"
+expect_failure malformed-invocation env INVOCATION_ID=not-an-invocation bash -c \
+  'source "$1"; backup_service_evidence_json' backup-service-evidence "${SELFTEST_DIRECTORY}/backup-common"
 expect_failure null-success-verification-count backup_validate_status_json "$(jq -c '.backup.lastSuccess.verificationCount=null' <<<"${successful}")"
 failed_later="$(backup_merge_attempt "${successful}" backup '2026-07-19T00:00:00Z' REPOSITORY_FAILED 2 1 null null)"
 [[ "$(jq -r '.backup.lastSuccess.snapshotId' <<<"${failed_later}")" == "aaaaaaaa" ]] || fail_selftest "failed attempt erased last success"

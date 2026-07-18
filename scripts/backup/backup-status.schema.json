@@ -47,11 +47,13 @@
     "attempt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["attemptedAt", "resultCode", "durationSeconds"],
+      "required": ["attemptedAt", "resultCode", "durationSeconds", "serviceInvocationId", "serviceBootId"],
       "properties": {
         "attemptedAt": { "$ref": "#/$defs/timestamp" },
         "resultCode": { "$ref": "#/$defs/resultCode" },
         "durationSeconds": { "type": "integer", "minimum": 0 },
+        "serviceInvocationId": { "type": ["string", "null"], "pattern": "^[0-9a-f]{32}$" },
+        "serviceBootId": { "type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
         "snapshotId": { "$ref": "#/$defs/snapshotId" },
         "interruptedCandidateCount": {
           "anyOf": [

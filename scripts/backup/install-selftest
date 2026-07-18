@@ -15,30 +15,10 @@ fail() {
 }
 
 active_unit=""
-service_result=success
-service_exit_status=0
-service_start_monotonic=123456
-service_start_wall_clock='Sat 2026-07-18 00:01:00 UTC'
 systemctl() {
     if [[ $1 == is-active ]]; then
         [[ ${3:-} == "${active_unit}" ]]
         return
-    fi
-    if [[ $1 == show && $2 == --property=Result && $3 == --value ]]; then
-        printf '%s\n' "${service_result}"
-        return 0
-    fi
-    if [[ $1 == show && $2 == --property=ExecMainStatus && $3 == --value ]]; then
-        printf '%s\n' "${service_exit_status}"
-        return 0
-    fi
-    if [[ $1 == show && $2 == --property=ExecMainStartTimestampMonotonic && $3 == --value ]]; then
-        printf '%s\n' "${service_start_monotonic}"
-        return 0
-    fi
-    if [[ $1 == show && $2 == --property=ExecMainStartTimestamp && $3 == --value ]]; then
-        printf '%s\n' "${service_start_wall_clock}"
-        return 0
     fi
     return 1
 }
@@ -68,6 +48,9 @@ if acquire_install_lock; then fail 'contended shared install lock was accepted';
 exec 9>&-
 
 readonly SNAPSHOT_ID=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+readonly BOOT_ID=01234567-89ab-cdef-0123-456789abcdef
+readonly BACKUP_INVOCATION_ID=0123456789abcdef0123456789abcdef
+readonly RESTORE_INVOCATION_ID=fedcba9876543210fedcba9876543210
 snapshot_fixture='[]'
 restic() {
     printf '%s\n' "$*" >"${SELFTEST_ROOT}/restic.log"
@@ -87,7 +70,8 @@ if verify_repository_snapshot "${SNAPSHOT_ID}"; then
 fi
 
 status_fixture="${SELFTEST_ROOT}/backup-status.json"
-jq -cn --arg snapshot "${SNAPSHOT_ID}" '
+jq -cn --arg snapshot "${SNAPSHOT_ID}" --arg boot_id "${BOOT_ID}" \
+    --arg backup_invocation "${BACKUP_INVOCATION_ID}" --arg restore_invocation "${RESTORE_INVOCATION_ID}" '
   {
     schemaVersion: 1,
     updatedAt: "2026-07-18T00:02:00Z",
@@ -96,6 +80,8 @@ jq -cn --arg snapshot "${SNAPSHOT_ID}" '
         attemptedAt: "2026-07-18T00:00:00Z",
         resultCode: "SUCCESS",
         durationSeconds: 1,
+        serviceInvocationId: $backup_invocation,
+        serviceBootId: $boot_id,
         snapshotId: $snapshot,
         interruptedCandidateCount: 0,
         retentionSucceeded: true
@@ -112,6 +98,8 @@ jq -cn --arg snapshot "${SNAPSHOT_ID}" '
         attemptedAt: "2026-07-18T00:01:00Z",
         resultCode: "SUCCESS",
         durationSeconds: 1,
+        serviceInvocationId: $restore_invocation,
+        serviceBootId: $boot_id,
         snapshotId: $snapshot,
         interruptedCandidateCount: 0,
         retentionSucceeded: null
@@ -129,23 +117,23 @@ jq -cn --arg snapshot "${SNAPSHOT_ID}" '
   }
 ' >"${status_fixture}"
 
-verify_rollout_status "${status_fixture}" || fail 'latest successful rollout evidence was rejected'
+verify_rollout_status "${status_fixture}" "${BOOT_ID}" || fail 'latest successful rollout evidence was rejected'
 
 jq '.backup.lastAttempt.resultCode="RETENTION_FAILED" | .backup.lastAttempt.retentionSucceeded=false' \
     "${status_fixture}" >"${SELFTEST_ROOT}/retention-failed.json"
-if verify_rollout_status "${SELFTEST_ROOT}/retention-failed.json"; then
+if verify_rollout_status "${SELFTEST_ROOT}/retention-failed.json" "${BOOT_ID}"; then
     fail 'old backup lastSuccess was accepted after retention failure'
 fi
 
 jq '.restore.lastAttempt.resultCode="RESTORE_CLEANUP_FAILED"' \
     "${status_fixture}" >"${SELFTEST_ROOT}/restore-cleanup-failed.json"
-if verify_rollout_status "${SELFTEST_ROOT}/restore-cleanup-failed.json"; then
+if verify_rollout_status "${SELFTEST_ROOT}/restore-cleanup-failed.json" "${BOOT_ID}"; then
     fail 'old restore lastSuccess was accepted after cleanup failure'
 fi
 
 jq '.restore.lastAttempt.snapshotId="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
     "${status_fixture}" >"${SELFTEST_ROOT}/attempt-snapshot-mismatch.json"
-if verify_rollout_status "${SELFTEST_ROOT}/attempt-snapshot-mismatch.json"; then
+if verify_rollout_status "${SELFTEST_ROOT}/attempt-snapshot-mismatch.json" "${BOOT_ID}"; then
     fail 'restore attempt and success snapshot mismatch was accepted'
 fi
 
@@ -158,15 +146,15 @@ if verify_install_marker "${marker_fixture}" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     fail 'installation marker hash mismatch was accepted'
 fi
 
-verify_rollout_freshness_epochs 100 110 120 115 125 130 130 140 ||
+verify_rollout_freshness_epochs 100 115 125 130 130 140 ||
     fail 'fresh post-install rollout evidence was rejected'
-if verify_rollout_freshness_epochs 120 110 121 115 125 130 130 140; then
+if verify_rollout_freshness_epochs 120 115 125 130 130 140; then
     fail 'pre-install backup evidence survived reinstall'
 fi
-if verify_rollout_freshness_epochs 100 110 120 115 125 130 130 $((130 + ROLLOUT_MAX_EVIDENCE_AGE_SECONDS + 1)); then
+if verify_rollout_freshness_epochs 100 115 125 130 130 $((130 + ROLLOUT_MAX_EVIDENCE_AGE_SECONDS + 1)); then
     fail 'expired rollout evidence was accepted'
 fi
-if verify_rollout_freshness_epochs 100 110 120 115 125 130 100 140; then
+if verify_rollout_freshness_epochs 100 115 125 130 100 140; then
     fail 'status file evidence predating installation was accepted'
 fi
 
@@ -194,22 +182,16 @@ if grep -Fv -- "--filter label=${RESTORE_LABEL_KEY}" "${SELFTEST_ROOT}/docker.lo
     fail 'Docker inventory escaped the restore ownership label'
 fi
 
-verify_rollout_services_succeeded || fail 'successful latest service results were rejected'
-[[ $(read_service_start_wall_clock fukurou-postgres-backup.service) == "${service_start_wall_clock}" ]] ||
-    fail 'service wall-clock start timestamp was not read through the bounded query'
-service_result=exit-code
-if verify_rollout_services_succeeded; then
-    fail 'failed latest service result was accepted with stale status success'
+if verify_rollout_status "${status_fixture}" fedcba98-7654-3210-fedc-ba9876543210; then
+    fail 'evidence from an earlier boot was accepted'
 fi
-service_result=success
-service_exit_status=1
-if verify_rollout_services_succeeded; then
-    fail 'nonzero latest service exit status was accepted with stale status success'
+jq '.restore.lastAttempt.serviceInvocationId=.backup.lastAttempt.serviceInvocationId' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/duplicate-invocation.json"
+if verify_rollout_status "${SELFTEST_ROOT}/duplicate-invocation.json" "${BOOT_ID}"; then
+    fail 'one service invocation was accepted as both backup and restore evidence'
 fi
-service_exit_status=0
-service_start_monotonic=0
-if verify_rollout_services_succeeded; then
-    fail 'unexecuted service defaults were accepted after reboot or before the first drill'
+if timestamp_epoch ''; then
+    fail 'empty timestamp was accepted as midnight'
 fi
 
-printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed marker=hash-bound freshness=post-install snapshot=current-repository-exact latest-attempts=required resources=zero services=successful\n'
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed marker=hash-bound freshness=post-install snapshot=current-repository-exact latest-attempts=required resources=zero service-evidence=durable-current-boot\n'

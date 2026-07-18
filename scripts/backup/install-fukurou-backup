@@ -11,8 +11,8 @@ readonly BACKUP_HOST=fukurou-production
 readonly BACKUP_STDIN_PATH=/postgres.dump
 readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
 readonly DOCKER_LIST_TIMEOUT_SECONDS=30
-readonly SYSTEMCTL_QUERY_TIMEOUT_SECONDS=30
 readonly ROLLOUT_MAX_EVIDENCE_AGE_SECONDS=86400
+readonly SERVICE_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 readonly STATUS_DIR=/srv/fukurou/monitoring
 readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
 readonly SECRET_DIR=/srv/fukurou/secrets
@@ -45,11 +45,6 @@ readonly -a ROLLOUT_UNITS=(
     fukurou-postgres-restore-drill.service
     fukurou-postgres-restore-drill.timer
 )
-readonly -a ROLLOUT_SERVICES=(
-    fukurou-postgres-backup.service
-    fukurou-postgres-restore-drill.service
-)
-
 die() {
     printf 'install-fukurou-backup: %s\n' "$1" >&2
     exit "${2:-1}"
@@ -119,14 +114,20 @@ verify_repository_snapshot() {
 
 verify_rollout_status() {
     local status_file=$1
+    local current_boot_id=$2
 
-    jq -e '
+    jq -e --arg current_boot_id "${current_boot_id}" '
         .schemaVersion == 1 and
         .backup.lastAttempt.resultCode == "SUCCESS" and
         .backup.lastAttempt.retentionSucceeded == true and
+        (.backup.lastAttempt.serviceInvocationId | type == "string" and test("^[0-9a-f]{32}$")) and
+        .backup.lastAttempt.serviceBootId == $current_boot_id and
         (.backup.lastAttempt.snapshotId | type == "string") and
         .backup.lastAttempt.snapshotId == .backup.lastSuccess.snapshotId and
         .restore.lastAttempt.resultCode == "SUCCESS" and
+        (.restore.lastAttempt.serviceInvocationId | type == "string" and test("^[0-9a-f]{32}$")) and
+        .restore.lastAttempt.serviceBootId == $current_boot_id and
+        .backup.lastAttempt.serviceInvocationId != .restore.lastAttempt.serviceInvocationId and
         (.restore.lastAttempt.snapshotId | type == "string") and
         .restore.lastAttempt.snapshotId == .restore.lastSuccess.snapshotId and
         .backup.lastSuccess.snapshotId == .restore.lastSuccess.snapshotId
@@ -147,21 +148,6 @@ verify_no_restore_owned_resources() {
     identifiers=$(timeout --signal=TERM --kill-after=5 "${DOCKER_LIST_TIMEOUT_SECONDS}" \
         docker volume ls -q --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null) || return 1
     [[ -z ${identifiers} ]]
-}
-
-verify_rollout_services_succeeded() {
-    local service result exit_status start_monotonic
-
-    for service in "${ROLLOUT_SERVICES[@]}"; do
-        result=$(timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
-            systemctl show --property=Result --value "${service}" 2>/dev/null) || return 1
-        exit_status=$(timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
-            systemctl show --property=ExecMainStatus --value "${service}" 2>/dev/null) || return 1
-        start_monotonic=$(timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
-            systemctl show --property=ExecMainStartTimestampMonotonic --value "${service}" 2>/dev/null) || return 1
-        [[ ${start_monotonic} =~ ^[0-9]+$ ]] && (( start_monotonic > 0 )) || return 1
-        [[ ${result} == success && ${exit_status} == 0 ]] || return 1
-    done
 }
 
 installed_artifact_paths() {
@@ -227,29 +213,31 @@ evidence_is_fresh_after_install() {
 }
 
 verify_rollout_freshness_epochs() {
-    local marker_epoch=$1 backup_service_epoch=$2 restore_service_epoch=$3
-    local backup_attempt_epoch=$4 restore_attempt_epoch=$5 status_updated_epoch=$6
-    local status_file_epoch=$7 now_epoch=$8
+    local marker_epoch=$1 backup_attempt_epoch=$2 restore_attempt_epoch=$3
+    local status_updated_epoch=$4 status_file_epoch=$5 now_epoch=$6
     local evidence_epoch
 
     for evidence_epoch in \
-        "${backup_service_epoch}" "${restore_service_epoch}" \
         "${backup_attempt_epoch}" "${restore_attempt_epoch}" \
         "${status_updated_epoch}" "${status_file_epoch}"; do
         evidence_is_fresh_after_install "${evidence_epoch}" "${marker_epoch}" "${now_epoch}" || return 1
     done
-    (( backup_attempt_epoch >= backup_service_epoch )) || return 1
-    (( restore_attempt_epoch >= restore_service_epoch )) || return 1
     (( status_updated_epoch >= backup_attempt_epoch && status_updated_epoch >= restore_attempt_epoch ))
 }
 
 timestamp_epoch() {
+    [[ -n $1 ]] || return 1
     date -u -d "$1" '+%s'
 }
 
-read_service_start_wall_clock() {
-    timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
-        systemctl show --property=ExecMainStartTimestamp --value "$1" 2>/dev/null
+current_boot_id() {
+    local boot_id
+
+    [[ -f ${SERVICE_BOOT_ID_FILE} && ! -L ${SERVICE_BOOT_ID_FILE} ]] || return 1
+    boot_id=$(<"${SERVICE_BOOT_ID_FILE}") || return 1
+    boot_id=$(printf '%s' "${boot_id}" | tr '[:upper:]' '[:lower:]') || return 1
+    [[ ${boot_id} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+    printf '%s\n' "${boot_id}"
 }
 
 install_artifacts() {
@@ -323,8 +311,7 @@ verify_installation() {
 }
 
 verify_rollout() {
-    local repository_config snapshot_id installed_at marker_epoch now_epoch
-    local backup_service_started restore_service_started backup_service_epoch restore_service_epoch
+    local repository_config snapshot_id installed_at marker_epoch now_epoch boot_id
     local backup_attempt_epoch restore_attempt_epoch status_updated_epoch status_file_epoch
 
     command -v systemctl >/dev/null || die "systemctl is unavailable" 69
@@ -345,7 +332,8 @@ verify_rollout() {
         bash -c 'source "$1"; document=$(<"$2"); backup_validate_status_json "${document}"' \
         backup-status-validation "${LIBEXEC_DIR}/backup-common" "${STATUS_FILE}" ||
         die "status document does not satisfy the installed contract" 65
-    verify_rollout_status "${STATUS_FILE}" ||
+    boot_id=$(current_boot_id) || die "current boot identity is unavailable" 65
+    verify_rollout_status "${STATUS_FILE}" "${boot_id}" ||
         die "latest backup retention and restore attempts are not successful exact-snapshot evidence" 65
     snapshot_id=$(jq -er '.backup.lastSuccess.snapshotId' "${STATUS_FILE}") ||
         die "backup snapshot identity is unavailable" 65
@@ -358,17 +346,9 @@ verify_rollout() {
         die "exact integrity-checked snapshot is absent from the current repository" 65
     verify_no_restore_owned_resources ||
         die "restore-owned Docker resources remain or cannot be enumerated" 65
-    verify_rollout_services_succeeded ||
-        die "latest backup or restore systemd service result is not successful" 65
     installed_at=$(jq -er '.installedAt' "${INSTALL_MARKER}") ||
         die "installation marker timestamp is unavailable" 65
-    backup_service_started=$(read_service_start_wall_clock fukurou-postgres-backup.service) ||
-        die "backup service wall-clock start timestamp is unavailable" 65
-    restore_service_started=$(read_service_start_wall_clock fukurou-postgres-restore-drill.service) ||
-        die "restore service wall-clock start timestamp is unavailable" 65
     marker_epoch=$(timestamp_epoch "${installed_at}") || die "installation marker timestamp is invalid" 65
-    backup_service_epoch=$(timestamp_epoch "${backup_service_started}") || die "backup service timestamp is invalid" 65
-    restore_service_epoch=$(timestamp_epoch "${restore_service_started}") || die "restore service timestamp is invalid" 65
     backup_attempt_epoch=$(timestamp_epoch "$(jq -er '.backup.lastAttempt.attemptedAt' "${STATUS_FILE}")") ||
         die "backup attempt timestamp is invalid" 65
     restore_attempt_epoch=$(timestamp_epoch "$(jq -er '.restore.lastAttempt.attemptedAt' "${STATUS_FILE}")") ||
@@ -378,8 +358,7 @@ verify_rollout() {
     status_file_epoch=$(stat -c '%Y' "${STATUS_FILE}") || die "status file timestamp is unavailable" 65
     now_epoch=$(date -u '+%s') || die "current wall clock is unavailable" 65
     verify_rollout_freshness_epochs \
-        "${marker_epoch}" "${backup_service_epoch}" "${restore_service_epoch}" \
-        "${backup_attempt_epoch}" "${restore_attempt_epoch}" "${status_updated_epoch}" \
+        "${marker_epoch}" "${backup_attempt_epoch}" "${restore_attempt_epoch}" "${status_updated_epoch}" \
         "${status_file_epoch}" "${now_epoch}" ||
         die "backup, restore, or status evidence is stale or predates the installed artifacts" 65
 
