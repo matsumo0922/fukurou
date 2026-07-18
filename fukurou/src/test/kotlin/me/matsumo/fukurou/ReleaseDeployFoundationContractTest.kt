@@ -97,6 +97,7 @@ class ReleaseDeployFoundationContractTest {
         ).jsonObject
         val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
         val inventory = Files.readAllLines(root.resolve("scripts/deploy/deploy-schema-sensitive-paths-v1.txt"))
+        val requiredFields = schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }
 
         assertEquals("Fukurou signed deploy bundle v2", schema.getValue("title").jsonPrimitive.content)
         assertEquals(2, schema.getValue("properties").jsonObject.getValue("bundleSchemaVersion").jsonObject.getValue("const").jsonPrimitive.content.toInt())
@@ -105,15 +106,17 @@ class ReleaseDeployFoundationContractTest {
             4,
             schema.getValue("allOf").jsonArray.single().jsonObject.getValue("oneOf").jsonArray.size,
         )
-        assertTrue(schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }.containsAll(
-            listOf(
-                "workflowEvent",
-                "deployIntent",
-                "operatorReason",
-                "migrationRollbackMode",
-                "schemaSensitivePathsSha256",
+        assertTrue(
+            requiredFields.containsAll(
+                listOf(
+                    "workflowEvent",
+                    "deployIntent",
+                    "operatorReason",
+                    "migrationRollbackMode",
+                    "schemaSensitivePathsSha256",
+                ),
             ),
-        ))
+        )
         assertTrue(executor.contains("readonly CONTRACT_VERSION=2"))
         assertTrue(executor.contains("observe_and_admit_deploy"))
         assertTrue(executor.contains("AUTHORIZED_ROLLBACK"))
