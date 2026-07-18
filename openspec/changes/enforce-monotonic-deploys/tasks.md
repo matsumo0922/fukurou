@@ -13,18 +13,18 @@
 
 - [ ] 3.1 Upgrade the root executor to contract v2 while retaining version-aware v1 journal recovery.
 - [ ] 3.2 Validate bundle v2 fields, reason safety, repository/installed inventory hashes, and exact signed target before candidate mutation.
-- [ ] 3.3 Observe current revision and fresh-install evidence under the deploy lock, fetch main history, and enforce `FORWARD` / `AUTHORIZED_ROLLBACK` ancestry before rollback capture.
+- [ ] 3.3 Observe current revision and fresh-install evidence (`PRE_FOUNDATION` plus zero published deployment directories) under the deploy lock, fetch main history, and enforce `FORWARD` / `AUTHORIZED_ROLLBACK` ancestry before rollback capture.
 - [ ] 3.4 Reclassify the actual current-to-target diff with the installed inventory and reject migration mode mismatches before rollback capture.
 
 ## 4. Durable recovery policy
 
 - [ ] 4.1 Persist accepted current/target, intent, reason, mode, inventory hash, and schema-sensitive result in rollback state and the first current-format journal entry.
 - [ ] 4.2 Preserve existing automatic image rollback for `AUTO_IMAGE_ROLLBACK` and `BACKWARD_COMPATIBLE`.
-- [ ] 4.3 Route `ROLL_FORWARD_ONLY` failure to re-established maintenance/fence and durable `MANUAL_RECOVERY_REQUIRED` without starting the previous image or restoring the database.
+- [ ] 4.3 Route pre-safety `ROLL_FORWARD_ONLY` failure to `CANDIDATE_ABORTED`, and post-safety live/startup failure to re-established maintenance/fence plus durable `MANUAL_RECOVERY_REQUIRED`, without starting the previous image or restoring the database.
 
 ## 5. Tests and documentation
 
-- [ ] 5.1 Complete workflow, contract, runtime, and production-like E2E scenarios for forward, queued-old, authorized rollback, tamper, fresh, divergent, inventory mismatch, compatibility modes, post-deploy mismatch, and v1 recovery.
+- [ ] 5.1 Complete workflow, contract, runtime, and production-like E2E scenarios for forward, queued-old, authorized rollback, mandatory historical quality, tamper, fresh/prior-history container loss, divergent, inventory mismatch, compatibility modes at pre/post-safety states, restart recovery, post-deploy mismatch, and v1 recovery.
 - [ ] 5.2 Update `docs/deploy.md` with current v2 semantics, manual inputs, controlled deploy freeze, exact root pre-install commands, verification, rollback, and PR-2 merge gate.
 - [ ] 5.3 Grep README/docs for stale quality, rollback, executor contract, migration, and bundle descriptions and update affected current-specification text.
 
