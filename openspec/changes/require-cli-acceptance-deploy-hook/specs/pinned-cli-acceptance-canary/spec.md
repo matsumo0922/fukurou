@@ -20,8 +20,8 @@ Every `FORWARD` deploy MUST include the existing `CLI_AUTH_PREFLIGHT_V1` operati
 - **THEN** validation or candidate preflight fails before production compose cutover
 
 #### Scenario: Acceptance exceeds the deploy deadline
-- **WHEN** the one-run acceptance does not complete within its 600-second pre-mutation budget
-- **THEN** the harness terminates its exact canary container, the executor fails without changing production launch state, and fresh 1,200-second forward plus 1,500-second recovery budgets remain available after acceptance succeeds
+- **WHEN** the one-run acceptance does not complete within its 720-second container or 750-second host pre-mutation budget
+- **THEN** the harness is given a bounded cleanup interval, the executor fails without changing production launch state, and fresh 1,200-second forward plus 1,500-second recovery budgets remain available after acceptance succeeds
 
 #### Scenario: Forward provider gate is unavailable during an incident
 - **WHEN** a new `FORWARD` deploy cannot pass the provider gate during a provider outage or credential incident

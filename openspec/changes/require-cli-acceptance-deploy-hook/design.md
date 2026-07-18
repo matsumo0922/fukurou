@@ -55,27 +55,31 @@ The candidate canary intentionally has neither auth volume nor provider network 
 
 ### Give acceptance a separate pre-mutation budget
 
-（agent 仮決め）The acceptance container's existing 2,400-second timeout is reduced to 600 seconds, above the four 120-second phase budgets. A host timeout bounds Docker/harness cleanup slightly above that container limit. Acceptance runs after unfinished-deployment recovery, intent admission, and exact candidate operation probing, but before rollback capture and launch mutation. After it succeeds, the executor re-bases both existing deadlines to the same new origin: 1,200 seconds for forward work and 1,500 seconds for recovery. Provider failure therefore leaves current production untouched and does not consume the launch-disabled window.
+（agent 仮決め）The shared acceptance container timeout becomes repetition-dependent: 720 seconds for one-run deploy smoke and 2,160 seconds for three-run qualification. Each repetition receives the four 120-second phase limits plus 240 seconds for JVM/CLI/fixture startup and cleanup, so the deploy limit does not make qualification impossible.
 
-（agent 仮決め）The GitHub deploy job timeout increases from 35 to 50 minutes. The conservative path is pre-acceptance work up to 490 seconds + acceptance/cleanup up to 630 seconds + recovery up to 1,500 seconds = 2,620 seconds, leaving about 380 seconds before the 3,000-second runner kill. The production mutation/recovery budgets themselves remain 20/25 minutes; only the outer runner ceiling changes.
+Acceptance runs after unfinished-deployment recovery, intent admission, exact candidate operation probing, and deterministic production-compose validation, but before rollback capture and launch mutation. At acceptance-stage entry the executor stops the old watchdog, creates a dedicated 750-second host deadline, and re-arms the watchdog; the 30-second margin lets the container timeout run its cleanup trap before the host deadline. After success it stops that watchdog, re-bases both existing deadlines to the same new origin—1,200 seconds for forward work and 1,500 seconds for recovery—and re-arms plus immediately checks the watchdog. Provider failure therefore leaves current production untouched and does not consume the launch-disabled window.
+
+（agent 仮決め）The GitHub deploy job timeout increases from 35 to 60 minutes. The structural path is pre-acceptance work bounded by 1,200 seconds + acceptance/cleanup 750 seconds + recovery 1,500 seconds = 3,450 seconds, leaving 150 seconds before the 3,600-second runner kill. The production mutation/recovery budgets themselves remain 20/25 minutes; only the outer runner ceiling changes.
 
 The signed candidate token is issued only for the later candidate hook loop. `CLI_AUTH_PREFLIGHT_V1` is ordered before `FOUNDATION_PREFLIGHT_V1`; both candidate admissions complete before the foundation harness is run. The only token invariant is that both short candidate admissions complete within its 900-second lifetime; the later foundation harness does not consume token-authorized work.
 
 ## Risks / Trade-offs
 
 - [Dedicated auth expires and blocks routine deploys] → This is the intended fail-closed behavior; docs retain explicit operator login/refresh and a one-run smoke command.
-- [Provider latency delays deploy admission] → Give acceptance a separate 600-second pre-mutation budget; reset the existing mutation/recovery deadline only after success and test TERM cleanup with the real harness selftest seam.
+- [Provider latency delays deploy admission] → Give one-run acceptance a separate 720/750-second container/host pre-mutation budget; re-arm the watchdog at stage entry and again for mutation/recovery, then test TERM cleanup with the real harness selftest seam.
 - [Forward/rollback hook sets drift across workflow, executor, candidate, and tests] → Encode the two exact intent-dependent sets and exercise both in contract and E2E fixtures.
 - [Installed executor/harness hash changes block the first deploy] → Follow the existing root-owned bootstrap/install procedure from the same reviewed SHA before automatic deploy; do not weaken signed hash checks.
 - [Real credentials make CI nondeterministic] → Contract tests execute the real harness with explicit selftest Docker and assert exact executor argv; E2E uses the existing fake executable for failure transaction coverage. Only the operator smoke uses `llm-canary-auth` and real providers.
 - [Provider outage blocks a new forward hotfix] → This is an explicit consequence of the permanent forward gate; use existing launch disable/manual halt and signed historical rollback for risk reduction.
 - [Fresh install or disaster recovery has no older image to authorize] → Treat provisioned `llm-canary-auth` as a NAS bootstrap prerequisite. If it is unavailable, no forward deploy occurs; do not claim rollback or runtime halt as available before a current runtime exists.
+- [Canary and production accounts may share provider quota] → Credential volumes are isolated but account/quota isolation is not proven; document the coupling and treat rate/session/quota failure as a safe deploy stop.
+- [Pre-mutation canary adds CPU/network load beside production] → Keep the existing 2 CPU / 2 GiB limits, run one matrix only, and document that it coexists with the current runtime before drain.
 
 ## Migration Plan
 
 1. Build and review the exact PR HEAD; run deploy contract, runtime, E2E, Kotlin, OpenSpec, and repository validation.
 2. Before fresh install, DR, or the first forward deploy, freeze concurrent deploys and install the reviewed executor plus the already-required harness/catalog artifact set from the same SHA using the existing NAS bootstrap procedure.
-3. Provision `llm-canary-auth` as a required NAS bootstrap artifact, freeze concurrent deploy/operator login activity, verify sudo does not retain canary selftest/override environment, and run the documented one-run operator smoke against the exact candidate digest.
+3. Provision `llm-canary-auth` as a required NAS bootstrap artifact, freeze concurrent deploy/operator login/smoke activity, verify sudo does not retain canary selftest/override environment, and run the documented one-run operator smoke against the exact candidate digest.
 4. Merge and deploy. The signed forward bundle requires both foundation and CLI auth hooks; failure restores the previous deployment.
 5. Rollback uses the previous image/compose rollback bundle automatically. An explicit historical `AUTHORIZED_ROLLBACK` uses the foundation-only hook set and does not claim current provider qualification.
 
