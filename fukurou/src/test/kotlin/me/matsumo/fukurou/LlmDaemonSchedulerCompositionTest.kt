@@ -7,7 +7,6 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.GmoLlmDaemonLaunchAvailability
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
-import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.OpportunityEpisodeLifecycleObserver
@@ -38,6 +37,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -46,6 +47,16 @@ import kotlin.test.assertNull
 
 /** production daemon composition が placeholder maintenance を使わないことを検証する。 */
 class LlmDaemonSchedulerCompositionTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
     @Test
     fun productionCompositionUsesPersistentMaintenanceAndLifecycleObserver() {
         val runtime = TradingRuntimeFactory.inMemory(
@@ -87,18 +98,7 @@ class LlmDaemonSchedulerCompositionTest {
 
     @Test
     fun productionRunnerFactoryUsesOrderbookSnapshotForStandardProposer() = runBlocking {
-        restoreAdmissionHealthFlags()
-
-        try {
-            assertProductionRunnerFactoryUsesOrderbookSnapshot()
-        } finally {
-            restoreAdmissionHealthFlags()
-        }
-    }
-
-    private fun restoreAdmissionHealthFlags() {
-        LlmExecutionAdmissionHealth.setHeartbeatHealthy(true)
-        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(true)
+        assertProductionRunnerFactoryUsesOrderbookSnapshot()
     }
 
     private suspend fun assertProductionRunnerFactoryUsesOrderbookSnapshot() {

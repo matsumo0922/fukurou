@@ -1,4 +1,5 @@
 plugins {
+    `java-test-fixtures`
     id("matsumo.primitive.kotlin.jvm")
     id("matsumo.primitive.detekt")
 }
@@ -14,6 +15,8 @@ dependencies {
     implementation(libs.exposed.core)
     implementation(libs.exposed.jdbc)
 
+    testFixturesImplementation(platform(libs.kotlin.bom))
+
     testImplementation(kotlin("test"))
     testImplementation(libs.testcontainers.postgresql)
 
@@ -25,6 +28,22 @@ dependencies {
             )
         }
     }
+}
+
+tasks.named<Test>("test") {
+    exclude("**/TradingAdmissionHealthIsolationRegressionSuite*.class")
+}
+
+tasks.register<Test>("admissionHealthIsolationRegressionTest") {
+    group = "verification"
+    description = "Runs admission-dependent trading tests after unhealthy predecessors in one JUnit 4 worker."
+    dependsOn(tasks.named("testClasses"))
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    include("**/TradingAdmissionHealthIsolationRegressionSuite.class")
+    systemProperty("fukurou.test.admission-health-isolation-regression", "true")
+    maxParallelForks = 1
+    forkEvery = 0
 }
 
 tasks.register<JavaExec>("runOneShotLlm") {

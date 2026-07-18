@@ -32,6 +32,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.util.concurrent.CancellationException
 import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -41,6 +42,12 @@ import kotlin.test.assertTrue
 
 /** current-process stale claim recovery の fence と競合を検証する。 */
 class LlmExecutionRecoveryServiceTest {
+    @BeforeTest
+    fun setUp() {
+        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionTerminationFenceRegistry.resetForTest()
+    }
+
     @AfterTest
     fun tearDown() {
         LlmExecutionAdmissionHealth.resetForTest()

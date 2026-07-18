@@ -18,6 +18,8 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -26,6 +28,15 @@ import kotlin.test.assertNull
 
 /** evaluation report と shared LLM reservation の persistence contract を検証する。 */
 class EvaluationReportPersistenceTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
 
     @Test
     fun admission_serializesWithSharedReservationAndRecoversRejectedAndInterruptedJobs() = runBlocking {

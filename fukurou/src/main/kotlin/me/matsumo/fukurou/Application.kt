@@ -68,6 +68,8 @@ import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.io.File
 import java.time.Clock
+import java.util.logging.Level
+import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -101,6 +103,7 @@ fun interface ReadinessProbe {
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param databaseConfig DB 接続設定。null なら DB 未構成として扱う
  * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
+ * @param shutdownResultObserver Application shutdown の全 resource cleanup 結果を受け取る observer
  */
 fun Application.module(
     readinessProbe: ReadinessProbe? = null,
@@ -127,6 +130,7 @@ fun Application.module(
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     databaseConfig: DatabaseConfig? = DatabaseConfig.fromEnv(),
     webRoot: File? = webRootFromEnv(),
+    shutdownResultObserver: (Result<Unit>) -> Unit = {},
 ) {
     val databaseResources = createApplicationDatabaseResources(
         readinessProbe = readinessProbe,
@@ -181,7 +185,12 @@ fun Application.module(
     }
 
     val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime)
-    subscribeApplicationShutdown(databaseResources, routeResources.ops, backgroundWorkers)
+    subscribeApplicationShutdown(
+        databaseResources = databaseResources,
+        opsResources = routeResources.ops,
+        backgroundWorkers = backgroundWorkers,
+        shutdownResultObserver = shutdownResultObserver,
+    )
 }
 
 private fun createApplicationDatabaseResources(
@@ -928,26 +937,74 @@ private fun Application.subscribeApplicationShutdown(
     databaseResources: ApplicationDatabaseResources,
     opsResources: ApplicationOpsRouteResources,
     backgroundWorkers: ApplicationBackgroundWorkers,
+    shutdownResultObserver: (Result<Unit>) -> Unit,
 ) {
-    val hasClosableResource = databaseResources.dataSource != null ||
-        backgroundWorkers.hasWorker ||
-        opsResources.createdManualLlmLaunchService != null ||
-        opsResources.createdLlmAuthService != null
+    monitor.subscribe(ApplicationStopped) {
+        val cleanupResult = closeApplicationResources(
+            listOfNotNull(
+                backgroundWorkers.llmAuditMaintenanceWorker?.let { worker -> worker::close },
+                backgroundWorkers.reflectionRunnerWorker?.let { worker -> worker::close },
+                backgroundWorkers.obsidianWriterWorker?.let { worker -> worker::close },
+                backgroundWorkers.llmDaemonWorker?.let { worker -> worker::close },
+                backgroundWorkers.llmExecutionRecoveryWorker?.let { worker -> worker::close },
+                opsResources.createdLlmAuthService?.let { service -> service::close },
+                opsResources.createdManualLlmLaunchService?.close,
+                backgroundWorkers.reconcilerWorker?.let { worker -> worker::close },
+                databaseResources.dataSource?.let { source -> source::close },
+            ),
+        )
+        reportApplicationShutdown(
+            cleanupResult = cleanupResult,
+            shutdownResultObserver = shutdownResultObserver,
+            reportError = { message, throwable -> log.error(message, throwable) },
+        )
+    }
+}
 
-    if (!hasClosableResource) {
-        return
+/** Application resource を順番どおり全件 close し、最初の失敗へ後続失敗を保持する。 */
+internal fun closeApplicationResources(closeOperations: List<() -> Unit>): Result<Unit> {
+    var firstFailure: Throwable? = null
+
+    closeOperations.forEach { close ->
+        runCatching(close).exceptionOrNull()?.let { failure ->
+            val existingFailure = firstFailure
+            if (existingFailure == null) {
+                firstFailure = failure
+            } else if (existingFailure !== failure) {
+                existingFailure.addSuppressed(failure)
+            }
+        }
     }
 
-    monitor.subscribe(ApplicationStopped) {
-        backgroundWorkers.llmAuditMaintenanceWorker?.close()
-        backgroundWorkers.reflectionRunnerWorker?.close()
-        backgroundWorkers.obsidianWriterWorker?.close()
-        backgroundWorkers.llmDaemonWorker?.close()
-        backgroundWorkers.llmExecutionRecoveryWorker?.close()
-        opsResources.createdLlmAuthService?.close()
-        opsResources.createdManualLlmLaunchService?.close?.invoke()
-        backgroundWorkers.reconcilerWorker?.close()
-        databaseResources.dataSource?.close()
+    return firstFailure?.let(Result.Companion::failure) ?: Result.success(Unit)
+}
+
+/** cleanup 結果を observer へ1回渡し、primary/fallback の独立境界で失敗を report する。 */
+internal fun reportApplicationShutdown(
+    cleanupResult: Result<Unit>,
+    shutdownResultObserver: (Result<Unit>) -> Unit,
+    reportError: (String, Throwable) -> Unit,
+) {
+    val observerFailure = runCatching { shutdownResultObserver(cleanupResult) }.exceptionOrNull()
+
+    cleanupResult.exceptionOrNull()?.let { throwable ->
+        reportApplicationShutdownFailure("Application resource cleanup failed.", throwable, reportError)
+    }
+    observerFailure?.let { throwable ->
+        reportApplicationShutdownFailure("Application shutdown result observer failed.", throwable, reportError)
+    }
+}
+
+private fun reportApplicationShutdownFailure(
+    message: String,
+    throwable: Throwable,
+    reportError: (String, Throwable) -> Unit,
+) {
+    val reporterFailure = runCatching { reportError(message, throwable) }.exceptionOrNull() ?: return
+
+    runCatching {
+        APPLICATION_SHUTDOWN_FALLBACK_LOGGER.log(Level.SEVERE, "$message Primary error reporter failed.", throwable)
+        APPLICATION_SHUTDOWN_FALLBACK_LOGGER.log(Level.SEVERE, "Application shutdown error reporter failed.", reporterFailure)
     }
 }
 
@@ -1149,14 +1206,10 @@ private data class ApplicationBackgroundWorkers(
     val llmAuditMaintenanceWorker: LlmAuditMaintenanceWorker? = null,
     val obsidianWriterWorker: ObsidianWriterWorker? = null,
     val reflectionRunnerWorker: ReflectionRunnerWorker? = null,
-) {
-    val hasWorker: Boolean = llmExecutionRecoveryWorker != null ||
-        reconcilerWorker != null ||
-        llmDaemonWorker != null ||
-        llmAuditMaintenanceWorker != null ||
-        obsidianWriterWorker != null ||
-        reflectionRunnerWorker != null
-}
+)
+
+/** primary error reporter 自体が失敗した場合の shutdown fallback logger。 */
+private val APPLICATION_SHUTDOWN_FALLBACK_LOGGER: Logger = Logger.getLogger("fukurou.application.shutdown")
 
 /**
  * runtime config が利用できないときの manual trigger 拒否理由。

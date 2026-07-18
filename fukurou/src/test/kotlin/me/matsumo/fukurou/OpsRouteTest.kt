@@ -10,8 +10,8 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
+import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -95,6 +95,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -107,6 +109,15 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  */
 @Suppress("LargeClass")
 class OpsRouteTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
 
     @Test
     fun sharedPersistenceBootstrap_recoversStaleRunThroughProductionFactory() = runBlocking {
@@ -763,16 +774,8 @@ class OpsRouteTest {
     }
 
     @Test
-    fun moduleKeepsRuntimeConfigRecoveryApiAvailableWhenActiveConfigIsInvalid() = testApplication {
-        if (!isDockerAvailable()) {
-            println("Skipping module runtime config recovery test because Docker is unavailable.")
-            return@testApplication
-        }
-
-        val container = FukurouPostgresContainer()
-        container.start()
-
-        try {
+    fun moduleKeepsRuntimeConfigRecoveryApiAvailableWhenActiveConfigIsInvalid() =
+        withFukurouPostgresTestApplication { container, shutdownResult ->
             val databaseConfig = DatabaseConfig(
                 url = container.jdbcUrl,
                 user = container.username,
@@ -786,6 +789,7 @@ class OpsRouteTest {
             )
             RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
             updateRuntimeConfigValue(database = database, key = "runner.maxToolCallsPerRun", value = "49")
+            assertRuntimeConfigWorkersDisabled(database)
 
             val manualService = CapturingManualLlmLaunchService(
                 ManualLlmLaunchResult.Accepted(
@@ -805,15 +809,19 @@ class OpsRouteTest {
                     reconcilerStatus = reconcilerStatus,
                     opsManualLlmLaunchService = manualService,
                     databaseConfig = databaseConfig,
+                    shutdownResultObserver = shutdownResult.observer,
                 )
             }
 
+            startApplication()
+            assertAdmissionHealthyForTest()
             val configResponse = client.get("/ops/runtime-config")
             val triggerResponse = client.post("/ops/trigger") {
                 contentType(ContentType.Application.Json)
                 setBody("""{"reason":"operator recovery check"}""")
             }
             val readyResponse = client.get("/health/ready")
+            assertAdmissionHealthyForTest()
             val responseBody = Json.parseToJsonElement(configResponse.bodyAsText()).jsonObject
             val warning = responseBody.getValue("warnings").jsonArray.single().jsonObject
             val validationError = warning
@@ -859,22 +867,11 @@ class OpsRouteTest {
             assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
             assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
             assertEquals(listOf("operator restored runtime config"), manualService.reasons)
-        } finally {
-            container.stop()
         }
-    }
 
     @Test
-    fun moduleKeepsReadinessAndManualRecoveryAvailableWhenActiveFomcCalendarIsMissing() = testApplication {
-        if (!isDockerAvailable()) {
-            println("Skipping FOMC calendar composition test because Docker is unavailable.")
-            return@testApplication
-        }
-
-        val container = FukurouPostgresContainer()
-        container.start()
-
-        try {
+    fun moduleKeepsReadinessAndManualRecoveryAvailableWhenActiveFomcCalendarIsMissing() =
+        withFukurouPostgresTestApplication { container, shutdownResult ->
             val databaseConfig = DatabaseConfig(
                 url = container.jdbcUrl,
                 user = container.username,
@@ -892,6 +889,7 @@ class OpsRouteTest {
                 key = "safety.economicEventBlackouts",
                 value = "[]",
             )
+            assertRuntimeConfigWorkersDisabled(database)
             val manualService = CapturingManualLlmLaunchService(
                 ManualLlmLaunchResult.Accepted(
                     invocationId = "manual-calendar-recovery",
@@ -920,6 +918,7 @@ class OpsRouteTest {
                     reconcilerStatus = reconcilerStatus,
                     opsManualLlmLaunchService = manualService,
                     databaseConfig = databaseConfig,
+                    shutdownResultObserver = shutdownResult.observer,
                 )
             }
 
@@ -939,22 +938,11 @@ class OpsRouteTest {
             assertEquals(HttpStatusCode.OK, readyResponse.status, readyResponse.bodyAsText())
             assertEquals(HttpStatusCode.Accepted, triggerResponse.status, triggerResponse.bodyAsText())
             assertEquals(listOf("calendar recovery"), manualService.reasons)
-        } finally {
-            container.stop()
         }
-    }
 
     @Test
-    fun moduleRetriesRuntimeConfigSnapshotAfterTransientResolveFailure() = testApplication {
-        if (!isDockerAvailable()) {
-            println("Skipping module runtime config transient recovery test because Docker is unavailable.")
-            return@testApplication
-        }
-
-        val container = FukurouPostgresContainer()
-        container.start()
-
-        try {
+    fun moduleRetriesRuntimeConfigSnapshotAfterTransientResolveFailure() =
+        withFukurouPostgresTestApplication { container, shutdownResult ->
             val databaseConfig = DatabaseConfig(
                 url = container.jdbcUrl,
                 user = container.username,
@@ -967,6 +955,7 @@ class OpsRouteTest {
                 password = databaseConfig.password,
             )
             RuntimeConfigPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+            assertRuntimeConfigWorkersDisabled(database)
             deleteRuntimeConfigValues(database)
 
             val manualService = CapturingManualLlmLaunchService(
@@ -981,14 +970,18 @@ class OpsRouteTest {
                     clock = fixedClock(),
                     opsManualLlmLaunchService = manualService,
                     databaseConfig = databaseConfig,
+                    shutdownResultObserver = shutdownResult.observer,
                 )
             }
 
+            startApplication()
+            assertAdmissionHealthyForTest()
             val unavailableReadyResponse = client.get("/health/ready")
             val unavailableTriggerResponse = client.post("/ops/trigger") {
                 contentType(ContentType.Application.Json)
                 setBody("""{"reason":"operator checks transient failure"}""")
             }
+            assertAdmissionHealthyForTest()
 
             assertEquals(HttpStatusCode.ServiceUnavailable, unavailableReadyResponse.status)
             assertEquals(HttpStatusCode.ServiceUnavailable, unavailableTriggerResponse.status)
@@ -1005,10 +998,7 @@ class OpsRouteTest {
             assertEquals(HttpStatusCode.OK, recoveredReadyResponse.status)
             assertEquals(HttpStatusCode.Accepted, recoveredTriggerResponse.status)
             assertEquals(listOf("operator confirms transient recovery"), manualService.reasons)
-        } finally {
-            container.stop()
         }
-    }
 
     @Test
     fun opsRoutes_accountReturnsCurrentSnapshotWithUpdatedAt() = testApplication {
@@ -1955,15 +1945,12 @@ private fun assertNoSecretLikeText(responseText: String) {
  * 待機が期限切れになった場合も最後の response を返し、呼び出し側の assertion が実際の status と body を報告できるようにする。
  */
 private suspend fun HttpClient.awaitReadyResponse(): HttpResponse {
-    val deadlineMillis = System.currentTimeMillis() + READINESS_AWAIT_TIMEOUT_MILLIS
-    var response = get("/health/ready")
-
-    while (response.status != HttpStatusCode.OK && System.currentTimeMillis() < deadlineMillis) {
-        delay(READINESS_POLL_INTERVAL_MILLIS)
-        response = get("/health/ready")
-    }
-
-    return response
+    return observeUntilMonotonicDeadline(
+        timeout = Duration.ofMillis(READINESS_AWAIT_TIMEOUT_MILLIS),
+        interval = Duration.ofMillis(READINESS_POLL_INTERVAL_MILLIS),
+        observe = { get("/health/ready") },
+        completed = { response -> response.status == HttpStatusCode.OK },
+    )
 }
 
 private fun assertConfigItem(
@@ -2278,6 +2265,28 @@ private const val POSTGRES_IMAGE = "postgres:16-alpine"
 private class FukurouPostgresContainer :
     BoundedTestPostgresContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
+private fun withFukurouPostgresTestApplication(
+    block: suspend ApplicationTestBuilder.(FukurouPostgresContainer, ApplicationShutdownResultCapture) -> Unit,
+) {
+    if (!isDockerAvailable()) {
+        println("Skipping DB-backed module test because Docker is unavailable.")
+        return
+    }
+
+    val tradingConfig = TradingBotConfig()
+    assertFalse(tradingConfig.daemon.enabled)
+    assertFalse(tradingConfig.obsidian.enabled)
+
+    FukurouPostgresContainer().use { container ->
+        container.start()
+        val shutdownResult = ApplicationShutdownResultCapture()
+
+        testApplication { block(container, shutdownResult) }
+
+        shutdownResult.assertSucceeded()
+    }
+}
+
 private fun isDockerAvailable(): Boolean {
     return runCatching {
         DockerClientFactory.instance().client().pingCmd().exec()
@@ -2356,6 +2365,29 @@ private fun updateRuntimeConfigValue(
             statement.setString(2, key)
             statement.executeUpdate()
         }
+    }
+}
+
+private fun assertRuntimeConfigWorkersDisabled(database: ExposedDatabase) {
+    exposedTransaction(database) {
+        val values = jdbcConnection().prepareStatement(
+            """
+                SELECT config_key, config_value
+                FROM runtime_config_values
+                WHERE config_key IN ('daemon.enabled', 'obsidian.enabled')
+            """.trimIndent(),
+        ).use { statement ->
+            statement.executeQuery().use { resultSet ->
+                buildMap {
+                    while (resultSet.next()) {
+                        put(resultSet.getString("config_key"), resultSet.getString("config_value"))
+                    }
+                }
+            }
+        }
+
+        assertEquals("false", values["daemon.enabled"])
+        assertEquals("false", values["obsidian.enabled"])
     }
 }
 

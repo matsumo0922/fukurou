@@ -43,6 +43,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -52,6 +54,15 @@ import kotlin.test.assertTrue
  * LlmDaemonScheduler の cadence / reservation contract を検証するテスト。
  */
 class LlmDaemonSchedulerTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun scheduledMaintenance_suppressesAfterEpisodeAndRestingMaintenanceWithoutReservationOrNoTrade() = runBlocking {

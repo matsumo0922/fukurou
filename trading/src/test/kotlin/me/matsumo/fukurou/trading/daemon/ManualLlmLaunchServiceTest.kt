@@ -47,6 +47,8 @@ import java.util.logging.LogRecord
 import java.util.logging.Logger
 import kotlin.concurrent.thread
 import kotlin.coroutines.CoroutineContext
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -59,6 +61,15 @@ import kotlin.time.toDuration
  * ManualLlmLaunchService の reservation / audit / lifecycle contract を検証するテスト。
  */
 class ManualLlmLaunchServiceTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun globalLaunchGateRejectsBeforeReservationOrChildLaunch() = runBlocking {

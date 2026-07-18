@@ -5,6 +5,7 @@ import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
@@ -32,6 +33,8 @@ import java.time.Instant
 import java.time.ZoneOffset
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.SocketFactory
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -43,6 +46,15 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
  * standalone one-shot runner の human-facing failure boundary を検証するテスト。
  */
 class OneShotRunnerMainTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun coldRuntimeConfigPoolReachesLaunchDisabledGateWithoutChildLaunch() = runBlocking {

@@ -147,6 +147,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.UUID
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -161,6 +163,15 @@ import kotlin.test.assertTrue
  * OneShotLlmRunner の DB 正本 contract を検証するテスト。
  */
 class OneShotLlmRunnerTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun parallelReplay_hasOneClaimWinnerAndAtMostOneChild() = runBlocking {

@@ -22,6 +22,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -32,6 +34,15 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 
 /** migration failure 時の application fail-closed composition を検証する。 */
 class ApplicationMigrationFailureTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
 
     @Test
     fun missingSingleAttemptColumnLockTimesOutBeforeFirstDdlAndKeepsApplicationFailClosed() {
@@ -139,14 +150,20 @@ class ApplicationMigrationFailureTest {
             }
             val reconcilerStatus = MutableReconcilerStatus()
             var requestElapsed = Duration.ZERO
+            val tradingConfig = TradingBotConfig()
+            val shutdownResult = ApplicationShutdownResultCapture()
+
+            assertFalse(tradingConfig.daemon.enabled)
+            assertFalse(tradingConfig.obsidian.enabled)
 
             testApplication {
                 application {
                     module(
                         clock = clock,
                         reconcilerStatus = reconcilerStatus,
-                        tradingConfig = TradingBotConfig(),
+                        tradingConfig = tradingConfig,
                         databaseConfig = databaseConfig,
+                        shutdownResultObserver = shutdownResult.observer,
                     )
                 }
 
@@ -156,6 +173,7 @@ class ApplicationMigrationFailureTest {
 
                 requestElapsed = Duration.ofNanos(System.nanoTime() - requestStartedAt)
             }
+            shutdownResult.assertSucceeded()
 
             assertTrue(requestElapsed < Duration.ofSeconds(6), "request elapsed=$requestElapsed")
             assertFalse(reconcilerStatus.snapshot().startupFullReconcileCompleted)
