@@ -259,7 +259,7 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 一度だけ照合し、foundation と pinned Claude/Codex acceptance を同じ image に束縛する。
 `--cli-acceptance --runs 1` は acceptance matrix だけの operator smoke であり、merge qualification として扱わない。
 acceptance は app UID/GID、read-only rootfs、private tmpfs、通常 bridge、read-only `llm-canary-auth` だけで動き、
-data-free fixture の canonical tool resolution と no-tool phase の空 policy を production renderer、process runner、
+data-free fixture の canonical tool名 resolution と no-tool phase の空 policy を production renderer、process runner、
 output parser 経由で検証する。fixture call record と response marker は独立に検証する。Codex は configured model のみ検証し、served model は provider output から観測できない。raw provider output は harness 外へ出さず、deploy required hook からも呼び出さない。
 
 同じ canary は candidate image 自身を PID 1 として起動し、timeout-shaped 100件と cancellation-shaped 100件を必須実行する。start gate 前後、root-first exit、session escape、exact proxy identity、stale start ticks を通し、`setsid`、`/proc`、process-group signal、各 case のいずれかが欠ける場合は skip せず失敗する。正常完了経路ではPID 1がadoptしたdescendantを回収し、process groupからzombieが消えた後にjob slotを解放してlauncher proxyへ終了statusを返すことも専用canary stageで検証する。
