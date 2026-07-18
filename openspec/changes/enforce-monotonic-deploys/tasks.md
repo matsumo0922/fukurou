@@ -32,4 +32,4 @@
 
 - [x] 6.1 Validate `enforce-monotonic-deploys` with OpenSpec strict validation and run shell syntax plus targeted contract/runtime/E2E tests.
 - [x] 6.2 Run final `make test`, `make detekt`, and `make build` under the validation lease at one exact HEAD and record evidence for the PR.
-- [ ] 6.3 Obtain clean-context Opus approval with G1-G5 all PASS, leave PR-2 unmerged, and provide the exact NAS root pre-install handoff.
+- [x] 6.3 Obtain clean-context Opus approval with G1-G5 all PASS, leave PR-2 unmerged, and provide the exact NAS root pre-install handoff.
