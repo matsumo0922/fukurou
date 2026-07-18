@@ -1,8 +1,11 @@
 # deploy-quality-gate Specification
 
 ## Purpose
-TBD - created by archiving change gate-deploy-on-quality. Update Purpose after archive.
+
+Production image publication is gated by JVM tests, static analysis, and exact target identity while preserving the explicit historical rollback path.
+
 ## Requirements
+
 ### Requirement: Target commit quality gates image publication
 Issue #190 CI DoD stage 1: For automatic main pushes and a workflow_dispatch target equal to the resolved `origin/main` tip, the deploy workflow MUST run the repository JVM test suite and detekt against the exact resolved target commit. It MUST NOT authenticate to GHCR, build or push a production image, create a deploy bundle, or start production deployment until both quality commands and the clean-tree check succeed.
 
@@ -58,4 +61,3 @@ This stage MUST preserve the signed bundle fields, immutable image identity, sel
 #### Scenario: Quality succeeds and deploy continues
 - **WHEN** the quality gate authorizes image publication
 - **THEN** the existing build bundle and NAS deploy steps execute with the same permissions, inputs, concurrency, timeout, and root executor invocation semantics
-
