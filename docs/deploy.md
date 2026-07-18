@@ -58,6 +58,41 @@ runner 割り当て待ち（`queued` 状態）の滞留は `timeout-minutes` の
 | self-hosted runner label | `fukurou-prod`                             |
 | production image         | `ghcr.io/matsumo0922/fukurou@sha256:<digest>` |
 
+## Pinned CLI acceptance qualification
+
+merge candidate の provider qualification は、production 用 `llm-auth` と分離した Docker volume
+`llm-canary-auth` を使う。candidate image の app UID/GID で directory を初期化し、Claude と Codex を
+この専用 volume にだけ login する。
+
+```sh
+IMAGE='ghcr.io/matsumo0922/fukurou@sha256:<digest>'
+docker volume create llm-canary-auth
+docker run --rm --user 0:0 --mount type=volume,src=llm-canary-auth,dst=/canary-auth \
+  --entrypoint /bin/sh "$IMAGE" -ec \
+  'chown 10001:10004 /canary-auth && install -d -o 10001 -g 10004 /canary-auth/.claude /canary-auth/.codex'
+docker run --rm -it --user 10001:10004 --mount type=volume,src=llm-canary-auth,dst=/canary-auth \
+  --env HOME=/canary-auth --env CLAUDE_CONFIG_DIR=/canary-auth/.claude \
+  --entrypoint /usr/local/bin/claude "$IMAGE" auth login
+docker run --rm -it --user 10001:10004 --mount type=volume,src=llm-canary-auth,dst=/canary-auth \
+  --env HOME=/canary-auth --env CODEX_HOME=/canary-auth/.codex \
+  --entrypoint /usr/local/bin/codex "$IMAGE" login --device-auth
+```
+
+merge qualification は immutable repository digest を一度だけ照合し、同じ harness invocation と image で
+foundation を1回、4 phase acceptance matrix を3回実行する。短い operator smoke は matrix だけを1回実行する。
+
+```sh
+scripts/mcp-credential-isolation-check --qualification --runs 3 --reuse-image "$IMAGE"
+scripts/mcp-credential-isolation-check --cli-acceptance --runs 1 --reuse-image "$IMAGE"
+```
+
+foundation harness を変更した image の deploy 前には、`sudo install -m 0555 /srv/fukurou/repo/scripts/mcp-credential-isolation-check /usr/local/libexec/fukurou-mcp-credential-isolation-check` を再実行し、signed bundle の harness hash と installed copy を一致させる。一致しない deploy は `INSTALLED_FOUNDATION_HARNESS_HASH_MISMATCH` で停止する。
+
+結果には digest と allowlist 済み status だけを残し、prompt、credential、provider stdout/stderr は含めない。production qualification は harness override env を拒否し、明示的な selftest mode だけ fake Docker / foundation harness を許可する。
+acceptance container は dedicated auth を read-only mount し、production auth、DB、vault、Docker socket、
+production network を持たない。deploy executor はこの acceptance を required hook として呼び出さないため、
+deploy-time smoke の完了条件は別 change まで未達のままとする。Codex は configured `-m gpt-5.5` を検証するが、CLI output が served model を報告しないため provider-observed model identity は未検証である。
+
 ## NAS 側の初期セットアップ
 
 NAS に必要なコマンドが入っていることを確認する。

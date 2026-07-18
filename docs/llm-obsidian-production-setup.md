@@ -99,11 +99,14 @@ ssh dxp4800plus \
   'docker exec fukurou-ktor sh -lc "test -r /tmp/fukurou-cli-home/.claude/.credentials.json"'
 ```
 
-Codex smoke は `llm-auth` volume 内の auth source を明示して login state を確認する。production runner の config/session は per-run home に生成される。
+Production の Codex login state は `llm-auth` volume の auth source に対して確認する。provider invocation compatibility は
+production credential を使った direct CLI ではなく、[セルフホストデプロイ手順](deploy.md#pinned-cli-acceptance-qualification)の
+専用 `llm-canary-auth` と exact-image acceptance で確認する。
+acceptance が検証するのは Codex の configured `-m gpt-5.5` と CLI/image pin であり、provider が実際に serve した model identity は Codex JSONL に含まれないため未検証のままとする。
 
 ```sh
 ssh dxp4800plus \
-  'docker exec fukurou-ktor sh -lc "CODEX_HOME=/tmp/fukurou-cli-home/.codex timeout 120 codex exec --skip-git-repo-check --ephemeral --sandbox read-only -c approval_policy=\\\"never\\\" '\''Reply exactly: FUKUROU_CODEX_OK'\'' < /dev/null"'
+  'docker exec fukurou-ktor sh -lc "CODEX_HOME=/tmp/fukurou-cli-home/.codex codex login status"'
 ```
 
 2026-07-04 時点の確認では、ChatGPT account の Codex CLI で `gpt-5-mini` は受け付けられず、未指定時は `gpt-5.5` が使われた。短い smoke test でも CLI の system prompt / session overhead により token 表示は小さくならないため、daemon 有効化前に model / cost 方針を決める。
