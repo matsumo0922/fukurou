@@ -11,6 +11,15 @@
   "requiredHooks": [
     "FOUNDATION_PREFLIGHT_V1"
   ],
+  "requiredHooksByIntent": {
+    "FORWARD": [
+      "CLI_AUTH_PREFLIGHT_V1",
+      "FOUNDATION_PREFLIGHT_V1"
+    ],
+    "AUTHORIZED_ROLLBACK": [
+      "FOUNDATION_PREFLIGHT_V1"
+    ]
+  },
   "capabilityCatalogHash": "4e48ef26b28df6de7c7d62359c1fede8ab2068c39427020eca294ae6cd3924de",
   "createDirectoryIds": [
     "LAUNCH_FENCE_ROOT"

@@ -14,21 +14,22 @@ import java.security.spec.X509EncodedKeySpec
 import java.time.Instant
 import java.util.Base64
 
-/** deploy candidate が production mutation 前に実行する unprivileged foundation preflight。 */
+/** deploy candidate が production mutation 前に実行する unprivileged preflight。 */
 object DeploymentPreflightMain {
     /** allowlist 済み hook と signed one-shot token だけを実行する。 */
     @JvmStatic
     fun main(args: Array<String>) {
-        require(args.size == 4 && args[0] == "foundation") {
+        require(args.size == 4) {
             "UNSUPPORTED_DEPLOYMENT_PREFLIGHT"
         }
+        val hookId = requireNotNull(hooksBySlug[args[0]]) { "UNSUPPORTED_DEPLOYMENT_PREFLIGHT" }
         val tokenBytes = Files.readAllBytes(Path.of(args[1]))
         verifySignature(
             tokenBytes = tokenBytes,
             signatureBytes = Files.readAllBytes(Path.of(args[2])),
             publicKeyPem = Files.readString(Path.of(args[3])),
         )
-        verifyToken(tokenBytes, System.getenv(), Instant.now().epochSecond)
+        verifyToken(tokenBytes, System.getenv(), Instant.now().epochSecond, hookId)
         check(!LlmLaunchReleaseBarrier.PREFILTER_ACTIVATION_RELEASED) {
             "PREFILTER_RELEASE_BARRIER_OPEN"
         }
@@ -36,7 +37,7 @@ object DeploymentPreflightMain {
             "CANARY_PRODUCTION_DATABASE_MOUNTED"
         }
 
-        println("FOUNDATION_PREFLIGHT_V1 OK")
+        println("$hookId OK")
     }
 
     internal fun verifySignature(
@@ -61,6 +62,7 @@ object DeploymentPreflightMain {
         tokenBytes: ByteArray,
         environment: Map<String, String>,
         nowEpochSecond: Long,
+        requestedHookId: String = "FOUNDATION_PREFLIGHT_V1",
     ) {
         val token = Json.parseToJsonElement(tokenBytes.decodeToString()).jsonObject
         require(token.getValue("profile").jsonPrimitive.content == "CANARY_ONLY") {
@@ -68,9 +70,10 @@ object DeploymentPreflightMain {
         }
         val allowedHookIds = token.getValue("allowedHookIds").jsonArray
             .map { element -> element.jsonPrimitive.content }
-        require(allowedHookIds == listOf("FOUNDATION_PREFLIGHT_V1")) {
+        require(allowedHookIds == FOUNDATION_HOOKS || allowedHookIds == FORWARD_HOOKS) {
             "INVALID_CANARY_HOOK_SET"
         }
+        require(requestedHookId in allowedHookIds) { "CANARY_HOOK_NOT_ALLOWED" }
         require(token.getValue("contractHash").jsonPrimitive.content == environment["FUKUROU_CANDIDATE_CATALOG_HASH"]) {
             "INVALID_CANARY_CONTRACT_BINDING"
         }
@@ -98,9 +101,16 @@ object DeploymentPreflightMain {
             "EXPIRED_CANARY_TOKEN"
         }
     }
+
+    private val hooksBySlug = mapOf(
+        "cli-auth" to "CLI_AUTH_PREFLIGHT_V1",
+        "foundation" to "FOUNDATION_PREFLIGHT_V1",
+    )
 }
 
 private const val MAX_TOKEN_LIFETIME_SECONDS = 15 * 60L
 private val IMAGE_DIGEST_PATTERN = Regex("sha256:[0-9a-f]{64}")
 private val NONCE_PATTERN = Regex("[0-9a-f]{64}")
 private val NAMESPACE_PATTERN = Regex("canary-[a-zA-Z0-9._-]{1,96}")
+private val FOUNDATION_HOOKS = listOf("FOUNDATION_PREFLIGHT_V1")
+private val FORWARD_HOOKS = listOf("CLI_AUTH_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1")

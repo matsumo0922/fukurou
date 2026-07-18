@@ -155,6 +155,15 @@ class ReleaseDeployFoundationContractTest {
             listOf("FOUNDATION_PREFLIGHT_V1"),
             contract.getValue("requiredHooks").jsonArray.map { it.jsonPrimitive.content },
         )
+        val hooksByIntent = contract.getValue("requiredHooksByIntent").jsonObject
+        assertEquals(
+            listOf("CLI_AUTH_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1"),
+            hooksByIntent.getValue("FORWARD").jsonArray.map { it.jsonPrimitive.content },
+        )
+        assertEquals(
+            listOf("FOUNDATION_PREFLIGHT_V1"),
+            hooksByIntent.getValue("AUTHORIZED_ROLLBACK").jsonArray.map { it.jsonPrimitive.content },
+        )
     }
 
     @Test
@@ -195,12 +204,15 @@ class ReleaseDeployFoundationContractTest {
 
         assertTrue(executor.contains("--canary-preflight"))
         assertTrue(executor.contains("docker compose --env-file"))
+        assertTrue(executor.contains("run --rm --no-deps -T ktor"))
         assertTrue(executor.contains("internal: true"))
         assertFalse(executor.contains("docker run --rm --read-only --network none"))
         assertTrue(executor.contains("FUKUROU_CANDIDATE_DIGEST"))
         assertFalse(executor.contains("--entrypoint java"))
         assertTrue(supervisor.contains("run_canary_preflight"))
         assertTrue(supervisor.contains("DeploymentPreflightMain"))
+        assertTrue(supervisor.contains("CLI_AUTH_PREFLIGHT_V1"))
+        assertTrue(supervisor.contains("strcmp(argv[6], \"cli-auth\")"))
     }
 
     @Test
@@ -227,6 +239,10 @@ class ReleaseDeployFoundationContractTest {
                 .contains("start_forward_deadline_watchdog"),
         )
         assertTrue(main.indexOf("validate_production_compose") < main.indexOf("capture_rollback_state"))
+        assertTrue(main.indexOf("run_cli_acceptance_gate") < main.indexOf("capture_rollback_state"))
+        assertTrue(executor.contains("FORWARD_DEADLINE_BOOTTIME=\$(( \$(boottime_seconds) + 750 ))"))
+        assertTrue(executor.contains("--cli-acceptance --runs 1"))
+        assertTrue(executor.contains("selftest=false"))
         assertTrue(executor.contains("legacy_journal_transition_allowed"))
         assertTrue(executor.contains("load_prepared_gap_event OPEN"))
     }

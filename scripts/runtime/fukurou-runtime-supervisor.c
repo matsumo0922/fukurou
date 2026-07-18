@@ -1708,10 +1708,15 @@ int main(int argc, char **argv) {
         for (const char *cursor = catalog_hash; *cursor != '\0'; cursor++) {
             if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) return 2;
         }
-        return strcmp(argv[3], "FOUNDATION_PREFLIGHT_V1") == 0 &&
+        int foundation_probe = strcmp(argv[3], "FOUNDATION_PREFLIGHT_V1") == 0 &&
             strcmp(argv[4], "SMOKE_HOOK_FOUNDATION_V1") == 0 &&
             strcmp(argv[5], "CANDIDATE_HOOK_V1") == 0 &&
-            strcmp(argv[6], "foundation") == 0 ? 0 : 2;
+            strcmp(argv[6], "foundation") == 0;
+        int cli_probe = strcmp(argv[3], "CLI_AUTH_PREFLIGHT_V1") == 0 &&
+            strcmp(argv[4], "SMOKE_HOOK_FOUNDATION_V1") == 0 &&
+            strcmp(argv[5], "CANDIDATE_HOOK_V1") == 0 &&
+            strcmp(argv[6], "cli-auth") == 0;
+        return foundation_probe || cli_probe ? 0 : 2;
     }
     if (argc == 4 && strcmp(argv[1], "--receipt-ids") == 0) {
         char reservation[37], registration[37];
