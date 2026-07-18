@@ -823,11 +823,10 @@ class OneShotLlmRunnerTest {
                                     if (failurePoint == "phase-bind") {
                                         Files.delete(manifestPath)
                                     } else {
-                                        val manifestId = manifestPath.fileName.toString().removeSuffix(".json")
-                                        val socketBlocker = Path.of("/tmp", "fukurou-${manifestId.take(24)}.sock")
+                                        val socketBlocker = submissionSocketPathForTest(manifestPath)
+                                        gatewayBlocker = socketBlocker
                                         Files.createDirectory(socketBlocker)
                                         Files.writeString(socketBlocker.resolve("child"), "block unlink")
-                                        gatewayBlocker = socketBlocker
                                     }
                                 }
 
@@ -840,30 +839,33 @@ class OneShotLlmRunnerTest {
                 submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
                 cleanExit()
             }
-            val invocationId = "prelaunch-$failurePoint"
+            val invocationId = "prelaunch-$failurePoint-${UUID.randomUUID()}"
 
-            val result = fixture.runOneShot(defaultRequest().copy(invocationId = invocationId)).getOrThrow()
-            val material =
-                assertNotNull(fixture.runtime.decisionMaterialStateRepository.find(invocationId).getOrThrow())
-            val run = assertNotNull(fixture.runtime.llmInputManifestRepository.findRun(invocationId).getOrThrow())
+            try {
+                val result = fixture.runOneShot(defaultRequest().copy(invocationId = invocationId)).getOrThrow()
+                val material =
+                    assertNotNull(fixture.runtime.decisionMaterialStateRepository.find(invocationId).getOrThrow())
+                val run = assertNotNull(fixture.runtime.llmInputManifestRepository.findRun(invocationId).getOrThrow())
 
-            assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
-            assertEquals(material.snapshotContentHash, run.materialContentHash)
-            assertEquals(1, fixture.processRunner.launches.size)
-            val launchManifest = fixture.processRunner.launches.single().mcpManifestContent()
-            assertTrue(launchManifest.contains("RISK_REDUCTION_ONLY"), "$failurePoint: $launchManifest")
-            assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
-            assertFalse(Files.exists(requireNotNull(standardManifestPath)))
-            val observation = fixture.runtime.llmInputManifestRepository
-                .findObservation("$invocationId:PROPOSER")
-                .getOrThrow()
-            assertEquals(
-                me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_OBSERVABLE_BEFORE_START,
-                observation?.modelCoverageStatus,
-            )
-            gatewayBlocker?.let { blocker ->
-                Files.deleteIfExists(blocker.resolve("child"))
-                Files.deleteIfExists(blocker)
+                assertEquals(OneShotRunnerStatus.NO_TRADE_DECISION, result.status)
+                assertEquals(material.snapshotContentHash, run.materialContentHash)
+                assertEquals(1, fixture.processRunner.launches.size)
+                val launchManifest = fixture.processRunner.launches.single().mcpManifestContent()
+                assertTrue(launchManifest.contains("RISK_REDUCTION_ONLY"), "$failurePoint: $launchManifest")
+                assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
+                assertFalse(Files.exists(requireNotNull(standardManifestPath)))
+                val observation = fixture.runtime.llmInputManifestRepository
+                    .findObservation("$invocationId:PROPOSER")
+                    .getOrThrow()
+                assertEquals(
+                    me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_OBSERVABLE_BEFORE_START,
+                    observation?.modelCoverageStatus,
+                )
+            } finally {
+                gatewayBlocker?.let { blocker ->
+                    Files.deleteIfExists(blocker.resolve("child"))
+                    Files.deleteIfExists(blocker)
+                }
             }
         }
     }
@@ -3927,6 +3929,23 @@ private fun RenderedLlmCommand.mcpManifestContent(): String {
 
     return Files.readString(manifestPath)
 }
+
+private fun submissionSocketPathForTest(manifestPath: Path): Path {
+    val manifestId = manifestPath.fileName.toString().removeSuffix(".json")
+    val siblingSocketPath = manifestPath.resolveSibling("$manifestId.sock")
+
+    return if (siblingSocketPath.toString().encodeToByteArray().size > UNIX_DOMAIN_SOCKET_PATH_LIMIT_BYTES) {
+        Path.of("/tmp", "fukurou-${manifestId.take(COMPACT_SOCKET_MANIFEST_ID_LENGTH)}.sock")
+    } else {
+        siblingSocketPath
+    }
+}
+
+/** Linux Unix domain socket path の実装上限。 */
+private const val UNIX_DOMAIN_SOCKET_PATH_LIMIT_BYTES = 103
+
+/** compact socket path に含める manifest ID の長さ。 */
+private const val COMPACT_SOCKET_MANIFEST_ID_LENGTH = 24
 
 private fun cleanExit(stdout: String = "", stderr: String = ""): ProcessRunResult {
     return ProcessRunResult(

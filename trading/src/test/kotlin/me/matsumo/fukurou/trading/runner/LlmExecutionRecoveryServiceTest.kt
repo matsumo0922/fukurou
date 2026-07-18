@@ -4,6 +4,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
@@ -38,6 +39,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /** current-process stale claim recovery の fence と競合を検証する。 */
@@ -438,18 +440,29 @@ class LlmExecutionRecoveryServiceTest {
         val childPidFile = tempDirectory.resolve("child.pid")
         val command = RenderedLlmCommand(
             executable = "/bin/sh",
-            args = listOf("-c", "(/bin/sleep 30) & echo $! > '$childPidFile'; wait"),
+            args = listOf(
+                "-c",
+                "trap 'wait; exit $SUPERVISOR_CLEANUP_ACK_EXIT_STATUS' TERM; " +
+                    "(/bin/sleep 30) & echo $! > '$childPidFile'; wait",
+            ),
             environment = emptyMap(),
             workingDirectory = tempDirectory,
-            timeout = Duration.ofSeconds(1),
+            timeout = LIVE_CHILD_PROCESS_TIMEOUT,
             stdin = null,
         )
         val processResult = async { ShellProcessRunner(Duration.ofMillis(100)).run(command).getOrThrow() }
-        repeat(100) {
-            if (Files.exists(childPidFile)) return@repeat
-            delay(10)
+        val observedChildPidFile = withTimeoutOrNull(CHILD_PID_FILE_TIMEOUT.toMillis()) {
+            while (!Files.exists(childPidFile)) {
+                delay(CHILD_PID_FILE_POLL_INTERVAL.toMillis())
+            }
+            childPidFile
         }
-        val childPid = Files.readString(childPidFile).trim().toLong()
+        assertNotNull(
+            actual = observedChildPidFile,
+            message = "child PID file was not created within ${CHILD_PID_FILE_TIMEOUT.toMillis()} ms: " +
+                "path=$childPidFile, exists=${Files.exists(childPidFile)}",
+        )
+        val childPid = Files.readString(observedChildPidFile).trim().toLong()
 
         LlmExecutionAdmissionHealth.recordHeartbeatResult("live-child-outage", CLAIM_TOKEN, healthy = false)
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
@@ -872,6 +885,18 @@ private fun isLinuxProcessRunning(processId: Long): Boolean {
     val stat = runCatching { Files.readString(Path.of("/proc/$processId/stat")) }.getOrNull() ?: return false
     return stat.substringAfterLast(") ").firstOrNull() != 'Z'
 }
+
+/** test supervisor が cleanup 完了を通知する exit status。 */
+private const val SUPERVISOR_CLEANUP_ACK_EXIT_STATUS = 124
+
+/** live child fixture の実行上限。 */
+private val LIVE_CHILD_PROCESS_TIMEOUT: Duration = Duration.ofSeconds(5)
+
+/** child PID file の生成待ち上限。 */
+private val CHILD_PID_FILE_TIMEOUT: Duration = Duration.ofSeconds(2)
+
+/** child PID file の生成確認間隔。 */
+private val CHILD_PID_FILE_POLL_INTERVAL: Duration = Duration.ofMillis(10)
 
 private suspend fun reserve(
     repository: LlmLaunchReservationRepository,
