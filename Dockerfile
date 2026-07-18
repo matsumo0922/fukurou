@@ -66,6 +66,7 @@ COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-llm-agent
 COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-mcp-launcher /usr/local/libexec/fukurou-mcp-launcher
 COPY --from=launcher-build --chown=root:root --chmod=0555 /src/fukurou-runtime-supervisor /usr/local/libexec/fukurou-runtime-supervisor
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-canary-client.mjs /usr/local/libexec/fukurou-mcp-canary-client.mjs
+COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-cli-canary-mcp.mjs /usr/local/libexec/fukurou-cli-canary-mcp.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/validate-llm-launcher-probe.mjs /usr/local/libexec/validate-llm-launcher-probe.mjs
 
 # Ktor fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
