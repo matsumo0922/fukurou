@@ -27,15 +27,19 @@ jobs:
         run: >-
           bash -n
           scripts/deploy/deploy-fukurou
+          scripts/deploy/deploy-intent-resolver
+          scripts/deploy/deploy-intent-resolver-selftest
           scripts/deploy/fukurou-deploy-db
           scripts/deploy/deploy-contract-selftest
           scripts/deploy/deploy-runtime-selftest
           scripts/deploy/deploy-db-selftest
           scripts/deploy/deploy-postgres-selftest
           scripts/deploy/canary-compose-selftest
+          scripts/deploy/deploy-e2e-selftest
 
       - name: Run deploy semantic selftests
         run: |
+          scripts/deploy/deploy-intent-resolver-selftest
           scripts/deploy/deploy-contract-selftest
           scripts/deploy/deploy-runtime-selftest
           scripts/deploy/deploy-db-selftest

@@ -18,18 +18,21 @@ class ReleaseDeployFoundationContractTest {
     @Test
     fun `production image publication is gated by exact target quality`() {
         val workflow = Files.readString(root.resolve(".github/workflows/deploy.yml"))
+        val resolver = Files.readString(root.resolve("scripts/deploy/deploy-intent-resolver"))
         val resolveJob = workflow.substringAfter("\n  resolve:").substringBefore("\n  quality:")
         val qualityJob = workflow.substringAfter("\n  quality:").substringBefore("\n  build:")
         val buildJob = workflow.substringAfter("\n  build:").substringBefore("\n  deploy:")
 
         assertTrue(resolveJob.contains("deploy_sha: \${{ steps.resolve.outputs.deploy_sha }}"))
-        assertTrue(resolveJob.contains("requires_quality: \${{ steps.resolve.outputs.requires_quality }}"))
         assertTrue(resolveJob.contains("GITHUB_EVENT_NAME"))
-        assertTrue(resolveJob.contains("origin/main"))
+        assertTrue(resolveJob.contains("scripts/deploy/deploy-intent-resolver"))
+        assertTrue(resolver.contains("origin/main"))
+        assertTrue(resolver.contains("AUTHORIZED_ROLLBACK"))
+        assertTrue(resolver.contains("AUTO_IMAGE_ROLLBACK"))
+        assertTrue(resolver.contains("SCHEMA_SENSITIVE_AUTOMATIC_DEPLOY_REQUIRES_MANUAL_REVIEW"))
         assertFalse(resolveJob.contains("packages: write"))
 
         assertTrue(qualityJob.contains("needs: resolve"))
-        assertTrue(qualityJob.contains("if: needs.resolve.outputs.requires_quality == 'true'"))
         assertTrue(qualityJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
         assertTrue(qualityJob.contains("make test"))
         assertTrue(qualityJob.contains("make detekt"))
@@ -40,13 +43,89 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(buildJob.contains("if: always()"))
         assertTrue(buildJob.contains("needs.resolve.result == 'success'"))
         assertTrue(buildJob.contains("needs.quality.result == 'success'"))
-        assertTrue(buildJob.contains("needs.quality.result == 'skipped'"))
-        assertTrue(buildJob.contains("needs.resolve.outputs.requires_quality == 'false'"))
+        assertFalse(buildJob.contains("needs.quality.result == 'skipped'"))
+        assertFalse(buildJob.contains("requires_quality"))
         assertTrue(buildJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
         assertTrue(buildJob.contains("FUKUROU_REVISION=\${{ needs.resolve.outputs.deploy_sha }}"))
         assertFalse(buildJob.contains("steps.resolve.outputs.deploy_sha"))
         assertTrue(buildJob.indexOf("Verify exact target checkout") < buildJob.indexOf("Login to GHCR"))
         assertTrue(buildJob.contains("packages: write"))
+    }
+
+    @Test
+    fun `workflow emits event-derived bundle v2 and requires installed contract v2`() {
+        val workflow = Files.readString(root.resolve(".github/workflows/deploy.yml"))
+        val resolver = Files.readString(root.resolve("scripts/deploy/deploy-intent-resolver"))
+        val buildJob = workflow.substringAfter("\n  build:").substringBefore("\n  deploy:")
+        val deployJob = workflow.substringAfter("\n  deploy:")
+
+        assertTrue(workflow.contains("rollback_reason:"))
+        assertTrue(workflow.contains("migration_rollback_mode:"))
+        assertTrue(resolver.contains("workflow_event="))
+        assertTrue(resolver.contains("deploy_intent="))
+        assertTrue(resolver.contains("operator_reason="))
+        assertTrue(resolver.contains("migration_rollback_mode="))
+        assertTrue(resolver.contains("schema_sensitive_paths_sha256="))
+        assertTrue(resolver.contains("SECRET_LIKE_REASON_PATTERN"))
+        assertTrue(buildJob.contains("bundleSchemaVersion:2"))
+        assertTrue(buildJob.contains("minimumContractVersion:2"))
+        assertTrue(buildJob.contains("workflowEvent:${'$'}workflowEvent"))
+        assertTrue(buildJob.contains("deployIntent:${'$'}deployIntent"))
+        assertTrue(buildJob.contains("operatorReason:${'$'}operatorReason"))
+        assertTrue(buildJob.contains("migrationRollbackMode:${'$'}migrationRollbackMode"))
+        assertTrue(buildJob.contains("schemaSensitivePathsSha256:${'$'}schemaSensitivePathsSha256"))
+        assertTrue(deployJob.contains("--print-contract-version") && deployJob.contains("== \"2\""))
+        assertTrue(deployJob.contains("--print-schema-sensitive-paths-sha256"))
+    }
+
+    @Test
+    fun `deploy intent resolver closes event reason and early diff cases`() {
+        val process = ProcessBuilder("scripts/deploy/deploy-intent-resolver-selftest")
+            .directory(root.toFile())
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+
+        assertEquals(0, process.waitFor(), output)
+        assertTrue(output.contains("DEPLOY_INTENT_RESOLVER_SELFTEST_OK"), output)
+    }
+
+    @Test
+    fun `bundle schema and executor enforce revision and migration admission v2`() {
+        val schema = Json.parseToJsonElement(
+            Files.readString(root.resolve("scripts/deploy/deploy-bundle.schema.json")),
+        ).jsonObject
+        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+        val inventory = Files.readAllLines(root.resolve("scripts/deploy/deploy-schema-sensitive-paths-v1.txt"))
+        val requiredFields = schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }
+
+        assertEquals("Fukurou signed deploy bundle v2", schema.getValue("title").jsonPrimitive.content)
+        assertEquals(2, schema.getValue("properties").jsonObject.getValue("bundleSchemaVersion").jsonObject.getValue("const").jsonPrimitive.content.toInt())
+        assertEquals(2, schema.getValue("properties").jsonObject.getValue("minimumContractVersion").jsonObject.getValue("const").jsonPrimitive.content.toInt())
+        assertEquals(
+            4,
+            schema.getValue("allOf").jsonArray.single().jsonObject.getValue("oneOf").jsonArray.size,
+        )
+        assertTrue(
+            requiredFields.containsAll(
+                listOf(
+                    "workflowEvent",
+                    "deployIntent",
+                    "operatorReason",
+                    "migrationRollbackMode",
+                    "schemaSensitivePathsSha256",
+                ),
+            ),
+        )
+        assertTrue(executor.contains("readonly CONTRACT_VERSION=2"))
+        assertTrue(executor.contains("observe_and_admit_deploy"))
+        assertTrue(executor.contains("AUTHORIZED_ROLLBACK"))
+        assertTrue(executor.contains("UNKNOWN_CURRENT_REVISION"))
+        assertTrue(executor.contains("SCHEMA_SENSITIVE_MODE_MISMATCH"))
+        assertTrue(executor.contains("CANDIDATE_ABORTED"))
+        assertTrue(executor.contains("ROLL_FORWARD_ONLY"))
+        assertTrue(inventory.contains("scripts/deploy/sql"))
+        assertTrue(inventory.contains("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence"))
     }
 
     @Test

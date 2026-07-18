@@ -26,6 +26,7 @@ set -Eeuo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 readonly HEAD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+readonly OLD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD^)"
 readonly SCENARIOS="${FUKUROU_E2E_SCENARIOS:-1 2 3}"
 
 readonly REGISTRY_NAME="fukurou-e2e-registry"
@@ -115,7 +116,7 @@ build_and_push_images() {
 FROM ${LOCAL_REPOSITORY}:candidate
 USER root
 RUN rm /usr/local/libexec/fukurou-runtime-supervisor
-ENV FUKUROU_REVISION=e2e-pre-foundation
+ENV FUKUROU_REVISION=${OLD_SHA}
 USER 10001
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
 DOCKERFILE
@@ -154,7 +155,10 @@ provision_sandbox() {
   cp "${REPO_ROOT}/scripts/deploy/sql/deploy-foundation-v1.sql" "${WORK}/share/deploy-foundation-v1.sql"
   cp "${REPO_ROOT}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql" "${WORK}/share/deploy-foundation-v1-indexes.sql"
   cp "${REPO_ROOT}/scripts/deploy/deploy-capability-catalog-v1.json" "${WORK}/share/deploy-capability-catalog-v1.json"
+  cp "${REPO_ROOT}/scripts/deploy/deploy-schema-sensitive-paths-v1.txt" "${WORK}/share/deploy-schema-sensitive-paths-v1.txt"
+  cp "${REPO_ROOT}/scripts/deploy/deploy-schema-sensitive-paths-v1.txt" "${DEPLOY_ROOT}/repo/scripts/deploy/deploy-schema-sensitive-paths-v1.txt"
   chmod 0755 "${WORK}/bin/"*
+  chmod 0444 "${WORK}/share/deploy-schema-sensitive-paths-v1.txt"
 
   openssl genpkey -algorithm ED25519 -out "${WORK}/keys/e2e-private.pem"
   openssl pkey -in "${WORK}/keys/e2e-private.pem" -pubout -out "${WORK}/keys/e2e-public.pem"
@@ -180,17 +184,22 @@ ENV
 
 make_bundle() {
   local deployment_id="$1" harness_path="$2"
-  local bundle_path="${WORK}/${deployment_id}-bundle.json"
-  local executor_hash foundation_harness_hash public_key_hash capability_catalog catalog_hash
+  local bundle_dir="${WORK}/bundles/${deployment_id}"
+  local bundle_path="${bundle_dir}/bundle.json"
+  local executor_hash foundation_harness_hash public_key_hash capability_catalog catalog_hash inventory_hash
+
+  mkdir -p "${bundle_dir}"
 
   executor_hash="$(sha256_file "${WORK}/bin/deploy-fukurou")"
   foundation_harness_hash="$( { sha256_file "${harness_path}"; sha256_file "${WORK}/share/mcp-role.sql"; } | shasum -a 256 | awk '{print $1}')"
   public_key_hash="$(sha256_file "${WORK}/keys/e2e-public.pem")"
   capability_catalog="$(jq -cS . "${WORK}/share/deploy-capability-catalog-v1.json")"
   catalog_hash="$(printf '%s' "${capability_catalog}" | shasum -a 256 | awk '{print $1}')"
+  inventory_hash="$(sha256_file "${WORK}/share/deploy-schema-sensitive-paths-v1.txt")"
 
   jq -cS -n \
     --arg deploymentId "${deployment_id}" \
+    --arg schemaSensitivePathsSha256 "${inventory_hash}" \
     --arg candidateSha "${HEAD_SHA}" \
     --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
     --arg executorSha256 "${executor_hash}" \
@@ -198,8 +207,9 @@ make_bundle() {
     --arg publicKeySha256 "${public_key_hash}" \
     --argjson capabilityCatalog "${capability_catalog}" \
     --arg capabilityCatalogHash "${catalog_hash}" \
-    '{deploymentId:$deploymentId,candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,
-      minimumContractVersion:1,
+    '{deploymentId:$deploymentId,bundleSchemaVersion:2,workflowEvent:"push",deployIntent:"FORWARD",operatorReason:"",
+      migrationRollbackMode:"AUTO_IMAGE_ROLLBACK",schemaSensitivePathsSha256:$schemaSensitivePathsSha256,
+      candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,minimumContractVersion:2,
       requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
       requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
       capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
@@ -217,6 +227,7 @@ make_bundle() {
       ]}' > "${bundle_path}"
   openssl pkeyutl -sign -rawin -inkey "${WORK}/keys/e2e-private.pem" \
     -in "${bundle_path}" -out "${bundle_path%.json}.sig"
+  cp "${WORK}/share/deploy-schema-sensitive-paths-v1.txt" "$(dirname "${bundle_path}")/deploy-schema-sensitive-paths-v1.txt"
   printf '%s' "${bundle_path}"
 }
 
@@ -232,6 +243,7 @@ run_executor() {
     -e "FUKUROU_DEPLOY_LOCK=${WORK}/deploy.lock" \
     -e "FUKUROU_DEPLOY_PUBLIC_KEY=${WORK}/keys/e2e-public.pem" \
     -e "FUKUROU_DEPLOY_CATALOG=${WORK}/share/deploy-capability-catalog-v1.json" \
+    -e "FUKUROU_DEPLOY_SCHEMA_SENSITIVE_PATHS=${WORK}/share/deploy-schema-sensitive-paths-v1.txt" \
     -e "FUKUROU_DEPLOY_DB_HELPER=${WORK}/bin/fukurou-deploy-db" \
     -e "FUKUROU_FOUNDATION_HARNESS=${harness_path}" \
     -e "FUKUROU_FOUNDATION_HARNESS_SQL=${WORK}/share/mcp-role.sql" \
@@ -353,7 +365,7 @@ scenario_two() {
     "$(journal_tail_details e2e-canary-fail-1)"
   assert_equals "scenario 2 fence" "ENABLED:1" "$(fence_state)"
   wait_for_application
-  assert_equals "scenario 2 revision" "e2e-pre-foundation" "$(application_revision)"
+  assert_equals "scenario 2 revision" "${OLD_SHA}" "$(application_revision)"
   assert_equals "scenario 2 maintenance" "f" "$(production_psql 'SELECT enabled FROM llm_launch_maintenance')"
   assert_equals "scenario 2 gap" "CLOSE" \
     "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-canary-fail-1' ORDER BY occurred_at DESC LIMIT 1")"
@@ -367,19 +379,28 @@ craft_dangling_recovery_state() {
   mkdir -p "${state_dir}" "${DEPLOY_ROOT}/runtime/launch-fence"
 
   # 実 DB の runtime config snapshot と一致させる（recovery の CAS 検証対象）。
-  local snapshot
+  local snapshot inventory_hash
   snapshot="$(run_in_harness "\"${WORK}/bin/fukurou-deploy-db\" snapshot")"
+  inventory_hash="$(sha256_file "${WORK}/share/deploy-schema-sensitive-paths-v1.txt")"
 
   jq -n \
     --arg deploymentId "${deployment_id}" \
     --arg previousRepoSha "${HEAD_SHA}" \
     --arg reference "${LOCAL_REPOSITORY}@${OLD_DIGEST}" \
+    --arg revision "${OLD_SHA}" \
+    --arg targetRevision "${HEAD_SHA}" \
+    --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
+    --arg inventoryHash "${inventory_hash}" \
     --arg runtimeConfigVersion "$(jq -er '.runtimeConfigVersion' <<<"${snapshot}")" \
     --arg runtimeConfigHash "$(jq -er '.runtimeConfigHash' <<<"${snapshot}")" \
-    '{deploymentId:$deploymentId,installKind:"FOUNDATION_V1",previousRepoSha:$previousRepoSha,
+    '{stateVersion:2,deploymentId:$deploymentId,installKind:"FOUNDATION_V1",previousRepoSha:$previousRepoSha,
       runtimeConfigVersion:$runtimeConfigVersion,runtimeConfigHash:$runtimeConfigHash,
       launchMaintenance:{generation:1,enabled:true,deploymentId:$deploymentId},
-      runningContainer:{configuredImageReference:$reference,repoDigests:[$reference],revision:"e2e-pre-foundation"}}' \
+      runningContainer:{configuredImageReference:$reference,repoDigests:[$reference],revision:$revision},
+      acceptedDeploy:{currentRevision:$revision,targetRevision:$targetRevision,intent:"FORWARD",operatorReason:"",
+        migrationRollbackMode:"AUTO_IMAGE_ROLLBACK",schemaSensitivePathsSha256:$inventoryHash,
+        schemaSensitive:false,candidateImageDigest:$candidateImageDigest},
+      installed:{schemaSensitivePathsSha256:$inventoryHash}}' \
     > "${state_dir}/state.json"
 
   cp "${COMPOSE_FILE}" "${state_dir}/docker-compose.prod.yml"
@@ -390,7 +411,7 @@ craft_dangling_recovery_state() {
     set -Eeuo pipefail
     source '${WORK}/bin/deploy-fukurou'
     ROLLBACK_STATE_DIR='${state_dir}'
-    journal_state PREPARED '{\"forwardBudgetSeconds\":1200,\"recoveryBudgetSeconds\":300}'
+    journal_state PREPARED '{\"forwardBudgetSeconds\":1200,\"recoveryBudgetSeconds\":300,\"currentRevision\":\"${OLD_SHA}\",\"targetRevision\":\"${HEAD_SHA}\",\"intent\":\"FORWARD\",\"operatorReason\":\"\",\"migrationRollbackMode\":\"AUTO_IMAGE_ROLLBACK\",\"schemaSensitivePathsSha256\":\"${inventory_hash}\",\"schemaSensitive\":false,\"candidateImageDigest\":\"${CANDIDATE_DIGEST}\"}'
     journal_state CAPTURED
     journal_state SAFETY_MUTATION_STARTED
     journal_state LAUNCHES_DISABLED

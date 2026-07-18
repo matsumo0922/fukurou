@@ -1,10 +1,53 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Fukurou signed deploy bundle v1",
+  "title": "Fukurou signed deploy bundle v2",
   "type": "object",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "workflowEvent": { "const": "push" },
+            "deployIntent": { "const": "FORWARD" },
+            "operatorReason": { "const": "" },
+            "migrationRollbackMode": { "const": "AUTO_IMAGE_ROLLBACK" }
+          }
+        },
+        {
+          "properties": {
+            "workflowEvent": { "const": "workflow_dispatch" },
+            "deployIntent": { "const": "FORWARD" },
+            "operatorReason": { "const": "" },
+            "migrationRollbackMode": { "const": "AUTO_IMAGE_ROLLBACK" }
+          }
+        },
+        {
+          "properties": {
+            "workflowEvent": { "const": "workflow_dispatch" },
+            "deployIntent": { "const": "FORWARD" },
+            "operatorReason": { "minLength": 1 },
+            "migrationRollbackMode": { "enum": ["BACKWARD_COMPATIBLE", "ROLL_FORWARD_ONLY"] }
+          }
+        },
+        {
+          "properties": {
+            "workflowEvent": { "const": "workflow_dispatch" },
+            "deployIntent": { "const": "AUTHORIZED_ROLLBACK" },
+            "operatorReason": { "minLength": 1 }
+          }
+        }
+      ]
+    }
+  ],
   "required": [
     "deploymentId",
+    "bundleSchemaVersion",
+    "workflowEvent",
+    "deployIntent",
+    "operatorReason",
+    "migrationRollbackMode",
+    "schemaSensitivePathsSha256",
     "candidateSha",
     "candidateImageDigest",
     "minimumContractVersion",
@@ -19,9 +62,15 @@
   ],
   "properties": {
     "deploymentId": { "type": "string", "pattern": "^[a-zA-Z0-9._-]{1,96}$" },
+    "bundleSchemaVersion": { "const": 2 },
+    "workflowEvent": { "enum": ["push", "workflow_dispatch"] },
+    "deployIntent": { "enum": ["FORWARD", "AUTHORIZED_ROLLBACK"] },
+    "operatorReason": { "type": "string", "maxLength": 240, "pattern": "^(?:$|\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?)$" },
+    "migrationRollbackMode": { "enum": ["AUTO_IMAGE_ROLLBACK", "BACKWARD_COMPATIBLE", "ROLL_FORWARD_ONLY"] },
+    "schemaSensitivePathsSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "candidateSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "candidateImageDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-    "minimumContractVersion": { "const": 1 },
+    "minimumContractVersion": { "const": 2 },
     "requiredCapabilities": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
     "requiredHooks": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
     "capabilityCatalog": { "type": "object" },

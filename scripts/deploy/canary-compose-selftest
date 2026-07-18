@@ -8,6 +8,10 @@ export FUKUROU_DEPLOY_ROOT="${SELFTEST_ROOT}/deploy"
 mkdir -p "${FUKUROU_DEPLOY_ROOT}/repo"
 cp "${ROOT}/docker-compose.prod.yml" "${FUKUROU_DEPLOY_ROOT}/repo/docker-compose.prod.yml"
 cp "${ROOT}/.env.example" "${FUKUROU_DEPLOY_ROOT}/.env"
+git -C "${FUKUROU_DEPLOY_ROOT}/repo" init -q
+git -C "${FUKUROU_DEPLOY_ROOT}/repo" add docker-compose.prod.yml
+git -C "${FUKUROU_DEPLOY_ROOT}/repo" \
+  -c user.name=fixture -c user.email=fixture@invalid commit -qm fixture
 
 # shellcheck source=deploy-fukurou
 source "${ROOT}/scripts/deploy/deploy-fukurou"
@@ -16,6 +20,7 @@ timeout() {
   "$@"
 }
 DEPLOYMENT_ID=fixture
+DEPLOY_SHA="$(git -C "${FUKUROU_DEPLOY_ROOT}/repo" rev-parse HEAD)"
 CANDIDATE_DIGEST="sha256:$(printf '0%.0s' {1..64})"
 CANDIDATE_CATALOG_HASH="$(printf '1%.0s' {1..64})"
 touch "${SELFTEST_ROOT}/token" "${SELFTEST_ROOT}/signature" "${SELFTEST_ROOT}/public"
