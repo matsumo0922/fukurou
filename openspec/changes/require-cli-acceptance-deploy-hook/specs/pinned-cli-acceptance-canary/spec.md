@@ -21,11 +21,15 @@ Every `FORWARD` deploy MUST include the existing `CLI_AUTH_PREFLIGHT_V1` operati
 
 #### Scenario: Acceptance exceeds the deploy deadline
 - **WHEN** the one-run acceptance does not complete within its 600-second pre-mutation budget
-- **THEN** the harness terminates its exact canary container, the executor fails without changing production launch state, and the existing 1,200-second mutation/recovery deadline remains available after acceptance
+- **THEN** the harness terminates its exact canary container, the executor fails without changing production launch state, and fresh 1,200-second forward plus 1,500-second recovery budgets remain available after acceptance succeeds
 
 #### Scenario: Forward provider gate is unavailable during an incident
 - **WHEN** a new `FORWARD` deploy cannot pass the provider gate during a provider outage or credential incident
 - **THEN** the executor provides no forward bypass, while existing launch-disable controls and a signed `AUTHORIZED_ROLLBACK` remain available as risk-reducing operations
+
+#### Scenario: Fresh install has no rollback target
+- **WHEN** fresh install or disaster recovery has no older running image eligible for `AUTHORIZED_ROLLBACK`
+- **THEN** provisioned canary credentials are a bootstrap prerequisite and the system does not claim a forward bypass or unavailable rollback path
 
 ## MODIFIED Requirements
 

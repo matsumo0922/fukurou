@@ -27,6 +27,8 @@ Issue #189 の pinned CLI acceptance harness は merge 済みだが、production
 - `.github/workflows/deploy.yml` の signed bundle required hook / operation set
 - `scripts/deploy/deploy-fukurou` の typed operation validation と candidate hook dispatch
 - `scripts/deploy/deploy-contract-v1.json` と candidate PID 1 / Kotlin preflight の exact hook contract
+- `scripts/mcp-credential-isolation-check` と selftest の acceptance timeout / cleanup contract
+- `.github/workflows/deploy.yml` の signed hook set と job timeout
 - deploy contract / E2E selftests と既存 Kotlin contract test
 - `docs/deploy.md`、`docs/mcp-runtime.md`
 - production credential、DB、trading semantics、API contractへの変更なし
