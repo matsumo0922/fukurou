@@ -24,12 +24,12 @@
 
 ## 5. Tests and documentation
 
-- [ ] 5.1 Complete workflow, contract, runtime, and production-like E2E scenarios for forward, queued-old, authorized rollback, mandatory historical quality, tamper, fresh/prior-history container loss, divergent, inventory mismatch, compatibility modes at pre/post-safety states, restart recovery, post-deploy mismatch, and v1 recovery.
+- [x] 5.1 Complete workflow, contract, runtime, and production-like E2E scenarios for forward, queued-old, authorized rollback, mandatory historical quality, tamper, fresh/prior-history container loss, divergent, inventory mismatch, compatibility modes at pre/post-safety states, restart recovery, post-deploy mismatch, and v1 recovery.
 - [x] 5.2 Update `docs/deploy.md` with current v2 semantics, manual inputs, controlled deploy freeze, exact root pre-install commands, verification, application/workflow rollback with v2 executor retained, unsupported v1 executor downgrade, and PR-2 merge gate.
 - [x] 5.3 Grep README/docs for stale quality, rollback, executor contract, migration, and bundle descriptions and update affected current-specification text.
 
 ## 6. Validation
 
-- [ ] 6.1 Validate `enforce-monotonic-deploys` with OpenSpec strict validation and run shell syntax plus targeted contract/runtime/E2E tests.
+- [x] 6.1 Validate `enforce-monotonic-deploys` with OpenSpec strict validation and run shell syntax plus targeted contract/runtime/E2E tests.
 - [ ] 6.2 Run final `make test`, `make detekt`, and `make build` under the validation lease at one exact HEAD and record evidence for the PR.
 - [ ] 6.3 Obtain clean-context Opus approval with G1-G5 all PASS, leave PR-2 unmerged, and provide the exact NAS root pre-install handoff.
