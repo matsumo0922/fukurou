@@ -50,6 +50,7 @@ exec 9>&-
 readonly SNAPSHOT_ID=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 snapshot_fixture='[]'
 restic() {
+    printf '%s\n' "$*" >"${SELFTEST_ROOT}/restic.log"
     printf '%s\n' "${snapshot_fixture}"
 }
 
@@ -58,9 +59,98 @@ if verify_repository_snapshot "${SNAPSHOT_ID}"; then
 fi
 snapshot_fixture="[{\"id\":\"${SNAPSHOT_ID}\"}]"
 verify_repository_snapshot "${SNAPSHOT_ID}" || fail 'exact current-repository snapshot was rejected'
+[[ $(<"${SELFTEST_ROOT}/restic.log") == *'--host fukurou-production --path /postgres.dump --tag fukurou-postgres,integrity-checked'* ]] ||
+    fail 'repository snapshot lookup did not use the fixed AND-tag group'
 snapshot_fixture='[{"id":"aaaaaaaa"},{"id":"bbbbbbbb"}]'
 if verify_repository_snapshot "${SNAPSHOT_ID}"; then
     fail 'ambiguous current-repository snapshot result was accepted'
 fi
 
-printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed snapshot=current-repository-exact\n'
+status_fixture="${SELFTEST_ROOT}/backup-status.json"
+jq -cn --arg snapshot "${SNAPSHOT_ID}" '
+  {
+    schemaVersion: 1,
+    updatedAt: "2026-07-18T00:02:00Z",
+    backup: {
+      lastAttempt: {
+        attemptedAt: "2026-07-18T00:00:00Z",
+        resultCode: "SUCCESS",
+        durationSeconds: 1,
+        snapshotId: $snapshot,
+        interruptedCandidateCount: 0,
+        retentionSucceeded: true
+      },
+      lastSuccess: {
+        snapshotId: $snapshot,
+        sourceRevision: "0123456789abcdef0123456789abcdef01234567",
+        verifiedAt: "2026-07-18T00:00:00Z",
+        durationSeconds: 1
+      }
+    },
+    restore: {
+      lastAttempt: {
+        attemptedAt: "2026-07-18T00:01:00Z",
+        resultCode: "SUCCESS",
+        durationSeconds: 1,
+        snapshotId: $snapshot,
+        interruptedCandidateCount: 0,
+        retentionSucceeded: null
+      },
+      lastSuccess: {
+        snapshotId: $snapshot,
+        sourceRevision: "0123456789abcdef0123456789abcdef01234567",
+        verifiedAt: "2026-07-18T00:01:00Z",
+        durationSeconds: 1,
+        verificationCount: 1,
+        tableCount: 1,
+        constraintCount: 0
+      }
+    }
+  }
+' >"${status_fixture}"
+
+verify_rollout_status "${status_fixture}" || fail 'latest successful rollout evidence was rejected'
+
+jq '.backup.lastAttempt.resultCode="RETENTION_FAILED" | .backup.lastAttempt.retentionSucceeded=false' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/retention-failed.json"
+if verify_rollout_status "${SELFTEST_ROOT}/retention-failed.json"; then
+    fail 'old backup lastSuccess was accepted after retention failure'
+fi
+
+jq '.restore.lastAttempt.resultCode="RESTORE_CLEANUP_FAILED"' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/restore-cleanup-failed.json"
+if verify_rollout_status "${SELFTEST_ROOT}/restore-cleanup-failed.json"; then
+    fail 'old restore lastSuccess was accepted after cleanup failure'
+fi
+
+jq '.restore.lastAttempt.snapshotId="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/attempt-snapshot-mismatch.json"
+if verify_rollout_status "${SELFTEST_ROOT}/attempt-snapshot-mismatch.json"; then
+    fail 'restore attempt and success snapshot mismatch was accepted'
+fi
+
+leaked_resource_kind=""
+docker() {
+    printf '%s\n' "$*" >>"${SELFTEST_ROOT}/docker.log"
+    if [[ $1 == "${leaked_resource_kind}" ]]; then
+        printf '%s\n' leaked-resource-id
+    fi
+}
+timeout() {
+    [[ $1 == --signal=TERM && $2 == --kill-after=5 && $3 == "${DOCKER_LIST_TIMEOUT_SECONDS}" ]] ||
+        fail 'Docker inventory was not bounded'
+    shift 3
+    "$@"
+}
+
+verify_no_restore_owned_resources || fail 'empty restore-owned resource inventory was rejected'
+for leaked_resource_kind in ps network volume; do
+    if verify_no_restore_owned_resources; then
+        fail "restore-owned ${leaked_resource_kind} leak was accepted"
+    fi
+done
+if grep -Fv -- "--filter label=${RESTORE_LABEL_KEY}" "${SELFTEST_ROOT}/docker.log" >/dev/null; then
+    fail 'Docker inventory escaped the restore ownership label'
+fi
+
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed snapshot=current-repository-exact latest-attempts=required resources=zero\n'

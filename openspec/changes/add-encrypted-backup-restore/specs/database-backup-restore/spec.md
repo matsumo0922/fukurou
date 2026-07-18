@@ -136,7 +136,7 @@ Backup automation MUST publish a schema-versioned status document using same-dir
 - **THEN** the directory is root-owned mode 0700 and the status file is root-owned mode 0600
 
 ### Requirement: Root automation requires an explicit rollout gate
-Systemd services and timers MUST be root-owned, use fixed installed entrypoints without embedded secrets, remain disabled by installation, and be enabled only after a manual backup and restore drill succeed. Artifact installation MUST hold the shared backup lock and MUST fail while any backup or restore service or timer is active. Rollout verification MUST confirm that the exact status snapshot exists uniquely in the current repository under the fixed host, stdin path, and production-plus-integrity AND tags. The change MUST NOT expand `github-runner` sudo authority.
+Systemd services and timers MUST be root-owned, use fixed installed entrypoints without embedded secrets, remain disabled by installation, and be enabled only after a manual backup and restore drill succeed. Artifact installation MUST hold the shared backup lock and MUST fail while any backup or restore service or timer is active. Rollout verification MUST require the latest backup attempt to be `SUCCESS` with successful retention, the latest restore attempt to be `SUCCESS`, both attempts to identify their matching last-success snapshot, and both last-success records to identify the same snapshot. It MUST confirm that exact snapshot exists uniquely in the current repository under the fixed host, stdin path, and production-plus-integrity AND tags. It MUST use bounded Docker inventory calls to confirm that no container, network, or volume with the restore ownership label remains. The change MUST NOT expand `github-runner` sudo authority.
 
 #### Scenario: Units are installed before the first drill
 - **WHEN** the operator installs commands, profiles, services, and timers
@@ -149,6 +149,14 @@ Systemd services and timers MUST be root-owned, use fixed installed entrypoints 
 #### Scenario: Status evidence does not belong to the current repository
 - **WHEN** status names an exact snapshot that is absent, ambiguous, or outside the fixed host, path, and AND-tag group in the currently opened repository
 - **THEN** rollout verification fails and the timers remain disabled
+
+#### Scenario: A failed latest attempt preserves older success evidence
+- **WHEN** backup retention or restore cleanup fails after an earlier successful backup and restore
+- **THEN** rollout verification rejects the stale last-success evidence and the timers remain disabled
+
+#### Scenario: Restore-owned resources remain after the drill
+- **WHEN** bounded Docker inventory finds any container, network, or volume with the restore ownership label
+- **THEN** rollout verification fails without deleting or pruning any Docker resource
 
 #### Scenario: First backup or restore has not succeeded
 - **WHEN** either initial manual operation lacks valid last-known-good evidence or cleanup verification

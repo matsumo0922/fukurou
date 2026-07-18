@@ -324,7 +324,20 @@ run_entrypoint_scenario() (
   output="$(run_backup 2>&1)"
   status="$?"
   set -e
-  (( status != 0 )) || exit 91
+  if [[ "${scenario}" == success ]]; then
+    (( status == 0 )) || exit 91
+    [[ "${output}" == *"result=SUCCESS"* ]] || exit 92
+    grep -Fx 'restic tag --add integrity-checked aaaaaaaa' "${calls}" >/dev/null || exit 93
+    grep -F -- '--tag fukurou-postgres,integrity-checked --keep-daily 14 --prune' "${calls}" >/dev/null || exit 94
+    status="$(backup_load_status)" || exit 95
+    [[ "$(jq -r '.backup.lastSuccess.snapshotId' <<<"${status}")" == bbbbbbbb ]] || exit 96
+    [[ "$(jq -r '.backup.lastAttempt.snapshotId' <<<"${status}")" == bbbbbbbb ]] || exit 97
+    [[ "$(jq -r '.backup.lastAttempt.resultCode' <<<"${status}")" == SUCCESS ]] || exit 98
+    [[ "$(jq -r '.backup.lastAttempt.retentionSucceeded' <<<"${status}")" == true ]] || exit 99
+    return 0
+  fi
+
+  (( status != 0 )) || exit 100
   [[ "${output}" == *"result=${expected_result}"* ]] || {
     printf 'scenario=%s expected=%s output=%s\n' "${scenario}" "${expected_result}" "${output}" >&2
     sed 's/^/call: /' "${calls}" >&2
@@ -348,6 +361,7 @@ run_entrypoint_scenario() (
   fi
 )
 
+run_entrypoint_scenario success SUCCESS || fail_selftest "entrypoint success wiring failed"
 run_entrypoint_scenario producer_failure DUMP_FAILED || fail_selftest "entrypoint producer failure wiring failed"
 run_entrypoint_scenario consumer_failure REPOSITORY_FAILED || fail_selftest "entrypoint consumer failure wiring failed"
 run_entrypoint_scenario timeout_hang DUMP_FAILED || fail_selftest "entrypoint timeout wiring failed"

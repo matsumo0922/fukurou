@@ -150,6 +150,15 @@ publish_result() {
     "${advance_success}"
 }
 
+publish_and_emit_result() {
+  local result_code="$1" advance_success="$2"
+  if ! publish_result "${result_code}" "${advance_success}"; then
+    backup_emit_result STATUS_PUBLICATION_FAILED
+    return 1
+  fi
+  backup_emit_result "${result_code}"
+}
+
 handle_signal() {
   trap - INT TERM
   local result=RESTORE_SIGNALLED
@@ -158,8 +167,7 @@ handle_signal() {
     wait "${active_process_id}" 2>/dev/null || true
   fi
   cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
-  publish_result "${result}" false || true
-  backup_emit_result "${result}"
+  publish_and_emit_result "${result}" false || true
   exit 143
 }
 
@@ -321,27 +329,23 @@ main() {
   ownership_label="${RESTORE_LABEL_KEY}=${attempt}"
 
   if ! verify_snapshot_authority; then
-    publish_result RESTORE_SNAPSHOT_FAILED false || true
-    backup_emit_result RESTORE_SNAPSHOT_FAILED
+    publish_and_emit_result RESTORE_SNAPSHOT_FAILED false || true
     return 1
   fi
 
   local stale_resource_count
   stale_resource_count="$(all_restore_resource_count)" || {
-    publish_result RESTORE_CLEANUP_FAILED false || true
-    backup_emit_result RESTORE_CLEANUP_FAILED
+    publish_and_emit_result RESTORE_CLEANUP_FAILED false || true
     return 1
   }
   if [[ "${stale_resource_count}" != "0" ]]; then
-    publish_result RESTORE_CLEANUP_FAILED false || true
-    backup_emit_result RESTORE_CLEANUP_FAILED
+    publish_and_emit_result RESTORE_CLEANUP_FAILED false || true
     return 1
   fi
 
   if ! prepare_resources || ! wait_for_postgres; then
-    cleanup_owned_resources || { publish_result RESTORE_CLEANUP_FAILED false || true; backup_emit_result RESTORE_CLEANUP_FAILED; return 1; }
-    publish_result RESTORE_START_FAILED false || true
-    backup_emit_result RESTORE_START_FAILED
+    cleanup_owned_resources || { publish_and_emit_result RESTORE_CLEANUP_FAILED false || true; return 1; }
+    publish_and_emit_result RESTORE_START_FAILED false || true
     return 1
   fi
 
@@ -351,26 +355,22 @@ main() {
     local result=RESTORE_SNAPSHOT_FAILED
     [[ "${restore_status}" == "124" ]] && result=RESTORE_TIMEOUT
     cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
-    publish_result "${result}" false || true
-    backup_emit_result "${result}"
+    publish_and_emit_result "${result}" false || true
     return 1
   fi
 
   if ! validate_inventory || ! validate_constraints || ! validate_critical_primary_keys || ! validate_readonly_invariants; then
     local result=RESTORE_PROFILE_FAILED
     cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
-    publish_result "${result}" false || true
-    backup_emit_result "${result}"
+    publish_and_emit_result "${result}" false || true
     return 1
   fi
 
   if ! cleanup_owned_resources; then
-    publish_result RESTORE_CLEANUP_FAILED false || true
-    backup_emit_result RESTORE_CLEANUP_FAILED
+    publish_and_emit_result RESTORE_CLEANUP_FAILED false || true
     return 1
   fi
-  publish_result SUCCESS true || { backup_emit_result RESTORE_START_FAILED; return 1; }
-  backup_emit_result SUCCESS
+  publish_and_emit_result SUCCESS true || return 1
 }
 
 main

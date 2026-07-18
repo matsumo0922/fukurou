@@ -100,7 +100,10 @@ backup_load_status() {
   printf '{"schemaVersion":1}\n'
 }
 backup_status_snapshot_id() { printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'; }
-backup_publish_restore_attempt() { printf '%s\n' "$*" >>'@PUBLISH_LOG@'; }
+backup_publish_restore_attempt() {
+  if [[ "${FIXTURE_PUBLISH_FAIL:-false}" == true ]]; then return 1; fi
+  printf '%s\n' "$*" >>'@PUBLISH_LOG@'
+}
 backup_emit_result() { printf 'fukurou-backup: result=%s\n' "$1" >&2; }
 COMMON
 }
@@ -299,6 +302,18 @@ profile_directory="$(run_fixture profile-failure RESTORE_PROFILE_FAILED FIXTURE_
 grep -F 'RESTORE_PROFILE_FAILED ' "${profile_directory}/publish.log" >/dev/null || fail 'profile failure was not published'
 grep -F ' false' "${profile_directory}/publish.log" >/dev/null || fail 'profile failure advanced evidence'
 assert_no_owned_resources "${profile_directory}"
+
+failure_publish_directory="$(run_fixture failure-publication-failure STATUS_PUBLICATION_FAILED FIXTURE_INVARIANT_FAIL=true FIXTURE_PUBLISH_FAIL=true)"
+if grep -F 'result=RESTORE_PROFILE_FAILED' "${failure_publish_directory}/stderr" >/dev/null; then
+  fail 'failed publication exposed the unpublished restore result'
+fi
+assert_no_owned_resources "${failure_publish_directory}"
+
+success_publish_directory="$(run_fixture success-publication-failure STATUS_PUBLICATION_FAILED FIXTURE_PUBLISH_FAIL=true)"
+if grep -F 'result=SUCCESS' "${success_publish_directory}/stderr" >/dev/null; then
+  fail 'failed success publication reported SUCCESS'
+fi
+assert_no_owned_resources "${success_publish_directory}"
 
 snapshot_directory="$(run_fixture snapshot-failure RESTORE_SNAPSHOT_FAILED FIXTURE_RESTIC_FAIL=true)"
 if grep -F 'unsafe-child-detail' "${snapshot_directory}/stderr" >/dev/null; then
