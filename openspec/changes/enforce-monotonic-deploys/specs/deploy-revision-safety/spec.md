@@ -122,9 +122,13 @@ The v2 workflow MUST require an installed contract v2 executor and matching root
 - **WHEN** contract v2 starts with a valid unfinished v1 journal
 - **THEN** existing version-aware recovery completes before evaluating the new candidate intent
 
-#### Scenario: Executor downgrade has unfinished v2 state
-- **WHEN** any v2 deployment state is non-terminal
-- **THEN** operations MUST keep contract v2 installed until v2 recovery reaches a terminal and MUST NOT invoke v1 recovery
+#### Scenario: Application or workflow rolls back after v2 rollout
+- **WHEN** application code or workflow behavior must return to a previous version after any v2 deployment state has been created
+- **THEN** operations MUST retain the contract v2 executor and v2 audit history, complete recovery with v2, and MUST NOT invoke the v1 executor
+
+#### Scenario: Root executor downgrade is requested
+- **WHEN** an operator proposes replacing contract v2 with the v1 executor
+- **THEN** the downgrade is unsupported by this change and requires a separate compatibility design that can parse retained v2 terminal and non-terminal history
 
 ### Requirement: Every target retains exact-SHA quality enforcement
 The workflow MUST require the exact-target JVM quality gate for forward and authorized rollback targets and MUST NOT provide a quality bypass.

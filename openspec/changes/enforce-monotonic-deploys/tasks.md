@@ -25,7 +25,7 @@
 ## 5. Tests and documentation
 
 - [ ] 5.1 Complete workflow, contract, runtime, and production-like E2E scenarios for forward, queued-old, authorized rollback, mandatory historical quality, tamper, fresh/prior-history container loss, divergent, inventory mismatch, compatibility modes at pre/post-safety states, restart recovery, post-deploy mismatch, and v1 recovery.
-- [ ] 5.2 Update `docs/deploy.md` with current v2 semantics, manual inputs, controlled deploy freeze, exact root pre-install commands, verification, rollback, and PR-2 merge gate.
+- [ ] 5.2 Update `docs/deploy.md` with current v2 semantics, manual inputs, controlled deploy freeze, exact root pre-install commands, verification, application/workflow rollback with v2 executor retained, unsupported v1 executor downgrade, and PR-2 merge gate.
 - [ ] 5.3 Grep README/docs for stale quality, rollback, executor contract, migration, and bundle descriptions and update affected current-specification text.
 
 ## 6. Validation
