@@ -184,8 +184,11 @@ ENV
 
 make_bundle() {
   local deployment_id="$1" harness_path="$2"
-  local bundle_path="${WORK}/${deployment_id}-bundle.json"
+  local bundle_dir="${WORK}/bundles/${deployment_id}"
+  local bundle_path="${bundle_dir}/bundle.json"
   local executor_hash foundation_harness_hash public_key_hash capability_catalog catalog_hash inventory_hash
+
+  mkdir -p "${bundle_dir}"
 
   executor_hash="$(sha256_file "${WORK}/bin/deploy-fukurou")"
   foundation_harness_hash="$( { sha256_file "${harness_path}"; sha256_file "${WORK}/share/mcp-role.sql"; } | shasum -a 256 | awk '{print $1}')"
