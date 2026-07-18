@@ -10,6 +10,7 @@ Issue #189 の pinned CLI acceptance harness は merge 済みだが、production
 - raw provider output と credential を deploy log に出さず、hook 成否と typed failure だけを残す。
 - contract / executor / workflow / E2E fixture と既存 deploy documentation を同じ変更で更新する。
 - 3-run operator qualification、credential login、自動再認証、Issue #154 の pre-filter 有効化はこの変更に含めない。
+- （ユーザー確認済み）全 `FORWARD` deploy を gate し、provider 障害時の新規 forward bypass は追加しない。risk-reducing な停止と復旧は既存 launch disable および署名済み `AUTHORIZED_ROLLBACK` を使う。
 
 ## Capabilities
 
@@ -25,6 +26,7 @@ Issue #189 の pinned CLI acceptance harness は merge 済みだが、production
 
 - `.github/workflows/deploy.yml` の signed bundle required hook / operation set
 - `scripts/deploy/deploy-fukurou` の typed operation validation と candidate hook dispatch
+- `scripts/deploy/deploy-contract-v1.json` と candidate PID 1 / Kotlin preflight の exact hook contract
 - deploy contract / E2E selftests と既存 Kotlin contract test
 - `docs/deploy.md`、`docs/mcp-runtime.md`
 - production credential、DB、trading semantics、API contractへの変更なし
