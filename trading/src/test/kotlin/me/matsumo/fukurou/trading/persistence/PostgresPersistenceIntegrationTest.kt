@@ -207,6 +207,7 @@ import javax.sql.DataSource
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -7420,7 +7421,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun evaluation_repository_bounds_large_scoped_populations_and_aggregates_prior_pnl() = runPostgresTest {
+    fun evaluation_repository_bounds_global_population_with_one_scoped_trade() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedEvaluationRepository(database)
         val scope = repository.resolveScope(null, "CURRENT").getOrThrow()
@@ -7501,25 +7502,9 @@ class PostgresPersistenceIntegrationTest {
         assertFalse(current.truncated)
         assertEquals(0, snapshot.priorPnlJpy.compareTo(BigDecimal.ZERO))
 
-        exposedTransaction(database) {
-            prepare("UPDATE positions SET account_epoch_id=?").use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.executeUpdate()
-            }
-            prepare("UPDATE orders SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setString(2, runtimeHash)
-                statement.executeUpdate()
-            }
-            prepare("UPDATE executions SET account_epoch_id=?, execution_semantics_version='PAPER_WS_V1', runtime_config_hash=?").use { statement ->
-                statement.setObject(1, scope.accountEpochId)
-                statement.setString(2, runtimeHash)
-                statement.executeUpdate()
-            }
-        }
         val oversizedSnapshot = repository.fetchReportSnapshot(period, scope)
-        assertTrue(oversizedSnapshot.isFailure)
-        assertTrue(oversizedSnapshot.exceptionOrNull()?.message.orEmpty().contains("EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT"))
+        val oversizedFailure = assertNotNull(oversizedSnapshot.exceptionOrNull())
+        assertContains(oversizedFailure.message.orEmpty(), "EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT")
     }
 
     @Test

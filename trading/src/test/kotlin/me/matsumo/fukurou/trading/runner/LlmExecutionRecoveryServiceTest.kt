@@ -24,6 +24,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
+import org.junit.Assume.assumeTrue
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
@@ -429,7 +430,10 @@ class LlmExecutionRecoveryServiceTest {
 
     @Test
     fun linuxLiveChildHeartbeatOutage_recoversWithoutRestartOnlyAfterProcessGroupExit() = runBlocking {
-        if (!Files.isExecutable(Path.of("/usr/bin/setsid"))) return@runBlocking
+        assumeTrue(
+            "Linux process-tree fixture requires executable /usr/bin/setsid.",
+            Files.isExecutable(Path.of("/usr/bin/setsid")),
+        )
         val claimedAt = RECOVERY_INSTANT
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         reserve(repository, "live-child-outage", claimedAt)
@@ -438,18 +442,18 @@ class LlmExecutionRecoveryServiceTest {
         val childPidFile = tempDirectory.resolve("child.pid")
         val command = RenderedLlmCommand(
             executable = "/bin/sh",
-            args = listOf("-c", "(/bin/sleep 30) & echo $! > '$childPidFile'; wait"),
+            args = listOf(
+                "-c",
+                "trap 'wait; exit $SUPERVISOR_CLEANUP_ACK_EXIT_STATUS' TERM; " +
+                    "(/bin/sleep 30) & echo $! > '$childPidFile'; wait",
+            ),
             environment = emptyMap(),
             workingDirectory = tempDirectory,
-            timeout = Duration.ofSeconds(1),
+            timeout = LIVE_CHILD_PROCESS_TIMEOUT,
             stdin = null,
         )
         val processResult = async { ShellProcessRunner(Duration.ofMillis(100)).run(command).getOrThrow() }
-        repeat(100) {
-            if (Files.exists(childPidFile)) return@repeat
-            delay(10)
-        }
-        val childPid = Files.readString(childPidFile).trim().toLong()
+        val childPid = awaitPositiveChildPid(childPidFile)
 
         LlmExecutionAdmissionHealth.recordHeartbeatResult("live-child-outage", CLAIM_TOKEN, healthy = false)
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
@@ -872,6 +876,102 @@ private fun isLinuxProcessRunning(processId: Long): Boolean {
     val stat = runCatching { Files.readString(Path.of("/proc/$processId/stat")) }.getOrNull() ?: return false
     return stat.substringAfterLast(") ").firstOrNull() != 'Z'
 }
+
+private suspend fun awaitPositiveChildPid(childPidFile: Path): Long {
+    val deadlineNanos = System.nanoTime() + CHILD_PID_FILE_TIMEOUT.toNanos()
+    var lastObservation = observeChildPid(childPidFile)
+
+    while (true) {
+        lastObservation.pid?.let { return it }
+
+        val remainingNanos = deadlineNanos - System.nanoTime()
+        if (remainingNanos <= 0L) {
+            error(
+                "positive child PID was not observed within ${CHILD_PID_FILE_TIMEOUT.toMillis()} ms: " +
+                    "path=$childPidFile, exists=${lastObservation.exists}, " +
+                    "content=${lastObservation.content}, parseState=${lastObservation.parseState}",
+            )
+        }
+
+        val pollDelayNanos = minOf(remainingNanos, CHILD_PID_FILE_POLL_INTERVAL.toNanos())
+        delay(Duration.ofNanos(pollDelayNanos).toMillis().coerceAtLeast(1L))
+        lastObservation = observeChildPid(childPidFile)
+    }
+}
+
+private fun observeChildPid(childPidFile: Path): ChildPidObservation {
+    if (!Files.exists(childPidFile)) return ChildPidObservation.missing()
+
+    val contentResult = runCatching { Files.readString(childPidFile) }
+    val content = contentResult.getOrNull()
+    if (content == null) return ChildPidObservation.readFailure(contentResult.exceptionOrNull())
+
+    val trimmedContent = content.trim()
+    val parsedPid = trimmedContent.toLongOrNull()
+    val parseState = when {
+        trimmedContent.isEmpty() -> "blank"
+        parsedPid == null -> "not-a-long"
+        parsedPid <= 0L -> "non-positive:$parsedPid"
+        else -> "valid"
+    }
+
+    return ChildPidObservation(
+        exists = true,
+        content = content.toPidDiagnosticContent(),
+        parseState = parseState,
+        pid = parsedPid?.takeIf { it > 0L },
+    )
+}
+
+/** child PID file の最後の bounded observation。 */
+private data class ChildPidObservation(
+    val exists: Boolean,
+    val content: String,
+    val parseState: String,
+    val pid: Long?,
+) {
+    /** observation factory。 */
+    companion object {
+        fun missing(): ChildPidObservation = ChildPidObservation(
+            exists = false,
+            content = "<missing>",
+            parseState = "missing",
+            pid = null,
+        )
+
+        fun readFailure(failure: Throwable?): ChildPidObservation = ChildPidObservation(
+            exists = true,
+            content = "<read-failed>",
+            parseState = "read-failed:${failure?.javaClass?.simpleName}:${failure?.message.orEmpty().take(128)}",
+            pid = null,
+        )
+    }
+}
+
+private fun String.toPidDiagnosticContent(): String {
+    val escaped = replace("\r", "\\r").replace("\n", "\\n")
+
+    return if (escaped.length <= CHILD_PID_DIAGNOSTIC_CONTENT_LIMIT) {
+        "'$escaped'"
+    } else {
+        "'${escaped.take(CHILD_PID_DIAGNOSTIC_CONTENT_LIMIT)}...<truncated>'"
+    }
+}
+
+/** test supervisor が cleanup 完了を通知する exit status。 */
+private const val SUPERVISOR_CLEANUP_ACK_EXIT_STATUS = 124
+
+/** live child fixture の実行上限。 */
+private val LIVE_CHILD_PROCESS_TIMEOUT: Duration = Duration.ofSeconds(5)
+
+/** child PID file の生成待ち上限。 */
+private val CHILD_PID_FILE_TIMEOUT: Duration = Duration.ofSeconds(2)
+
+/** child PID file の生成確認間隔。 */
+private val CHILD_PID_FILE_POLL_INTERVAL: Duration = Duration.ofMillis(10)
+
+/** child PID file の deadline failure に残す最大文字数。 */
+private const val CHILD_PID_DIAGNOSTIC_CONTENT_LIMIT = 256
 
 private suspend fun reserve(
     repository: LlmLaunchReservationRepository,

@@ -1,10 +1,5 @@
-# postgres-test-connection-bounds Specification
+## MODIFIED Requirements
 
-## Purpose
-
-Testcontainers PostgreSQL fixture の接続停止を有限時間で失敗させ、production の接続 semantics を変えずに test suite の完走性を保つ。
-
-## Requirements
 ### Requirement: Testcontainers PostgreSQL connections are time bounded
 
 Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture は module-local な bounded base container を MUST 継承し、生成する全 JDBC URL に connection establishment と socket read の有限 timeout を設定する。large population test は socket timeout を test oracle にせず、同じ period に1件 scoped + 20,001件 scope外を作り、normal scoped aggregation と global oversized rejection を別々の assertion で bounded time に検証しなければならない。
@@ -49,12 +44,3 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 - **WHEN** evaluation repository test が同じ period に1件 scoped + 20,001件 scope外を作る
 - **THEN** scoped trade query は1件だけを返し、prior PnL aggregation は正常に成功する
 - **AND** 同じ20,002件の global population に対する別の assertion は JDBC socket timeout 前に `EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT` を返す
-
-### Requirement: Production connection semantics remain unchanged
-
-Issue #245 の non-goal として、変更は test source の Testcontainers fixture に限定し、production の JDBC configuration と retry semantics を MUST 変更しない。
-
-#### Scenario: Production application is built
-
-- **WHEN** application または trading runtime の production DataSource を構築する
-- **THEN** 本 change による timeout parameter や retry は追加されない

@@ -1,8 +1,5 @@
-# deploy-quality-gate Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change gate-deploy-on-quality. Update Purpose after archive.
-## Requirements
 ### Requirement: Target commit quality gates image publication
 Issue #190 CI DoD stage 1: For automatic main pushes and a workflow_dispatch target equal to the resolved `origin/main` tip, the deploy workflow MUST run the repository JVM test suite and detekt against the exact resolved target commit. It MUST NOT authenticate to GHCR, build or push a production image, create a deploy bundle, or start production deployment until both quality commands and the clean-tree check succeed. Deploy-gated fixtures MUST exercise Linux supervisor semantics on Linux CI and MUST exercise platform-independent gateway path semantics on Linux CI and supported macOS development environments. A platform capability skip MUST NOT be reported as executed contract evidence.
 
@@ -45,36 +42,3 @@ Issue #190 CI DoD stage 1: For automatic main pushes and a workflow_dispatch tar
 - **WHEN** the targeted PostgreSQL fixture runs on Linux or macOS
 - **THEN** 同じ period の1件 scoped + 20,001件 scope外に対する正常集計と global oversized rejection を別々に assertion する
 - **AND** JDBC transport timeout を成功条件にしない
-
-### Requirement: Historical manual rollback remains available until explicit intent exists
-Stage 1 MUST preserve the existing workflow_dispatch recovery path for a target SHA older than the resolved `origin/main` tip. Such a historical manual target SHALL skip this stage's quality job and MAY build/deploy only through an explicit closed dependency condition. This temporary exception MUST NOT apply to automatic pushes or the latest main target and SHALL be replaced by signed `AUTHORIZED_ROLLBACK` intent in stage 2.
-
-#### Scenario: Historical main target is selected manually
-- **WHEN** workflow_dispatch resolves a main-reachable target older than the current `origin/main` tip
-- **THEN** resolution marks it as historical, quality is skipped, and build may proceed without treating a failed or cancelled quality job as a bypass
-
-#### Scenario: Automatic push quality is cancelled or fails
-- **WHEN** an automatic main push has quality status other than success
-- **THEN** build remains blocked even if the target later becomes an ancestor of a newer main tip
-
-#### Scenario: Latest manual target quality is cancelled or fails
-- **WHEN** workflow_dispatch targets the current `origin/main` tip and quality status is not success
-- **THEN** build remains blocked and cannot use the historical rollback exception
-
-### Requirement: Quality jobs retain least privilege
-The resolved-SHA and quality jobs MUST have no package-write or production-runner authority. The image build job SHALL retain package publication authority and MUST depend explicitly on successful resolved-SHA and quality jobs.
-
-#### Scenario: Quality executes on GitHub-hosted runner
-- **WHEN** the quality gate runs
-- **THEN** it uses a GitHub-hosted runner with `contents: read` only and cannot publish packages or invoke the root deploy executor
-
-#### Scenario: Image build dependency is inspected
-- **WHEN** the production workflow contract is evaluated
-- **THEN** the image build job has explicit dependencies on both target resolution and quality success
-
-### Requirement: Existing deploy authority remains unchanged
-This stage MUST preserve the signed bundle fields, immutable image identity, self-hosted deploy serialization, installed root executor contract, and existing post-deploy verification/recovery behavior.
-
-#### Scenario: Quality succeeds and deploy continues
-- **WHEN** the quality gate authorizes image publication
-- **THEN** the existing build bundle and NAS deploy steps execute with the same permissions, inputs, concurrency, timeout, and root executor invocation semantics
