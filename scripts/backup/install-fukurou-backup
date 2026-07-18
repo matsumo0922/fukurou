@@ -11,6 +11,7 @@ readonly BACKUP_HOST=fukurou-production
 readonly BACKUP_STDIN_PATH=/postgres.dump
 readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
 readonly DOCKER_LIST_TIMEOUT_SECONDS=30
+readonly SYSTEMCTL_QUERY_TIMEOUT_SECONDS=30
 readonly STATUS_DIR=/srv/fukurou/monitoring
 readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
 readonly SECRET_DIR=/srv/fukurou/secrets
@@ -41,6 +42,10 @@ readonly -a ROLLOUT_UNITS=(
     fukurou-postgres-backup.timer
     fukurou-postgres-restore-drill.service
     fukurou-postgres-restore-drill.timer
+)
+readonly -a ROLLOUT_SERVICES=(
+    fukurou-postgres-backup.service
+    fukurou-postgres-restore-drill.service
 )
 
 die() {
@@ -142,6 +147,21 @@ verify_no_restore_owned_resources() {
     [[ -z ${identifiers} ]]
 }
 
+verify_rollout_services_succeeded() {
+    local service result exit_status start_monotonic
+
+    for service in "${ROLLOUT_SERVICES[@]}"; do
+        result=$(timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
+            systemctl show --property=Result --value "${service}" 2>/dev/null) || return 1
+        exit_status=$(timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
+            systemctl show --property=ExecMainStatus --value "${service}" 2>/dev/null) || return 1
+        start_monotonic=$(timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
+            systemctl show --property=ExecMainStartTimestampMonotonic --value "${service}" 2>/dev/null) || return 1
+        [[ ${start_monotonic} =~ ^[0-9]+$ ]] && (( start_monotonic > 0 )) || return 1
+        [[ ${result} == success && ${exit_status} == 0 ]] || return 1
+    done
+}
+
 install_artifacts() {
     local artifact
 
@@ -235,8 +255,10 @@ verify_rollout() {
         die "exact integrity-checked snapshot is absent from the current repository" 65
     verify_no_restore_owned_resources ||
         die "restore-owned Docker resources remain or cannot be enumerated" 65
+    verify_rollout_services_succeeded ||
+        die "latest backup or restore systemd service result is not successful" 65
 
-    printf '%s\n' 'latest backup retention, exact-snapshot restore, repository, and cleanup evidence verified'
+    printf '%s\n' 'latest backup retention, exact-snapshot restore, repository, cleanup, and service results verified'
 }
 
 usage() {

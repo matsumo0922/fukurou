@@ -589,7 +589,7 @@ sudo jq . /srv/fukurou/monitoring/backup-status.json
 sudo ./scripts/backup/install-fukurou-backup verify-rollout
 ```
 
-最新の`backup.lastAttempt`が`SUCCESS`かつ`retentionSucceeded=true`、最新の`restore.lastAttempt`が`SUCCESS`であり、各attemptのsnapshot IDが対応する`lastSuccess`と一致することを確認する。backupとrestoreの`lastSuccess.snapshotId`も同じであり、そのexact IDが現在開いているrepositoryの固定host/pathと`fukurou-postgres,integrity-checked` AND tagsで一意に存在する必要がある。古い`lastSuccess`が残っていても、最新retentionまたはrestore cleanupが失敗していればgateは失敗する。status directory/fileはroot:root 0700/0600である。bounded Docker inventoryで`me.matsumo.fukurou.restore.attempt` labelを持つcontainer、network、volumeがすべて0件であることも確認する。Docker global pruneは行わない。
+最新の`backup.lastAttempt`が`SUCCESS`かつ`retentionSucceeded=true`、最新の`restore.lastAttempt`が`SUCCESS`であり、各attemptのsnapshot IDが対応する`lastSuccess`と一致することを確認する。backupとrestoreの`lastSuccess.snapshotId`も同じであり、そのexact IDが現在開いているrepositoryの固定host/pathと`fukurou-postgres,integrity-checked` AND tagsで一意に存在する必要がある。両systemd serviceの最新`Result=success`かつ`ExecMainStatus=0`に加え、`ExecMainStartTimestampMonotonic>0`も必須とし、status publication失敗後に残る古いsuccess evidence、再起動後に失われた実行結果、未実行unitの既定値を通さない。NAS再起動後はbackupとrestore drillを再実行してからrollout verificationを行う。古い`lastSuccess`が残っていても、最新retentionまたはrestore cleanupが失敗していればgateは失敗する。status directory/fileはroot:root 0700/0600である。bounded Docker inventoryで`me.matsumo.fukurou.restore.attempt` labelを持つcontainer、network、volumeがすべて0件であることも確認する。Docker global pruneは行わない。
 
 初回backupの成功によってcustom dumpが固定60秒bound内に完了したことを確認し、`durationSeconds`はdump、repository write、full-stream integrity readを含むattempt全体の実測時間として記録する。capacity floorを満たさない場合、last-known-good backup/restoreのいずれかがない場合、cleanup failureがある場合はtimerをdisabledのままにする。完全なdeploy/backup相互排他が必要な場合はdeploy executorをこのchangeで変更せず、別changeとして設計する。
 

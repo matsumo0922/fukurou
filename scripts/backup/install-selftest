@@ -15,10 +15,25 @@ fail() {
 }
 
 active_unit=""
+service_result=success
+service_exit_status=0
+service_start_monotonic=123456
 systemctl() {
     if [[ $1 == is-active ]]; then
         [[ ${3:-} == "${active_unit}" ]]
         return
+    fi
+    if [[ $1 == show && $2 == --property=Result && $3 == --value ]]; then
+        printf '%s\n' "${service_result}"
+        return 0
+    fi
+    if [[ $1 == show && $2 == --property=ExecMainStatus && $3 == --value ]]; then
+        printf '%s\n' "${service_exit_status}"
+        return 0
+    fi
+    if [[ $1 == show && $2 == --property=ExecMainStartTimestampMonotonic && $3 == --value ]]; then
+        printf '%s\n' "${service_start_monotonic}"
+        return 0
     fi
     return 1
 }
@@ -137,8 +152,8 @@ docker() {
     fi
 }
 timeout() {
-    [[ $1 == --signal=TERM && $2 == --kill-after=5 && $3 == "${DOCKER_LIST_TIMEOUT_SECONDS}" ]] ||
-        fail 'Docker inventory was not bounded'
+    [[ $1 == --signal=TERM && $2 == --kill-after=5 && $3 == 30 ]] ||
+        fail 'rollout dependency query was not bounded'
     shift 3
     "$@"
 }
@@ -153,4 +168,20 @@ if grep -Fv -- "--filter label=${RESTORE_LABEL_KEY}" "${SELFTEST_ROOT}/docker.lo
     fail 'Docker inventory escaped the restore ownership label'
 fi
 
-printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed snapshot=current-repository-exact latest-attempts=required resources=zero\n'
+verify_rollout_services_succeeded || fail 'successful latest service results were rejected'
+service_result=exit-code
+if verify_rollout_services_succeeded; then
+    fail 'failed latest service result was accepted with stale status success'
+fi
+service_result=success
+service_exit_status=1
+if verify_rollout_services_succeeded; then
+    fail 'nonzero latest service exit status was accepted with stale status success'
+fi
+service_exit_status=0
+service_start_monotonic=0
+if verify_rollout_services_succeeded; then
+    fail 'unexecuted service defaults were accepted after reboot or before the first drill'
+fi
+
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed snapshot=current-repository-exact latest-attempts=required resources=zero services=successful\n'
