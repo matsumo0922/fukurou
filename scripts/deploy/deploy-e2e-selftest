@@ -151,6 +151,17 @@ provision_sandbox() {
   cp "${REPO_ROOT}/scripts/deploy/deploy-fukurou" "${WORK}/bin/deploy-fukurou"
   cp "${REPO_ROOT}/scripts/deploy/fukurou-deploy-db" "${WORK}/bin/fukurou-deploy-db"
   cp "${REPO_ROOT}/scripts/mcp-credential-isolation-check" "${WORK}/bin/mcp-credential-isolation-check"
+  cp "${WORK}/bin/mcp-credential-isolation-check" "${WORK}/bin/mcp-credential-isolation-foundation"
+  cat > "${WORK}/bin/mcp-credential-isolation-check" <<EOF
+#!/bin/sh
+set -eu
+if [ "\${1:-}" = --cli-acceptance ]; then
+  [ "\$2" = --runs ] && [ "\$3" = 1 ] && [ "\$4" = --reuse-image ]
+  echo "CLI_ACCEPTANCE_SMOKE_V1 OK digest=\$5 runs=1 selftest=false"
+  exit 0
+fi
+exec "${WORK}/bin/mcp-credential-isolation-foundation" "\$@"
+EOF
   cp "${REPO_ROOT}/scripts/deploy/sql/mcp-role.sql" "${WORK}/share/mcp-role.sql"
   cp "${REPO_ROOT}/scripts/deploy/sql/deploy-foundation-v1.sql" "${WORK}/share/deploy-foundation-v1.sql"
   cp "${REPO_ROOT}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql" "${WORK}/share/deploy-foundation-v1-indexes.sql"
@@ -211,7 +222,7 @@ make_bundle() {
       migrationRollbackMode:"AUTO_IMAGE_ROLLBACK",schemaSensitivePathsSha256:$schemaSensitivePathsSha256,
       candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,minimumContractVersion:2,
       requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
-      requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
+      requiredHooks:["CLI_AUTH_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"],
       capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
       executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,foundationHarnessSha256:$foundationHarnessSha256,
       operations:[
@@ -220,6 +231,7 @@ make_bundle() {
         {capability:"DB_MIGRATION_V1",operationId:"INSTALL_FOUNDATION_V1"},
         {capability:"DB_MAINTENANCE_V1",operationId:"SET_LAUNCH_MAINTENANCE"},
         {capability:"DB_MAINTENANCE_V1",operationId:"OPEN_INFRASTRUCTURE_GAP"},
+        {capability:"SMOKE_HOOK_V1",operationId:"CLI_AUTH_PREFLIGHT_V1"},
         {capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_PREFLIGHT_V1"},
         {capability:"RUN_COMPOSE_PROJECT_V1",operationId:"PRODUCTION"},
         {capability:"DB_MAINTENANCE_V1",operationId:"CLOSE_INFRASTRUCTURE_GAP"},
@@ -344,10 +356,10 @@ scenario_one() {
   log "scenario 1 PASS"
 }
 
-# --- シナリオ 2: canary 失敗 → fence-fallback 付き ROLLED_BACK -------------
+# --- シナリオ 2: acceptance 失敗 → production mutation なし ---------------
 
 scenario_two() {
-  log "scenario 2: canary failure recovers to ROLLED_BACK with fence fallback"
+  log "scenario 2: acceptance failure leaves production untouched"
   reset_production
   start_pre_foundation_production
 
@@ -360,15 +372,12 @@ scenario_two() {
     fail "scenario 2: executor unexpectedly succeeded"
   fi
 
-  assert_equals "scenario 2 journal" ROLLED_BACK "$(journal_tail_state e2e-canary-fail-1)"
-  assert_equals "scenario 2 restore method" '{"restoredEnable":"fence-fallback"}' \
-    "$(journal_tail_details e2e-canary-fail-1)"
-  assert_equals "scenario 2 fence" "ENABLED:1" "$(fence_state)"
+  [[ ! -e "${DEPLOY_ROOT}/deploy-state/e2e-canary-fail-1/journal.jsonl" ]] || fail "scenario 2: rollback journal was created"
   wait_for_application
   assert_equals "scenario 2 revision" "${OLD_SHA}" "$(application_revision)"
   assert_equals "scenario 2 maintenance" "f" "$(production_psql 'SELECT enabled FROM llm_launch_maintenance')"
-  assert_equals "scenario 2 gap" "CLOSE" \
-    "$(production_psql "SELECT boundary FROM infrastructure_gap_events WHERE deployment_id='e2e-canary-fail-1' ORDER BY occurred_at DESC LIMIT 1")"
+  assert_equals "scenario 2 gap count" "0" \
+    "$(production_psql "SELECT count(*) FROM infrastructure_gap_events WHERE deployment_id='e2e-canary-fail-1'")"
   log "scenario 2 PASS"
 }
 

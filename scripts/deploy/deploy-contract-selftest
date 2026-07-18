@@ -4,11 +4,19 @@ set -Eeuo pipefail
 readonly SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELFTEST_HARNESS="$(mktemp)"
 SELFTEST_HARNESS_SQL="$(mktemp)"
-printf '%s\n' '#!/bin/sh' 'exit 0' > "${SELFTEST_HARNESS}"
+SELFTEST_DEPLOY_ROOT="$(mktemp -d)"
+printf '%s\n' '#!/bin/sh' 'set -eu' \
+  'if [ "${1:-}" = --cli-acceptance ]; then' \
+  '  [ "${FUKUROU_CANARY_DOCKER+x}${FUKUROU_FOUNDATION_HARNESS+x}${FUKUROU_CLI_CANARY_SELFTEST+x}" = "" ]' \
+  '  printf "%s\n" "$*" > "$SELFTEST_ACCEPTANCE_LOG"' \
+  '  [ "${SELFTEST_ACCEPTANCE_FAIL:-false}" != true ] || { echo raw-provider-output >&2; exit 7; }' \
+  '  echo "CLI_ACCEPTANCE_SMOKE_V1 OK digest=$5 runs=1 selftest=false"' \
+  'fi' > "${SELFTEST_HARNESS}"
 printf '%s\n' 'SELECT 1;' > "${SELFTEST_HARNESS_SQL}"
 chmod 0755 "${SELFTEST_HARNESS}"
 export FUKUROU_FOUNDATION_HARNESS="${SELFTEST_HARNESS}"
 export FUKUROU_FOUNDATION_HARNESS_SQL="${SELFTEST_HARNESS_SQL}"
+export FUKUROU_DEPLOY_ROOT="${SELFTEST_DEPLOY_ROOT}"
 source "${SCRIPT_DIRECTORY}/deploy-fukurou"
 
 timeout() {
@@ -86,7 +94,7 @@ jq -e '
 ' "${SCRIPT_DIRECTORY}/deploy-bundle.schema.json" >/dev/null || \
   fail_selftest "bundle schema does not require the signed foundation harness hash"
 baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
-  {minimumContractVersion:2,
+  {minimumContractVersion:2,deployIntent:"AUTHORIZED_ROLLBACK",
    requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],
    requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
    operations:[$catalog.operations[] |
@@ -94,6 +102,20 @@ baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
      {capability:.capabilityId,operationId:.operationId}]}
 ')"
 validate_typed_operation_set "${baseline_bundle}" "${installed_catalog}" || fail_selftest "baseline rejected"
+forward_bundle="$(jq -cS '
+  .deployIntent="FORWARD" |
+  .requiredHooks=["CLI_AUTH_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"] |
+  .operations |= (map(select(.operationId != "FOUNDATION_PREFLIGHT_V1")) +
+    [{capability:"SMOKE_HOOK_V1",operationId:"CLI_AUTH_PREFLIGHT_V1"},
+     {capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_PREFLIGHT_V1"}])
+' <<<"${baseline_bundle}")"
+validate_typed_operation_set "${forward_bundle}" "${installed_catalog}" || fail_selftest "forward hook set rejected"
+expect_rejected missing-cli-forward validate_typed_operation_set \
+  "$(jq -cS '.deployIntent="FORWARD"' <<<"${baseline_bundle}")" "${installed_catalog}"
+expect_rejected cli-on-rollback validate_typed_operation_set \
+  "$(jq -cS '.deployIntent="AUTHORIZED_ROLLBACK"' <<<"${forward_bundle}")" "${installed_catalog}"
+expect_rejected reordered-forward-hooks validate_typed_operation_set \
+  "$(jq -cS '.requiredHooks |= reverse' <<<"${forward_bundle}")" "${installed_catalog}"
 
 intent_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
   {deploymentId:"selftest",bundleSchemaVersion:2,workflowEvent:"push",deployIntent:"FORWARD",operatorReason:"",
@@ -148,7 +170,7 @@ superset_bundle="$(jq -cS '
   .operations += [{capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_RECOVERY_PROBE_V2"}]
 ' <<<"${baseline_bundle}")"
 validate_catalog_extension "${installed_catalog}" "${superset_catalog}" "${installed_hash}" || fail_selftest "superset catalog rejected"
-validate_typed_operation_set "${superset_bundle}" "${superset_catalog}" || fail_selftest "superset bundle rejected"
+expect_rejected undeclared-intent-hook validate_typed_operation_set "${superset_bundle}" "${superset_catalog}"
 CANDIDATE_CATALOG="${superset_catalog}"
 SIGNED_BUNDLE_JSON="${superset_bundle}"
 [[ "$(required_operation_plan CANDIDATE_HOOK_V1 | jq -s 'length')" == "2" ]] || fail_selftest "accepted required hook missing from dispatch plan"
@@ -176,18 +198,26 @@ CANDIDATE_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
 CANDIDATE_CATALOG_HASH="${installed_hash}"
 CANDIDATE_CATALOG="${installed_catalog}"
 SIGNED_BUNDLE_JSON="${baseline_bundle}"
+PROBED_HOOKS=""
 docker() {
   if [[ "$1" == image && "$2" == inspect ]]; then
     printf '%s@%s\n' "${IMAGE_REPOSITORY}" "${CANDIDATE_DIGEST}"
     return 0
   fi
   if [[ "$1" == run ]]; then
-    [[ " $* " == *" FOUNDATION_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 foundation "* ]]
+    case " $* " in
+      *" CLI_AUTH_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 cli-auth "*) PROBED_HOOKS="${PROBED_HOOKS}cli," ;;
+      *" FOUNDATION_PREFLIGHT_V1 SMOKE_HOOK_FOUNDATION_V1 CANDIDATE_HOOK_V1 foundation "*) PROBED_HOOKS="${PROBED_HOOKS}foundation," ;;
+      *) return 1 ;;
+    esac
     return
   fi
   return 0
 }
 probe_candidate_operations || fail_selftest "exact candidate foundation probe rejected"
+SIGNED_BUNDLE_JSON="${forward_bundle}"
+probe_candidate_operations || fail_selftest "exact candidate forward probes rejected"
+[[ "${PROBED_HOOKS}" == "foundation,cli,foundation," ]] || fail_selftest "candidate hook probe order drifted"
 CANDIDATE_CATALOG="${superset_catalog}"
 SIGNED_BUNDLE_JSON="${superset_bundle}"
 expect_rejected future-image-operation probe_candidate_operations
@@ -203,5 +233,23 @@ harness_hash="$(sha256sum "${SELFTEST_HARNESS}" "${SELFTEST_HARNESS_SQL}" | awk 
 validate_foundation_harness_hash "${harness_hash}" || fail_selftest "signed harness hash rejected"
 expect_rejected tampered-harness-mutation0 validate_foundation_harness_hash "$(printf '0%.0s' {1..64})"
 [[ "${MUTATION_COUNT}" == 0 ]] || fail_selftest "harness mismatch mutated state"
+
+DEPLOY_INTENT=FORWARD
+CANDIDATE_DIGEST="sha256:$(printf 'c%.0s' {1..64})"
+SELFTEST_ACCEPTANCE_LOG="${SELFTEST_DEPLOY_ROOT}/acceptance-argv"
+export SELFTEST_ACCEPTANCE_LOG FUKUROU_CANARY_DOCKER=fake FUKUROU_CLI_CANARY_SELFTEST=true
+run_cli_acceptance_gate || fail_selftest "one-run CLI acceptance gate rejected"
+[[ "$(cat "${SELFTEST_ACCEPTANCE_LOG}")" == \
+  "--cli-acceptance --runs 1 --reuse-image ${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" ]] || \
+  fail_selftest "CLI acceptance argv drifted"
+SELFTEST_ACCEPTANCE_FAIL=true
+export SELFTEST_ACCEPTANCE_FAIL
+acceptance_failure="${SELFTEST_DEPLOY_ROOT}/acceptance-failure"
+expect_rejected cli-acceptance-failure run_cli_acceptance_gate 2>"${acceptance_failure}"
+! grep -Fq raw-provider-output "${acceptance_failure}" || fail_selftest "raw CLI failure escaped artifact"
+artifact_dir="$(sed -n 's/.*artifacts=//p' "${acceptance_failure}")"
+[[ -d "${artifact_dir}" ]] || fail_selftest "CLI failure artifact was not preserved"
+rm -rf -- "${artifact_dir}"
+unset SELFTEST_ACCEPTANCE_FAIL FUKUROU_CANARY_DOCKER FUKUROU_CLI_CANARY_SELFTEST
 
 echo "DEPLOY_CONTRACT_SELFTEST_OK signature=regular-file-accepted-tamper-rejected superset=accepted-dispatched exact-image-probe=future-rejected-mutation0 durable-dispatch=recorded deletion=rejected redefinition=rejected fork=rejected downgrade=rejected schema-profile-entrypoint-duplicates=rejected"

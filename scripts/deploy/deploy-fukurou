@@ -176,12 +176,17 @@ validate_typed_operation_set() {
       "CREATE_DIR_V1", "DB_MAINTENANCE_V1", "DB_MIGRATION_V1",
       "INSTALL_SECRET_REF_V1", "RUN_COMPOSE_PROJECT_V1", "SMOKE_HOOK_V1"
     ];
+    def expected_hooks:
+      if .deployIntent == "FORWARD" then ["CLI_AUTH_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"]
+      elif .deployIntent == "AUTHORIZED_ROLLBACK" then ["FOUNDATION_PREFLIGHT_V1"]
+      else [] end;
     . as $bundle |
     .minimumContractVersion == 2 and
     unique_items(.requiredCapabilities) and unique_items(.requiredHooks) and
     unique_items([.operations[].operationId]) and
     contains_all(.requiredCapabilities; baseline_capabilities) and
-    contains_all(.requiredHooks; ["FOUNDATION_PREFLIGHT_V1"]) and
+    .requiredHooks == expected_hooks and
+    ([.operations[] | select(.capability == "SMOKE_HOOK_V1") | .operationId] == expected_hooks) and
     contains_all(.operations; baseline_operations) and
     all(.requiredCapabilities[]; . as $capability | any($catalog.builtInCapabilities[]; .capabilityId == $capability)) and
     all(.requiredHooks[]; . as $hook | any($catalog.hooks[]; .hookId == $hook)) and
@@ -1607,7 +1612,7 @@ run_candidate_preflight() {
   local result="failure"
   local effective_canary="${ROLLBACK_STATE_DIR}/canary-compose.json"
   bind_image_reference "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
-  local hook_entry operation_id entrypoint_json hook_count=0
+  local hook_entry operation_id entrypoint_json hook_count=0 hook_output expected_marker
   while IFS= read -r hook_entry; do
     [[ -n "${hook_entry}" ]] || continue
     hook_count=$((hook_count + 1))
@@ -1619,16 +1624,18 @@ run_candidate_preflight() {
       -f "${COMPOSE_FILE}" -f "${canary_compose}" config --format json > "${effective_canary}" || \
       fail "CANARY_COMPOSE_DERIVATION_FAILED"
     validate_canary_compose_json "${effective_canary}" || fail "CANARY_DENY_OVERLAY_FAILED"
-    timeout 180 docker compose --env-file "${ENV_FILE}" -p "${canary_project}" \
-      -f "${COMPOSE_FILE}" -f "${canary_compose}" run --rm --no-deps ktor || \
+    hook_output="$(timeout 180 docker compose --env-file "${ENV_FILE}" -p "${canary_project}" \
+      -f "${COMPOSE_FILE}" -f "${canary_compose}" run --rm --no-deps -T ktor)" || \
       fail "REQUIRED_HOOK_FAILED:${operation_id}"
-    if [[ "${operation_id}" == "FOUNDATION_PREFLIGHT_V1" ]]; then
-      FUKUROU_MCP_ROLE_SQL="${FOUNDATION_HARNESS_SQL}" timeout 900 "${FOUNDATION_HARNESS}" --reuse-image \
-        "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" || fail "FOUNDATION_LIFECYCLE_CANARY_FAILED"
-    fi
-    record_operation_dispatch "${operation_id}"
+    expected_marker="${operation_id} OK"
+    [[ "${hook_output}" == "${expected_marker}" ]] || fail "REQUIRED_HOOK_MARKER_MISMATCH:${operation_id}"
   done < <(required_operation_plan CANDIDATE_HOOK_V1)
   [[ "${hook_count}" -gt 0 ]] || fail "REQUIRED_HOOK_PLAN_EMPTY"
+  FUKUROU_MCP_ROLE_SQL="${FOUNDATION_HARNESS_SQL}" timeout 900 "${FOUNDATION_HARNESS}" --reuse-image \
+    "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" || fail "FOUNDATION_LIFECYCLE_CANARY_FAILED"
+  while IFS= read -r operation_id; do
+    [[ -n "${operation_id}" ]] && record_operation_dispatch "${operation_id}"
+  done < <(jq -r '.requiredHooks[]' <<<"${SIGNED_BUNDLE_JSON}")
   result="success"
   timeout 60 docker compose --env-file "${ENV_FILE}" -p "${canary_project}" \
     -f "${COMPOSE_FILE}" -f "${canary_compose}" down --volumes --remove-orphans >/dev/null 2>&1 || result="failure"
@@ -1636,6 +1643,27 @@ run_candidate_preflight() {
   rm -f "${token}" "${signature}"
   sync -f "${ROLLBACK_STATE_DIR}"
   [[ "${result}" == "success" ]] || fail "FOUNDATION_PREFLIGHT_FAILED"
+}
+
+run_cli_acceptance_gate() {
+  [[ "${DEPLOY_INTENT}" == "FORWARD" ]] || return 0
+  local artifact_dir expected_marker actual_marker
+  artifact_dir="$(mktemp -d "${DEPLOY_ROOT}/cli-acceptance.XXXXXX")"
+  chmod 0700 "${artifact_dir}"
+  expected_marker="CLI_ACCEPTANCE_SMOKE_V1 OK digest=${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST} runs=1 selftest=false"
+  if ! timeout 720 env -u FUKUROU_CANARY_DOCKER -u FUKUROU_FOUNDATION_HARNESS \
+    -u FUKUROU_CLI_CANARY_SELFTEST "${FOUNDATION_HARNESS}" --cli-acceptance --runs 1 \
+    --reuse-image "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}" \
+    >"${artifact_dir}/stdout" 2>"${artifact_dir}/stderr"; then
+    fail "CLI_ACCEPTANCE_FAILED:artifacts=${artifact_dir}"
+    return 1
+  fi
+  actual_marker="$(cat "${artifact_dir}/stdout")"
+  [[ "${actual_marker}" == "${expected_marker}" && ! -s "${artifact_dir}/stderr" ]] || {
+    fail "CLI_ACCEPTANCE_SAFE_OUTPUT_MISMATCH:artifacts=${artifact_dir}"
+    return 1
+  }
+  rm -rf -- "${artifact_dir}"
 }
 
 checkout_deploy_sha() {
@@ -1773,6 +1801,17 @@ main() {
   check_forward_deadline
   DEPLOY_STAGE=VALIDATE_PRODUCTION_COMPOSE
   validate_production_compose
+  check_forward_deadline
+  DEPLOY_STAGE=RUN_CLI_ACCEPTANCE
+  stop_forward_deadline_watchdog
+  FORWARD_DEADLINE_BOOTTIME=$(( $(boottime_seconds) + 750 ))
+  start_forward_deadline_watchdog
+  run_cli_acceptance_gate
+  stop_forward_deadline_watchdog
+  DEPLOY_START_BOOTTIME="$(boottime_seconds)"
+  FORWARD_DEADLINE_BOOTTIME=$((DEPLOY_START_BOOTTIME + 1200))
+  RECOVERY_LIMIT_BOOTTIME=$((DEPLOY_START_BOOTTIME + 1500))
+  start_forward_deadline_watchdog
   check_forward_deadline
   DEPLOY_STAGE=CAPTURE_ROLLBACK_STATE
   capture_rollback_state

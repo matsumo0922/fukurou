@@ -29,6 +29,22 @@ class DeploymentPreflightMainTest {
     }
 
     @Test
+    fun `forward token admits exact ordered CLI and foundation hooks`() {
+        val token = token(expiresAt = 1_900, hookIds = listOf("CLI_AUTH_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1"))
+
+        DeploymentPreflightMain.verifyToken(token, tokenEnvironment(), 1_100, "CLI_AUTH_PREFLIGHT_V1")
+        DeploymentPreflightMain.verifyToken(token, tokenEnvironment(), 1_100, "FOUNDATION_PREFLIGHT_V1")
+        assertFailsWith<IllegalArgumentException> {
+            DeploymentPreflightMain.verifyToken(
+                token(expiresAt = 1_900, hookIds = listOf("FOUNDATION_PREFLIGHT_V1", "CLI_AUTH_PREFLIGHT_V1")),
+                tokenEnvironment(),
+                1_100,
+                "CLI_AUTH_PREFLIGHT_V1",
+            )
+        }
+    }
+
+    @Test
     fun signatureVerificationRejectsMutation() {
         val keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
         val token = token(expiresAt = 1_900)
@@ -49,12 +65,12 @@ class DeploymentPreflightMainTest {
         }
     }
 
-    private fun token(expiresAt: Long): ByteArray = """
+    private fun token(expiresAt: Long, hookIds: List<String> = listOf("FOUNDATION_PREFLIGHT_V1")): ByteArray = """
         {
           "profile":"CANARY_ONLY",
           "namespaceId":"canary-fixture",
           "generation":7,
-          "allowedHookIds":["FOUNDATION_PREFLIGHT_V1"],
+          "allowedHookIds":[${hookIds.joinToString(",") { hookId -> "\"$hookId\"" }}],
           "candidateSha":"candidate-sha",
           "candidateDigest":"${"sha256:" + "a".repeat(64)}",
           "contractHash":"catalog-hash",
