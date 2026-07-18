@@ -616,7 +616,7 @@ sudo jq '{updatedAt, backup, restore}' /srv/fukurou/monitoring/backup-status.jso
 ```
 
 - `BACKUP_BUSY` / `DEPLOY_IN_PROGRESS`: 競合jobまたはdeploy終了後にmanual再実行する。start-time probe後に始まるdeploy raceまで相互排他とはみなさない。
-- `CAPACITY_FLOOR_NOT_MET`: DB sizeとfree spaceを再測定し、filesystem capacityを解消するまで再実行しない。
+- `CAPACITY_FLOOR_NOT_MET`: DB sizeの測定失敗を含む。PostgreSQL connectivityとDB size、free spaceを再測定し、原因を解消するまで再実行しない。
 - `WATCHDOG_TERMINATION_FAILED`: 対象backendのPID/application identityを確認できていない。timerを止め、production lock影響を調査する。
 - `INTEGRITY_CHECK_FAILED` / `SNAPSHOT_IDENTITY_FAILED`: retention/pruneを行わずrepositoryとattempt-tagged candidateをroot-onlyで調査する。
 - `RETENTION_FAILED`: integrity-checked snapshot evidenceは残るがhousekeepingは失敗している。repositoryを確認してmanual retentionを判断する。

@@ -154,6 +154,7 @@ assert_contains "${script_text}" 'wait "${WATCHDOG_PID}"' "watchdog reap"
 assert_contains "${script_text}" 'cat >/dev/null' "archive EOF drain"
 assert_contains "${script_text}" '--compression auto' "explicit restic compression"
 assert_contains "${script_text}" 'DUMP_DEADLINE_SECONDS <= 60' "dump deadline cap"
+assert_contains "${script_text}" 'readonly POSTGRES_CONTROL_TIMEOUT_SECONDS=5' "postgres control query tail-latency budget"
 
 cat >"${SELFTEST_ROOT}/bin/flock" <<'FAKE'
 #!/usr/bin/env bash
