@@ -26,9 +26,9 @@ Production は PostgreSQL 16 を `/srv/fukurou` で運用し、root-owned deploy
 
 ### 1. （ユーザー確認済み）restic と `pg_dump -Fc` を使う
 
-root command はproduction container内のshellから`POSTGRES_USER`と`POSTGRES_DB`だけを出力してstrict identifier validationし、host非公開のPostgreSQLへ`docker exec -i fukurou-postgres pg_dump`で接続する。container-local connectionを使い、production DB passwordをinspect出力、pg_dump引数・環境変数、host filesystemへ渡さない。`pg_dump --format=custom --compress=0`のstdoutを`restic backup --stdin`へ流し、固定host/path/tagとbounded metadataだけをsnapshotへ付ける。repository passwordはroot:root 0400の固定password fileから読み、値を引数、log、statusへ出さない。
+root command はproduction container内のshellから`POSTGRES_USER`と`POSTGRES_DB`だけを出力してstrict identifier validationし、host非公開のPostgreSQLへ`docker exec -i fukurou-postgres pg_dump`で接続する。container-local connectionを使い、production DB passwordをinspect出力、pg_dump引数・環境変数、host filesystemへ渡さない。`pg_dump --format=custom --compress=0`のstdoutを`restic backup --stdin`へ流し、固定host/path/tagとbounded metadataだけをsnapshotへ付ける。source revisionはdump前後で同一であることを確認したapplication revisionであり、PostgreSQL/Application container ID、DB identity、application revisionのいずれかが変化したattemptはsuccess evidenceを進めない。repository passwordはroot:root 0400の固定password fileから読み、値を引数、log、statusへ出さない。
 
-DB lock保持時間を上限60秒にする。pg_dump sessionにはattempt固有のvalidated `application_name`を設定する。独立watchdogは別connectionから同名backendがexactly oneであることを確認してPIDを固定し、deadline時に単一SQLの`WHERE pid = expected AND application_name = expected`で再照合してそのbackendだけを`pg_terminate_backend`し、backend消滅をboundedに確認する。dumpが先に完了した場合はwatchdogをcancel/reapする。0件または複数件なら他backendをterminateせずstable failureにし、termination/disappearanceを確認できなければ`WATCHDOG_TERMINATION_FAILED`としてsuccess evidenceを進めない。`pg_dump`が自身で上書きするsession timeoutはlock解放の根拠にしない。`pipefail`と各pipeline processの終了値を検証し、dump側が失敗したのにrestic側だけが成功したsnapshotをsuccess扱いしない。current processがexact IDを得た部分snapshotだけを`forget`（`--prune`なし）し、特定またはforgetに失敗した場合は以後のintegrity/retentionを実行しない。
+DB lock保持時間を上限60秒にする。pg_dump sessionにはattempt固有のvalidated `application_name`を設定する。独立watchdogは別connectionから同名backendがexactly oneであることを確認してPIDを固定し、deadline時に単一SQLの`WHERE pid = expected AND application_name = expected`で再照合してそのbackendだけを`pg_terminate_backend`し、backend消滅をboundedに確認する。watchdogの全control query、cancel、wait、reapは同じabsolute deadlineの残時間でboundedにし、設定から60秒を超えて拡張できない。dumpが先に完了した場合はwatchdogをcancel/reapする。0件または複数件なら他backendをterminateせずstable failureにし、termination/disappearanceを確認できなければ`WATCHDOG_TERMINATION_FAILED`としてsuccess evidenceを進めない。`pg_dump`が自身で上書きするsession timeoutはlock解放の根拠にしない。`pipefail`と各pipeline processの終了値を検証し、dump側が失敗したのにrestic側だけが成功したsnapshotをsuccess扱いしない。current processがexact IDを得た部分snapshotだけを`forget`（`--prune`なし）し、特定またはforgetに失敗した場合は以後のintegrity/retentionを実行しない。
 
 独自暗号形式は暗号とintegrity formatを自作するため採らない。稼働中 volume のfilesystem copyはdatabase整合性を保証しない。PITR toolingは合意済みscopeを超える。
 
@@ -52,21 +52,21 @@ restore drillはstatusのlast integrity-checked snapshot IDを明示選択し、
 
 restore後はapplication/bootstrapを起動せず、欠落schemaを自動作成して隠さない。versioned code-owned manifestは名前を列挙し、contract testが各entryを現行schema authorityへ結び付けて重複・driftを検出する。固定のtable数を設計へ転記しない。drillはmanifestの全table/view/sequence、unvalidated constraintが0であること、critical-table manifestのprimary key、`BEGIN READ ONLY`下のpaper account/runtime config/ledger lineage data invariantsを検証する。ここでread-onlyはquery transactionの非破壊性を意味し、MCP role/ACL検証を意味しない。legacy cohortのnullable lineageをcurrent writeと誤認してrejectしない。
 
-successは全検証とcontainer/network/volume/temp cleanupの完了を必要とする。global Docker pruneは行わず、own label/prefixだけを削除し、cleanup後のinventoryが空であることを確認する。
+successは全検証とcontainer/network/volume/temp cleanupの完了を必要とする。global Docker pruneは行わず、own label/prefixだけを削除し、cleanup後のinventoryが空であることを確認する。次のdrillはresource作成前にrestore label全体を列挙し、前回のSIGKILLや電源断で残ったresourceが1件でもあれば`RESTORE_CLEANUP_FAILED`で停止する。
 
 ### 5. （agent 仮決め）status schema v1はattemptとlast-known-goodを分ける
 
-`backup-status.json` は `schemaVersion: 1`、`updatedAt`、backup/restoreそれぞれの`lastAttempt`とnullableな`lastSuccess`を持つ。result codeはallowlist、timestampはUTC、snapshot ID/source revision/count/durationだけを公開する。credential、child stderr、raw SQL、dump fragment、repository/password path、Docker inspect dumpを禁止する。
+`backup-status.json` は `schemaVersion: 1`、`updatedAt`、backup/restoreそれぞれの`lastAttempt`とnullableな`lastSuccess`を持つ。result codeはallowlist、timestampはUTC、snapshot ID/source revision/count/durationだけを公開する。repositoryを読めずinterrupted candidate countを証明できないattemptはcountを`null`として0件と区別する。credential、child stderr、raw SQL、dump fragment、repository/password path、Docker inspect dumpを禁止する。
 
 同一directoryの0600 temp fileへ書き、JSON validation、file sync、atomic rename、parent directory syncの順でpublishする。directoryはroot:root 0700、statusはroot:root 0600をinstalled contractとする。malformed/unsupported previous statusでは自動mergeとrestoreをfail closedにするが、runbookはcorrupt documentのroot-only quarantine、repository evidence確認、schema v1再初期化を明示し、risk-reducing backupを恒久停止させない。後続PRがprojectionを設計するまでapplicationへmountしない。
 
 ### 6. （agent 仮決め）installed authorityとtimerはdefault disabledにする
 
-repository scriptをsystemdから直接実行せず、reviewed exact revisionから `/usr/local/libexec/fukurou/` と `/usr/local/share/fukurou/` へroot-owned installする。serviceはroot oneshot、fixed `ExecStart`、restrictive umask/hardening、bounded timeoutを持つ。daily/weekly timerはpersistentかつrandomized delayを持つが、installだけではenableしない。timerはdaily/weeklyのattempt cadenceであり、lock/deploy/failureを越えた毎暦日のsuccessを保証しない。PR-4のalert導入まではoperatorがsystemd failureとroot-only statusを能動確認する。`github-runner` sudoersは変更しない。
+repository scriptをsystemdから直接実行せず、reviewed exact revisionから `/usr/local/libexec/fukurou/` と `/usr/local/share/fukurou/` へroot-owned installする。installerはshared backup lockをnon-blockingで保持し、backup/restoreのserviceとtimerがすべてinactiveである場合だけartifactを置換する。serviceはroot oneshot、fixed `ExecStart`、restrictive umask/hardening、bounded timeoutを持つ。daily/weekly timerはpersistentかつrandomized delayを持つが、installだけではenableしない。timerはdaily/weeklyのattempt cadenceであり、lock/deploy/failureを越えた毎暦日のsuccessを保証しない。PR-4のalert導入まではoperatorがsystemd failureとroot-only statusを能動確認する。`github-runner` sudoersは変更しない。
 
 ### 7. （高リスク・要人間確認）root rolloutをPR approval後のhandoffにする
 
-merge後、operatorはNASでrestic/systemdとpersistent install pathの利用可能性を確認し、root-owned backup/status/secret directoryとpasswordを作り、別管理のrecovery copyを保管し、compressionを有効にしたrestic repository format v2を初期化する。reviewed exact HEADのcommands/profile/unitsをinstallし、DB size、backup filesystem free space、manual dump所要時間を測定する。初回dumpが60秒bound内に完了しなければtimerをenableせず、deployとのcoordination方式を別changeで設計する。初回manual backup、同一snapshotのisolated restore drill、status ownership/modeとresource cleanupを確認した後だけtimersをenableする。secret値やdump内容は証跡に残さない。前提が満たせなければtimersをdisabledのままにする。
+merge後、operatorはNASでrestic/systemdとpersistent install pathの利用可能性を確認し、root-owned backup/status/secret directoryとpasswordを作り、別管理のrecovery copyを保管し、compressionを有効にしたrestic repository format v2を初期化する。reviewed exact HEADのcommands/profile/unitsをinstallし、DB size、backup filesystem free space、manual dump所要時間を測定する。初回dumpが60秒bound内に完了しなければtimerをenableせず、deployとのcoordination方式を別changeで設計する。初回manual backup、同一snapshotのisolated restore drill、status ownership/mode、現在開いているrepository内のfixed host/pathとAND tagsに一致するexact snapshot、resource cleanupを確認した後だけtimersをenableする。secret値やdump内容は証跡に残さない。前提が満たせなければtimersをdisabledのままにする。
 
 ### 8. （ユーザー確認済み）production recoveryは明示operator actionのままにする
 

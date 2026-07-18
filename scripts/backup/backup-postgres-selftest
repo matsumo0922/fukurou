@@ -3,16 +3,28 @@ set -Eeuo pipefail
 
 readonly SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly RESTORE_SCRIPT="${SCRIPT_DIRECTORY}/restore-fukurou"
+readonly REQUIRE_INTEGRATION="${FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE:-false}"
 
-for command in docker jq openssl python3; do
+dependency_unavailable() {
+  local detail="$1"
+  if [[ "${REQUIRE_INTEGRATION}" == "true" ]]; then
+    printf 'BACKUP_POSTGRES_SELFTEST_FAILED %s\n' "${detail}" >&2
+    exit 1
+  fi
+  printf 'BACKUP_POSTGRES_SELFTEST_SKIPPED %s\n' "${detail}"
+  exit 0
+}
+
+[[ "${REQUIRE_INTEGRATION}" == "true" || "${REQUIRE_INTEGRATION}" == "false" ]] ||
+  dependency_unavailable 'require-flag=invalid'
+
+for command in docker jq openssl python3 restic; do
   if ! command -v "${command}" >/dev/null 2>&1; then
-    printf 'BACKUP_POSTGRES_SELFTEST_SKIPPED missing=%s\n' "${command}"
-    exit 0
+    dependency_unavailable "missing=${command}"
   fi
 done
 if ! docker info >/dev/null 2>&1; then
-  printf 'BACKUP_POSTGRES_SELFTEST_SKIPPED docker=unavailable\n'
-  exit 0
+  dependency_unavailable 'docker=unavailable'
 fi
 
 readonly fixture_root="$(mktemp -d)"
@@ -21,13 +33,16 @@ readonly fixture_label="me.matsumo.fukurou.backup.integration=${fixture_id}"
 readonly source_container="${fixture_id}-source"
 readonly source_network="${fixture_id}-network"
 readonly source_volume="${fixture_id}-data"
-readonly snapshot_id='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
 
 cleanup() {
   docker rm -f -- "${source_container}" >/dev/null 2>&1 || true
   docker network rm -- "${source_network}" >/dev/null 2>&1 || true
   docker volume rm -- "${source_volume}" >/dev/null 2>&1 || true
-  rm -rf -- "${fixture_root}"
+  if [[ "${FUKUROU_BACKUP_POSTGRES_SELFTEST_KEEP:-false}" == "true" ]]; then
+    printf 'BACKUP_POSTGRES_SELFTEST_FIXTURE=%s\n' "${fixture_root}" >&2
+  else
+    rm -rf -- "${fixture_root}"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -117,38 +132,49 @@ docker cp "${source_container}:/tmp/fixture.dump" "${fixture_root}/fixture.dump"
 [[ -s "${fixture_root}/fixture.dump" ]]
 docker exec -i "${source_container}" pg_restore --list <"${fixture_root}/fixture.dump" >/dev/null
 
-cat >"${fixture_root}/restic" <<'RESTIC'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-[[ "$*" == *'--no-cache'* ]]
-[[ "$*" == *'dump abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 /stdin'* ]]
-cat "${FIXTURE_ARCHIVE}"
-RESTIC
-chmod +x "${fixture_root}/restic"
+restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  init --repository-version 2 >/dev/null
+backup_summary="$(restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  backup --json --stdin --stdin-filename postgres.dump --host fukurou-production \
+  --tag fukurou-postgres --tag attempt-integration <"${fixture_root}/fixture.dump")"
+candidate_snapshot="$(jq -er 'select(.message_type == "summary") | .snapshot_id' <<<"${backup_summary}" | tail -n 1)"
+restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  tag --add integrity-checked "${candidate_snapshot}" >/dev/null
+snapshot_json="$(restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  snapshots --json --host fukurou-production --path /postgres.dump \
+  --tag fukurou-postgres,integrity-checked,attempt-integration)"
+[[ "$(jq -er 'length' <<<"${snapshot_json}")" == 1 ]]
+snapshot_id="$(jq -er '.[0].id' <<<"${snapshot_json}")"
+[[ "${snapshot_id}" != "${candidate_snapshot}" ]]
+restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  dump "${snapshot_id}" /postgres.dump | docker exec -i "${source_container}" pg_restore --list >/dev/null
 
-cat >"${fixture_root}/backup-common" <<'COMMON'
-RESTIC_REPOSITORY="${RESTIC_REPOSITORY}"
-RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}"
+cat >"${fixture_root}/backup-common" <<COMMON
+RESTIC_REPOSITORY="\${RESTIC_REPOSITORY}"
+RESTIC_PASSWORD_FILE="\${RESTIC_PASSWORD_FILE}"
+BACKUP_HOST=fukurou-production
+BACKUP_STDIN_PATH=/postgres.dump
 STATUS_FILE=fixture-status
 backup_require_root() { return 0; }
 backup_acquire_shared_lock() { return 0; }
 backup_probe_deploy_lock() { return 0; }
-backup_require_command() { command -v "$1" >/dev/null 2>&1; }
+backup_require_command() { command -v "\$1" >/dev/null 2>&1; }
 backup_load_status() { printf '{"schemaVersion":1}\n'; }
-backup_status_snapshot_id() { printf 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n'; }
-backup_publish_restore_attempt() { printf '%s\n' "$*" >"${FIXTURE_PUBLISH_LOG}"; }
-backup_emit_result() { printf 'fukurou-backup: result=%s\n' "$1" >&2; }
+backup_status_snapshot_id() { printf '${snapshot_id}\n'; }
+backup_publish_restore_attempt() { printf '%s\n' "\$*" >"\${FIXTURE_PUBLISH_LOG}"; }
+backup_emit_result() { printf 'fukurou-backup: result=%s\n' "\$1" >&2; }
 COMMON
 
 production_before="$(docker inspect --format '{{.Id}}' fukurou-postgres 2>/dev/null || true)"
 env \
-  FIXTURE_ARCHIVE="${fixture_root}/fixture.dump" \
   FIXTURE_PUBLISH_LOG="${fixture_root}/publish.log" \
   FUKUROU_BACKUP_COMMON_PATH="${fixture_root}/backup-common" \
+  FUKUROU_BACKUP_LOCK_FILE="${fixture_root}/backup.lock" \
+  FUKUROU_FLOCK_BIN=true \
   FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1 \
   FUKUROU_BACKUP_SHARE_DIRECTORY="${fixture_root}/profiles" \
   FUKUROU_RESTORE_RUNTIME_DIRECTORY="${fixture_root}/run" \
-  FUKUROU_RESTIC_BIN="${fixture_root}/restic" \
+  FUKUROU_RESTIC_BIN=restic \
   FUKUROU_SETSID_BIN="${fixture_root}/setsid" \
   FUKUROU_TIMEOUT_BIN="${fixture_root}/timeout" \
   RESTIC_REPOSITORY="${fixture_root}/repository" \

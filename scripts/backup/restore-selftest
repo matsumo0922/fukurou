@@ -20,9 +20,19 @@ make_fixture_tools() {
   apply_restic_fixture "${directory}/bin/restic"
   apply_setsid_fixture "${directory}/bin/setsid"
   apply_timeout_fixture "${directory}/bin/timeout"
-  chmod +x "${directory}/bin/docker" "${directory}/bin/restic" "${directory}/bin/setsid" "${directory}/bin/timeout"
+  apply_flock_fixture "${directory}/bin/flock"
+  chmod +x "${directory}/bin/docker" "${directory}/bin/restic" "${directory}/bin/setsid" "${directory}/bin/timeout" "${directory}/bin/flock"
   printf 'not-a-real-secret\n' >"${directory}/restic-password"
   chmod 0400 "${directory}/restic-password"
+}
+
+apply_flock_fixture() {
+  local target="$1"
+  cat >"${target}" <<'FLOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${FIXTURE_PRE_SOURCE_LOCK_BUSY:-false}" == true ]]; then exit 1; fi
+FLOCK
 }
 
 apply_timeout_fixture() {
@@ -78,12 +88,17 @@ apply_common_fixture() {
   sed "s|@PUBLISH_LOG@|${target%/*}/publish.log|g" >"${target}" <<'COMMON'
 RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-fixture-repository}"
 RESTIC_PASSWORD_FILE="${FIXTURE_PASSWORD_FILE}"
+BACKUP_HOST=fukurou-production
+BACKUP_STDIN_PATH=/postgres.dump
 STATUS_FILE=fixture-status
 backup_require_root() { return 0; }
-backup_acquire_shared_lock() { return 0; }
+backup_acquire_shared_lock() { [[ "${BACKUP_PRE_SOURCE_LOCK_HELD:-false}" == true ]]; }
 backup_probe_deploy_lock() { return 0; }
 backup_require_command() { command -v "$1" >/dev/null 2>&1; }
-backup_load_status() { printf '{"schemaVersion":1}\n'; }
+backup_load_status() {
+  if [[ "${FIXTURE_INVALID_STATUS:-false}" == true ]]; then return 1; fi
+  printf '{"schemaVersion":1}\n'
+}
 backup_status_snapshot_id() { printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'; }
 backup_publish_restore_attempt() { printf '%s\n' "$*" >>'@PUBLISH_LOG@'; }
 backup_emit_result() { printf 'fukurou-backup: result=%s\n' "$1" >&2; }
@@ -106,25 +121,39 @@ case "${command_name}" in
   network)
     action="${1:-}"; shift || true
     case "${action}" in
-      create) touch "${state}/networks/${last_argument}" ;;
+      create)
+        touch "${state}/networks/${last_argument}"
+        if [[ "${FIXTURE_NETWORK_CREATE_SIDE_EFFECT_FAIL:-false}" == true ]]; then exit 1; fi
+        ;;
       rm)
         name="${last_argument}"
         [[ "${FIXTURE_CLEANUP_FAIL:-false}" == true ]] && exit 1
         rm -f -- "${state}/networks/${name}"
         ;;
-      ls) find "${state}/networks" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; ;;
+      ls)
+        [[ "${FIXTURE_STALE_RESOURCES:-false}" == true ]] && printf 'stale-network\n'
+        find "${state}/networks" -mindepth 1 -maxdepth 1 -type f -exec basename {} \;
+        ;;
     esac
     ;;
   volume)
     action="${1:-}"; shift || true
     case "${action}" in
-      create) name="${last_argument}"; touch "${state}/volumes/${name}"; printf '%s\n' "${name}" ;;
+      create)
+        name="${last_argument}"
+        touch "${state}/volumes/${name}"
+        if [[ "${FIXTURE_VOLUME_CREATE_SIDE_EFFECT_FAIL:-false}" == true ]]; then exit 1; fi
+        printf '%s\n' "${name}"
+        ;;
       rm)
         name="${last_argument}"
         [[ "${FIXTURE_CLEANUP_FAIL:-false}" == true ]] && exit 1
         rm -f -- "${state}/volumes/${name}"
         ;;
-      ls) find "${state}/volumes" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; ;;
+      ls)
+        [[ "${FIXTURE_STALE_RESOURCES:-false}" == true ]] && printf 'stale-volume\n'
+        find "${state}/volumes" -mindepth 1 -maxdepth 1 -type f -exec basename {} \;
+        ;;
     esac
     ;;
   run)
@@ -133,6 +162,7 @@ case "${command_name}" in
       if [[ "$1" == --name ]]; then name="$2"; shift 2; else shift; fi
     done
     touch "${state}/containers/${name}"
+    if [[ "${FIXTURE_CONTAINER_RUN_SIDE_EFFECT_FAIL:-false}" == true ]]; then exit 1; fi
     printf 'fixture-container\n'
     ;;
   rm)
@@ -140,7 +170,10 @@ case "${command_name}" in
     [[ "${FIXTURE_CLEANUP_FAIL:-false}" == true ]] && exit 1
     rm -f -- "${state}/containers/${name}"
     ;;
-  ps) find "${state}/containers" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; ;;
+  ps)
+    [[ "${FIXTURE_STALE_RESOURCES:-false}" == true ]] && printf 'stale-container\n'
+    find "${state}/containers" -mindepth 1 -maxdepth 1 -type f -exec basename {} \;
+    ;;
   exec)
     while [[ "${1:-}" == -i || "${1:-}" == --env ]]; do
       if [[ "$1" == --env ]]; then shift 2; else shift; fi
@@ -189,7 +222,11 @@ apply_restic_fixture() {
 set -Eeuo pipefail
 printf '%q ' "$@" >>'@LOG@'
 printf '\n' >>'@LOG@'
-[[ "$*" == *'dump 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef /stdin'* ]] || exit 2
+if [[ "$*" == *'snapshots --json --host fukurou-production --path /postgres.dump --tag fukurou-postgres,integrity-checked 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'* ]]; then
+  printf '%s\n' '[{"id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]'
+  exit 0
+fi
+[[ "$*" == *'dump 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef /postgres.dump'* ]] || exit 2
 if [[ "${FIXTURE_RESTIC_SLEEP:-0}" != 0 ]]; then sleep "${FIXTURE_RESTIC_SLEEP}"; fi
 if [[ "${FIXTURE_RESTIC_FAIL:-false}" == true ]]; then
   printf 'unsafe-child-detail password=fixture raw-sql=SELECT-secret\n' >&2
@@ -213,6 +250,7 @@ run_fixture() {
     PATH="${directory}/bin:${PATH}" \
     FIXTURE_PASSWORD_FILE="${directory}/restic-password" \
     FUKUROU_BACKUP_COMMON_PATH="${directory}/backup-common" \
+    FUKUROU_BACKUP_LOCK_FILE="${directory}/backup.lock" \
     FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1 \
     RESTIC_REPOSITORY="${directory}/repository" \
     FUKUROU_BACKUP_SHARE_DIRECTORY="${SCRIPT_DIRECTORY}" \
@@ -268,6 +306,25 @@ if grep -F 'unsafe-child-detail' "${snapshot_directory}/stderr" >/dev/null; then
 fi
 assert_no_owned_resources "${snapshot_directory}"
 
+invalid_status_directory="$(run_fixture invalid-status INVALID_STATUS FIXTURE_INVALID_STATUS=true)"
+assert_no_owned_resources "${invalid_status_directory}"
+
+pre_source_busy_directory="$(run_fixture pre-source-busy BACKUP_BUSY FIXTURE_PRE_SOURCE_LOCK_BUSY=true)"
+[[ "$(wc -l <"${pre_source_busy_directory}/stderr" | tr -d ' ')" == "1" ]] || fail 'pre-source busy emitted unstable detail'
+assert_no_owned_resources "${pre_source_busy_directory}"
+
+network_create_failure_directory="$(run_fixture network-create-side-effect-failure RESTORE_START_FAILED FIXTURE_NETWORK_CREATE_SIDE_EFFECT_FAIL=true)"
+assert_no_owned_resources "${network_create_failure_directory}"
+
+volume_create_failure_directory="$(run_fixture volume-create-side-effect-failure RESTORE_START_FAILED FIXTURE_VOLUME_CREATE_SIDE_EFFECT_FAIL=true)"
+assert_no_owned_resources "${volume_create_failure_directory}"
+
+container_run_failure_directory="$(run_fixture container-run-side-effect-failure RESTORE_START_FAILED FIXTURE_CONTAINER_RUN_SIDE_EFFECT_FAIL=true)"
+assert_no_owned_resources "${container_run_failure_directory}"
+
+stale_directory="$(run_fixture stale-resources RESTORE_CLEANUP_FAILED FIXTURE_STALE_RESOURCES=true)"
+grep -F 'RESTORE_CLEANUP_FAILED ' "${stale_directory}/publish.log" >/dev/null || fail 'stale resources were not reported'
+
 timeout_directory="$(run_fixture timeout RESTORE_TIMEOUT FIXTURE_RESTIC_SLEEP=5)"
 assert_no_owned_resources "${timeout_directory}"
 
@@ -279,4 +336,4 @@ signal_directory="$(run_fixture signal RESTORE_SIGNALLED FIXTURE_SIGNAL_ON_READY
 grep -F 'RESTORE_SIGNALLED ' "${signal_directory}/publish.log" >/dev/null || fail 'signal attempt was not published'
 assert_no_owned_resources "${signal_directory}"
 
-printf 'RESTORE_SELFTEST_OK exact-snapshot=selected isolation=postgres16-owned-only invariants=fail-closed timeout=cleaned signal=cleaned cleanup=reported owned-resources=zero\n'
+printf 'RESTORE_SELFTEST_OK exact-snapshot=selected isolation=postgres16-owned-only invariants=fail-closed create-side-effects=cleaned timeout=cleaned signal=cleaned cleanup=reported owned-resources=zero\n'

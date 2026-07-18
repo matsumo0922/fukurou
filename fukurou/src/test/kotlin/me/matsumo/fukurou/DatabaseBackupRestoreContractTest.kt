@@ -3,6 +3,7 @@ package me.matsumo.fukurou
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.isExecutable
+import kotlin.io.path.readText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -36,18 +37,38 @@ class DatabaseBackupRestoreContractTest {
 
         val installer = Files.readString(backupDirectory.resolve("install-fukurou-backup"))
         val common = Files.readString(backupDirectory.resolve("backup-common"))
+        val backup = Files.readString(backupDirectory.resolve("backup-fukurou"))
+        val restore = Files.readString(backupDirectory.resolve("restore-fukurou"))
         assertTrue(installer.contains("readonly LIBEXEC_DIR=/usr/local/libexec/fukurou"))
         assertTrue(installer.contains("readonly SHARE_DIR=/usr/local/share/fukurou"))
         assertTrue(installer.contains("readonly UNIT_DIR=/etc/systemd/system"))
         assertTrue(installer.contains("[[ \${EUID} -eq 0 ]]"))
         assertTrue(installer.contains("-m 0555 \"\${SCRIPT_DIR}/\${artifact}\""))
         assertTrue(installer.contains("-m 0444 \"\${UNIT_SOURCE_DIR}/\${artifact}\""))
-        assertTrue(installer.contains("-m 0700 \"\${BACKUP_ROOT}\" \"\${STATUS_DIR}\" \"\${SECRET_DIR}\""))
-        assertTrue(installer.contains("disable \${artifact} before installing reviewed artifacts"))
+        assertTrue(
+            installer.contains(
+                "-m 0700 \"\${BACKUP_PARENT}\" \"\${BACKUP_ROOT}\" \"\${STATUS_DIR}\" \"\${SECRET_DIR}\"",
+            ),
+        )
+        assertTrue(installer.contains("verify_owner_mode \"\${BACKUP_PARENT}\" 700"))
+        assertTrue(installer.contains("acquire_install_lock"))
+        assertTrue(installer.contains("all_rollout_units_inactive"))
+        assertTrue(installer.contains("require_quiescent_rollout"))
+        assertTrue(installer.contains("verify_repository_snapshot \"\${snapshot_id}\""))
+        assertTrue(installer.contains("die \"disable \${timer} before continuing\" 75"))
         assertFalse(installer.contains("systemctl enable"))
         assertFalse(installer.contains("restic -r \"\${BACKUP_ROOT}\" init"))
         assertTrue(common.contains("FUKUROU_BACKUP_SHARE_DIRECTORY"))
+        assertTrue(common.contains("FUKUROU_BACKUP_STDIN_PATH:-/postgres.dump"))
+        assertFalse(backup.contains("readonly BACKUP_STDIN_PATH="))
+        assertTrue(restore.contains("dump \"\${snapshot_id}\" \"\${BACKUP_STDIN_PATH}\""))
         assertTrue(installer.contains("FUKUROU_BACKUP_SHARE_DIRECTORY=\"\${SHARE_DIR}\""))
+        val validationWorkflow = root.resolve(".github/workflows/deploy-validation.yml").readText()
+        assertTrue(
+            validationWorkflow.contains(
+                "FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest",
+            ),
+        )
     }
 
     @Test
@@ -72,6 +93,10 @@ class DatabaseBackupRestoreContractTest {
             assertFalse(service.lowercase().contains("password="), name)
             assertFalse(service.lowercase().contains("secret="), name)
         }
+
+        val restoreService = Files.readString(unitDirectory.resolve("fukurou-postgres-restore-drill.service"))
+        assertTrue(restoreService.contains("RuntimeDirectory=fukurou-restore"))
+        assertTrue(restoreService.contains("RuntimeDirectoryMode=0700"))
 
         val daily = Files.readString(unitDirectory.resolve("fukurou-postgres-backup.timer"))
         val weekly = Files.readString(unitDirectory.resolve("fukurou-postgres-restore-drill.timer"))
@@ -111,6 +136,18 @@ class DatabaseBackupRestoreContractTest {
         assertFalse(application.contains("backup-status.json"))
         assertFalse(backupSources.contains("docker-compose.prod.yml"))
         assertFalse(backupSources.contains("sudoers-fukurou"))
+    }
+
+    @Test
+    fun `backup semantic and PostgreSQL selftests are wired into CI`() {
+        val workflow = Files.readString(root.resolve(".github/workflows/deploy-validation.yml"))
+
+        assertTrue(workflow.contains("scripts/backup/**"))
+        assertTrue(workflow.contains("scripts/backup/backup-selftest"))
+        assertTrue(workflow.contains("scripts/backup/restore-selftest"))
+        assertTrue(workflow.contains("scripts/backup/backup-postgres-selftest"))
+        assertTrue(workflow.contains("scripts/backup/install-selftest"))
+        assertTrue(workflow.contains("postgresql-client restic"))
     }
 
     @Test

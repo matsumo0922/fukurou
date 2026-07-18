@@ -9,6 +9,8 @@ User=root
 Group=root
 UMask=0077
 Environment=FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou
+RuntimeDirectory=fukurou-restore
+RuntimeDirectoryMode=0700
 ExecStart=/usr/local/libexec/fukurou/restore-fukurou
 TimeoutStartSec=60min
 KillMode=control-group

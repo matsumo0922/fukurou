@@ -4,7 +4,11 @@ set -Eeuo pipefail
 readonly LIBEXEC_DIR=/usr/local/libexec/fukurou
 readonly SHARE_DIR=/usr/local/share/fukurou
 readonly UNIT_DIR=/etc/systemd/system
-readonly BACKUP_ROOT=/srv/fukurou/backups/postgres
+readonly BACKUP_PARENT=/srv/fukurou/backups
+readonly BACKUP_ROOT=${BACKUP_PARENT}/postgres
+readonly BACKUP_LOCK_FILE="${FUKUROU_BACKUP_LOCK_FILE:-/var/lock/fukurou-backup.lock}"
+readonly BACKUP_HOST=fukurou-production
+readonly BACKUP_STDIN_PATH=/postgres.dump
 readonly STATUS_DIR=/srv/fukurou/monitoring
 readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
 readonly SECRET_DIR=/srv/fukurou/secrets
@@ -25,6 +29,12 @@ readonly -a SHARE_ARTIFACTS=(
     restore-readonly-invariants-v1.sql
 )
 readonly -a UNIT_ARTIFACTS=(
+    fukurou-postgres-backup.service
+    fukurou-postgres-backup.timer
+    fukurou-postgres-restore-drill.service
+    fukurou-postgres-restore-drill.timer
+)
+readonly -a ROLLOUT_UNITS=(
     fukurou-postgres-backup.service
     fukurou-postgres-backup.timer
     fukurou-postgres-restore-drill.service
@@ -60,21 +70,56 @@ timer_is_enabled() {
     systemctl is-enabled --quiet "$1" 2>/dev/null
 }
 
+all_rollout_units_inactive() {
+    local unit
+
+    for unit in "${ROLLOUT_UNITS[@]}"; do
+        if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+            return 1
+        fi
+    done
+}
+
+acquire_install_lock() {
+    exec 9>"${BACKUP_LOCK_FILE}" || return 1
+    flock -n 9
+}
+
+require_quiescent_rollout() {
+    local timer
+
+    acquire_install_lock || die "backup or restore job owns the shared backup lock" 75
+    all_rollout_units_inactive || die "stop every backup and restore service/timer before continuing" 75
+    for timer in fukurou-postgres-backup.timer fukurou-postgres-restore-drill.timer; do
+        if timer_is_enabled "${timer}"; then
+            die "disable ${timer} before continuing" 75
+        fi
+    done
+}
+
+verify_repository_snapshot() {
+    local snapshot_id=$1
+    local snapshots
+
+    snapshots=$(RESTIC_PASSWORD_FILE="${PASSWORD_FILE}" restic --no-cache -r "${BACKUP_ROOT}" \
+        snapshots --json --host "${BACKUP_HOST}" --path "${BACKUP_STDIN_PATH}" \
+        --tag fukurou-postgres,integrity-checked "${snapshot_id}") || return 1
+    [[ $(jq -er 'length' <<<"${snapshots}") == 1 ]] || return 1
+    [[ $(jq -er '.[0].id' <<<"${snapshots}") == "${snapshot_id}" ]]
+}
+
 install_artifacts() {
     local artifact
 
     command -v install >/dev/null || die "install command is unavailable" 69
     command -v systemctl >/dev/null || die "systemctl is unavailable" 69
+    command -v flock >/dev/null || die "flock is unavailable" 69
 
-    for artifact in fukurou-postgres-backup.timer fukurou-postgres-restore-drill.timer; do
-        if timer_is_enabled "${artifact}"; then
-            die "disable ${artifact} before installing reviewed artifacts" 75
-        fi
-    done
+    require_quiescent_rollout
 
     install -d -o root -g root -m 0555 "${LIBEXEC_DIR}"
     install -d -o root -g root -m 0755 "${SHARE_DIR}"
-    install -d -o root -g root -m 0700 "${BACKUP_ROOT}" "${STATUS_DIR}" "${SECRET_DIR}"
+    install -d -o root -g root -m 0700 "${BACKUP_PARENT}" "${BACKUP_ROOT}" "${STATUS_DIR}" "${SECRET_DIR}"
 
     for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
         require_regular_source "${SCRIPT_DIR}/${artifact}"
@@ -100,6 +145,7 @@ verify_installation() {
     command -v systemd-analyze >/dev/null || die "systemd-analyze is unavailable" 69
     verify_owner_mode "${LIBEXEC_DIR}" 555
     verify_owner_mode "${SHARE_DIR}" 755
+    verify_owner_mode "${BACKUP_PARENT}" 700
     verify_owner_mode "${BACKUP_ROOT}" 700
     verify_owner_mode "${STATUS_DIR}" 700
     verify_owner_mode "${SECRET_DIR}" 700
@@ -122,8 +168,11 @@ verify_installation() {
 }
 
 verify_rollout() {
-    local repository_config
+    local repository_config snapshot_id
 
+    command -v systemctl >/dev/null || die "systemctl is unavailable" 69
+    command -v flock >/dev/null || die "flock is unavailable" 69
+    require_quiescent_rollout
     verify_installation
     command -v restic >/dev/null || die "restic is unavailable" 69
     command -v jq >/dev/null || die "jq is unavailable" 69
@@ -143,11 +192,15 @@ verify_rollout() {
         (.backup.lastSuccess.snapshotId | type == "string") and
         (.restore.lastSuccess.snapshotId == .backup.lastSuccess.snapshotId)
     ' "${STATUS_FILE}" >/dev/null || die "manual backup and exact-snapshot restore evidence is incomplete" 65
+    snapshot_id=$(jq -er '.backup.lastSuccess.snapshotId' "${STATUS_FILE}") ||
+        die "backup snapshot identity is unavailable" 65
 
-    repository_config=$(RESTIC_PASSWORD_FILE="${PASSWORD_FILE}" restic -r "${BACKUP_ROOT}" cat config) ||
+    repository_config=$(RESTIC_PASSWORD_FILE="${PASSWORD_FILE}" restic --no-cache -r "${BACKUP_ROOT}" cat config) ||
         die "restic repository cannot be opened" 74
     jq -e '.version == 2' <<<"${repository_config}" >/dev/null ||
         die "restic repository is not format version 2" 65
+    verify_repository_snapshot "${snapshot_id}" ||
+        die "exact integrity-checked snapshot is absent from the current repository" 65
 
     printf '%s\n' 'backup rollout prerequisites and exact-snapshot restore evidence verified'
 }
@@ -177,4 +230,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

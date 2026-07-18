@@ -22,8 +22,8 @@
       "type": "string",
       "enum": [
         "BACKUP_BUSY",
+        "BACKUP_SIGNALLED",
         "CAPACITY_FLOOR_NOT_MET",
-        "CLEANUP_FAILED",
         "DEPLOY_IN_PROGRESS",
         "DUMP_FAILED",
         "INTEGRITY_CHECK_FAILED",
@@ -31,7 +31,6 @@
         "INVALID_STATUS",
         "PARTIAL_SNAPSHOT_FORGET_FAILED",
         "REPOSITORY_FAILED",
-        "RESTORE_FAILED",
         "RESTORE_CLEANUP_FAILED",
         "RESTORE_PROFILE_FAILED",
         "RESTORE_SIGNALLED",
@@ -54,7 +53,12 @@
         "resultCode": { "$ref": "#/$defs/resultCode" },
         "durationSeconds": { "type": "integer", "minimum": 0 },
         "snapshotId": { "$ref": "#/$defs/snapshotId" },
-        "interruptedCandidateCount": { "type": "integer", "minimum": 0 },
+        "interruptedCandidateCount": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 0 }
+          ]
+        },
         "retentionSucceeded": { "type": ["boolean", "null"] }
       }
     },

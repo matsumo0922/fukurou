@@ -7,7 +7,9 @@ on:
       - ".env.example"
       - "docker-compose.prod.yml"
       - "scripts/deploy/**"
+      - "scripts/backup/**"
       - "fukurou/src/test/kotlin/me/matsumo/fukurou/ReleaseDeployFoundationContractTest.kt"
+      - "fukurou/src/test/kotlin/me/matsumo/fukurou/DatabaseBackupRestoreContractTest.kt"
       - "docs/deploy.md"
   workflow_dispatch:
 
@@ -46,6 +48,25 @@ jobs:
           scripts/deploy/deploy-postgres-selftest
           scripts/deploy/canary-compose-selftest
 
+      - name: Install backup validation tools
+        run: sudo apt-get update && sudo apt-get install --yes postgresql-client restic
+
+      - name: Validate backup and restore contracts
+        run: |
+          bash -n \
+            scripts/backup/backup-common \
+            scripts/backup/backup-fukurou \
+            scripts/backup/backup-selftest \
+            scripts/backup/backup-postgres-selftest \
+            scripts/backup/install-fukurou-backup \
+            scripts/backup/install-selftest \
+            scripts/backup/restore-fukurou \
+            scripts/backup/restore-selftest
+          scripts/backup/backup-selftest
+          scripts/backup/install-selftest
+          scripts/backup/restore-selftest
+          FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest
+
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
@@ -55,4 +76,7 @@ jobs:
       - name: Run file-level deploy contract test
         env:
           GRADLE_USER_HOME: ${{ runner.temp }}/gradle-deploy-validation
-        run: ./gradlew :fukurou:test --tests me.matsumo.fukurou.ReleaseDeployFoundationContractTest
+        run: >-
+          ./gradlew :fukurou:test
+          --tests me.matsumo.fukurou.ReleaseDeployFoundationContractTest
+          --tests me.matsumo.fukurou.DatabaseBackupRestoreContractTest

@@ -535,6 +535,7 @@ directoryとpasswordの作成、recovery copyの保管、repository初期化はi
 
 ```sh
 sudo install -d -o root -g root -m 0700 \
+  /srv/fukurou/backups \
   /srv/fukurou/backups/postgres \
   /srv/fukurou/monitoring \
   /srv/fukurou/secrets
@@ -570,7 +571,7 @@ systemctl is-enabled fukurou-postgres-backup.timer || true
 systemctl is-enabled fukurou-postgres-restore-drill.timer || true
 ```
 
-install後のentrypointは`/usr/local/libexec/fukurou/{backup-common,backup-fukurou,restore-fukurou}`、profileは`/usr/local/share/fukurou/`、unitは`/etc/systemd/system/`にある。entrypointはroot:root 0555、profileとunitはroot:root 0444、backup/status/secret directoryはroot:root 0700である。unitにsecretは埋め込まず、`FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou`だけを固定する。`github-runner`のsudo authorityは`/usr/local/sbin/deploy-fukurou`だけであり、backup/restore権限を追加しない。
+install後のentrypointは`/usr/local/libexec/fukurou/{backup-common,backup-fukurou,restore-fukurou}`、profileは`/usr/local/share/fukurou/`、unitは`/etc/systemd/system/`にある。entrypointはroot:root 0555、profileとunitはroot:root 0444、backup/status/secret directoryはroot:root 0700である。installerはshared backup lockをnon-blockingで取得し、backup/restore serviceとtimerがすべてinactiveである場合だけartifactを置換する。unitにsecretは埋め込まず、`FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou`だけを固定する。`github-runner`のsudo authorityは`/usr/local/sbin/deploy-fukurou`だけであり、backup/restore権限を追加しない。
 
 ### 初回 backup / restore gate
 
@@ -588,7 +589,7 @@ sudo jq . /srv/fukurou/monitoring/backup-status.json
 sudo ./scripts/backup/install-fukurou-backup verify-rollout
 ```
 
-backupとrestoreの`lastSuccess.snapshotId`が同じであり、backupがintegrity-checked、restoreがschema/invariant/cleanup成功を示すことを確認する。status directory/fileはroot:root 0700/0600である。restore所有label/prefixのcontainer、network、volume、temporary resourceが残っていないことも確認する。Docker global pruneは行わない。
+backupとrestoreの`lastSuccess.snapshotId`が同じであり、そのexact IDが現在開いているrepositoryの固定host/pathと`fukurou-postgres,integrity-checked` AND tagsで一意に存在し、backupがintegrity-checked、restoreがschema/invariant/cleanup成功を示すことを確認する。status directory/fileはroot:root 0700/0600である。restore所有label/prefixのcontainer、network、volume、temporary resourceが残っていないことも確認する。Docker global pruneは行わない。
 
 初回backupの成功によってcustom dumpが固定60秒bound内に完了したことを確認し、`durationSeconds`はdump、repository write、full-stream integrity readを含むattempt全体の実測時間として記録する。capacity floorを満たさない場合、last-known-good backup/restoreのいずれかがない場合、cleanup failureがある場合はtimerをdisabledのままにする。完全なdeploy/backup相互排他が必要な場合はdeploy executorをこのchangeで変更せず、別changeとして設計する。
 
@@ -623,7 +624,9 @@ sudo jq '{updatedAt, backup, restore}' /srv/fukurou/monitoring/backup-status.jso
 - `WATCHDOG_TERMINATION_FAILED`: 対象backendのPID/application identityを確認できていない。timerを止め、production lock影響を調査する。
 - `INTEGRITY_CHECK_FAILED` / `SNAPSHOT_IDENTITY_FAILED`: retention/pruneを行わずrepositoryとattempt-tagged candidateをroot-onlyで調査する。
 - `RETENTION_FAILED`: integrity-checked snapshot evidenceは残るがhousekeepingは失敗している。repositoryを確認してmanual retentionを判断する。
-- `RESTORE_*` / `CLEANUP_FAILED`: last verified restoreは更新されない。own label/prefixのresourceだけを確認・cleanupし、global pruneを行わない。
+- `BACKUP_SIGNALLED`: backup serviceがsignalで中断された。`lastSuccess`は維持されるため、候補snapshotとjournalを確認してから再実行する。
+- `RESTORE_CLEANUP_FAILED`: last verified restoreは更新されない。前回の強制終了で残ったものを含め、`me.matsumo.fukurou.restore.attempt` labelを持つresourceだけを確認・cleanupし、global pruneを行わない。stale resourceが1件でもある間、次のdrillは新しいresourceを作らない。
+- その他の`RESTORE_*`: exact integrity-checked snapshotの存在、`/postgres.dump`のcustom archive、profile/invariantを順に確認する。last verified restoreは更新されない。
 - `INVALID_STATUS` / `STATUS_PUBLICATION_FAILED`: automationを止め、completeな旧status、repository evidence、filesystemを調べる。
 
 ### Repository/status repair
@@ -631,6 +634,7 @@ sudo jq '{updatedAt, backup, restore}' /srv/fukurou/monitoring/backup-status.jso
 statusがmalformedまたはunsupportedな場合はtimerを無効にし、root-only directory内でstatusをquarantineする。repositoryのsnapshot、fixed tag/host/path、last integrity evidenceを確認する。status fileが存在しない状態では次のmanual backupがschema v1を初期化するため、そのbackupとrestore gateをやり直す。破損statusを手編集でsuccessへ変えない。
 
 interrupted attempt-tagged candidateは自動削除しない。対象snapshotをexact IDでfull-stream検証し、必要性を確認してからmanual `restic forget`を`--prune`なしで行う。その後に`restic check`を完了し、orphan packがないことを確認した場合だけchecked pruneを別操作で行う。repository integrityが不確実な間は`forget --prune`や`prune`を行わない。
+statusの`interruptedCandidateCount`が`null`の場合はrepository照合自体が失敗した未知状態であり、0件として扱わない。
 
 ```sh
 sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \

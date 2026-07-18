@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+BACKUP_PRE_SOURCE_LOCK_HELD=false
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  readonly PRE_SOURCE_BACKUP_LOCK_FILE="${FUKUROU_BACKUP_LOCK_FILE:-/var/lock/fukurou-backup.lock}"
+  readonly PRE_SOURCE_FLOCK_BIN="${FUKUROU_FLOCK_BIN:-flock}"
+  if ! command -v "${PRE_SOURCE_FLOCK_BIN}" >/dev/null 2>&1 ||
+    ! { exec 9>"${PRE_SOURCE_BACKUP_LOCK_FILE}"; } 2>/dev/null ||
+    ! "${PRE_SOURCE_FLOCK_BIN}" -n 9 2>/dev/null; then
+    printf '%s\n' 'fukurou-backup: result=BACKUP_BUSY' >&2
+    exit 1
+  fi
+  BACKUP_PRE_SOURCE_LOCK_HELD=true
+fi
+readonly BACKUP_PRE_SOURCE_LOCK_HELD
+
 readonly SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly COMMON_PATH="${FUKUROU_BACKUP_COMMON_PATH:-${SCRIPT_DIRECTORY}/backup-common}"
 # shellcheck source=scripts/backup/backup-common
@@ -21,6 +35,7 @@ readonly CLEANUP_TIMEOUT_SECONDS="${FUKUROU_RESTORE_CLEANUP_TIMEOUT_SECONDS:-30}
 readonly VALIDATION_TIMEOUT_SECONDS="${FUKUROU_RESTORE_VALIDATION_TIMEOUT_SECONDS:-30}"
 readonly RESTORE_RUNTIME_DIRECTORY="${FUKUROU_RESTORE_RUNTIME_DIRECTORY:-/run/fukurou-restore}"
 readonly RESTORE_IMAGE=postgres:16
+readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
 
 attempt=""
 container_name=""
@@ -34,9 +49,6 @@ constraint_count=0
 attempt_publishable=false
 active_process_id=""
 started_millis=0
-container_created=false
-network_created=false
-volume_created=false
 
 epoch_millis() {
   printf '%s\n' "$(( $(date -u '+%s') * 1000 ))"
@@ -78,21 +90,42 @@ owned_resource_count() {
   printf '%s\n' "$(( containers + networks + volumes ))"
 }
 
+all_restore_resource_count() {
+  local containers networks volumes
+  containers="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" "${DOCKER_BIN}" ps -aq --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')" || return 1
+  networks="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" "${DOCKER_BIN}" network ls -q --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')" || return 1
+  volumes="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" "${DOCKER_BIN}" volume ls -q --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')" || return 1
+  printf '%s\n' "$(( containers + networks + volumes ))"
+}
+
 cleanup_owned_resources() {
   local cleanup_failed=false
+  local identifiers identifier
 
-  if [[ "${container_created}" == "true" ]]; then
+  identifiers="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" ps -aq --filter "label=${ownership_label}" --filter "name=^/${container_name}$" 2>/dev/null)" || cleanup_failed=true
+  while IFS= read -r identifier; do
+    [[ -n "${identifier}" ]] || continue
     "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
-      "${DOCKER_BIN}" rm -f -- "${container_name}" >/dev/null 2>&1 || cleanup_failed=true
-  fi
-  if [[ "${network_created}" == "true" ]]; then
+      "${DOCKER_BIN}" rm -f -- "${identifier}" >/dev/null 2>&1 || cleanup_failed=true
+  done <<<"${identifiers}"
+
+  identifiers="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" network ls -q --filter "label=${ownership_label}" --filter "name=^${network_name}$" 2>/dev/null)" || cleanup_failed=true
+  while IFS= read -r identifier; do
+    [[ -n "${identifier}" ]] || continue
     "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
-      "${DOCKER_BIN}" network rm -- "${network_name}" >/dev/null 2>&1 || cleanup_failed=true
-  fi
-  if [[ "${volume_created}" == "true" ]]; then
+      "${DOCKER_BIN}" network rm -- "${identifier}" >/dev/null 2>&1 || cleanup_failed=true
+  done <<<"${identifiers}"
+
+  identifiers="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" volume ls -q --filter "label=${ownership_label}" --filter "name=^${volume_name}$" 2>/dev/null)" || cleanup_failed=true
+  while IFS= read -r identifier; do
+    [[ -n "${identifier}" ]] || continue
     "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
-      "${DOCKER_BIN}" volume rm -- "${volume_name}" >/dev/null 2>&1 || cleanup_failed=true
-  fi
+      "${DOCKER_BIN}" volume rm -- "${identifier}" >/dev/null 2>&1 || cleanup_failed=true
+  done <<<"${identifiers}"
+
   if [[ -n "${credential_directory}" ]]; then
     rm -rf -- "${credential_directory}" || cleanup_failed=true
   fi
@@ -133,19 +166,17 @@ handle_signal() {
 trap handle_signal INT TERM
 
 prepare_resources() {
-  mkdir -p -- "${RESTORE_RUNTIME_DIRECTORY}"
-  chmod 0700 "${RESTORE_RUNTIME_DIRECTORY}"
-  credential_directory="$(mktemp -d "${RESTORE_RUNTIME_DIRECTORY}/${attempt}.XXXXXX")"
-  chmod 0700 "${credential_directory}"
-  "${OPENSSL_BIN}" rand -hex 32 >"${credential_directory}/postgres-password" 2>/dev/null
-  chmod 0400 "${credential_directory}/postgres-password"
+  mkdir -p -- "${RESTORE_RUNTIME_DIRECTORY}" || return 1
+  chmod 0700 "${RESTORE_RUNTIME_DIRECTORY}" || return 1
+  credential_directory="$(mktemp -d "${RESTORE_RUNTIME_DIRECTORY}/${attempt}.XXXXXX")" || return 1
+  chmod 0700 "${credential_directory}" || return 1
+  "${OPENSSL_BIN}" rand -hex 32 >"${credential_directory}/postgres-password" 2>/dev/null || return 1
+  chmod 0400 "${credential_directory}/postgres-password" || return 1
 
   "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${START_TIMEOUT_SECONDS}" \
-    "${DOCKER_BIN}" network create --internal --label "${ownership_label}" "${network_name}" >/dev/null 2>&1
-  network_created=true
+    "${DOCKER_BIN}" network create --internal --label "${ownership_label}" "${network_name}" >/dev/null 2>&1 || return 1
   "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${START_TIMEOUT_SECONDS}" \
-    "${DOCKER_BIN}" volume create --label "${ownership_label}" "${volume_name}" >/dev/null 2>&1
-  volume_created=true
+    "${DOCKER_BIN}" volume create --label "${ownership_label}" "${volume_name}" >/dev/null 2>&1 || return 1
   "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${START_TIMEOUT_SECONDS}" "${DOCKER_BIN}" run --detach \
     --name "${container_name}" \
     --label "${ownership_label}" \
@@ -160,8 +191,7 @@ prepare_resources() {
     --pids-limit 256 \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
     --tmpfs /var/run/postgresql:rw,nosuid,nodev,size=16m \
-    "${RESTORE_IMAGE}" >/dev/null 2>&1
-  container_created=true
+    "${RESTORE_IMAGE}" >/dev/null 2>&1 || return 1
 }
 
 wait_for_postgres() {
@@ -177,9 +207,9 @@ wait_for_postgres() {
 }
 
 restore_snapshot() {
-  export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_BIN DOCKER_BIN container_name snapshot_id
+  export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_BIN DOCKER_BIN BACKUP_STDIN_PATH container_name snapshot_id
   "${SETSID_BIN}" "${TIMEOUT_BIN}" --foreground --signal=TERM --kill-after=10 "${RESTORE_TIMEOUT_SECONDS}" \
-    bash -c 'set -o pipefail; "${RESTIC_BIN}" --no-cache --repo "${RESTIC_REPOSITORY}" --password-file "${RESTIC_PASSWORD_FILE}" dump "${snapshot_id}" /stdin 2>/dev/null | "${DOCKER_BIN}" exec -i "${container_name}" pg_restore --username=fukurou_restore --dbname=fukurou_restore --no-owner --no-acl --exit-on-error --single-transaction 2>/dev/null' &
+    bash -c 'set -o pipefail; "${RESTIC_BIN}" --no-cache --repo "${RESTIC_REPOSITORY}" --password-file "${RESTIC_PASSWORD_FILE}" dump "${snapshot_id}" "${BACKUP_STDIN_PATH}" 2>/dev/null | "${DOCKER_BIN}" exec -i "${container_name}" pg_restore --username=fukurou_restore --dbname=fukurou_restore --no-owner --no-acl --exit-on-error --single-transaction 2>/dev/null' &
   active_process_id=$!
   local restore_status=0
   wait "${active_process_id}" || restore_status=$?
@@ -189,6 +219,15 @@ restore_snapshot() {
     return 124
   fi
   return "${restore_status}"
+}
+
+verify_snapshot_authority() {
+  local snapshots
+  snapshots="$("${RESTIC_BIN}" --no-cache --repo "${RESTIC_REPOSITORY}" --password-file "${RESTIC_PASSWORD_FILE}" \
+    snapshots --json --host "${BACKUP_HOST}" --path "${BACKUP_STDIN_PATH}" \
+    --tag fukurou-postgres,integrity-checked "${snapshot_id}" 2>/dev/null)" || return 1
+  [[ "$(jq -er 'length' <<<"${snapshots}")" == "1" ]] || return 1
+  [[ "$(jq -er '.[0].id' <<<"${snapshots}")" == "${snapshot_id}" ]]
 }
 
 docker_psql_command() {
@@ -271,7 +310,7 @@ main() {
   fi
   [[ -r "${INVENTORY_FILE}" && -r "${CRITICAL_TABLES_FILE}" && -r "${INVARIANTS_FILE}" ]] || { backup_emit_result RESTORE_START_FAILED; return 1; }
 
-  STATUS_JSON="$(backup_load_status)" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  STATUS_JSON="$(backup_load_status)" || { backup_emit_result INVALID_STATUS; return 1; }
   snapshot_id="$(backup_status_snapshot_id "${STATUS_JSON}")" || { backup_emit_result RESTORE_START_FAILED; return 1; }
   attempt_publishable=true
   attempt="restore-$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
@@ -279,7 +318,25 @@ main() {
   container_name="${attempt}-postgres"
   network_name="${attempt}-network"
   volume_name="${attempt}-data"
-  ownership_label="me.matsumo.fukurou.restore.attempt=${attempt}"
+  ownership_label="${RESTORE_LABEL_KEY}=${attempt}"
+
+  if ! verify_snapshot_authority; then
+    publish_result RESTORE_SNAPSHOT_FAILED false || true
+    backup_emit_result RESTORE_SNAPSHOT_FAILED
+    return 1
+  fi
+
+  local stale_resource_count
+  stale_resource_count="$(all_restore_resource_count)" || {
+    publish_result RESTORE_CLEANUP_FAILED false || true
+    backup_emit_result RESTORE_CLEANUP_FAILED
+    return 1
+  }
+  if [[ "${stale_resource_count}" != "0" ]]; then
+    publish_result RESTORE_CLEANUP_FAILED false || true
+    backup_emit_result RESTORE_CLEANUP_FAILED
+    return 1
+  fi
 
   if ! prepare_resources || ! wait_for_postgres; then
     cleanup_owned_resources || { publish_result RESTORE_CLEANUP_FAILED false || true; backup_emit_result RESTORE_CLEANUP_FAILED; return 1; }

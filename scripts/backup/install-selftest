@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT INT TERM
+
+export FUKUROU_BACKUP_LOCK_FILE="${SELFTEST_ROOT}/backup.lock"
+# shellcheck source=scripts/backup/install-fukurou-backup
+source "${SELFTEST_DIRECTORY}/install-fukurou-backup"
+
+fail() {
+    printf 'install-selftest: %s\n' "$1" >&2
+    exit 1
+}
+
+active_unit=""
+systemctl() {
+    if [[ $1 == is-active ]]; then
+        [[ ${3:-} == "${active_unit}" ]]
+        return
+    fi
+    return 1
+}
+
+flock_result=0
+flock() {
+    printf '%s\n' "$*" >"${SELFTEST_ROOT}/flock.log"
+    return "${flock_result}"
+}
+
+all_rollout_units_inactive || fail 'inactive rollout units were rejected'
+active_unit=fukurou-postgres-backup.service
+if all_rollout_units_inactive; then
+    fail 'active backup service was accepted'
+fi
+active_unit=fukurou-postgres-restore-drill.timer
+if all_rollout_units_inactive; then
+    fail 'active restore timer was accepted'
+fi
+
+active_unit=""
+acquire_install_lock || fail 'shared install lock was not acquired'
+[[ $(<"${SELFTEST_ROOT}/flock.log") == '-n 9' ]] || fail 'installer did not request a non-blocking fd lock'
+exec 9>&-
+flock_result=1
+if acquire_install_lock; then fail 'contended shared install lock was accepted'; fi
+exec 9>&-
+
+readonly SNAPSHOT_ID=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+snapshot_fixture='[]'
+restic() {
+    printf '%s\n' "${snapshot_fixture}"
+}
+
+if verify_repository_snapshot "${SNAPSHOT_ID}"; then
+    fail 'missing current-repository snapshot was accepted'
+fi
+snapshot_fixture="[{\"id\":\"${SNAPSHOT_ID}\"}]"
+verify_repository_snapshot "${SNAPSHOT_ID}" || fail 'exact current-repository snapshot was rejected'
+snapshot_fixture='[{"id":"aaaaaaaa"},{"id":"bbbbbbbb"}]'
+if verify_repository_snapshot "${SNAPSHOT_ID}"; then
+    fail 'ambiguous current-repository snapshot result was accepted'
+fi
+
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed snapshot=current-repository-exact\n'
