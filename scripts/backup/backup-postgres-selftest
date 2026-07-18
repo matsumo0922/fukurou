@@ -39,6 +39,16 @@ readonly application_container="${fixture_id}-application"
 readonly source_network="${fixture_id}-network"
 readonly source_volume="${fixture_id}-data"
 readonly source_revision=0123456789abcdef0123456789abcdef01234567
+phase=fixture-setup
+
+report_failure() {
+  local exit_code="$?"
+  printf 'BACKUP_POSTGRES_SELFTEST_FAILED phase=%s\n' "${phase}" >&2
+  if [[ "${phase}" == production-backup-entrypoint && -f "${fixture_root}/backup-stderr" ]]; then
+    grep -E '^fukurou-backup: result=[A-Z_]+$' "${fixture_root}/backup-stderr" >&2 || true
+  fi
+  exit "${exit_code}"
+}
 
 cleanup() {
   docker rm -f -- "${source_container}" >/dev/null 2>&1 || true
@@ -52,6 +62,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
+trap report_failure ERR
 
 mkdir -p "${fixture_root}/profiles" "${fixture_root}/repository" "${fixture_root}/run"
 chmod 0700 "${fixture_root}" "${fixture_root}/repository" "${fixture_root}/run"
@@ -153,6 +164,7 @@ restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture
 
 # Seed fifteen distinct daily generations. The production entrypoint below must create the
 # newest generation and prune this fixed retention group back to fourteen.
+phase=retention-fixture-seed
 for day_offset in $(seq 15 -1 1); do
   snapshot_time="$(python3 - "${day_offset}" <<'PY'
 import datetime
@@ -169,6 +181,7 @@ PY
     <"${fixture_root}/fixture.dump"
 done
 
+phase=production-backup-entrypoint
 env \
   FUKUROU_POSTGRES_CONTAINER="${source_container}" \
   FUKUROU_APPLICATION_CONTAINER="${application_container}" \
@@ -182,6 +195,7 @@ env \
   RESTIC_PASSWORD_FILE="${fixture_root}/restic-password" \
   "${BACKUP_SCRIPT}" >"${fixture_root}/backup-stdout" 2>"${fixture_root}/backup-stderr"
 
+phase=production-backup-verification
 [[ ! -s "${fixture_root}/backup-stdout" ]]
 [[ "$(<"${fixture_root}/backup-stderr")" == 'fukurou-backup: result=SUCCESS' ]]
 if grep -F -e 'integration-password' -e 'integration-restic-password' \
@@ -202,6 +216,7 @@ snapshot_json="$(restic --no-cache --repo "${fixture_root}/repository" --passwor
 restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
   dump "${snapshot_id}" /postgres.dump | docker exec -i "${source_container}" pg_restore --list >/dev/null
 
+phase=restore-entrypoint
 cat >"${fixture_root}/backup-common" <<COMMON
 RESTIC_REPOSITORY="\${RESTIC_REPOSITORY}"
 RESTIC_PASSWORD_FILE="\${RESTIC_PASSWORD_FILE}"
@@ -240,4 +255,5 @@ docker inspect "${source_container}" >/dev/null
 production_after="$(docker inspect --format '{{.Id}}' fukurou-postgres 2>/dev/null || true)"
 [[ "${production_after}" == "${production_before}" ]]
 
+phase=complete
 printf 'BACKUP_POSTGRES_SELFTEST_OK backup-entrypoint=real retention=pruned redaction=verified restore=postgres16 profile=validated constraints=preserved production=unchanged cleanup=owned-only\n'

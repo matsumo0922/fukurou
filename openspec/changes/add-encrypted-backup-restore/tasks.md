@@ -3,7 +3,7 @@
 - [x] 1.1 Add the versioned status JSON schema, stable result-code allowlist, and versioned restore inventory/profile contracts.
 - [x] 1.2 Add deterministic backup fixtures for success, producer/consumer split pipeline failure, full archive drain with early list completion, PID-and-application rechecked backend termination, watchdog cancel/reap, non-target preservation/disappearance, tag-induced snapshot-ID replacement, interrupted candidate preservation, current-attempt partial forget without prune, dump timeout, capacity floor, repository/status failure, secret redaction, atomic publication, lock contention, integrity no-prune, and comma-separated AND retention semantics.
 - [x] 1.3 Add deterministic restore fixtures for exact snapshot selection, PostgreSQL 16 isolation, invariant failure, timeout/signal cleanup, cleanup failure reporting, and zero leaked owned resources.
-- [x] 1.4 Add repository contract tests for script syntax, installed ownership/unit hardening, unchanged sudo authority, production container identity parity, and manifest drift across Exposed tables, deploy-foundation SQL, bootstrap SQL, evaluation-report SQL, and documentation wiring.
+- [x] 1.4 Add repository contract tests for script syntax, installed ownership/unit hardening, unchanged sudo authority, production container identity parity, invariant-column and critical-primary-key drift, manifest drift across Exposed tables, deploy-foundation SQL, bootstrap SQL, evaluation-report SQL, and documentation wiring.
 
 ## 2. Backup producer
 
