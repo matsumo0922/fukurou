@@ -65,8 +65,10 @@ fun main(args: Array<String>) {
     }
     val phase = LlmInvocationPhase.valueOf(requireNotNull(args.getOrNull(0)))
     val provider = LlmProvider.valueOf(requireNotNull(args.getOrNull(1)))
+    val invocationId = args.getOrNull(2) ?: CANARY_INVOCATION_ID
     require(phase in CANARY_PHASES)
-    generateArtifacts(phase, provider)
+    require(invocationId.matches(Regex("[a-zA-Z0-9._:-]+"))) { "Invalid canary invocation ID." }
+    generateArtifacts(phase, provider, invocationId)
 }
 
 private fun probeGatewayRejection(manifestId: String, mismatch: String) {
@@ -170,7 +172,11 @@ private fun cleanupArtifacts(paths: List<Path>) = runBlocking {
     ShellProcessRunner().cleanup(command).getOrThrow()
 }
 
-private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) {
+private fun generateArtifacts(
+    phase: LlmInvocationPhase,
+    provider: LlmProvider,
+    invocationId: String,
+) {
     val config = TradingBotConfig.fromEnvironment()
     val shortTools = when (phase) {
         LlmInvocationPhase.PROPOSER -> CANONICAL_PROPOSER_MCP_TOOL_NAMES
@@ -182,14 +188,14 @@ private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) 
         -> error("Unsupported canary phase.")
     }
     val context = DecisionRunContext(
-        decisionRunId = CANARY_INVOCATION_ID,
+        decisionRunId = invocationId,
         llmProvider = provider.name.lowercase(),
         promptHash = "fixture",
         systemPromptVersion = "fixture",
         marketSnapshotId = "fixture",
     )
     val capability = McpLaunchManifestWriter().write(
-        invocationId = CANARY_INVOCATION_ID,
+        invocationId = invocationId,
         phase = phase,
         context = context,
         allowedTools = shortTools.toList(),
@@ -204,7 +210,7 @@ private fun generateArtifacts(phase: LlmInvocationPhase, provider: LlmProvider) 
     val serverName = DEFAULT_RUNNER_MCP_SERVER_NAME
     val allowedTools = shortTools.map { tool -> "mcp__${serverName}__$tool" }
     val request = LlmInvocationRequest(
-        invocationId = CANARY_INVOCATION_ID,
+        invocationId = invocationId,
         provider = provider,
         phase = phase,
         prompt = "deterministic canary fixture",
