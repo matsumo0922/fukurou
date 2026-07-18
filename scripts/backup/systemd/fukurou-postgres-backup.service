@@ -11,6 +11,7 @@ UMask=0077
 Environment=FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou
 ExecStart=/usr/local/libexec/fukurou/backup-fukurou
 TimeoutStartSec=20min
+TimeoutStopSec=7min
 KillMode=control-group
 NoNewPrivileges=yes
 PrivateDevices=yes

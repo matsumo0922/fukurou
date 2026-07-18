@@ -3,6 +3,8 @@
 ### Requirement: Production PostgreSQL receives scheduled encrypted logical backup attempts
 A root-owned timer MUST attempt a PostgreSQL 16 custom-format logical backup once per calendar day and store successful snapshots only in an encrypted same-NAS restic repository. It MUST reach the host-unpublished database through the fixed production container without placing the production database password in inspect output, dump arguments/environment, or host artifacts. It MUST bound the database-locking dump phase to 60 seconds with an independent exact-backend termination watchdog, and MUST NOT persist a plaintext dump, database password, or repository password in a filesystem artifact, process argument, log, or status document. The cadence is an attempt schedule and MUST NOT be represented as guaranteed daily success.
 
+The Docker-backed integration contract MUST execute the production backup entrypoint itself against real PostgreSQL 16 and restic, and MUST cover its retention prune and redacted output rather than reproducing the orchestration as test-only commands.
+
 #### Scenario: Daily backup succeeds
 - **WHEN** production PostgreSQL is reachable and the encrypted repository is healthy
 - **THEN** the job streams a custom-format dump into a restic snapshot and records its exact non-secret identity, source revision, integrity time, and successful attempt time
@@ -80,6 +82,8 @@ Backup and restore jobs MUST share a non-blocking root lock and MUST probe the p
 ### Requirement: Weekly restore drills use an exact snapshot and disposable PostgreSQL
 A weekly root-owned drill MUST restore the exact last integrity-checked snapshot into a disposable PostgreSQL 16 instance that shares no production container name, network, volume, host port, or database credential. It MUST restore data and schema with owner and ACL replay disabled, because code-owned deployment bootstrap remains the role/privilege authority. It MUST validate the versioned schema manifest, constraints, critical tables, and data invariants inside read-only transactions without starting application schema bootstrap, and MUST NOT claim to validate MCP role or ACL recovery.
 
+Repository contract tests MUST bind every column referenced by the invariant SQL and every critical-table primary-key assumption to the current code-owned schema authority, so a column rename or primary-key removal fails before a production restore drill.
+
 #### Scenario: Scheduled restore drill succeeds
 - **WHEN** the exact verified snapshot restores successfully, every profile invariant passes, and all owned disposable resources are removed
 - **THEN** the drill records snapshot identity, verified time, measured duration, and non-secret verification counts as last-known-good restore evidence
@@ -96,9 +100,13 @@ A weekly root-owned drill MUST restore the exact last integrity-checked snapshot
 - **WHEN** restore and invariant validation pass but any owned container, network, volume, or temporary resource remains
 - **THEN** the drill reports cleanup failure and does not advance last verified restore evidence
 
+#### Scenario: Additional signals arrive during cleanup
+- **WHEN** HUP, INT, or TERM starts owned-resource cleanup and another HUP, INT, or TERM arrives before cleanup finishes
+- **THEN** the cleanup continues within a service stop timeout longer than its worst-case bound and the process is not killed between container, network, and volume removal
+
 #### Scenario: A previous drill left owned resources
 - **WHEN** a previous force-killed or interrupted drill left any resource with the restore ownership label
-- **THEN** the next drill reports cleanup failure before creating new resources and does not hide the leak behind a later successful attempt
+- **THEN** the next drill reports cleanup failure before creating new resources and does not hide the leak behind a later successful attempt, and an unencrypted residual restore volume is handled as a data-at-rest incident
 
 #### Scenario: Isolation contract is inspected
 - **WHEN** fixture tests inspect the disposable restore resources and child arguments
@@ -136,11 +144,11 @@ Backup automation MUST publish a schema-versioned status document using same-dir
 - **THEN** the directory is root-owned mode 0700 and the status file is root-owned mode 0600
 
 ### Requirement: Root automation requires an explicit rollout gate
-Systemd services and timers MUST be root-owned, use fixed installed entrypoints without embedded secrets, remain disabled by installation, and be enabled only after a manual backup and restore drill succeed. Artifact installation MUST hold the shared backup lock and MUST fail while any backup or restore service or timer is active. Rollout verification MUST require the latest backup attempt to be `SUCCESS` with successful retention, the latest restore attempt to be `SUCCESS`, both attempts to identify their matching last-success snapshot, and both last-success records to identify the same snapshot. It MUST also require both systemd services to have executed in the current boot and their latest results to be successful with zero exit status, so a status publication failure, reboot-cleared execution result, or unexecuted unit default cannot expose stale success evidence as the latest attempt. It MUST confirm that exact snapshot exists uniquely in the current repository under the fixed host, stdin path, and production-plus-integrity AND tags. It MUST use bounded Docker inventory calls to confirm that no container, network, or volume with the restore ownership label remains. The change MUST NOT expand `github-runner` sudo authority.
+Systemd services and timers MUST be root-owned, use fixed installed entrypoints without embedded secrets, remain disabled by installation, and be enabled only after a manual backup and restore drill succeed. Artifact installation MUST hold the shared backup lock and MUST fail while any backup or restore service or timer is active. After artifact placement and daemon reload, installation MUST atomically publish a root-only marker that binds the installed artifact aggregate hash and installation timestamp. Installation and rollout verification MUST reject a missing, malformed, incorrectly owned, or hash-mismatched marker. Rollout verification MUST require the latest backup attempt to be `SUCCESS` with successful retention, the latest restore attempt to be `SUCCESS`, both attempts to identify their matching last-success snapshot, and both last-success records to identify the same snapshot. It MUST also require both systemd services to have executed in the current boot and their latest results to be successful with zero exit status. Both service wall-clock start timestamps, both attempt timestamps, status `updatedAt`, and status file evidence MUST postdate the install marker and fall within the fixed 24-hour freshness age. A status publication failure, reinstall, reboot-cleared execution result, expired evidence, or unexecuted unit default MUST NOT expose stale success evidence as current. It MUST confirm that exact snapshot exists uniquely in the current repository under the fixed host, stdin path, and production-plus-integrity AND tags. It MUST use bounded Docker inventory calls to confirm that no container, network, or volume with the restore ownership label remains. The change MUST NOT expand `github-runner` sudo authority.
 
 #### Scenario: Units are installed before the first drill
 - **WHEN** the operator installs commands, profiles, services, and timers
-- **THEN** no scheduled backup or restore begins until the operator explicitly enables the timers
+- **THEN** a root-only hash-bound install marker is published and no scheduled backup or restore begins until the operator explicitly enables the timers
 
 #### Scenario: Installation overlaps a backup or restore job
 - **WHEN** the shared backup lock is owned or any backup or restore service or timer is active
@@ -153,6 +161,14 @@ Systemd services and timers MUST be root-owned, use fixed installed entrypoints 
 #### Scenario: A failed latest attempt preserves older success evidence
 - **WHEN** backup retention or restore cleanup fails after an earlier successful backup and restore
 - **THEN** rollout verification rejects the stale last-success evidence and the timers remain disabled
+
+#### Scenario: Artifacts are reinstalled after a successful drill
+- **WHEN** the install marker is newer than the service, attempt, status timestamp, or status file evidence
+- **THEN** rollout verification rejects the pre-install evidence and requires a new manual backup and restore drill
+
+#### Scenario: Installed artifacts drift or evidence expires
+- **WHEN** the installed aggregate hash differs from the marker or any required evidence is older than 24 hours
+- **THEN** installation or rollout verification fails and the timers remain disabled
 
 #### Scenario: Restore-owned resources remain after the drill
 - **WHEN** bounded Docker inventory finds any container, network, or volume with the restore ownership label

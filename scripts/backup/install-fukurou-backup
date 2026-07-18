@@ -12,10 +12,12 @@ readonly BACKUP_STDIN_PATH=/postgres.dump
 readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
 readonly DOCKER_LIST_TIMEOUT_SECONDS=30
 readonly SYSTEMCTL_QUERY_TIMEOUT_SECONDS=30
+readonly ROLLOUT_MAX_EVIDENCE_AGE_SECONDS=86400
 readonly STATUS_DIR=/srv/fukurou/monitoring
 readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
 readonly SECRET_DIR=/srv/fukurou/secrets
 readonly PASSWORD_FILE=${SECRET_DIR}/restic-password
+readonly INSTALL_MARKER=${SHARE_DIR}/backup-installation-v1.json
 readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly UNIT_SOURCE_DIR=${SCRIPT_DIR}/systemd
 
@@ -162,12 +164,103 @@ verify_rollout_services_succeeded() {
     done
 }
 
+installed_artifact_paths() {
+    local artifact
+
+    for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
+        printf '%s\n' "${LIBEXEC_DIR}/${artifact}"
+    done
+    for artifact in "${SHARE_ARTIFACTS[@]}"; do
+        printf '%s\n' "${SHARE_DIR}/${artifact}"
+    done
+    for artifact in "${UNIT_ARTIFACTS[@]}"; do
+        printf '%s\n' "${UNIT_DIR}/${artifact}"
+    done
+}
+
+calculate_installed_artifact_hash() {
+    local path digest manifest=""
+
+    while IFS= read -r path; do
+        [[ -f ${path} && ! -L ${path} ]] || return 1
+        digest=$(sha256sum "${path}" | awk '{print $1}') || return 1
+        [[ ${digest} =~ ^[0-9a-f]{64}$ ]] || return 1
+        manifest+="${path} ${digest}"$'\n'
+    done < <(installed_artifact_paths)
+    printf '%s' "${manifest}" | sha256sum | awk '{print $1}'
+}
+
+verify_install_marker() {
+    local marker_file=$1 expected_hash=$2
+
+    jq -e --arg expected_hash "${expected_hash}" '
+        type == "object" and
+        (keys | sort) == (["artifactAggregateSha256", "installedAt", "schemaVersion"] | sort) and
+        .schemaVersion == 1 and
+        (.installedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+        .artifactAggregateSha256 == $expected_hash
+    ' "${marker_file}" >/dev/null
+}
+
+write_install_marker() {
+    local aggregate_hash installed_at temporary
+
+    aggregate_hash=$(calculate_installed_artifact_hash) || return 1
+    installed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    temporary=$(mktemp "${SHARE_DIR}/.backup-installation-v1.json.tmp.XXXXXX") || return 1
+    if ! jq -cn --arg installed_at "${installed_at}" --arg aggregate_hash "${aggregate_hash}" \
+        '{schemaVersion:1,installedAt:$installed_at,artifactAggregateSha256:$aggregate_hash}' >"${temporary}" ||
+        ! chown root:root "${temporary}" || ! chmod 0400 "${temporary}" || ! sync -f "${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    mv -f -- "${temporary}" "${INSTALL_MARKER}" || { rm -f -- "${temporary}"; return 1; }
+    sync -f "${SHARE_DIR}"
+}
+
+evidence_is_fresh_after_install() {
+    local evidence_epoch=$1 marker_epoch=$2 now_epoch=$3
+
+    [[ ${evidence_epoch} =~ ^[0-9]+$ && ${marker_epoch} =~ ^[0-9]+$ && ${now_epoch} =~ ^[0-9]+$ ]] || return 1
+    (( evidence_epoch > marker_epoch && evidence_epoch <= now_epoch )) || return 1
+    (( now_epoch - evidence_epoch <= ROLLOUT_MAX_EVIDENCE_AGE_SECONDS ))
+}
+
+verify_rollout_freshness_epochs() {
+    local marker_epoch=$1 backup_service_epoch=$2 restore_service_epoch=$3
+    local backup_attempt_epoch=$4 restore_attempt_epoch=$5 status_updated_epoch=$6
+    local status_file_epoch=$7 now_epoch=$8
+    local evidence_epoch
+
+    for evidence_epoch in \
+        "${backup_service_epoch}" "${restore_service_epoch}" \
+        "${backup_attempt_epoch}" "${restore_attempt_epoch}" \
+        "${status_updated_epoch}" "${status_file_epoch}"; do
+        evidence_is_fresh_after_install "${evidence_epoch}" "${marker_epoch}" "${now_epoch}" || return 1
+    done
+    (( backup_attempt_epoch >= backup_service_epoch )) || return 1
+    (( restore_attempt_epoch >= restore_service_epoch )) || return 1
+    (( status_updated_epoch >= backup_attempt_epoch && status_updated_epoch >= restore_attempt_epoch ))
+}
+
+timestamp_epoch() {
+    date -u -d "$1" '+%s'
+}
+
+read_service_start_wall_clock() {
+    timeout --signal=TERM --kill-after=5 "${SYSTEMCTL_QUERY_TIMEOUT_SECONDS}" \
+        systemctl show --property=ExecMainStartTimestamp --value "$1" 2>/dev/null
+}
+
 install_artifacts() {
     local artifact
 
     command -v install >/dev/null || die "install command is unavailable" 69
     command -v systemctl >/dev/null || die "systemctl is unavailable" 69
     command -v flock >/dev/null || die "flock is unavailable" 69
+    command -v sha256sum >/dev/null || die "sha256sum is unavailable" 69
+    command -v jq >/dev/null || die "jq is unavailable" 69
+    command -v sync >/dev/null || die "sync is unavailable" 69
 
     require_quiescent_rollout
 
@@ -189,14 +282,17 @@ install_artifacts() {
     done
 
     systemctl daemon-reload
+    write_install_marker || die "installation marker publication failed" 74
     verify_installation
     printf '%s\n' 'backup artifacts installed; timers remain disabled until the manual rollout gate passes'
 }
 
 verify_installation() {
-    local artifact
+    local artifact aggregate_hash
 
     command -v systemd-analyze >/dev/null || die "systemd-analyze is unavailable" 69
+    command -v sha256sum >/dev/null || die "sha256sum is unavailable" 69
+    command -v jq >/dev/null || die "jq is unavailable" 69
     verify_owner_mode "${LIBEXEC_DIR}" 555
     verify_owner_mode "${SHARE_DIR}" 755
     verify_owner_mode "${BACKUP_PARENT}" 700
@@ -217,12 +313,19 @@ verify_installation() {
             die "unit embeds secret-like assignment: ${artifact}"
         fi
     done
+    [[ -f ${INSTALL_MARKER} && ! -L ${INSTALL_MARKER} ]] || die "installation marker is missing or symbolic" 66
+    verify_owner_mode "${INSTALL_MARKER}" 400
+    aggregate_hash=$(calculate_installed_artifact_hash) || die "installed artifact aggregate hash is unavailable" 74
+    verify_install_marker "${INSTALL_MARKER}" "${aggregate_hash}" ||
+        die "installation marker does not match installed artifacts" 65
 
     printf '%s\n' 'backup installation verified'
 }
 
 verify_rollout() {
-    local repository_config snapshot_id
+    local repository_config snapshot_id installed_at marker_epoch now_epoch
+    local backup_service_started restore_service_started backup_service_epoch restore_service_epoch
+    local backup_attempt_epoch restore_attempt_epoch status_updated_epoch status_file_epoch
 
     command -v systemctl >/dev/null || die "systemctl is unavailable" 69
     command -v flock >/dev/null || die "flock is unavailable" 69
@@ -257,8 +360,30 @@ verify_rollout() {
         die "restore-owned Docker resources remain or cannot be enumerated" 65
     verify_rollout_services_succeeded ||
         die "latest backup or restore systemd service result is not successful" 65
+    installed_at=$(jq -er '.installedAt' "${INSTALL_MARKER}") ||
+        die "installation marker timestamp is unavailable" 65
+    backup_service_started=$(read_service_start_wall_clock fukurou-postgres-backup.service) ||
+        die "backup service wall-clock start timestamp is unavailable" 65
+    restore_service_started=$(read_service_start_wall_clock fukurou-postgres-restore-drill.service) ||
+        die "restore service wall-clock start timestamp is unavailable" 65
+    marker_epoch=$(timestamp_epoch "${installed_at}") || die "installation marker timestamp is invalid" 65
+    backup_service_epoch=$(timestamp_epoch "${backup_service_started}") || die "backup service timestamp is invalid" 65
+    restore_service_epoch=$(timestamp_epoch "${restore_service_started}") || die "restore service timestamp is invalid" 65
+    backup_attempt_epoch=$(timestamp_epoch "$(jq -er '.backup.lastAttempt.attemptedAt' "${STATUS_FILE}")") ||
+        die "backup attempt timestamp is invalid" 65
+    restore_attempt_epoch=$(timestamp_epoch "$(jq -er '.restore.lastAttempt.attemptedAt' "${STATUS_FILE}")") ||
+        die "restore attempt timestamp is invalid" 65
+    status_updated_epoch=$(timestamp_epoch "$(jq -er '.updatedAt' "${STATUS_FILE}")") ||
+        die "status update timestamp is invalid" 65
+    status_file_epoch=$(stat -c '%Y' "${STATUS_FILE}") || die "status file timestamp is unavailable" 65
+    now_epoch=$(date -u '+%s') || die "current wall clock is unavailable" 65
+    verify_rollout_freshness_epochs \
+        "${marker_epoch}" "${backup_service_epoch}" "${restore_service_epoch}" \
+        "${backup_attempt_epoch}" "${restore_attempt_epoch}" "${status_updated_epoch}" \
+        "${status_file_epoch}" "${now_epoch}" ||
+        die "backup, restore, or status evidence is stale or predates the installed artifacts" 65
 
-    printf '%s\n' 'latest backup retention, exact-snapshot restore, repository, cleanup, and service results verified'
+    printf '%s\n' 'installed artifacts and fresh backup, restore, repository, cleanup, and service evidence verified'
 }
 
 usage() {

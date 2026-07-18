@@ -27,4 +27,4 @@ Issue #190 のうち exact-SHA quality gate と monotonic deploy intent は main
 - `scripts/backup/` に root command、status/profile contract、selftest、systemd templates を追加する。
 - `docs/deploy.md`、`docs/design.md`、README に現在の backup scope、rollout、restore drill、manual recovery を記載する。
 - NAS operator は merge 後に restic の導入、root-owned secret/directory/repository の初期化、reviewed artifact の install、初回 backup/restore drill、timer enable を行う。
-- Ktor route、production compose、deploy workflow/executor、`github-runner` sudoers、DB schema は変更しない。
+- Ktor route、production compose、production deploy workflow/executor、`github-runner` sudoers、DB schema は変更しない。backup contractを検証するstepは既存の`deploy-validation.yml`へ追加する。

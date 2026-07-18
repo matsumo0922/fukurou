@@ -36,6 +36,7 @@ readonly VALIDATION_TIMEOUT_SECONDS="${FUKUROU_RESTORE_VALIDATION_TIMEOUT_SECOND
 readonly RESTORE_RUNTIME_DIRECTORY="${FUKUROU_RESTORE_RUNTIME_DIRECTORY:-/run/fukurou-restore}"
 readonly RESTORE_IMAGE=postgres:16
 readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
+readonly INVARIANT_EXPECTED_SELECT_COUNT=5
 
 attempt=""
 container_name=""
@@ -160,7 +161,8 @@ publish_and_emit_result() {
 }
 
 handle_signal() {
-  trap - INT TERM
+  local exit_code="$1"
+  trap '' HUP INT TERM
   local result=RESTORE_SIGNALLED
   if [[ -n "${active_process_id}" ]]; then
     kill -TERM -- "-${active_process_id}" >/dev/null 2>&1 || true
@@ -168,10 +170,12 @@ handle_signal() {
   fi
   cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
   publish_and_emit_result "${result}" false || true
-  exit 143
+  exit "${exit_code}"
 }
 
-trap handle_signal INT TERM
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 prepare_resources() {
   mkdir -p -- "${RESTORE_RUNTIME_DIRECTORY}" || return 1
@@ -293,9 +297,13 @@ validate_constraints() {
 }
 
 validate_readonly_invariants() {
-  local output
+  local output profile_select_count output_line_count
+  profile_select_count="$(grep -Eic '^[[:space:]]*SELECT([[:space:]]|$)' "${INVARIANTS_FILE}")" || return 1
+  [[ "${profile_select_count}" == "${INVARIANT_EXPECTED_SELECT_COUNT}" ]] || return 1
   output="$(docker_psql_file)" || return 1
   [[ -n "${output}" ]] || return 1
+  output_line_count="$(awk 'END { print NR }' <<<"${output}")"
+  [[ "${output_line_count}" == "${INVARIANT_EXPECTED_SELECT_COUNT}" ]] || return 1
   ! grep -Ev '^0$' <<<"${output}" >/dev/null
 }
 

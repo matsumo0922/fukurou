@@ -67,6 +67,14 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(installer.contains("systemctl show --property=ExecMainStartTimestampMonotonic --value"))
         assertTrue(installer.contains("timeout --signal=TERM --kill-after=5"))
         assertTrue(installer.contains("label=\${RESTORE_LABEL_KEY}"))
+        assertTrue(installer.contains("readonly INSTALL_MARKER=\${SHARE_DIR}/backup-installation-v1.json"))
+        assertTrue(installer.contains("calculate_installed_artifact_hash"))
+        assertTrue(installer.contains("write_install_marker || die"))
+        assertTrue(installer.contains("verify_owner_mode \"\${INSTALL_MARKER}\" 400"))
+        assertTrue(installer.contains("verify_install_marker \"\${INSTALL_MARKER}\" \"\${aggregate_hash}\""))
+        assertTrue(installer.contains("readonly ROLLOUT_MAX_EVIDENCE_AGE_SECONDS=86400"))
+        assertTrue(installer.contains("ExecMainStartTimestamp --value"))
+        assertTrue(installer.contains("verify_rollout_freshness_epochs"))
         assertTrue(installer.contains("die \"disable \${timer} before continuing\" 75"))
         assertFalse(installer.contains("systemctl enable"))
         assertFalse(installer.contains("restic -r \"\${BACKUP_ROOT}\" init"))
@@ -78,7 +86,7 @@ class DatabaseBackupRestoreContractTest {
         val validationWorkflow = root.resolve(".github/workflows/deploy-validation.yml").readText()
         assertTrue(
             validationWorkflow.contains(
-                "FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest",
+                "sudo env FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest",
             ),
         )
     }
@@ -98,6 +106,7 @@ class DatabaseBackupRestoreContractTest {
             assertTrue(service.contains("Environment=FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou"), name)
             assertTrue(service.contains("ExecStart=$entrypoint"), name)
             assertTrue(service.contains("TimeoutStartSec="), name)
+            assertTrue(service.contains("TimeoutStopSec=7min"), name)
             assertTrue(service.contains("KillMode=control-group"), name)
             assertTrue(service.contains("NoNewPrivileges=yes"), name)
             assertTrue(service.contains("ProtectSystem=strict"), name)
@@ -203,6 +212,45 @@ class DatabaseBackupRestoreContractTest {
     }
 
     @Test
+    fun `restore invariant columns and critical primary keys follow schema authority`() {
+        val exposed = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/TradingTables.kt"),
+        )
+        val foundation = Files.readString(root.resolve("scripts/deploy/sql/deploy-foundation-v1.sql"))
+        val schemaTables = parseExposedSchemaTables(exposed) + parseSqlSchemaTables(foundation)
+        val invariantSql = Files.readString(backupDirectory.resolve("restore-readonly-invariants-v1.sql"))
+        val invariantReferences = parseQualifiedInvariantReferences(invariantSql)
+        val expectedInvariantReferences = setOf(
+            "paper_account.btc_quantity",
+            "paper_account.cash_jpy",
+            "paper_account.id",
+            "paper_account.initial_cash_jpy",
+            "paper_account.mode",
+            "paper_account.total_equity_jpy",
+            "runtime_config_versions.status",
+            "runtime_config_versions.id",
+            "runtime_config_values.version_id",
+            "executions.account_epoch_id",
+            "executions.execution_semantics_version",
+            "executions.runtime_config_hash",
+            "paper_account_epochs.id",
+        )
+
+        assertEquals(expectedInvariantReferences, invariantReferences)
+        invariantReferences.forEach { reference ->
+            val (table, column) = reference.split('.', limit = 2)
+            assertTrue(schemaTables.getValue(table).columns.contains(column), "$reference is absent from schema authority")
+        }
+
+        val criticalTables = Files.readAllLines(backupDirectory.resolve("restore-critical-tables-v1.txt"))
+            .filterNot { line -> line.isBlank() || line.startsWith("#") }
+            .map { line -> line.substringAfterLast(' ') }
+        criticalTables.forEach { table ->
+            assertTrue(schemaTables.getValue(table).hasPrimaryKey, "$table has no primary key in schema authority")
+        }
+    }
+
+    @Test
     fun `operator documentation states the limited recovery contract`() {
         val readme = Files.readString(root.resolve("README.md"))
         val deploy = Files.readString(root.resolve("docs/deploy.md"))
@@ -219,7 +267,63 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(deploy.contains("systemctl enable --now fukurou-postgres-backup.timer"))
         assertTrue(deploy.contains("Production database replacement boundary"))
         assertTrue(deploy.contains("github-runner`のsudo authorityは`/usr/local/sbin/deploy-fukurou`だけ"))
+        val restoreContainerInventory = deploy.indexOf("docker ps -a --filter \"label=\${restore_label}\"")
+        val restoreNetworkInventory = deploy.indexOf("docker network ls --filter \"label=\${restore_label}\"")
+        val restoreVolumeInventory = deploy.indexOf("docker volume ls --filter \"label=\${restore_label}\"")
+        assertTrue(restoreContainerInventory >= 0)
+        assertTrue(restoreContainerInventory < restoreNetworkInventory)
+        assertTrue(restoreNetworkInventory < restoreVolumeInventory)
+        assertTrue(deploy.contains("data-at-rest incident"))
+        assertTrue(deploy.contains("global pruneは使わない"))
     }
+}
+
+private data class SchemaTableContract(
+    val columns: Set<String>,
+    val hasPrimaryKey: Boolean,
+)
+
+private fun parseExposedSchemaTables(source: String): Map<String, SchemaTableContract> {
+    val tableBlocks = Regex(
+        """(?ms)^object\s+\w+\s*:\s*Table\("([a-z][a-z0-9_]*)"\)\s*\{(.*?)(?=^object\s+\w+\s*:\s*Table|\z)""",
+    )
+    val column = Regex("""(?ms)^\s*val\s+\w+\s*=\s*\w+\(\s*"([a-z][a-z0-9_]*)"""")
+
+    return tableBlocks.findAll(source).associate { match ->
+        val body = match.groupValues[2]
+        match.groupValues[1] to SchemaTableContract(
+            columns = column.findAll(body).map { it.groupValues[1] }.toSet(),
+            hasPrimaryKey = body.contains("override val primaryKey = PrimaryKey("),
+        )
+    }
+}
+
+private fun parseSqlSchemaTables(source: String): Map<String, SchemaTableContract> {
+    val tableBlocks = Regex(
+        """(?ims)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z][a-z0-9_]*)\s*\((.*?)^\);""",
+    )
+    val column = Regex("""(?m)^\s{4}([a-z][a-z0-9_]*)\s+[A-Z]""")
+
+    return tableBlocks.findAll(source).associate { match ->
+        val body = match.groupValues[2]
+        match.groupValues[1] to SchemaTableContract(
+            columns = column.findAll(body).map { it.groupValues[1] }.toSet(),
+            hasPrimaryKey = body.contains("PRIMARY KEY", ignoreCase = true),
+        )
+    }
+}
+
+private fun parseQualifiedInvariantReferences(source: String): Set<String> {
+    val aliases = Regex(
+        """(?i)\b(?:FROM|JOIN)\s+public\.([a-z][a-z0-9_]*)\s+(?:AS\s+)?([a-z][a-z0-9_]*)""",
+    ).findAll(source).associate { match -> match.groupValues[2] to match.groupValues[1] }
+
+    return Regex("""\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b""")
+        .findAll(source)
+        .mapNotNull { match ->
+            aliases[match.groupValues[1]]?.let { table -> "$table.${match.groupValues[2]}" }
+        }
+        .toSet()
 }
 
 private fun backupRepositoryRoot(): Path {

@@ -18,6 +18,7 @@ active_unit=""
 service_result=success
 service_exit_status=0
 service_start_monotonic=123456
+service_start_wall_clock='Sat 2026-07-18 00:01:00 UTC'
 systemctl() {
     if [[ $1 == is-active ]]; then
         [[ ${3:-} == "${active_unit}" ]]
@@ -33,6 +34,10 @@ systemctl() {
     fi
     if [[ $1 == show && $2 == --property=ExecMainStartTimestampMonotonic && $3 == --value ]]; then
         printf '%s\n' "${service_start_monotonic}"
+        return 0
+    fi
+    if [[ $1 == show && $2 == --property=ExecMainStartTimestamp && $3 == --value ]]; then
+        printf '%s\n' "${service_start_wall_clock}"
         return 0
     fi
     return 1
@@ -144,6 +149,27 @@ if verify_rollout_status "${SELFTEST_ROOT}/attempt-snapshot-mismatch.json"; then
     fail 'restore attempt and success snapshot mismatch was accepted'
 fi
 
+readonly MARKER_HASH=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+marker_fixture="${SELFTEST_ROOT}/backup-installation-v1.json"
+jq -cn --arg hash "${MARKER_HASH}" \
+    '{schemaVersion:1,installedAt:"2026-07-18T00:00:00Z",artifactAggregateSha256:$hash}' >"${marker_fixture}"
+verify_install_marker "${marker_fixture}" "${MARKER_HASH}" || fail 'matching installation marker was rejected'
+if verify_install_marker "${marker_fixture}" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; then
+    fail 'installation marker hash mismatch was accepted'
+fi
+
+verify_rollout_freshness_epochs 100 110 120 115 125 130 130 140 ||
+    fail 'fresh post-install rollout evidence was rejected'
+if verify_rollout_freshness_epochs 120 110 121 115 125 130 130 140; then
+    fail 'pre-install backup evidence survived reinstall'
+fi
+if verify_rollout_freshness_epochs 100 110 120 115 125 130 130 $((130 + ROLLOUT_MAX_EVIDENCE_AGE_SECONDS + 1)); then
+    fail 'expired rollout evidence was accepted'
+fi
+if verify_rollout_freshness_epochs 100 110 120 115 125 130 100 140; then
+    fail 'status file evidence predating installation was accepted'
+fi
+
 leaked_resource_kind=""
 docker() {
     printf '%s\n' "$*" >>"${SELFTEST_ROOT}/docker.log"
@@ -169,6 +195,8 @@ if grep -Fv -- "--filter label=${RESTORE_LABEL_KEY}" "${SELFTEST_ROOT}/docker.lo
 fi
 
 verify_rollout_services_succeeded || fail 'successful latest service results were rejected'
+[[ $(read_service_start_wall_clock fukurou-postgres-backup.service) == "${service_start_wall_clock}" ]] ||
+    fail 'service wall-clock start timestamp was not read through the bounded query'
 service_result=exit-code
 if verify_rollout_services_succeeded; then
     fail 'failed latest service result was accepted with stale status success'
@@ -184,4 +212,4 @@ if verify_rollout_services_succeeded; then
     fail 'unexecuted service defaults were accepted after reboot or before the first drill'
 fi
 
-printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed snapshot=current-repository-exact latest-attempts=required resources=zero services=successful\n'
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed marker=hash-bound freshness=post-install snapshot=current-repository-exact latest-attempts=required resources=zero services=successful\n'

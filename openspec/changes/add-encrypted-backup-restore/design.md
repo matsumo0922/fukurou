@@ -12,7 +12,7 @@ Production は PostgreSQL 16 を `/srv/fukurou` で運用し、root-owned deploy
 - integrity を確認できた snapshot を newest 14 daily generations 保持する。
 - exact verified snapshot を週次で isolated PostgreSQL 16 へ restoreし、schema/constraint/critical-table/read-only invariant と cleanup を検証する。
 - attempt と last-known-good evidence を分離した atomic・versioned・redacted status を公開する。
-- deterministic fixture、Docker integration drill、root systemd templates、operator runbook を同じ change に含める。
+- deterministic fixture、production backup entrypointを実PostgreSQL/resticで通すDocker integration drill、root systemd templates、operator runbook を同じ change に含める。
 
 **Non-Goals:**
 
@@ -52,7 +52,7 @@ restore drillはstatusのlast integrity-checked snapshot IDを明示選択し、
 
 restore後はapplication/bootstrapを起動せず、欠落schemaを自動作成して隠さない。versioned code-owned manifestは名前を列挙し、contract testが各entryを現行schema authorityへ結び付けて重複・driftを検出する。固定のtable数を設計へ転記しない。drillはmanifestの全table/view/sequence、unvalidated constraintが0であること、critical-table manifestのprimary key、`BEGIN READ ONLY`下のpaper account/runtime config/ledger lineage data invariantsを検証する。ここでread-onlyはquery transactionの非破壊性を意味し、MCP role/ACL検証を意味しない。legacy cohortのnullable lineageをcurrent writeと誤認してrejectしない。
 
-successは全検証とcontainer/network/volume/temp cleanupの完了を必要とする。global Docker pruneは行わず、own label/prefixだけを削除し、cleanup後のinventoryが空であることを確認する。次のdrillはresource作成前にrestore label全体を列挙し、前回のSIGKILLや電源断で残ったresourceが1件でもあれば`RESTORE_CLEANUP_FAILED`で停止する。
+successは全検証とcontainer/network/volume/temp cleanupの完了を必要とする。global Docker pruneは行わず、own label/prefixだけをcontainer、network、volumeの順で削除し、cleanup後のinventoryが空であることを確認する。signal cleanup開始後は追加のHUP/INT/TERMをmaskし、systemdのstop timeoutは全cleanup commandのworst-case boundより長く保つ。次のdrillはresource作成前にrestore label全体を列挙し、前回のSIGKILLや電源断で残ったresourceが1件でもあれば`RESTORE_CLEANUP_FAILED`で停止する。残留volumeは暗号化されていないproduction data copyなのでdata-at-rest incidentとしてmanual reclaimと記録を要求する。
 
 ### 5. （agent 仮決め）status schema v1はattemptとlast-known-goodを分ける
 
@@ -62,11 +62,11 @@ successは全検証とcontainer/network/volume/temp cleanupの完了を必要と
 
 ### 6. （agent 仮決め）installed authorityとtimerはdefault disabledにする
 
-repository scriptをsystemdから直接実行せず、reviewed exact revisionから `/usr/local/libexec/fukurou/` と `/usr/local/share/fukurou/` へroot-owned installする。installerはshared backup lockをnon-blockingで保持し、backup/restoreのserviceとtimerがすべてinactiveである場合だけartifactを置換する。serviceはroot oneshot、fixed `ExecStart`、restrictive umask/hardening、bounded timeoutを持つ。daily/weekly timerはpersistentかつrandomized delayを持つが、installだけではenableしない。timerはdaily/weeklyのattempt cadenceであり、lock/deploy/failureを越えた毎暦日のsuccessを保証しない。PR-4のalert導入まではoperatorがsystemd failureとroot-only statusを能動確認する。`github-runner` sudoersは変更しない。
+repository scriptをsystemdから直接実行せず、reviewed exact revisionから `/usr/local/libexec/fukurou/` と `/usr/local/share/fukurou/` へroot-owned installする。installerはshared backup lockをnon-blockingで保持し、backup/restoreのserviceとtimerがすべてinactiveである場合だけartifactを置換する。artifact配置とdaemon reload後、fixed pathのroot:root 0400 markerへinstalled artifact aggregate SHA-256とinstall UTC時刻をatomic publishする。verificationはmarkerのowner/mode/schema/hashを再計算し、欠損・drift・不正をfail closedにする。serviceはroot oneshot、fixed `ExecStart`、restrictive umask/hardening、bounded timeoutを持つ。daily/weekly timerはpersistentかつrandomized delayを持つが、installだけではenableしない。timerはdaily/weeklyのattempt cadenceであり、lock/deploy/failureを越えた毎暦日のsuccessを保証しない。PR-4のalert導入まではoperatorがsystemd failureとroot-only statusを能動確認する。`github-runner` sudoersは変更しない。
 
 ### 7. （高リスク・要人間確認）root rolloutをPR approval後のhandoffにする
 
-merge後、operatorはNASでrestic/systemdとpersistent install pathの利用可能性を確認し、root-owned backup/status/secret directoryとpasswordを作り、別管理のrecovery copyを保管し、compressionを有効にしたrestic repository format v2を初期化する。reviewed exact HEADのcommands/profile/unitsをinstallし、DB size、backup filesystem free space、manual dump所要時間を測定する。初回dumpが60秒bound内に完了しなければtimerをenableせず、deployとのcoordination方式を別changeで設計する。rollout verificationは最新backup attemptの`SUCCESS`かつretention成功、最新restore attemptの`SUCCESS`、attempt/last-success間とbackup/restore間のexact snapshot ID一致に加え、両systemd serviceが現在のbootで実行済みで最新結果がsuccessかつexit 0であることを要求する。そのsnapshotが現在開いているrepository内のfixed host/pathとAND tagsに一意に存在し、bounded Docker inventoryでrestore ownership labelを持つcontainer/network/volumeが0件であることを確認した後だけtimersをenableする。NAS再起動後はdrillを再実行し、status publication失敗後の古い`lastSuccess`や最新retention/cleanup失敗を成功へ読み替えない。secret値やdump内容は証跡に残さない。前提が満たせなければtimersをdisabledのままにする。
+merge後、operatorはNASでrestic/systemdとpersistent install pathの利用可能性を確認する。installerがroot-owned backup/status/secret directoryを作成し、operatorがpasswordを作って別管理のrecovery copyを保管し、compressionを有効にしたrestic repository format v2を初期化する。reviewed exact HEADのcommands/profile/unitsをinstallし、DB size、backup filesystem free space、manual dump所要時間を測定する。初回dumpが60秒bound内に完了しなければtimerをenableせず、deployとのcoordination方式を別changeで設計する。rollout verificationは最新backup attemptの`SUCCESS`かつretention成功、最新restore attemptの`SUCCESS`、attempt/last-success間とbackup/restore間のexact snapshot ID一致に加え、両systemd serviceが現在のbootで実行済みで最新結果がsuccessかつexit 0であることを要求する。両serviceのwall-clock開始、両attempt、status更新とfile evidenceはinstall marker後かつ24時間以内でなければならない。そのsnapshotが現在開いているrepository内のfixed host/pathとAND tagsに一意に存在し、bounded Docker inventoryでrestore ownership labelを持つcontainer/network/volumeが0件であることを確認した後だけtimersをenableする。NAS再起動またはartifact reinstall後はdrillを再実行し、status publication失敗後の古い`lastSuccess`、期限切れevidence、最新retention/cleanup失敗を成功へ読み替えない。secret値やdump内容は証跡に残さない。前提が満たせなければtimersをdisabledのままにする。
 
 ### 8. （ユーザー確認済み）production recoveryは明示operator actionのままにする
 

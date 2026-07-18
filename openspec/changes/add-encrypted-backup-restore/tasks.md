@@ -16,14 +16,14 @@
 
 - [x] 3.1 Implement exact integrity-checked snapshot selection and bounded restic-to-`pg_restore --no-owner --no-acl` streaming into a uniquely labelled disposable PostgreSQL 16 environment.
 - [x] 3.2 Implement versioned table/view/sequence/constraint, critical-table primary-key, and read-only paper-account/runtime-config/ledger-lineage invariant validation without application bootstrap.
-- [x] 3.3 Implement signal-safe owned-resource cleanup, cleanup postcondition checks, and restore status publication that advances last verified evidence only after cleanup succeeds.
-- [x] 3.4 Add a Docker-backed PostgreSQL integration selftest for real custom-format backup, restore, profile validation, constraint preservation, and production-resource non-interference.
+- [x] 3.3 Implement HUP/INT/TERM re-entry-safe owned-resource cleanup, cleanup postcondition checks, and restore status publication that advances last verified evidence only after cleanup succeeds.
+- [x] 3.4 Add a Docker-backed PostgreSQL integration selftest that executes the production backup entrypoint with real custom-format backup, retention prune, redaction, restore, profile validation, constraint preservation, and production-resource non-interference.
 
 ## 4. Root rollout artifacts
 
 - [x] 4.1 Add root-only install and verification commands for fixed backup/restore entrypoints, validation profiles, status/secret/repository directories, and disabled-by-default unit installation.
-- [x] 4.2 Add hardened root oneshot services and persistent randomized daily/weekly timers with bounded execution and no embedded secret.
-- [x] 4.3 Verify that the change does not modify `github-runner` sudoers, deploy executor/workflow, Ktor routes, production compose, or database schema.
+- [x] 4.2 Add hardened root oneshot services whose stop timeout exceeds worst-case cleanup, plus persistent randomized daily/weekly timers with bounded execution and no embedded secret.
+- [x] 4.3 Verify that the change does not modify `github-runner` sudoers, production deploy executor/workflow, Ktor routes, production compose, or database schema; the existing deploy-validation CI gate may receive backup contract validation.
 - [x] 4.4 Require successful latest backup retention and restore attempts, current-repository exact snapshot evidence, and bounded zero-resource cleanup inventory before rollout enablement.
 
 ## 5. Documentation
@@ -36,5 +36,5 @@
 
 - [x] 6.1 Pass strict OpenSpec validation, `bash -n`, deterministic backup/restore selftests, JSON schema/profile validation, and Docker integration selftest.
 - [x] 6.2 Through the shared validation lease, pass `make test`, `make detekt`, and `make build` at one exact HEAD and confirm a clean worktree apart from intended changes.
-- [x] 6.3 Pass clean-context design falsification and final G1-G5 implementation review, resolving every blocking finding before PR approval.
+- [ ] 6.3 Pass clean-context design falsification and final G1-G5 implementation review, resolving every blocking finding before PR approval.
 - [x] 6.4 Record the NAS root rollout as HANDOFF: install restic/artifacts, create and recoverably store the password, initialize repository, run first backup and exact-snapshot restore drill, verify modes/status/cleanup, then enable timers.

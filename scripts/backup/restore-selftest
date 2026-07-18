@@ -185,8 +185,16 @@ case "${command_name}" in
     case "${1:-}" in
       pg_isready)
         if [[ "${FIXTURE_SIGNAL_ON_READY:-false}" == true ]]; then
-          kill -TERM "${PPID}"
-          sleep 0.1
+          signal_target="${PPID}"
+          kill -s "${FIXTURE_PRIMARY_SIGNAL:-TERM}" "${signal_target}"
+          if [[ "${FIXTURE_REPEAT_SIGNALS:-false}" == true ]]; then
+            (
+              sleep 0.05
+              kill -HUP "${signal_target}" 2>/dev/null || true
+              kill -INT "${signal_target}" 2>/dev/null || true
+              kill -TERM "${signal_target}" 2>/dev/null || true
+            ) &
+          fi
         fi
         exit 0
         ;;
@@ -351,4 +359,25 @@ signal_directory="$(run_fixture signal RESTORE_SIGNALLED FIXTURE_SIGNAL_ON_READY
 grep -F 'RESTORE_SIGNALLED ' "${signal_directory}/publish.log" >/dev/null || fail 'signal attempt was not published'
 assert_no_owned_resources "${signal_directory}"
 
-printf 'RESTORE_SELFTEST_OK exact-snapshot=selected isolation=postgres16-owned-only invariants=fail-closed create-side-effects=cleaned timeout=cleaned signal=cleaned cleanup=reported owned-resources=zero\n'
+repeated_signal_directory="$(run_fixture repeated-signal-cleanup RESTORE_SIGNALLED FIXTURE_SIGNAL_ON_READY=true FIXTURE_PRIMARY_SIGNAL=HUP FIXTURE_REPEAT_SIGNALS=true)"
+grep -F 'RESTORE_SIGNALLED ' "${repeated_signal_directory}/publish.log" >/dev/null || fail 'HUP/repeated signal attempt was not published'
+assert_no_owned_resources "${repeated_signal_directory}"
+
+truncated_invariants="${FIXTURE_ROOT}/truncated-invariants.sql"
+cat >"${truncated_invariants}" <<'TRUNCATED'
+BEGIN TRANSACTION READ ONLY;
+SELECT 0;
+SELECT 0;
+SELECT 0;
+SELECT 0;
+COMMIT;
+TRUNCATED
+truncated_invariant_directory="$(run_fixture truncated-invariant-profile RESTORE_PROFILE_FAILED FUKUROU_RESTORE_INVARIANTS_FILE="${truncated_invariants}")"
+assert_no_owned_resources "${truncated_invariant_directory}"
+
+grep -F "trap '' HUP INT TERM" "${RESTORE_SCRIPT}" >/dev/null || fail 'cleanup does not mask repeated HUP/INT/TERM'
+for service in fukurou-postgres-backup.service fukurou-postgres-restore-drill.service; do
+  grep -Fx 'TimeoutStopSec=7min' "${SCRIPT_DIRECTORY}/systemd/${service}" >/dev/null || fail "${service}: stop timeout does not cover cleanup"
+done
+
+printf 'RESTORE_SELFTEST_OK exact-snapshot=selected isolation=postgres16-owned-only invariants=exact-five create-side-effects=cleaned timeout=cleaned signal=hup-repeat-safe cleanup=reported owned-resources=zero\n'

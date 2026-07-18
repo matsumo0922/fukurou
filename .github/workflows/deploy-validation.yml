@@ -65,7 +65,7 @@ jobs:
           scripts/backup/backup-selftest
           scripts/backup/install-selftest
           scripts/backup/restore-selftest
-          FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest
+          sudo env FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
