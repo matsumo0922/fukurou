@@ -151,8 +151,10 @@ if (phase === "PROPOSER") {
     intent_id: intentId, verdict: "APPROVED", llm_provider: "codex", reason_ja: "canary fixture",
   });
 } else {
+  const invocationId = process.env.FUKUROU_INVOCATION_ID;
+  if (!invocationId) throw new Error("canary invocation id is required");
   const decision = {
-    invocation_id: "mcp-canary-run", action: rroAction,
+    invocation_id: invocationId, action: rroAction,
     setup_tags: ["canary"], estimated_win_probability: "0", expected_r_multiple: "0",
     fact_check: "{}", self_review: "{}", reason_ja: "canary fixture",
   };

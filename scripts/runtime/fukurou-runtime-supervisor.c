@@ -73,6 +73,9 @@ static int launch_listener = -1;
 static pid_t application_pid = -1;
 static int application_reaped = 0;
 static int application_wait_status = 0;
+static pid_t accept_selftest_sender_pid = -1;
+static int accept_selftest_sender_reaped = 0;
+static int accept_selftest_sender_wait_status = 0;
 
 static int read_database_state(unsigned long long *generation, int *maintenance_enabled, unsigned *active_registrations);
 static int reconcile_database(void);
@@ -221,8 +224,13 @@ static void record_reaped_child(pid_t child, int status) {
         application_wait_status = status;
         return;
     }
+    if (child == accept_selftest_sender_pid) {
+        accept_selftest_sender_reaped = 1;
+        accept_selftest_sender_wait_status = status;
+        return;
+    }
     for (size_t index = 0; index < MAX_JOBS; index++) {
-        if (jobs[index].pid == child) {
+        if (jobs[index].pid == child && !jobs[index].root_reaped) {
             jobs[index].root_reaped = 1;
             jobs[index].wait_status = status;
             return;
@@ -920,12 +928,7 @@ static void accept_launch(int listener) {
 }
 
 static void reap_jobs(void) {
-    for (size_t index = 0; index < MAX_JOBS; index++) {
-        if (jobs[index].pid == 0 || jobs[index].root_reaped) continue;
-        int status = 0;
-        pid_t child = waitpid(jobs[index].pid, &status, WNOHANG);
-        if (child == jobs[index].pid) record_reaped_child(child, status);
-    }
+    drain_adopted_children();
     struct process_identity rogues[MAX_AI_PROCESSES];
     if (scan_ai_processes(rogues, 1) > 0) {
         cleanup_all_ai_jobs();
@@ -1382,20 +1385,31 @@ static int accept_selftest_case(enum accept_selftest_case test_case, unsigned no
     if (test_case == ACCEPT_JOB_FULL) {
         for (size_t index = 0; index < MAX_JOBS; index++) jobs[index].pid = 1;
     }
+    accept_selftest_sender_pid = -1;
+    accept_selftest_sender_reaped = 0;
+    accept_selftest_sender_wait_status = 0;
     pid_t sender = fork();
     if (sender < 0) return -1;
     if (sender == 0) _exit(send_accept_selftest_request(path, test_case, nonce_seed));
+    accept_selftest_sender_pid = sender;
     accept_launch(listener);
     for (size_t attempt = 0; attempt < 200; attempt++) {
         reap_jobs();
         if (available_job_slot() == 0 || test_case == ACCEPT_JOB_FULL) break;
         usleep(10000);
     }
-    int status = 0;
-    if (waitpid(sender, &status, 0) != sender) status = 0;
+    for (size_t attempt = 0; attempt < 100 && !accept_selftest_sender_reaped; attempt++) {
+        drain_adopted_children();
+        if (!accept_selftest_sender_reaped) usleep(1000);
+    }
+    int status = accept_selftest_sender_wait_status;
+    int sender_result = 0;
+    if (!accept_selftest_sender_reaped && waitpid(sender, &status, 0) != sender) sender_result = -1;
+    accept_selftest_sender_pid = -1;
     close(listener);
     unlink(path);
     if (test_case == ACCEPT_JOB_FULL) memset(jobs, 0, sizeof(jobs));
+    if (sender_result != 0) return -1;
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
@@ -1643,9 +1657,51 @@ static int cleanup_selftest(void) {
     return 0;
 }
 
+static int normal_completion_descendant_selftest(void) {
+    memset(jobs, 0, sizeof(jobs));
+    int response[2], ready[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, response) != 0 ||
+        pipe2(ready, O_CLOEXEC) != 0) return 125;
+    pid_t root = fork();
+    if (root < 0) return 125;
+    if (root == 0) {
+        close(response[0]); close(response[1]); close(ready[0]);
+        if (setpgid(0, 0) != 0) _exit(125);
+        pid_t descendant = fork();
+        if (descendant < 0) _exit(125);
+        if (descendant == 0) {
+            usleep(50000);
+            _exit(0);
+        }
+        if (write(ready[1], "1", 1) != 1) _exit(125);
+        _exit(0);
+    }
+    close(ready[1]);
+    if (setpgid(root, root) != 0 && errno != EACCES) return 125;
+    char value = 0;
+    if (read(ready[0], &value, 1) != 1) return 125;
+    close(ready[0]);
+    jobs[0] = (struct job){.pid = root, .pgid = root, .response_fd = response[0]};
+    for (size_t attempt = 0; attempt < 500 && available_job_slot() != 0; attempt++) {
+        reap_jobs();
+        usleep(10000);
+    }
+    int status = -1;
+    ssize_t received = recv(response[1], &status, sizeof(status), MSG_DONTWAIT);
+    close(response[1]);
+    if (available_job_slot() != 0 || received != (ssize_t)sizeof(status) || status != 0) return 125;
+    printf("NORMAL_COMPLETION_DESCENDANT_SELFTEST_OK adopted_descendant=reaped job_slot=released\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--protocol-selftest") == 0) return protocol_selftest();
     if (argc == 2 && strcmp(argv[1], "--cleanup-selftest") == 0) return cleanup_selftest();
+    if (argc == 2 && strcmp(argv[1], "--normal-completion-descendant-selftest") == 0) {
+        if (getpid() != 1 || getuid() != 0 || access("/proc/self/stat", R_OK) != 0) return 125;
+        signal(SIGPIPE, SIG_IGN);
+        return normal_completion_descendant_selftest();
+    }
     if (argc == 7 && strcmp(argv[1], "--deploy-operation-probe") == 0) {
         const char *catalog_hash = argv[2];
         if (strlen(catalog_hash) != 64) return 2;
