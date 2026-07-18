@@ -1,72 +1,90 @@
 ## ADDED Requirements
 
 ### Requirement: Exact candidate image proves pinned provider compatibility
-The release process MUST execute Claude Code 2.1.199 and Codex 0.142.5 from the exact candidate image through the production command renderer, fixed launcher, process runner, and versioned output adapter before production activation.
+The qualification process MUST execute Claude Code 2.1.199 and Codex 0.142.5 from the exact candidate image through the production command renderer, process runner, and versioned output adapter before merge approval.
 
 #### Scenario: Pinned phase matrix succeeds
 - **WHEN** Claude `PRE_FILTER`, Claude `PROPOSER`, Codex `FALSIFIER`, and Claude `REFLECTION` each return a complete supported output envelope with the configured canary model and semantic probe marker
-- **THEN** the canary records only a safe success result for each phase and permits the deploy gate to continue
+- **THEN** the canary records only a safe success result for each phase and the image may be considered provider-qualified
 
 #### Scenario: Provider contract is incompatible
-- **WHEN** authentication, process exit, output schema, configured or observed model, semantic marker, timeout, or cleanup validation fails for any phase
-- **THEN** the canary fails closed with a typed safe reason and production activation does not begin
+- **WHEN** authentication, process exit, output schema, configured model, supported observed model, semantic marker, timeout, or cleanup validation fails for any phase
+- **THEN** the canary fails closed with a typed safe reason and the image is not provider-qualified
+
+#### Scenario: Codex omits observed model identity
+- **WHEN** pinned Codex returns its supported complete JSONL contract without a model field
+- **THEN** the canary verifies configured `gpt-5.5` and the exact CLI/image pin, retains observed identity as unavailable, and does not infer a model from session files
 
 ### Requirement: No-tool and MCP phase policies are both exercised
 The canary MUST render `PRE_FILTER` and `REFLECTION` with an empty canonical tool policy and no MCP server, and MUST render `PROPOSER` and `FALSIFIER` with their exact canonical tool policy and a data-free fixture MCP server.
 
 #### Scenario: No-tool phase runs
 - **WHEN** the canary executes `PRE_FILTER` or `REFLECTION`
-- **THEN** the provider authenticates from the per-run copy, receives an explicit empty tool policy, and completes without resolving or invoking an MCP tool
+- **THEN** the provider authenticates from the per-run copy, receives an explicit empty tool policy, and completes without an MCP server
 
 #### Scenario: MCP phase resolves a canonical tool
 - **WHEN** the canary executes `PROPOSER` or `FALSIFIER`
-- **THEN** the provider resolves the canonical fixture tool, invokes it exactly once, and returns the run-specific nonce without receiving production DB or market data
+- **THEN** the provider resolves a canonical fixture tool, invokes it at least once, and returns a run-specific nonce without receiving production DB or market data
 
 #### Scenario: Tool policy or fixture call drifts
 - **WHEN** enabled tools differ from the phase canonical policy, an unknown tool is requested, the required probe call is absent, or the returned nonce differs
-- **THEN** the invocation fails before the deploy gate can authorize production activation
+- **THEN** the image is not provider-qualified
 
-### Requirement: Provider credentials remain isolated from deploy artifacts
-The deploy canary MUST mount only the existing provider auth source as read-only persistent input, copy only required auth files into per-run tmpfs, and MUST NOT mount or expose the production database, vault, Docker socket, raw credential, or raw provider output.
+### Requirement: Canary credentials are isolated from production credentials
+The acceptance harness MUST mount only a dedicated canary auth source as read-only persistent input, copy only required auth files into per-run tmpfs, and MUST NOT mount or expose the production auth source, database, vault, Docker socket, raw credential, or raw provider output.
 
-#### Scenario: Auth source is valid
-- **WHEN** a phase starts with a readable supported provider credential file
-- **THEN** the renderer copies it into the private per-run home, the provider authenticates, and the source content remains unchanged after cleanup
+#### Scenario: Dedicated auth source is valid and reusable
+- **WHEN** all four phases run from supported canary credential files across the requested matrix repetitions
+- **THEN** every phase authenticates from an independent per-run copy and the dedicated source remains reusable for the next phase
 
-#### Scenario: Auth source is missing or mutable
-- **WHEN** a required credential is absent, the auth mount is not read-only, or the source changes during the run
-- **THEN** the canary fails closed without printing the credential path, content, digest, prompt, stdout, or stderr
+#### Scenario: Dedicated auth source is missing or expires
+- **WHEN** a required credential is absent or remote refresh rotation makes the dedicated source unusable
+- **THEN** qualification fails without affecting the production auth source and without printing credential path, content, digest, prompt, stdout, or stderr
 
-#### Scenario: Production resources are inspected
+#### Scenario: Container resources are inspected
 - **WHEN** the acceptance container security contract is evaluated
-- **THEN** no production DB environment or mount, vault mount, Docker socket, production network, or trading mutation authority is present
+- **THEN** no production auth, DB environment or mount, vault mount, Docker socket, production network, or trading mutation authority is present
 
-### Requirement: Qualification and deployment use bounded repetition
-The same acceptance harness MUST support only a three-run merge qualification and a one-run production deploy gate over the complete four-phase matrix.
+### Requirement: Qualification repetition and image identity are explicit and bounded
+The exact-image harness MUST support only a one-run operator smoke and a three-run merge qualification over the complete four-phase matrix. Merge qualification MUST accept an immutable repository digest, resolve it once, and execute foundation plus all acceptance repetitions in one harness invocation against that resolved image.
 
 #### Scenario: Merge candidate is qualified
-- **WHEN** a final exact image is proposed for merge
-- **THEN** every phase succeeds three consecutive times on that image before the PR is considered qualified
+- **WHEN** a final immutable repository digest is proposed for merge
+- **THEN** one harness invocation runs foundation once and every acceptance phase three consecutive times on the same resolved image within the matrix deadline
 
-#### Scenario: Production deploy is evaluated
-- **WHEN** a signed deploy bundle reaches the candidate preflight stage
-- **THEN** every phase succeeds once after foundation preflight and before any production mutation
+#### Scenario: One-run smoke is requested
+- **WHEN** an operator invokes the harness with one repetition
+- **THEN** every phase executes once with the same validation semantics and the result is not represented as three-run merge qualification
 
 #### Scenario: Unsupported repetition is requested
 - **WHEN** the harness is invoked with a repetition count other than one or three
 - **THEN** it exits before mounting credentials or starting a provider process
 
-### Requirement: CLI auth preflight is a signed required deploy hook
-The signed deploy bundle, candidate capability catalog, installed executor contract, and dispatch receipt MUST require `CLI_AUTH_PREFLIGHT_V1` after `FOUNDATION_PREFLIGHT_V1` and before production compose mutation.
+#### Scenario: Mutable image reference is requested
+- **WHEN** merge qualification receives a tag, bare image ID, unresolved digest, or a resolved identity different from the requested repository digest
+- **THEN** it exits before foundation or provider execution and emits no qualification result
 
-#### Scenario: Both required hooks succeed
-- **WHEN** foundation isolation and the one-run CLI acceptance matrix both succeed for the signed candidate SHA and digest
-- **THEN** the executor may continue to the production deployment operations and records both hook dispatches
+### Requirement: Acceptance evidence composes with foundation evidence
+Merge qualification MUST bind the offline foundation result and the real-provider acceptance result to the single immutable image digest resolved by the same harness invocation, while keeping their security responsibilities distinct.
 
-#### Scenario: CLI auth hook fails
-- **WHEN** the candidate rejects the signed hook or any acceptance phase fails
-- **THEN** the executor preserves the current runtime, does not activate the candidate, and records no successful CLI auth dispatch
+#### Scenario: Both evidence sets succeed
+- **WHEN** the foundation canary proves fixed launcher, process cleanup, MCP/DB/tool isolation and the acceptance harness proves real auth, output schema, and provider MCP resolution for the same digest
+- **THEN** the harness emits one safe qualification record containing that digest and the PR may report the candidate image as merge-qualified
 
-#### Scenario: Bundle omits the CLI auth hook
-- **WHEN** a deploy bundle or catalog does not bind `CLI_AUTH_PREFLIGHT_V1` with the supported candidate hook profile and harness hash
-- **THEN** validation fails before the candidate canary or production mutation begins
+#### Scenario: Only one evidence set succeeds
+- **WHEN** foundation or real-provider evidence is missing, failed, or refers to a different image digest
+- **THEN** the PR MUST report qualification as incomplete
+
+### Requirement: Implementation remains within the reviewed PR boundary
+The code, test, script, and documentation implementation for this change MUST remain at or below 1,100 added/deleted lines, excluding the OpenSpec planning artifacts and recovered archive committed before implementation.
+
+#### Scenario: Implementation reaches the hard stop
+- **WHEN** the scoped implementation diff exceeds 1,100 added/deleted lines or cannot meet the limit without weakening a normative requirement
+- **THEN** implementation stops and the remaining responsibility is moved to a separate change before review continues
+
+### Requirement: Issue closure remains evidence-based
+The PR MUST distinguish completed Issue #189 DoD evidence from the deploy required hook that remains outside this change and MUST NOT close Issue #189 while that hook is absent.
+
+#### Scenario: Acceptance harness is merged without deploy wiring
+- **WHEN** this change is otherwise complete and merge-qualified
+- **THEN** Issue #189 remains open with the deploy-time smoke DoD marked incomplete

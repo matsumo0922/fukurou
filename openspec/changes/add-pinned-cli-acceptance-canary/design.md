@@ -1,95 +1,92 @@
 ## Context
 
-Issue #189 の renderer、versioned output adapter、typed failure、process cleanup、session retention、cost attribution は先行 PR で実装済みである。既存 `FOUNDATION_PREFLIGHT_V1` と `scripts/mcp-credential-isolation-check` は exact image、fixed launcher、MCP tool matrix、secret/process isolation を offline fixture で検証する一方、実 Claude/Codex credential と provider endpoint は使用せず、deploy bundle も foundation hook だけを要求する。
+Issue #189 の renderer、versioned output adapter、typed failure、process cleanup、session retention、cost attribution は先行 PR で実装済みである。既存 `FOUNDATION_PREFLIGHT_V1` と `scripts/mcp-credential-isolation-check` は exact image、fixed launcher、MCP tool matrix、secret/process isolation をoffline fixtureで検証する一方、実Claude/Codex credentialとprovider endpointは使用しない。
 
-`DeploymentPreflightMain` は supervisor PID 1 が JVM child を同期 wait する構造であるため、その child から同じ supervisor の launch socketを使うと deadlockする。実 provider canary は一回限りの JVM preflight childへ詰め込まず、candidate imageを通常の fixed-launch serviceとして起動した別 harnessから実行する必要がある。
-
-本変更は個人運用の実験システム向けである。新しい network proxy、credential broker、DB schema、汎用 canary framework は導入せず、#189 を閉じるための小さな phase matrixだけを常設する。
+実provider smokeを現行signed deploy hookへ直ちにrequired化すると、content hashで固定されたinstalled executor/harnessとmonotonic capability catalogによりhook導入前SHAへのhistorical rollbackを破壊する。このchangeはacceptance runtimeとmerge qualificationだけを実装し、deploy wiringはrollback contractと両立する別changeへstage-outする。
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- exact candidate image に pin された Claude Code 2.1.199 / Codex 0.142.5 を実 provider credential で起動する。
-- production の `DefaultLlmCommandRenderer`、fixed LLM launcher、`ShellProcessRunner`、`DefaultLlmOutputParser` を同じ invocation で通す。
-- Claude `PRE_FILTER`、Claude `PROPOSER`、Codex `FALSIFIER`、Claude `REFLECTION` の no-MCP / MCP matrixを検証する。
-- candidate activation 前に auth、output envelope、configured/observed model、MCP tool resolution、timeout、cleanupを fail closed で判定する。
-- production credential source、DB、vault、trading state、raw provider outputを canary artifactやログへ出さない。
+- exact candidate image にpinされたClaude Code 2.1.199 / Codex 0.142.5を専用credentialで起動する。
+- productionの `DefaultLlmCommandRenderer`、`ShellProcessRunner`、`DefaultLlmOutputParser` を同じinvocationで通す。
+- Claude `PRE_FILTER`、Claude `PROPOSER`、Codex `FALSIFIER`、Claude `REFLECTION` のno-MCP / MCP matrixを検証する。
+- auth、output envelope、configured model、Claude observed model、MCP tool resolution、timeout、cleanupをfail closedで判定する。
+- production credential source、DB、vault、trading state、raw provider outputをcanary artifactやログへ出さない。
 
 **Non-Goals:**
 
+- deploy executor、signed bundle、capability catalog、`CLI_AUTH_PREFLIGHT_V1` required hookへの接続。
+- hook導入前SHAを含むsigned historical rollback contractの変更。
+- fixed launcher、DB role、full MCP call matrix、process-tree isolationの再検証。これらは同一digestで実行するfoundation canaryの責務とする。
 - #154 pre-filter activation、daemon cadence、role assignmentの変更。
 - provider trafficのproxy、egress allowlist、sidecarなどの新しいnetwork topology。
-- production DBまたは実market dataを使うcanary。
-- SafetyFloor、paper/live order lifecycle、DB migrationの変更。
-- 既存 foundation canary が担う full MCP call matrix、DB role、read/write/secret/process isolationの再実装。
-- provider品質や投資判断の評価。
+- production DB、実market data、SafetyFloor、paper/live order lifecycle、DB migrationの変更。
 
 ## Decisions
 
-### 1. Signed hook と実 provider harness を二段に分ける
+### 1. 実provider acceptanceをdeploy wiringから分離する
 
-deploy bundle は `FOUNDATION_PREFLIGHT_V1` に続いて `CLI_AUTH_PREFLIGHT_V1` を required hook として署名する。candidate の `--canary-preflight cli-auth` は署名、candidate SHA/digest/catalog binding、closed pre-filter barrier、DB非搭載を検証する。その成功後だけ、root executor がbundleにhash固定された `scripts/cli-auth-acceptance-check` を exact digestへ実行する。
+本changeは `scripts/mcp-credential-isolation-check` に `--qualification --runs 3 --reuse-image <repository@sha256:digest>` と `--cli-acceptance --runs 1 --reuse-image <repository@sha256:digest>` を追加する。既存offline foundation modeの意味と既定動作は変えない。
 
-foundation と同様に「candidate自身がsigned hookを認識すること」と「外部harnessが実際のlifecycleを検証すること」を分ける。JVM preflight childからfixed launcherを呼ぶ案はsupervisorの同期waitとlaunch listenerが競合するため採用しない。
+merge qualification modeはmutable tagとbare image IDを拒否し、final imageのimmutable repository digestをDockerから一度だけresolveする。同じscript processと同じresolved referenceで既存foundation canaryを完了した後、実provider matrixを3回実行する。safe evidenceにはresolved digestと両stageの結果を1組だけ出力するため、別imageの成功を合成できない。
 
-### 2. acceptance-only supervisor mode を追加する
+`--cli-acceptance --runs 1` は同じimmutable referenceに対する短いoperator smokeとして提供するが、foundationとの合成やmerge qualificationとは表示しない。production deployからも自動起動しない。これによりrollback contractを暗黙に変更せず、次のdeploy wiring changeが同じharnessを再利用できる。
 
-runtime supervisor にPID 1専用の `--acceptance-service` を追加する。このmodeはlaunch socketとjob cleanup loopだけを起動し、Ktor application、control socket、DB reconciliationを起動しない。通常runtimeと同じprovider process spawn、timeout/cancel、acknowledged cleanupを再利用する。
+### 2. 専用credential sourceを使う
 
-任意commandを受ける汎用serviceにはしない。image内のfixed launcher protocolだけを受け、container終了時に全AI jobを回収する。これによりproduction DBを用意せずproduction launcher pathを検証できる。
+harnessはoperatorが事前loginしたDocker volume `llm-canary-auth` だけを `/canary-auth:ro` にmountする。production composeの `llm-auth` volumeはmountしない。rendererへ渡す環境はClaude/Codexのcanary auth source path、fixed CLI pin、private tmpfsだけであり、DB password、`.env`、vault、Docker socket、production network/volumeを含めない。
 
-### 3. canary driver は production renderer/parser を直接再利用する
+providerがrefresh tokenをrotationしても影響は専用canary credentialに限定される。harnessはphaseごとにsourceから独立copyを作り、3連続matrixでsourceの再利用可能性も検証する。source filesystem digestの不変だけをremote credential有効性の証明とは扱わない。途中で専用credentialが失効した場合はqualificationを止め、operatorがcanary専用loginを更新する。
 
-`CliAcceptanceCanaryMain` は4 phaseの固定tableから `LlmInvocationRequest` を生成し、次を実行する。
+### 3. driverはapp UIDでproduction renderer/parserを再利用する
+
+`CliAcceptanceCanaryMain` はcontainer内でUID/GID `10001:10004`として実行し、4 phaseの固定tableから `LlmInvocationRequest` を生成する。command templateはimage内のpinned `/usr/local/bin/claude` と `/usr/local/bin/codex` を直接指定する。別container内にproduction resourceが存在しないため、実provider側のfixed launcher経由実行は重複させない。fixed launcher、UID分離、process tree、cleanup acknowledgementは同じexact digestに対するfoundation canaryで検証する。
+
+phase matrixは次のとおりとする。
 
 - `PRE_FILTER`: Claude、`claude-haiku-4-5-20251001`、no-MCP、empty canonical policy
 - `PROPOSER`: Claude、`claude-haiku-4-5-20251001`、fixture MCP、canonical Proposer policy
 - `FALSIFIER`: Codex、`gpt-5.5`、fixture MCP、canonical Falsifier policy、LOW effort
 - `REFLECTION`: Claude、`claude-haiku-4-5-20251001`、no-MCP、empty canonical policy
 
-各requestは `DefaultLlmCommandRenderer` でper-run auth/configを生成し、fixed launcherを通して `ShellProcessRunner` で起動し、`DefaultLlmOutputParser` でpinned output envelopeを解析する。provider failure、非0終了、timeout、schema drift、model mismatch、semantic marker不一致、cleanup failureのいずれもrun失敗とする。
+各requestをrender、run、parseし、provider failure、非0終了、timeout、schema drift、semantic marker不一致、cleanup failureをrun失敗とする。Claudeはsupported outputが報告するobserved modelもpinと一致させる。Codex 0.142.5はobserved modelを報告しないため、configured `-m gpt-5.5` とexact CLI/image pinだけを保証し、observed identityは `NOT_REPORTED_BY_PROVIDER` のままとする。
 
-CLI default modelやproduction DB runtime configには依存しない。canary pinはcode-owned constantとし、image pin / adapter pin / test期待値を同じ変更で更新する。
+### 4. MCP validationはdata-free fixtureに限定する
 
-### 4. MCP validation はdata-free fixtureに限定する
+image内のstdio MCP fixture serverはProposer/Falsifierのcanonical tool名を列挙し、副作用や外部I/Oを持たないprobe結果を返す。run固有nonceはpromptへ含めずfixtureだけが返し、driverはfinal responseにnonceが含まれることを検証する。これは少なくとも1回のtool resolutionとcall completionを検出する互換性probeであり、悪意あるmodelに対するproofやexact call countは保証しない。
 
-image内にstdio MCP fixture serverを追加する。Proposer/Falsifierのcanonical tool名を列挙するが、副作用や外部I/Oを持たず、指定されたprobe toolへrun固有nonceを返す。promptはprobe toolを1回呼び、返されたnonceを最終responseに含めるよう要求する。driverはnonce一致を確認するため、単なるMCP config読込ではなくtool resolutionとcall completionまで証明できる。
+production fixed MCP launcher、phase manifest、DB role、全required callはfoundation canaryが検証する。merge qualification evidenceは同一exact digestについてfoundation successと実provider acceptance successを併記する。
 
-fixtureはproduction fixed MCP launcherを置き換える責務を持たない。fixed MCP launcher、phase manifest、DB role、全required callは直前の `FOUNDATION_PREFLIGHT_V1` が検証済みであり、CLI auth canaryはprovider互換性だけを追加する。
+### 5. harnessはresourceとlogを最小化する
 
-### 5. credential source は既存 volume をread-onlyで参照する
+acceptance containerはread-only rootfs、cap-drop ALL、no-new-privileges、private tmpfs、pids limit、provider outbound用の通常bridge networkだけを持つ。credential volume以外のhost mountとproduction networkを禁止する。matrix全体のdeadlineは30分、各phaseは120秒とし、`--runs 3` の最大12 invocationを直列実行する。
 
-harnessはproduction composeの `llm-auth` volumeだけを `/tmp/fukurou-cli-home:ro` にmountする。DB password、`.env`、vault、Docker socket、production network/volumeはmountしない。containerはread-only rootfs、production相当capability、private tmpfs、provider outbound用の通常bridge networkだけを持つ。
+raw stdout/stderrはdriver内でversioned parserへ渡すだけで出力しない。top-level failureはallowlist済みcodeへ変換し、phase、iteration、adapter version、safe resultだけを表示する。credential path/content/digest、prompt、provider response、exception messageは表示しない。終了時はper-run config/homeを全削除し、container/temporary volumeを残さない。
 
-rendererはClaude/Codexの必要auth fileだけをper-run tmpfsへcopyする。harnessはsource fileの存在とread-only mountを検証し、実行前後のsource digestが不変であることを比較するが、path、digest、credential contentをログへ出さない。raw stdout/stderrもdriver内だけで解析し、安全なphase/result codeだけを出力する。
+### 6. 差分hard stopを機械的に守る
 
-### 6. merge qualification とdeploy gateの回数を分ける
+initial design commit以後のOpenSpec planning artifactと回収済みarchiveを除き、code、test、script、docsのadded/deleted line合計を1,100行以下に保つ。実装中に超える見込みまたは実測超過が出た時点でSTOPし、fixture/testまたはharness責務を次changeへstage-outする。既存巨大scriptの無関係な整形は行わない。
 
-harnessは `--runs 1|3` だけを受ける。merge qualificationはexact final imageで `--runs 3` を実行し、4 phaseすべての連続3成功を要求する。production deployはprovider消費とdeploy時間を抑えるため `--runs 1` をrequired hookとして毎回実行する。
+### 7. Issue #189 closure evidenceを明示する
 
-GitHub-hosted CIにはcredentialを渡さず、contract/unit/offline exact-image testsだけを実行する。実 provider qualificationはoperator credentialを持つ環境で行い、成功をPR evidenceとして記録する。
-
-### 7. deploy contract は両hook成功までmutationを許可しない
-
-signed bundle、installed catalog、executor validation、dispatch ledgerは `CLI_AUTH_PREFLIGHT_V1` を必須化する。hook順序は foundation、CLI auth とし、どちらかが失敗した場合はproduction compose更新、maintenance解除、candidate activationへ進まない。既存runtimeはそのまま維持される。
+このchangeのPR descriptionにはIssue #189全DoDのclosure matrixを載せる。先行PRのtest/evidence、既存foundation canary、本changeのoffline tests、operator real-provider×3 evidence、未完了のdeploy required hookを区別する。本change merge後もdeploy hookが未完了なのでIssue #189はopenのままとする。
 
 ## Risks / Trade-offs
 
-- [Providerの一時障害やquotaでdeployが止まる] → typed safe reasonでfail closedし、既存runtimeを維持する。自動retryは各phase 1回に限定し、operatorがdeployを再実行する。
-- [実modelの応答がprobe指示に従わずflakeする] → 短い固定prompt、単一nonce、LOW effortを使い、merge前に各phase×3で安定性を確認する。意味的なJSON判断は要求しない。
-- [通常bridgeはprovider以外へのoutboundも可能] → containerにcredential source以外をmountせず、MCP fixtureにnetwork機能を持たせない。provider egress proxyは本issueの範囲外とする。
-- [read-only auth sourceでもcopy後にproviderがtoken refreshする] → refreshはper-run copyに閉じ、sourceへ書き戻さない。sourceが失効している場合はdeployを止め、既存WebUI login flowで更新する。
-- [hook追加でdeploy時間とprovider利用量が増える] → deployは4 invocationを各1回だけ実行し、cheap Claude pinとLOW effortを使う。
-- [supervisor acceptance modeがruntime権限を広げる] → PID 1かつ固定argumentでのみ起動し、application/DB/controlを持たず、既存launcher protocol以外を追加しない。
+- [専用credentialのlogin保守が増える] → production credentialを壊さないことを優先し、WebUI/production volumeと分離したoperator手順をdocsへ記載する。
+- [provider一時障害やquotaでqualificationが止まる] → safe typed reasonでfail closedし、自動retryせずoperatorが再実行する。
+- [実modelがprobe指示に従わずflakeする] → 短い固定prompt、single nonce、LOW effortを使い、各phase×3で安定性を確認する。
+- [通常bridgeはprovider以外へのoutboundも可能] → production resourceをmountせず、fixtureにnetwork機能を持たせない。egress proxyは範囲外とする。
+- [direct CLIはfixed launcher実経路ではない] →同一digestのfoundation canaryと合成し、責務をPR evidenceで明示する。新しいsupervisor modeは追加しない。
 
 ## Migration Plan
 
-1. offline contract/unit testsとexact-image fixture testを通す。
-2. final candidate imageをbuildし、operator credential環境で `--runs 3` を通す。
-3. harness、catalog、executor、workflow bundleを同じcommitで配布する。
-4. deploy時にfoundation、CLI authの順でpreflightし、両方成功後だけproduction mutationへ進む。
-5. rollbackでは旧main SHAを明示的に再deployし、旧bundle/catalogのrequired hook setへ戻す。credential volumeとproduction DBにはmigrationがない。
+1. offline contract/unit testsとexact-image fixture failure testsを通す。
+2. operatorが専用 `llm-canary-auth` volumeへClaude/Codex loginを用意する。
+3. final immutable repository digestを指定した単一qualification invocationでfoundation canaryを1回、実provider matrixを3回連続で実行する。
+4. PR evidenceへsafe resultとIssue #189 closure matrixを記録する。
+5. merge後もruntime/deploy contractは変わらない。rollbackは通常のcode rollbackだけで完了する。
 
 ## Open Questions
 
