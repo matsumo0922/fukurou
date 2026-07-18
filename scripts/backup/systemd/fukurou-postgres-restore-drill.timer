@@ -1,0 +1,12 @@
+[Unit]
+Description=Attempt the Fukurou isolated PostgreSQL restore drill weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=2h
+AccuracySec=1min
+Unit=fukurou-postgres-restore-drill.service
+
+[Install]
+WantedBy=timers.target

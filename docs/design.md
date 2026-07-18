@@ -3684,6 +3684,16 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 
 ---
 
+### 14.6 PostgreSQL backup / restore
+
+[確定] production PostgreSQL は、同一 NAS の root-owned restic format v2 repository へ custom-format logical backup を日次で試行する。`pg_dump -Fc -Z0` の stream は平文 dump を filesystem に置かず restic の暗号化と圧縮へ渡す。repository と archive の integrity を確認した固定 tag・host・path groupについて、restic calendar bucketの newest 14 daily generationsを保持する。
+
+[確定] root-owned weekly timer は、status が示す exact integrity-checked snapshot をproductionとcontainer、network、volume、credential、host portを共有しない disposable PostgreSQL 16へrestoreする。schema inventory、constraint、critical tableのprimary key、paper account・runtime config・ledger lineageのread-only invariant、owned resource cleanupがすべて成功した場合だけlast verified restore evidenceを更新する。restoreではownerとACLを再生せず、production role/ACLのauthorityはcode-owned deploy foundationとrole bootstrapに残す。
+
+[確定] `/srv/fukurou/monitoring/backup-status.json` はroot-onlyのversioned statusで、各jobのlast attemptとlast-known-good evidenceを分離する。自動alertはこのstatusのproducer contractに含まれず、operatorがsystemd failureとstatusを能動確認する。
+
+[確定] このbackupは同一NAS内のscheduled attemptと実測restore evidenceだけを提供する。毎暦日の成功、PITR/WAL archive、off-site disaster recovery、NAS-loss protection、保証RPO/RTO、production DBの自動置換を提供しない。deploy rollbackはDB snapshotをreplayしない。production DB replacementはrisk-increasing operationを停止し、exact snapshotのisolated restore evidenceを確認し、別途明示承認を得た後にrole/ACL bootstrapを含む手順として扱う。
+
 ## 15. 検証（ペーパー約定シミュレータ）と合格判定
 
 ### 15.1 ペーパー約定シミュレータの目的
@@ -4010,7 +4020,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
    - `Notifier` 実装としてDiscord/Slack/メールを追加。重大イベントは即時通知する。
 
 4. PostgreSQL運用強化
-   - backup、migration、lock監視、connection pool tuningを運用手順に追加する。
+   - migration、lock監視、connection pool tuningを運用手順に追加する。logical backupとisolated restore drillは現在の運用手順に含む。
 
 5. 複数モデル比較
    - 同じtriggerで `claude` と `codex` にread-only判断を出させ、actは片方だけに許可するA/B評価。ただし発注裁量が複雑になるためv1後。

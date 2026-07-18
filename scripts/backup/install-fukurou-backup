@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly LIBEXEC_DIR=/usr/local/libexec/fukurou
+readonly SHARE_DIR=/usr/local/share/fukurou
+readonly UNIT_DIR=/etc/systemd/system
+readonly BACKUP_ROOT=/srv/fukurou/backups/postgres
+readonly STATUS_DIR=/srv/fukurou/monitoring
+readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
+readonly SECRET_DIR=/srv/fukurou/secrets
+readonly PASSWORD_FILE=${SECRET_DIR}/restic-password
+readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly UNIT_SOURCE_DIR=${SCRIPT_DIR}/systemd
+
+readonly -a LIBEXEC_ARTIFACTS=(
+    backup-common
+    backup-fukurou
+    restore-fukurou
+)
+readonly -a SHARE_ARTIFACTS=(
+    backup-status.schema.json
+    backup-result-codes-v1.txt
+    restore-inventory-v1.txt
+    restore-critical-tables-v1.txt
+    restore-readonly-invariants-v1.sql
+)
+readonly -a UNIT_ARTIFACTS=(
+    fukurou-postgres-backup.service
+    fukurou-postgres-backup.timer
+    fukurou-postgres-restore-drill.service
+    fukurou-postgres-restore-drill.timer
+)
+
+die() {
+    printf 'install-fukurou-backup: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+require_root() {
+    [[ ${EUID} -eq 0 ]] || die "root is required" 77
+}
+
+require_regular_source() {
+    local source=$1
+
+    [[ -f ${source} && ! -L ${source} ]] || die "reviewed artifact is not a regular file: ${source}" 66
+}
+
+verify_owner_mode() {
+    local path=$1
+    local expected_mode=$2
+    local actual
+
+    [[ -e ${path} && ! -L ${path} ]] || die "installed artifact is missing or symbolic: ${path}"
+    actual=$(stat -c '%U:%G:%a' "${path}")
+    [[ ${actual} == "root:root:${expected_mode}" ]] || die "unexpected owner or mode for ${path}: ${actual}"
+}
+
+timer_is_enabled() {
+    systemctl is-enabled --quiet "$1" 2>/dev/null
+}
+
+install_artifacts() {
+    local artifact
+
+    command -v install >/dev/null || die "install command is unavailable" 69
+    command -v systemctl >/dev/null || die "systemctl is unavailable" 69
+
+    for artifact in fukurou-postgres-backup.timer fukurou-postgres-restore-drill.timer; do
+        if timer_is_enabled "${artifact}"; then
+            die "disable ${artifact} before installing reviewed artifacts" 75
+        fi
+    done
+
+    install -d -o root -g root -m 0555 "${LIBEXEC_DIR}"
+    install -d -o root -g root -m 0755 "${SHARE_DIR}"
+    install -d -o root -g root -m 0700 "${BACKUP_ROOT}" "${STATUS_DIR}" "${SECRET_DIR}"
+
+    for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
+        require_regular_source "${SCRIPT_DIR}/${artifact}"
+        install -o root -g root -m 0555 "${SCRIPT_DIR}/${artifact}" "${LIBEXEC_DIR}/${artifact}"
+    done
+    for artifact in "${SHARE_ARTIFACTS[@]}"; do
+        require_regular_source "${SCRIPT_DIR}/${artifact}"
+        install -o root -g root -m 0444 "${SCRIPT_DIR}/${artifact}" "${SHARE_DIR}/${artifact}"
+    done
+    for artifact in "${UNIT_ARTIFACTS[@]}"; do
+        require_regular_source "${UNIT_SOURCE_DIR}/${artifact}"
+        install -o root -g root -m 0444 "${UNIT_SOURCE_DIR}/${artifact}" "${UNIT_DIR}/${artifact}"
+    done
+
+    systemctl daemon-reload
+    verify_installation
+    printf '%s\n' 'backup artifacts installed; timers remain disabled until the manual rollout gate passes'
+}
+
+verify_installation() {
+    local artifact
+
+    command -v systemd-analyze >/dev/null || die "systemd-analyze is unavailable" 69
+    verify_owner_mode "${LIBEXEC_DIR}" 555
+    verify_owner_mode "${SHARE_DIR}" 755
+    verify_owner_mode "${BACKUP_ROOT}" 700
+    verify_owner_mode "${STATUS_DIR}" 700
+    verify_owner_mode "${SECRET_DIR}" 700
+
+    for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
+        verify_owner_mode "${LIBEXEC_DIR}/${artifact}" 555
+    done
+    for artifact in "${SHARE_ARTIFACTS[@]}"; do
+        verify_owner_mode "${SHARE_DIR}/${artifact}" 444
+    done
+    for artifact in "${UNIT_ARTIFACTS[@]}"; do
+        verify_owner_mode "${UNIT_DIR}/${artifact}" 444
+        systemd-analyze verify "${UNIT_DIR}/${artifact}" >/dev/null
+        if grep -Eiq '(password|secret|token)=' "${UNIT_DIR}/${artifact}"; then
+            die "unit embeds secret-like assignment: ${artifact}"
+        fi
+    done
+
+    printf '%s\n' 'backup installation verified'
+}
+
+verify_rollout() {
+    local repository_config
+
+    verify_installation
+    command -v restic >/dev/null || die "restic is unavailable" 69
+    command -v jq >/dev/null || die "jq is unavailable" 69
+    command -v docker >/dev/null || die "docker is unavailable" 69
+
+    [[ -f ${PASSWORD_FILE} ]] || die "restic password file is not a regular file" 66
+    [[ -f ${STATUS_FILE} ]] || die "status document is not a regular file" 66
+    verify_owner_mode "${PASSWORD_FILE}" 400
+    verify_owner_mode "${STATUS_FILE}" 600
+    FUKUROU_BACKUP_SHARE_DIRECTORY="${SHARE_DIR}" \
+        FUKUROU_BACKUP_STATUS_FILE="${STATUS_FILE}" \
+        bash -c 'source "$1"; document=$(<"$2"); backup_validate_status_json "${document}"' \
+        backup-status-validation "${LIBEXEC_DIR}/backup-common" "${STATUS_FILE}" ||
+        die "status document does not satisfy the installed contract" 65
+    jq -e '
+        .schemaVersion == 1 and
+        (.backup.lastSuccess.snapshotId | type == "string") and
+        (.restore.lastSuccess.snapshotId == .backup.lastSuccess.snapshotId)
+    ' "${STATUS_FILE}" >/dev/null || die "manual backup and exact-snapshot restore evidence is incomplete" 65
+
+    repository_config=$(RESTIC_PASSWORD_FILE="${PASSWORD_FILE}" restic -r "${BACKUP_ROOT}" cat config) ||
+        die "restic repository cannot be opened" 74
+    jq -e '.version == 2' <<<"${repository_config}" >/dev/null ||
+        die "restic repository is not format version 2" 65
+
+    printf '%s\n' 'backup rollout prerequisites and exact-snapshot restore evidence verified'
+}
+
+usage() {
+    printf '%s\n' 'Usage: install-fukurou-backup {install|verify-installation|verify-rollout}' >&2
+    exit 64
+}
+
+main() {
+    require_root
+
+    case ${1:-} in
+        install)
+            [[ $# -eq 1 ]] || usage
+            install_artifacts
+            ;;
+        verify-installation)
+            [[ $# -eq 1 ]] || usage
+            verify_installation
+            ;;
+        verify-rollout)
+            [[ $# -eq 1 ]] || usage
+            verify_rollout
+            ;;
+        *) usage ;;
+    esac
+}
+
+main "$@"

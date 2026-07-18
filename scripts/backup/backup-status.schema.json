@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fukurou.matsumo.me/schemas/backup-status-v1.json",
+  "title": "Fukurou root backup status v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "updatedAt", "backup", "restore"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "updatedAt": { "$ref": "#/$defs/timestamp" },
+    "backup": { "$ref": "#/$defs/jobStatus" },
+    "restore": { "$ref": "#/$defs/jobStatus" }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "snapshotId": { "type": "string", "pattern": "^[0-9a-f]{8,64}$" },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "resultCode": {
+      "type": "string",
+      "enum": [
+        "BACKUP_BUSY",
+        "CAPACITY_FLOOR_NOT_MET",
+        "CLEANUP_FAILED",
+        "DEPLOY_IN_PROGRESS",
+        "DUMP_FAILED",
+        "INTEGRITY_CHECK_FAILED",
+        "INVALID_CONFIGURATION",
+        "INVALID_STATUS",
+        "PARTIAL_SNAPSHOT_FORGET_FAILED",
+        "REPOSITORY_FAILED",
+        "RESTORE_FAILED",
+        "RESTORE_CLEANUP_FAILED",
+        "RESTORE_PROFILE_FAILED",
+        "RESTORE_SIGNALLED",
+        "RESTORE_SNAPSHOT_FAILED",
+        "RESTORE_START_FAILED",
+        "RESTORE_TIMEOUT",
+        "RETENTION_FAILED",
+        "SNAPSHOT_IDENTITY_FAILED",
+        "STATUS_PUBLICATION_FAILED",
+        "SUCCESS",
+        "WATCHDOG_TERMINATION_FAILED"
+      ]
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attemptedAt", "resultCode", "durationSeconds"],
+      "properties": {
+        "attemptedAt": { "$ref": "#/$defs/timestamp" },
+        "resultCode": { "$ref": "#/$defs/resultCode" },
+        "durationSeconds": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/snapshotId" },
+        "interruptedCandidateCount": { "type": "integer", "minimum": 0 },
+        "retentionSucceeded": { "type": ["boolean", "null"] }
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshotId", "sourceRevision", "verifiedAt", "durationSeconds"],
+      "properties": {
+        "snapshotId": { "$ref": "#/$defs/snapshotId" },
+        "sourceRevision": { "$ref": "#/$defs/revision" },
+        "verifiedAt": { "$ref": "#/$defs/timestamp" },
+        "durationSeconds": { "type": "integer", "minimum": 0 },
+        "verificationCount": { "type": "integer", "minimum": 0 },
+        "tableCount": { "type": "integer", "minimum": 0 },
+        "constraintCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "jobStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lastAttempt", "lastSuccess"],
+      "properties": {
+        "lastAttempt": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/attempt" }] },
+        "lastSuccess": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/success" }] }
+      }
+    }
+  }
+}

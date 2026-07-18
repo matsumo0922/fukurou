@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=backup-common
+source "${SCRIPT_DIRECTORY}/backup-common"
+
+readonly PRODUCTION_CONTAINER="${FUKUROU_POSTGRES_CONTAINER:-fukurou-postgres}"
+readonly APPLICATION_CONTAINER="${FUKUROU_APPLICATION_CONTAINER:-fukurou-ktor}"
+readonly BACKUP_HOST="${FUKUROU_BACKUP_HOST:-fukurou-production}"
+readonly BACKUP_STDIN_PATH="${FUKUROU_BACKUP_STDIN_PATH:-/postgres.dump}"
+readonly BACKUP_RESERVE_BYTES="${FUKUROU_BACKUP_RESERVE_BYTES:-5368709120}"
+readonly DUMP_DEADLINE_SECONDS="${FUKUROU_BACKUP_DUMP_DEADLINE_SECONDS:-60}"
+
+ATTEMPT_STARTED_AT=""
+ATTEMPT_STARTED_EPOCH=""
+ATTEMPT_TAG=""
+APPLICATION_NAME=""
+DATABASE_NAME=""
+DATABASE_USER=""
+SOURCE_REVISION=""
+INTERRUPTED_CANDIDATE_COUNT=0
+WATCHDOG_PID=""
+WORK_DIRECTORY=""
+
+cleanup() {
+  if [[ -n "${WATCHDOG_PID}" ]]; then
+    kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
+    wait "${WATCHDOG_PID}" 2>/dev/null || true
+    WATCHDOG_PID=""
+  fi
+  if [[ -n "${WORK_DIRECTORY}" ]]; then
+    rm -rf -- "${WORK_DIRECTORY}"
+    WORK_DIRECTORY=""
+  fi
+}
+
+handle_signal() {
+  local exit_code="$1"
+  trap - TERM INT HUP
+  cleanup
+  backup_emit_result DUMP_FAILED
+  exit "${exit_code}"
+}
+trap cleanup EXIT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 130' INT
+trap 'handle_signal 129' HUP
+
+restic_command() {
+  env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --no-cache --compression auto -r "${RESTIC_REPOSITORY}" "$@"
+}
+
+publish_backup_attempt() {
+  local result_code="$1" snapshot_id="${2:-}" retention="${3:-null}" advance_success="${4:-false}"
+  local previous duration success_json document now
+  previous="$(backup_load_status)" || return 1
+  now="$(backup_now)"
+  duration=$(( $(backup_epoch) - ATTEMPT_STARTED_EPOCH ))
+  (( duration >= 0 )) || duration=0
+  success_json="null"
+  if [[ "${advance_success}" == "true" ]]; then
+    backup_validate_snapshot_id "${snapshot_id}" || return 1
+    backup_validate_revision "${SOURCE_REVISION}" || return 1
+    success_json="$(jq -cn --arg snapshot "${snapshot_id}" --arg revision "${SOURCE_REVISION}" \
+      --arg verified "${now}" --argjson duration "${duration}" \
+      '{snapshotId:$snapshot,sourceRevision:$revision,verifiedAt:$verified,durationSeconds:$duration,verificationCount:1}')"
+  fi
+  document="$(backup_merge_attempt "${previous}" backup "${ATTEMPT_STARTED_AT}" "${result_code}" \
+    "${duration}" "${INTERRUPTED_CANDIDATE_COUNT}" "${retention}" "${success_json}")" || return 1
+  if [[ -n "${snapshot_id}" ]]; then
+    document="$(jq -ce --arg snapshot "${snapshot_id}" '.backup.lastAttempt.snapshotId=$snapshot' <<<"${document}")" || return 1
+  fi
+  backup_publish_status "${document}"
+}
+
+fail_attempt() {
+  local result_code="$1" snapshot_id="${2:-}"
+  if [[ -n "${ATTEMPT_STARTED_AT}" ]]; then
+    publish_backup_attempt "${result_code}" "${snapshot_id}" null false >/dev/null 2>&1 || true
+  fi
+  backup_emit_result "${result_code}"
+  return 1
+}
+
+validate_secret_file() {
+  [[ -f "${RESTIC_PASSWORD_FILE}" && ! -L "${RESTIC_PASSWORD_FILE}" ]] || return 1
+  [[ "$(stat -c '%U:%G:%a' "${RESTIC_PASSWORD_FILE}")" == "root:root:400" ]]
+}
+
+validate_root_directory() {
+  [[ -d "$1" && ! -L "$1" ]] || return 1
+  [[ "$(stat -c '%U:%G:%a' "$1")" == "root:root:700" ]]
+}
+
+validate_runtime_paths() {
+  validate_root_directory "$(dirname "${BACKUP_STATUS_FILE}")" &&
+    validate_root_directory "$(dirname "${RESTIC_PASSWORD_FILE}")" &&
+    validate_root_directory "$(dirname "${RESTIC_REPOSITORY}")" &&
+    validate_root_directory "${RESTIC_REPOSITORY}"
+}
+
+read_production_identity() {
+  local identity
+  identity="$(docker exec "${PRODUCTION_CONTAINER}" sh -ceu \
+    'printf "%s\n%s\n" "${POSTGRES_USER:?}" "${POSTGRES_DB:?}"' 2>/dev/null)" || return 1
+  [[ "$(wc -l <<<"${identity}")" == "2" ]] || return 1
+  DATABASE_USER="$(sed -n '1p' <<<"${identity}")"
+  DATABASE_NAME="$(sed -n '2p' <<<"${identity}")"
+  backup_validate_identifier "${DATABASE_USER}" && backup_validate_identifier "${DATABASE_NAME}" || return 1
+
+  SOURCE_REVISION="${FUKUROU_BACKUP_SOURCE_REVISION:-$(docker exec "${APPLICATION_CONTAINER}" printenv FUKUROU_REVISION 2>/dev/null)}"
+  backup_validate_revision "${SOURCE_REVISION}"
+}
+
+postgres_scalar() {
+  local sql="$1"
+  printf '%s\n' "${sql}" | docker exec -i "${PRODUCTION_CONTAINER}" \
+    psql -X -v ON_ERROR_STOP=1 -U "${DATABASE_USER}" -d "${DATABASE_NAME}" -Atq 2>/dev/null
+}
+
+dump_backend_count() {
+  local count
+  count="$(postgres_scalar "SELECT count(*) FROM pg_stat_activity WHERE datname = '${DATABASE_NAME}' AND application_name = '${APPLICATION_NAME}';")" || return 1
+  [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${count}"
+}
+
+dump_watchdog_is_running() {
+  [[ -n "${WATCHDOG_PID}" ]] && kill -0 "${WATCHDOG_PID}" 2>/dev/null
+}
+
+cancel_and_reap_dump_watchdog() {
+  [[ -n "${WATCHDOG_PID}" ]] || return 0
+  kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
+  wait "${WATCHDOG_PID}" 2>/dev/null || true
+  WATCHDOG_PID=""
+}
+
+wait_for_dump_watchdog() {
+  [[ -n "${WATCHDOG_PID}" ]] || return 0
+  wait "${WATCHDOG_PID}" 2>/dev/null || true
+  WATCHDOG_PID=""
+}
+
+settle_watchdog_after_pipeline_failure() {
+  local result_file="$1" backend_count
+  if ! dump_watchdog_is_running; then
+    wait_for_dump_watchdog
+    return 0
+  fi
+
+  backend_count="$(dump_backend_count 2>/dev/null || true)"
+  case "${backend_count}" in
+    0)
+      cancel_and_reap_dump_watchdog
+      ;;
+    1)
+      wait_for_dump_watchdog
+      ;;
+    *)
+      cancel_and_reap_dump_watchdog
+      printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
+      return 1
+      ;;
+  esac
+}
+
+validate_capacity_floor() {
+  [[ "${BACKUP_RESERVE_BYTES}" =~ ^[0-9]+$ ]] || return 1
+  local database_bytes available_bytes repository_parent
+  database_bytes="$(postgres_scalar 'SELECT pg_database_size(current_database());')" || return 1
+  [[ "${database_bytes}" =~ ^[0-9]+$ ]] || return 1
+  repository_parent="$(dirname "${RESTIC_REPOSITORY}")"
+  [[ -d "${repository_parent}" ]] || return 1
+  available_bytes="$(df -PB1 --output=avail "${repository_parent}" | tail -n 1 | tr -d ' ')" || return 1
+  [[ "${available_bytes}" =~ ^[0-9]+$ ]] || return 1
+  (( available_bytes >= database_bytes + BACKUP_RESERVE_BYTES ))
+}
+
+watch_dump_backend() {
+  local result_file="$1" deadline pid_rows expected_pid termination disappeared
+  trap 'exit 0' TERM INT HUP
+  deadline=$(( $(backup_epoch) + DUMP_DEADLINE_SECONDS ))
+  expected_pid=""
+  while (( $(backup_epoch) < deadline )); do
+    pid_rows="$(postgres_scalar "SELECT pid FROM pg_stat_activity WHERE datname = '${DATABASE_NAME}' AND application_name = '${APPLICATION_NAME}' ORDER BY pid;")" || {
+      printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
+      return 1
+    }
+    if [[ -z "${pid_rows}" ]]; then
+      sleep 1
+      continue
+    fi
+    [[ "${pid_rows}" =~ ^[0-9]+$ ]] || {
+      printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
+      return 1
+    }
+    expected_pid="${pid_rows}"
+    break
+  done
+  [[ -n "${expected_pid}" ]] || {
+    printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
+    return 1
+  }
+
+  while (( $(backup_epoch) < deadline )); do sleep 1; done
+  termination="$(postgres_scalar "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ${expected_pid} AND application_name = '${APPLICATION_NAME}';")" || true
+  [[ "${termination}" == "t" ]] || {
+    printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
+    return 1
+  }
+  deadline=$(( $(backup_epoch) + 5 ))
+  while (( $(backup_epoch) < deadline )); do
+    disappeared="$(postgres_scalar "SELECT count(*) FROM pg_stat_activity WHERE pid = ${expected_pid} AND application_name = '${APPLICATION_NAME}';")" || true
+    if [[ "${disappeared}" == "0" ]]; then
+      printf 'TERMINATED\n' >"${result_file}"
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
+  return 1
+}
+
+snapshot_from_backup_summary() {
+  jq -er 'select(.message_type == "summary") | .snapshot_id' "$1" | tail -n 1
+}
+
+forget_current_partial() {
+  local snapshot_id="$1"
+  backup_validate_snapshot_id "${snapshot_id}" || return 1
+  restic_command forget "${snapshot_id}" >/dev/null 2>&1
+}
+
+count_interrupted_candidates() {
+  local snapshots
+  snapshots="$(restic_command snapshots --json --host "${BACKUP_HOST}" --path "${BACKUP_STDIN_PATH}" \
+    --tag fukurou-postgres 2>/dev/null)" || return 1
+  jq -er '[.[] | select(any(.tags[]?; startswith("attempt-"))) |
+    select((.tags | index("integrity-checked")) == null)] | length' <<<"${snapshots}"
+}
+
+verify_archive_stream() {
+  set +e
+  restic_command dump "$1" "${BACKUP_STDIN_PATH}" 2>/dev/null | {
+    set +e
+    pg_restore --list >/dev/null 2>&1
+    list_status="$?"
+    cat >/dev/null
+    drain_status="$?"
+    (( list_status == 0 && drain_status == 0 ))
+  }
+  local statuses=("${PIPESTATUS[@]}")
+  set -e
+  (( statuses[0] == 0 && statuses[1] == 0 ))
+}
+
+resolve_authoritative_snapshot() {
+  local snapshots
+  snapshots="$(restic_command snapshots --json --host "${BACKUP_HOST}" --path "${BACKUP_STDIN_PATH}" \
+    --tag "fukurou-postgres,integrity-checked,${ATTEMPT_TAG}" 2>/dev/null)" || return 1
+  [[ "$(jq -er 'length' <<<"${snapshots}")" == "1" ]] || return 1
+  jq -er '.[0].id' <<<"${snapshots}"
+}
+
+run_backup() {
+  local candidate_snapshot authoritative_snapshot producer_status restic_status watchdog_result
+  (( $# == 0 )) || { backup_emit_result INVALID_CONFIGURATION; return 2; }
+  ATTEMPT_STARTED_AT="$(backup_now)"
+  ATTEMPT_STARTED_EPOCH="$(backup_epoch)"
+  ATTEMPT_TAG="attempt-${ATTEMPT_STARTED_AT//[:T-]/}-$$-${RANDOM}"
+  ATTEMPT_TAG="${ATTEMPT_TAG/Z/}"
+  APPLICATION_NAME="fukurou_backup_$$_${RANDOM}"
+  WORK_DIRECTORY="$(mktemp -d)" || { fail_attempt INVALID_CONFIGURATION; return 1; }
+
+  if [[ "${FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST:-0}" != "1" ]] && ! backup_require_root; then fail_attempt INVALID_CONFIGURATION; return 1; fi
+  for command_name in docker restic pg_restore jq flock timeout stat df sync; do
+    backup_require_command "${command_name}" || { fail_attempt INVALID_CONFIGURATION; return 1; }
+  done
+  backup_acquire_shared_lock || { backup_emit_result BACKUP_BUSY; return 1; }
+  backup_probe_deploy_lock || { backup_emit_result DEPLOY_IN_PROGRESS; return 1; }
+  backup_load_status >/dev/null || { backup_emit_result INVALID_STATUS; return 1; }
+  validate_secret_file || { fail_attempt INVALID_CONFIGURATION; return 1; }
+  validate_runtime_paths || { fail_attempt INVALID_CONFIGURATION; return 1; }
+  read_production_identity || { fail_attempt INVALID_CONFIGURATION; return 1; }
+  validate_capacity_floor || { fail_attempt CAPACITY_FLOOR_NOT_MET; return 1; }
+  restic_command cat config 2>/dev/null | jq -e '.version == 2' >/dev/null || { fail_attempt REPOSITORY_FAILED; return 1; }
+  restic_command check >/dev/null 2>&1 || { fail_attempt REPOSITORY_FAILED; return 1; }
+
+  watch_dump_backend "${WORK_DIRECTORY}/watchdog-result" &
+  WATCHDOG_PID="$!"
+  set +e
+  timeout --signal=TERM --kill-after=5 "$((DUMP_DEADLINE_SECONDS + 5))" \
+    docker exec -e "PGAPPNAME=${APPLICATION_NAME}" -i "${PRODUCTION_CONTAINER}" \
+      pg_dump --format=custom --compress=0 -U "${DATABASE_USER}" -d "${DATABASE_NAME}" 2>/dev/null |
+    restic_command backup --json --stdin --stdin-filename "${BACKUP_STDIN_PATH#/}" \
+      --host "${BACKUP_HOST}" --tag fukurou-postgres --tag "${ATTEMPT_TAG}" \
+      >"${WORK_DIRECTORY}/backup-summary.jsonl" 2>/dev/null
+  local pipeline_statuses=("${PIPESTATUS[@]}")
+  set -e
+  producer_status="${pipeline_statuses[0]}"
+  restic_status="${pipeline_statuses[1]}"
+  candidate_snapshot="$(snapshot_from_backup_summary "${WORK_DIRECTORY}/backup-summary.jsonl" 2>/dev/null || true)"
+
+  if (( producer_status == 0 && restic_status == 0 )); then
+    cancel_and_reap_dump_watchdog
+    if [[ -e "${WORK_DIRECTORY}/watchdog-result" ]]; then
+      fail_attempt WATCHDOG_TERMINATION_FAILED "${candidate_snapshot}"
+      return 1
+    fi
+  else
+    settle_watchdog_after_pipeline_failure "${WORK_DIRECTORY}/watchdog-result" || true
+    watchdog_result=""
+    if [[ -f "${WORK_DIRECTORY}/watchdog-result" ]]; then
+      watchdog_result="$(<"${WORK_DIRECTORY}/watchdog-result")"
+    fi
+    if [[ -n "${candidate_snapshot}" ]]; then
+      forget_current_partial "${candidate_snapshot}" || { fail_attempt PARTIAL_SNAPSHOT_FORGET_FAILED "${candidate_snapshot}"; return 1; }
+    fi
+    if [[ "${watchdog_result}" == "WATCHDOG_TERMINATION_FAILED" ]]; then
+      fail_attempt WATCHDOG_TERMINATION_FAILED
+    elif (( producer_status != 0 )); then
+      fail_attempt DUMP_FAILED
+    else
+      fail_attempt REPOSITORY_FAILED
+    fi
+    return 1
+  fi
+
+  backup_validate_snapshot_id "${candidate_snapshot}" || { fail_attempt SNAPSHOT_IDENTITY_FAILED; return 1; }
+  restic_command check >/dev/null 2>&1 || { fail_attempt INTEGRITY_CHECK_FAILED "${candidate_snapshot}"; return 1; }
+  verify_archive_stream "${candidate_snapshot}" || { fail_attempt INTEGRITY_CHECK_FAILED "${candidate_snapshot}"; return 1; }
+  restic_command tag --add integrity-checked "${candidate_snapshot}" >/dev/null 2>&1 || { fail_attempt INTEGRITY_CHECK_FAILED "${candidate_snapshot}"; return 1; }
+  authoritative_snapshot="$(resolve_authoritative_snapshot)" || { fail_attempt SNAPSHOT_IDENTITY_FAILED; return 1; }
+  backup_validate_snapshot_id "${authoritative_snapshot}" || { fail_attempt SNAPSHOT_IDENTITY_FAILED; return 1; }
+  [[ "${authoritative_snapshot}" != "${candidate_snapshot}" ]] || { fail_attempt SNAPSHOT_IDENTITY_FAILED; return 1; }
+  INTERRUPTED_CANDIDATE_COUNT="$(count_interrupted_candidates)" || { fail_attempt REPOSITORY_FAILED "${authoritative_snapshot}"; return 1; }
+
+  publish_backup_attempt SUCCESS "${authoritative_snapshot}" null true || { backup_emit_result STATUS_PUBLICATION_FAILED; return 1; }
+  if ! restic_command forget --host "${BACKUP_HOST}" --path "${BACKUP_STDIN_PATH}" \
+    --tag fukurou-postgres,integrity-checked --keep-daily 14 --prune >/dev/null 2>&1; then
+    publish_backup_attempt RETENTION_FAILED "${authoritative_snapshot}" false false >/dev/null 2>&1 || true
+    backup_emit_result RETENTION_FAILED
+    return 1
+  fi
+  publish_backup_attempt SUCCESS "${authoritative_snapshot}" true false || { backup_emit_result STATUS_PUBLICATION_FAILED; return 1; }
+  backup_emit_result SUCCESS
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  run_backup "$@"
+fi

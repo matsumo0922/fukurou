@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly COMMON_PATH="${FUKUROU_BACKUP_COMMON_PATH:-${SCRIPT_DIRECTORY}/backup-common}"
+# shellcheck source=scripts/backup/backup-common
+source "${COMMON_PATH}"
+
+readonly DOCKER_BIN="${FUKUROU_DOCKER_BIN:-docker}"
+readonly RESTIC_BIN="${FUKUROU_RESTIC_BIN:-restic}"
+readonly OPENSSL_BIN="${FUKUROU_OPENSSL_BIN:-openssl}"
+readonly TIMEOUT_BIN="${FUKUROU_TIMEOUT_BIN:-timeout}"
+readonly SETSID_BIN="${FUKUROU_SETSID_BIN:-setsid}"
+readonly PROFILE_DIRECTORY="${FUKUROU_BACKUP_SHARE_DIRECTORY:-${SCRIPT_DIRECTORY}}"
+readonly INVENTORY_FILE="${FUKUROU_RESTORE_INVENTORY_FILE:-${PROFILE_DIRECTORY}/restore-inventory-v1.txt}"
+readonly CRITICAL_TABLES_FILE="${FUKUROU_RESTORE_CRITICAL_TABLES_FILE:-${PROFILE_DIRECTORY}/restore-critical-tables-v1.txt}"
+readonly INVARIANTS_FILE="${FUKUROU_RESTORE_INVARIANTS_FILE:-${PROFILE_DIRECTORY}/restore-readonly-invariants-v1.sql}"
+readonly RESTORE_TIMEOUT_SECONDS="${FUKUROU_RESTORE_TIMEOUT_SECONDS:-900}"
+readonly START_TIMEOUT_SECONDS="${FUKUROU_RESTORE_START_TIMEOUT_SECONDS:-60}"
+readonly CLEANUP_TIMEOUT_SECONDS="${FUKUROU_RESTORE_CLEANUP_TIMEOUT_SECONDS:-30}"
+readonly VALIDATION_TIMEOUT_SECONDS="${FUKUROU_RESTORE_VALIDATION_TIMEOUT_SECONDS:-30}"
+readonly RESTORE_RUNTIME_DIRECTORY="${FUKUROU_RESTORE_RUNTIME_DIRECTORY:-/run/fukurou-restore}"
+readonly RESTORE_IMAGE=postgres:16
+
+attempt=""
+container_name=""
+network_name=""
+volume_name=""
+credential_directory=""
+ownership_label=""
+snapshot_id=""
+table_count=0
+constraint_count=0
+attempt_publishable=false
+active_process_id=""
+started_millis=0
+container_created=false
+network_created=false
+volume_created=false
+
+epoch_millis() {
+  printf '%s\n' "$(( $(date -u '+%s') * 1000 ))"
+}
+
+duration_millis() {
+  local now
+  now="$(epoch_millis)"
+  printf '%s\n' "$(( now - started_millis ))"
+}
+
+valid_profile_token() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_]{0,62}$ ]]
+}
+
+validate_root_secret_file() {
+  local path="$1"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  if [[ "${FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST:-0}" == "1" ]]; then
+    return 0
+  fi
+  [[ "$(stat -c '%U:%G:%a' -- "${path}")" == "root:root:400" ]]
+}
+
+validate_root_directory() {
+  local path="$1"
+  [[ -d "${path}" && ! -L "${path}" ]] || return 1
+  if [[ "${FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST:-0}" == "1" ]]; then
+    return 0
+  fi
+  [[ "$(stat -c '%U:%G:%a' -- "${path}")" == "root:root:700" ]]
+}
+
+owned_resource_count() {
+  local containers networks volumes
+  containers="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" "${DOCKER_BIN}" ps -aq --filter "label=${ownership_label}" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')" || return 1
+  networks="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" "${DOCKER_BIN}" network ls -q --filter "label=${ownership_label}" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')" || return 1
+  volumes="$("${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" "${DOCKER_BIN}" volume ls -q --filter "label=${ownership_label}" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')" || return 1
+  printf '%s\n' "$(( containers + networks + volumes ))"
+}
+
+cleanup_owned_resources() {
+  local cleanup_failed=false
+
+  if [[ "${container_created}" == "true" ]]; then
+    "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
+      "${DOCKER_BIN}" rm -f -- "${container_name}" >/dev/null 2>&1 || cleanup_failed=true
+  fi
+  if [[ "${network_created}" == "true" ]]; then
+    "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
+      "${DOCKER_BIN}" network rm -- "${network_name}" >/dev/null 2>&1 || cleanup_failed=true
+  fi
+  if [[ "${volume_created}" == "true" ]]; then
+    "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${CLEANUP_TIMEOUT_SECONDS}" \
+      "${DOCKER_BIN}" volume rm -- "${volume_name}" >/dev/null 2>&1 || cleanup_failed=true
+  fi
+  if [[ -n "${credential_directory}" ]]; then
+    rm -rf -- "${credential_directory}" || cleanup_failed=true
+  fi
+
+  if [[ -n "${ownership_label}" ]]; then
+    local remaining
+    remaining="$(owned_resource_count)" || cleanup_failed=true
+    [[ "${remaining:-1}" == "0" ]] || cleanup_failed=true
+  fi
+  [[ "${cleanup_failed}" == "false" ]]
+}
+
+publish_result() {
+  local result_code="$1" advance_success="$2"
+  [[ "${attempt_publishable}" == "true" ]] || return 0
+  backup_publish_restore_attempt \
+    "${result_code}" \
+    "${snapshot_id}" \
+    "$(duration_millis)" \
+    "${table_count}" \
+    "${constraint_count}" \
+    "${advance_success}"
+}
+
+handle_signal() {
+  trap - INT TERM
+  local result=RESTORE_SIGNALLED
+  if [[ -n "${active_process_id}" ]]; then
+    kill -TERM -- "-${active_process_id}" >/dev/null 2>&1 || true
+    wait "${active_process_id}" 2>/dev/null || true
+  fi
+  cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
+  publish_result "${result}" false || true
+  backup_emit_result "${result}"
+  exit 143
+}
+
+trap handle_signal INT TERM
+
+prepare_resources() {
+  mkdir -p -- "${RESTORE_RUNTIME_DIRECTORY}"
+  chmod 0700 "${RESTORE_RUNTIME_DIRECTORY}"
+  credential_directory="$(mktemp -d "${RESTORE_RUNTIME_DIRECTORY}/${attempt}.XXXXXX")"
+  chmod 0700 "${credential_directory}"
+  "${OPENSSL_BIN}" rand -hex 32 >"${credential_directory}/postgres-password" 2>/dev/null
+  chmod 0400 "${credential_directory}/postgres-password"
+
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${START_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" network create --internal --label "${ownership_label}" "${network_name}" >/dev/null 2>&1
+  network_created=true
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${START_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" volume create --label "${ownership_label}" "${volume_name}" >/dev/null 2>&1
+  volume_created=true
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${START_TIMEOUT_SECONDS}" "${DOCKER_BIN}" run --detach \
+    --name "${container_name}" \
+    --label "${ownership_label}" \
+    --network "${network_name}" \
+    --mount "type=volume,src=${volume_name},dst=/var/lib/postgresql/data" \
+    --mount "type=bind,src=${credential_directory}/postgres-password,dst=/run/secrets/postgres-password,readonly" \
+    --env POSTGRES_USER=fukurou_restore \
+    --env POSTGRES_DB=fukurou_restore \
+    --env POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password \
+    --memory 1g \
+    --cpus 1.0 \
+    --pids-limit 256 \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+    --tmpfs /var/run/postgresql:rw,nosuid,nodev,size=16m \
+    "${RESTORE_IMAGE}" >/dev/null 2>&1
+  container_created=true
+}
+
+wait_for_postgres() {
+  local deadline=$(( $(date -u '+%s') + START_TIMEOUT_SECONDS ))
+  while (( $(date -u '+%s') < deadline )); do
+    if "${DOCKER_BIN}" exec "${container_name}" pg_isready \
+      --username=fukurou_restore --dbname=fukurou_restore >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+restore_snapshot() {
+  export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_BIN DOCKER_BIN container_name snapshot_id
+  "${SETSID_BIN}" "${TIMEOUT_BIN}" --foreground --signal=TERM --kill-after=10 "${RESTORE_TIMEOUT_SECONDS}" \
+    bash -c 'set -o pipefail; "${RESTIC_BIN}" --no-cache --repo "${RESTIC_REPOSITORY}" --password-file "${RESTIC_PASSWORD_FILE}" dump "${snapshot_id}" /stdin 2>/dev/null | "${DOCKER_BIN}" exec -i "${container_name}" pg_restore --username=fukurou_restore --dbname=fukurou_restore --no-owner --no-acl --exit-on-error --single-transaction 2>/dev/null' &
+  active_process_id=$!
+  local restore_status=0
+  wait "${active_process_id}" || restore_status=$?
+  active_process_id=""
+
+  if [[ "${restore_status}" == "124" || "${restore_status}" == "137" ]]; then
+    return 124
+  fi
+  return "${restore_status}"
+}
+
+docker_psql_command() {
+  local sql="$1"
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${VALIDATION_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" exec --env 'PGOPTIONS=-c statement_timeout=20000 -c lock_timeout=5000' \
+    "${container_name}" psql -XAtq --set=ON_ERROR_STOP=1 \
+    --username=fukurou_restore --dbname=fukurou_restore --command="${sql}" 2>/dev/null
+}
+
+docker_psql_file() {
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${VALIDATION_TIMEOUT_SECONDS}" \
+    "${DOCKER_BIN}" exec -i --env 'PGOPTIONS=-c statement_timeout=20000 -c lock_timeout=5000' \
+    "${container_name}" psql -XAtq --set=ON_ERROR_STOP=1 \
+    --username=fukurou_restore --dbname=fukurou_restore <"${INVARIANTS_FILE}" 2>/dev/null
+}
+
+validate_inventory() {
+  local kind schema object relation_kind
+  table_count=0
+  while read -r kind schema object extra; do
+    [[ -z "${kind}" || "${kind}" == \#* ]] && continue
+    [[ -z "${extra:-}" ]] || return 1
+    valid_profile_token "${schema}" && valid_profile_token "${object}" || return 1
+    case "${kind}" in
+      table) relation_kind="r"; table_count=$(( table_count + 1 )) ;;
+      view) relation_kind="v" ;;
+      sequence) relation_kind="S" ;;
+      *) return 1 ;;
+    esac
+    docker_psql_command \
+      "SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='${schema}' AND c.relname='${object}' AND c.relkind='${relation_kind}'" \
+      | grep -Fx 1 >/dev/null || return 1
+  done <"${INVENTORY_FILE}"
+}
+
+validate_critical_primary_keys() {
+  local schema table
+  while read -r schema table extra; do
+    [[ -z "${schema}" || "${schema}" == \#* ]] && continue
+    [[ -z "${extra:-}" ]] || return 1
+    valid_profile_token "${schema}" && valid_profile_token "${table}" || return 1
+    docker_psql_command \
+      "SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='${schema}' AND t.relname='${table}' AND c.contype='p' AND c.convalidated" \
+      | grep -Fx 1 >/dev/null || return 1
+  done <"${CRITICAL_TABLES_FILE}"
+}
+
+validate_constraints() {
+  local invalid_count
+  invalid_count="$(docker_psql_command "SELECT COUNT(*) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace AND NOT convalidated")" || return 1
+  [[ "${invalid_count}" == "0" ]] || return 1
+  constraint_count="$(docker_psql_command "SELECT COUNT(*) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace")" || return 1
+  [[ "${constraint_count}" =~ ^[0-9]+$ ]]
+}
+
+validate_readonly_invariants() {
+  local output
+  output="$(docker_psql_file)" || return 1
+  [[ -n "${output}" ]] || return 1
+  ! grep -Ev '^0$' <<<"${output}" >/dev/null
+}
+
+main() {
+  started_millis="$(epoch_millis)"
+  backup_require_root || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  backup_acquire_shared_lock || { backup_emit_result BACKUP_BUSY; return 1; }
+  backup_probe_deploy_lock || { backup_emit_result DEPLOY_IN_PROGRESS; return 1; }
+  for command in "${DOCKER_BIN}" "${RESTIC_BIN}" "${OPENSSL_BIN}" "${TIMEOUT_BIN}" "${SETSID_BIN}" jq; do
+    backup_require_command "${command}" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  done
+  [[ "${RESTORE_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ && "${START_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ && "${CLEANUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ && "${VALIDATION_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] || {
+    backup_emit_result RESTORE_START_FAILED
+    return 1
+  }
+  validate_root_secret_file "${RESTIC_PASSWORD_FILE}" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  validate_root_directory "${RESTIC_REPOSITORY}" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  if [[ -e "${RESTORE_RUNTIME_DIRECTORY}" ]]; then
+    validate_root_directory "${RESTORE_RUNTIME_DIRECTORY}" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  fi
+  [[ -r "${INVENTORY_FILE}" && -r "${CRITICAL_TABLES_FILE}" && -r "${INVARIANTS_FILE}" ]] || { backup_emit_result RESTORE_START_FAILED; return 1; }
+
+  STATUS_JSON="$(backup_load_status)" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  snapshot_id="$(backup_status_snapshot_id "${STATUS_JSON}")" || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  attempt_publishable=true
+  attempt="restore-$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+  [[ "${attempt}" =~ ^restore-[A-Za-z0-9-]{1,80}$ ]] || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  container_name="${attempt}-postgres"
+  network_name="${attempt}-network"
+  volume_name="${attempt}-data"
+  ownership_label="me.matsumo.fukurou.restore.attempt=${attempt}"
+
+  if ! prepare_resources || ! wait_for_postgres; then
+    cleanup_owned_resources || { publish_result RESTORE_CLEANUP_FAILED false || true; backup_emit_result RESTORE_CLEANUP_FAILED; return 1; }
+    publish_result RESTORE_START_FAILED false || true
+    backup_emit_result RESTORE_START_FAILED
+    return 1
+  fi
+
+  local restore_status=0
+  restore_snapshot || restore_status=$?
+  if [[ "${restore_status}" != "0" ]]; then
+    local result=RESTORE_SNAPSHOT_FAILED
+    [[ "${restore_status}" == "124" ]] && result=RESTORE_TIMEOUT
+    cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
+    publish_result "${result}" false || true
+    backup_emit_result "${result}"
+    return 1
+  fi
+
+  if ! validate_inventory || ! validate_constraints || ! validate_critical_primary_keys || ! validate_readonly_invariants; then
+    local result=RESTORE_PROFILE_FAILED
+    cleanup_owned_resources || result=RESTORE_CLEANUP_FAILED
+    publish_result "${result}" false || true
+    backup_emit_result "${result}"
+    return 1
+  fi
+
+  if ! cleanup_owned_resources; then
+    publish_result RESTORE_CLEANUP_FAILED false || true
+    backup_emit_result RESTORE_CLEANUP_FAILED
+    return 1
+  fi
+  publish_result SUCCESS true || { backup_emit_result RESTORE_START_FAILED; return 1; }
+  backup_emit_result SUCCESS
+}
+
+main

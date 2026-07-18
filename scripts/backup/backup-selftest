@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT
+mkdir -p "${SELFTEST_ROOT}/status" "${SELFTEST_ROOT}/repo" "${SELFTEST_ROOT}/bin"
+
+export FUKUROU_BACKUP_STATUS_FILE="${SELFTEST_ROOT}/status/backup-status.json"
+export FUKUROU_BACKUP_LOCK_FILE="${SELFTEST_ROOT}/backup.lock"
+export FUKUROU_DEPLOY_LOCK_FILE="${SELFTEST_ROOT}/deploy.lock"
+export RESTIC_REPOSITORY="${SELFTEST_ROOT}/repo/repository"
+export RESTIC_PASSWORD_FILE="${SELFTEST_ROOT}/restic-password"
+export FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1
+# shellcheck source=backup-fukurou
+source "${SELFTEST_DIRECTORY}/backup-fukurou"
+
+fail_selftest() {
+  printf 'backup-selftest: %s\n' "$*" >&2
+  exit 1
+}
+
+expect_failure() {
+  local name="$1"
+  shift
+  if "$@"; then fail_selftest "${name} unexpectedly succeeded"; fi
+}
+
+assert_contains() {
+  local value="$1" expected="$2" name="$3"
+  [[ "${value}" == *"${expected}"* ]] || fail_selftest "${name}: missing ${expected}"
+}
+
+initial="$(backup_initial_status '2026-07-18T00:00:00Z')"
+backup_validate_status_json "${initial}" || fail_selftest "initial status rejected"
+expect_failure malformed-status backup_validate_status_json '{"schemaVersion":1}'
+expect_failure unsupported-status backup_validate_status_json "$(jq -c '.schemaVersion=2' <<<"${initial}")"
+expect_failure unknown-result backup_validate_status_json "$(jq -c '.backup.lastAttempt={attemptedAt:"2026-07-18T00:00:00Z",resultCode:"PASSWORD=secret",durationSeconds:0,interruptedCandidateCount:0,retentionSucceeded:null}' <<<"${initial}")"
+
+success='{"snapshotId":"aaaaaaaa","sourceRevision":"0123456789abcdef0123456789abcdef01234567","verifiedAt":"2026-07-18T00:01:00Z","durationSeconds":10,"verificationCount":1}'
+successful="$(backup_merge_attempt "${initial}" backup '2026-07-18T00:00:00Z' SUCCESS 10 0 true "${success}")"
+failed_later="$(backup_merge_attempt "${successful}" backup '2026-07-19T00:00:00Z' REPOSITORY_FAILED 2 1 null null)"
+[[ "$(jq -r '.backup.lastSuccess.snapshotId' <<<"${failed_later}")" == "aaaaaaaa" ]] || fail_selftest "failed attempt erased last success"
+[[ "$(jq -r '.backup.lastAttempt.resultCode' <<<"${failed_later}")" == "REPOSITORY_FAILED" ]] || fail_selftest "failed attempt was not recorded"
+
+backup_publish_status "${successful}" || fail_selftest "atomic status publication failed"
+published_before="$(<"${BACKUP_STATUS_FILE}")"
+STATUS_JSON="${published_before}"
+[[ "$(backup_status_snapshot_id)" == "aaaaaaaa" ]] || fail_selftest "backup snapshot accessor rejected authority"
+backup_publish_restore_attempt SUCCESS aaaaaaaa 1501 7 3 true || fail_selftest "restore success publication failed"
+restore_success="$(backup_load_status)"
+[[ "$(jq -r '.restore.lastSuccess.durationSeconds' <<<"${restore_success}")" == "2" ]] || fail_selftest "restore duration was not rounded up"
+[[ "$(jq -r '.restore.lastSuccess.tableCount' <<<"${restore_success}")" == "7" ]] || fail_selftest "restore table evidence was lost"
+backup_publish_restore_attempt RESTORE_PROFILE_FAILED aaaaaaaa 500 0 0 false || fail_selftest "restore failure publication failed"
+[[ "$(backup_load_status | jq -r '.restore.lastSuccess.snapshotId')" == "aaaaaaaa" ]] || fail_selftest "restore failure erased last success"
+backup_publish_status "${successful}" || fail_selftest "status fixture reset failed"
+printf '{' >"${SELFTEST_ROOT}/status/.backup-status.json.tmp.interrupted"
+[[ "$(<"${BACKUP_STATUS_FILE}")" == "${published_before}" ]] || fail_selftest "pre-rename interruption changed authority"
+ln -s "${SELFTEST_ROOT}/redirect" "${SELFTEST_ROOT}/status/symlink-status"
+
+redacted_output="$(backup_emit_result REPOSITORY_FAILED 2>&1 || true)"
+[[ "${redacted_output}" == 'fukurou-backup: result=REPOSITORY_FAILED' ]] || fail_selftest "result output was not stable and redacted"
+[[ "${redacted_output}" != *password* && "${redacted_output}" != *"${RESTIC_PASSWORD_FILE}"* ]] || fail_selftest "secret detail leaked"
+
+restic_command() {
+  case "$1" in
+    dump) printf 'custom-archive-and-trailing-bytes' ;;
+    *) return 1 ;;
+  esac
+}
+cat >"${SELFTEST_ROOT}/bin/pg_restore" <<'FAKE'
+#!/usr/bin/env bash
+head -c 1 >/dev/null
+exit "${FAKE_PG_RESTORE_STATUS:-0}"
+FAKE
+chmod +x "${SELFTEST_ROOT}/bin/pg_restore"
+PATH="${SELFTEST_ROOT}/bin:${PATH}"
+verify_archive_stream aaaaaaaa || fail_selftest "early list completion did not drain producer"
+FAKE_PG_RESTORE_STATUS=7
+export FAKE_PG_RESTORE_STATUS
+expect_failure consumer-status verify_archive_stream aaaaaaaa
+unset FAKE_PG_RESTORE_STATUS
+restic_command() { [[ "$1" != dump ]] || return 9; }
+expect_failure producer-status verify_archive_stream aaaaaaaa
+
+RESTIC_CALLS="${SELFTEST_ROOT}/restic-calls"
+restic_command() {
+  printf '%s\n' "$*" >>"${RESTIC_CALLS}"
+  if [[ "$1" == snapshots ]]; then
+    printf '%s\n' '[{"id":"bbbbbbbb","tags":["fukurou-postgres","integrity-checked","attempt-fixed"]}]'
+  fi
+}
+ATTEMPT_TAG=attempt-fixed
+authoritative="$(resolve_authoritative_snapshot)"
+[[ "${authoritative}" == "bbbbbbbb" ]] || fail_selftest "tag-induced authoritative ID was not resolved"
+assert_contains "$(<"${RESTIC_CALLS}")" '--tag fukurou-postgres,integrity-checked,attempt-fixed' "authoritative AND tags"
+
+: >"${RESTIC_CALLS}"
+forget_current_partial aaaaaaaa || fail_selftest "partial snapshot forget failed"
+forget_call="$(<"${RESTIC_CALLS}")"
+assert_contains "${forget_call}" 'forget aaaaaaaa' "partial forget"
+[[ "${forget_call}" != *--prune* ]] || fail_selftest "partial forget used prune"
+
+postgres_scalar() { printf '%s\n' 1000; }
+cat >"${SELFTEST_ROOT}/bin/df" <<'FAKE'
+#!/usr/bin/env bash
+printf 'Avail\n%s\n' "${FAKE_AVAILABLE_BYTES:?}"
+FAKE
+chmod +x "${SELFTEST_ROOT}/bin/df"
+FAKE_AVAILABLE_BYTES=$((1000 + BACKUP_RESERVE_BYTES - 1))
+export FAKE_AVAILABLE_BYTES
+expect_failure capacity-floor validate_capacity_floor
+FAKE_AVAILABLE_BYTES=$((1000 + BACKUP_RESERVE_BYTES))
+export FAKE_AVAILABLE_BYTES
+validate_capacity_floor || fail_selftest "capacity floor rejected exact sufficient capacity"
+
+flock() {
+  [[ "${1:-}" == "-u" ]] && return 0
+  if [[ "${2:-}" == "9" && "${FAKE_BACKUP_LOCK_BUSY:-0}" == "1" ]]; then return 1; fi
+  if [[ "${2:-}" == "8" && "${FAKE_DEPLOY_LOCK_BUSY:-0}" == "1" ]]; then return 1; fi
+  return 0
+}
+FAKE_BACKUP_LOCK_BUSY=1
+expect_failure backup-lock-contention backup_acquire_shared_lock
+FAKE_BACKUP_LOCK_BUSY=0
+backup_acquire_shared_lock || fail_selftest "backup lock remained busy"
+flock -u 9
+exec 9>&-
+
+FAKE_DEPLOY_LOCK_BUSY=1
+expect_failure deploy-lock-contention backup_probe_deploy_lock
+FAKE_DEPLOY_LOCK_BUSY=0
+backup_probe_deploy_lock || fail_selftest "deploy lock remained busy"
+
+script_text="$(<"${SELFTEST_DIRECTORY}/backup-fukurou")"
+assert_contains "${script_text}" '--tag fukurou-postgres,integrity-checked --keep-daily 14 --prune' "retention AND predicate"
+assert_contains "${script_text}" "WHERE pid = \${expected_pid} AND application_name = '\${APPLICATION_NAME}'" "exact watchdog recheck"
+assert_contains "${script_text}" 'kill -TERM "${WATCHDOG_PID}"' "watchdog cancellation"
+assert_contains "${script_text}" 'wait "${WATCHDOG_PID}"' "watchdog reap"
+assert_contains "${script_text}" 'cat >/dev/null' "archive EOF drain"
+assert_contains "${script_text}" '--compression auto' "explicit restic compression"
+
+WATCHDOG_EVENTS=""
+WATCHDOG_PID=123
+dump_watchdog_is_running() { return 0; }
+cancel_and_reap_dump_watchdog() { WATCHDOG_EVENTS="${WATCHDOG_EVENTS} cancel"; WATCHDOG_PID=""; }
+wait_for_dump_watchdog() { WATCHDOG_EVENTS="${WATCHDOG_EVENTS} wait"; WATCHDOG_PID=""; }
+dump_backend_count() { printf '%s\n' 1; }
+settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-present"
+[[ "${WATCHDOG_EVENTS}" == " wait" ]] || fail_selftest "producer failure cancelled a watchdog while its backend was present"
+
+WATCHDOG_EVENTS=""
+WATCHDOG_PID=124
+dump_backend_count() { printf '%s\n' 0; }
+settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-absent"
+[[ "${WATCHDOG_EVENTS}" == " cancel" ]] || fail_selftest "zero-backend producer failure did not cancel/reap watchdog"
+
+WATCHDOG_EVENTS=""
+WATCHDOG_PID=125
+dump_backend_count() { printf '%s\n' 2; }
+expect_failure multiple-backends settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-multiple"
+[[ "$(<"${SELFTEST_ROOT}/watchdog-multiple")" == "WATCHDOG_TERMINATION_FAILED" ]] || fail_selftest "multiple backends were not failed closed"
+
+schema_result="$(jq -r '.properties.schemaVersion.const' "${SELFTEST_DIRECTORY}/backup-status.schema.json")"
+[[ "${schema_result}" == "1" ]] || fail_selftest "status schema version drifted"
+[[ "$(sort "${SELFTEST_DIRECTORY}/backup-result-codes-v1.txt" | uniq -d | wc -l | tr -d ' ')" == "0" ]] || fail_selftest "result-code allowlist has duplicates"
+schema_codes="$(jq -r '.["$defs"].resultCode.enum[]' "${SELFTEST_DIRECTORY}/backup-status.schema.json" | sort)"
+file_codes="$(sort "${SELFTEST_DIRECTORY}/backup-result-codes-v1.txt")"
+[[ "${schema_codes}" == "${file_codes}" ]] || fail_selftest "status schema and result-code allowlist drifted"
+
+printf '%s\n' 'BACKUP_SELFTEST_OK status=atomic-last-good-redacted pipeline=producer-consumer-drained watchdog=exact-cancel-reap retention=and-tags-no-uncertain-prune capacity=fail-closed locks=nonblocking'

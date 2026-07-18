@@ -1,0 +1,26 @@
+# schema table
+public runtime_config_versions
+public runtime_config_values
+public risk_state
+public paper_account
+public paper_account_epochs
+public equity_snapshots
+public positions
+public orders
+public executions
+public paper_order_cancellation_details
+public command_event_log
+public safety_violations
+public trade_intent_consumptions
+public decisions
+public decision_submission_authorities
+public trade_plans
+public trade_intents
+public falsifications
+public market_data_sessions
+public paper_market_event_receipts
+public market_data_gaps
+public evaluation_exclusions
+public llm_launch_maintenance
+public infrastructure_gap_events
+public llm_pid_registrations

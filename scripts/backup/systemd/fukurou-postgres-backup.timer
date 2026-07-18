@@ -1,0 +1,12 @@
+[Unit]
+Description=Attempt the Fukurou PostgreSQL backup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=2h
+AccuracySec=1min
+Unit=fukurou-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

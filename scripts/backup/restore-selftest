@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly RESTORE_SCRIPT="${SCRIPT_DIRECTORY}/restore-fukurou"
+readonly FIXTURE_ROOT="$(mktemp -d)"
+trap '[[ "${FUKUROU_RESTORE_SELFTEST_KEEP:-false}" == true ]] || rm -rf -- "${FIXTURE_ROOT}"' EXIT
+
+fail() {
+  printf 'restore-selftest: %s\n' "$1" >&2
+  exit 1
+}
+
+make_fixture_tools() {
+  local directory="$1"
+  mkdir -p "${directory}/bin" "${directory}/state/containers" "${directory}/state/networks" "${directory}/state/volumes" "${directory}/run" "${directory}/repository"
+
+  apply_common_fixture "${directory}/backup-common"
+  apply_docker_fixture "${directory}/bin/docker"
+  apply_restic_fixture "${directory}/bin/restic"
+  apply_setsid_fixture "${directory}/bin/setsid"
+  apply_timeout_fixture "${directory}/bin/timeout"
+  chmod +x "${directory}/bin/docker" "${directory}/bin/restic" "${directory}/bin/setsid" "${directory}/bin/timeout"
+  printf 'not-a-real-secret\n' >"${directory}/restic-password"
+  chmod 0400 "${directory}/restic-password"
+}
+
+apply_timeout_fixture() {
+  local target="$1"
+  cat >"${target}" <<'TIMEOUT'
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+while arguments and arguments[0].startswith("--"):
+    arguments.pop(0)
+seconds = float(arguments.pop(0))
+process = subprocess.Popen(arguments, start_new_session=True)
+
+def forward(signum, _frame):
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+
+signal.signal(signal.SIGTERM, forward)
+signal.signal(signal.SIGINT, forward)
+try:
+    sys.exit(process.wait(timeout=seconds))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    sys.exit(124)
+TIMEOUT
+}
+
+apply_setsid_fixture() {
+  local target="$1"
+  cat >"${target}" <<'SETSID'
+#!/usr/bin/env python3
+import os
+import sys
+
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])
+SETSID
+}
+
+apply_common_fixture() {
+  local target="$1"
+  sed "s|@PUBLISH_LOG@|${target%/*}/publish.log|g" >"${target}" <<'COMMON'
+RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-fixture-repository}"
+RESTIC_PASSWORD_FILE="${FIXTURE_PASSWORD_FILE}"
+STATUS_FILE=fixture-status
+backup_require_root() { return 0; }
+backup_acquire_shared_lock() { return 0; }
+backup_probe_deploy_lock() { return 0; }
+backup_require_command() { command -v "$1" >/dev/null 2>&1; }
+backup_load_status() { printf '{"schemaVersion":1}\n'; }
+backup_status_snapshot_id() { printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'; }
+backup_publish_restore_attempt() { printf '%s\n' "$*" >>'@PUBLISH_LOG@'; }
+backup_emit_result() { printf 'fukurou-backup: result=%s\n' "$1" >&2; }
+COMMON
+}
+
+apply_docker_fixture() {
+  local target="$1"
+  sed "s|@STATE@|${target%/bin/docker}/state|g; s|@LOG@|${target%/bin/docker}/docker.log|g" >"${target}" <<'DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+readonly state='@STATE@'
+printf '%q ' "$@" >>'@LOG@'
+printf '\n' >>'@LOG@'
+command_name="${1:-}"
+shift || true
+last_argument=""
+for argument in "$@"; do last_argument="${argument}"; done
+case "${command_name}" in
+  network)
+    action="${1:-}"; shift || true
+    case "${action}" in
+      create) touch "${state}/networks/${last_argument}" ;;
+      rm)
+        name="${last_argument}"
+        [[ "${FIXTURE_CLEANUP_FAIL:-false}" == true ]] && exit 1
+        rm -f -- "${state}/networks/${name}"
+        ;;
+      ls) find "${state}/networks" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; ;;
+    esac
+    ;;
+  volume)
+    action="${1:-}"; shift || true
+    case "${action}" in
+      create) name="${last_argument}"; touch "${state}/volumes/${name}"; printf '%s\n' "${name}" ;;
+      rm)
+        name="${last_argument}"
+        [[ "${FIXTURE_CLEANUP_FAIL:-false}" == true ]] && exit 1
+        rm -f -- "${state}/volumes/${name}"
+        ;;
+      ls) find "${state}/volumes" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; ;;
+    esac
+    ;;
+  run)
+    name=""
+    while (($#)); do
+      if [[ "$1" == --name ]]; then name="$2"; shift 2; else shift; fi
+    done
+    touch "${state}/containers/${name}"
+    printf 'fixture-container\n'
+    ;;
+  rm)
+    name="${last_argument}"
+    [[ "${FIXTURE_CLEANUP_FAIL:-false}" == true ]] && exit 1
+    rm -f -- "${state}/containers/${name}"
+    ;;
+  ps) find "${state}/containers" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; ;;
+  exec)
+    while [[ "${1:-}" == -i || "${1:-}" == --env ]]; do
+      if [[ "$1" == --env ]]; then shift 2; else shift; fi
+    done
+    container="$1"; shift
+    case "${1:-}" in
+      pg_isready)
+        if [[ "${FIXTURE_SIGNAL_ON_READY:-false}" == true ]]; then
+          kill -TERM "${PPID}"
+          sleep 0.1
+        fi
+        exit 0
+        ;;
+      pg_restore)
+        cat >/dev/null
+        if [[ "${FIXTURE_RESTORE_FAIL:-false}" == true ]]; then exit 1; fi
+        ;;
+      psql)
+        command_text=""
+        for argument in "$@"; do
+          [[ "${argument}" == --command=* ]] && command_text="${argument#--command=}"
+        done
+        if [[ -z "${command_text}" ]]; then
+          cat >/dev/null
+          [[ "${FIXTURE_INVARIANT_FAIL:-false}" == true ]] && printf '1\n' || printf '0\n0\n0\n0\n0\n'
+        elif [[ "${command_text}" == *'NOT convalidated'* ]]; then
+          printf '0\n'
+        elif [[ "${command_text}" == *'SELECT COUNT(*) FROM pg_catalog.pg_constraint'* ]]; then
+          printf '7\n'
+        else
+          printf '1\n'
+        fi
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+DOCKER
+}
+
+apply_restic_fixture() {
+  local target="$1"
+  sed "s|@LOG@|${target%/bin/restic}/restic.log|g" >"${target}" <<'RESTIC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%q ' "$@" >>'@LOG@'
+printf '\n' >>'@LOG@'
+[[ "$*" == *'dump 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef /stdin'* ]] || exit 2
+if [[ "${FIXTURE_RESTIC_SLEEP:-0}" != 0 ]]; then sleep "${FIXTURE_RESTIC_SLEEP}"; fi
+if [[ "${FIXTURE_RESTIC_FAIL:-false}" == true ]]; then
+  printf 'unsafe-child-detail password=fixture raw-sql=SELECT-secret\n' >&2
+  exit 1
+fi
+printf 'custom-archive-fixture'
+RESTIC
+}
+
+run_fixture() {
+  local name="$1" expected_result="$2"
+  shift 2
+  local directory="${FIXTURE_ROOT}/${name}"
+  make_fixture_tools "${directory}"
+  local status=0
+  local -a restore_command=("${RESTORE_SCRIPT}")
+  if [[ "${FUKUROU_RESTORE_SELFTEST_TRACE:-false}" == true ]]; then
+    restore_command=(bash -x "${RESTORE_SCRIPT}")
+  fi
+  env \
+    PATH="${directory}/bin:${PATH}" \
+    FIXTURE_PASSWORD_FILE="${directory}/restic-password" \
+    FUKUROU_BACKUP_COMMON_PATH="${directory}/backup-common" \
+    FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1 \
+    RESTIC_REPOSITORY="${directory}/repository" \
+    FUKUROU_BACKUP_SHARE_DIRECTORY="${SCRIPT_DIRECTORY}" \
+    FUKUROU_RESTORE_RUNTIME_DIRECTORY="${directory}/run" \
+    FUKUROU_RESTORE_TIMEOUT_SECONDS=1 \
+    FUKUROU_RESTORE_START_TIMEOUT_SECONDS=2 \
+    FUKUROU_RESTORE_CLEANUP_TIMEOUT_SECONDS=1 \
+    "$@" \
+    "${restore_command[@]}" >"${directory}/stdout" 2>"${directory}/stderr" || status=$?
+  if ! grep -F "result=${expected_result}" "${directory}/stderr" >/dev/null; then
+    sed -n '1,120p' "${directory}/stderr" >&2
+    tail -n 120 "${directory}/stderr" >&2
+    fail "${name}: expected ${expected_result}"
+  fi
+  if [[ "${expected_result}" == SUCCESS ]]; then
+    [[ "${status}" == 0 ]] || fail "${name}: success exited ${status}"
+  else
+    [[ "${status}" != 0 ]] || fail "${name}: failure exited zero"
+  fi
+  printf '%s\n' "${directory}"
+}
+
+assert_no_owned_resources() {
+  local directory="$1"
+  local remaining
+  remaining="$(find "${directory}/state" -mindepth 2 -maxdepth 2 -type f | wc -l | tr -d ' ')"
+  [[ "${remaining}" == 0 ]] || fail "owned resource leak in ${directory}"
+}
+
+success_directory="$(run_fixture success SUCCESS)"
+grep -F 'SUCCESS 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' "${success_directory}/publish.log" >/dev/null || fail 'success evidence did not select exact snapshot'
+grep -F -- '--no-cache' "${success_directory}/restic.log" >/dev/null || fail 'restic cache was not disabled'
+grep -F ' true' "${success_directory}/publish.log" >/dev/null || fail 'success evidence was not advanced'
+grep -F -- '--network restore-' "${success_directory}/docker.log" >/dev/null || fail 'restore did not use its isolated network'
+grep -F -- '--memory 1g' "${success_directory}/docker.log" >/dev/null || fail 'restore memory bound missing'
+grep -F -- '--pids-limit 256' "${success_directory}/docker.log" >/dev/null || fail 'restore PID bound missing'
+grep -F 'postgres:16' "${success_directory}/docker.log" >/dev/null || fail 'restore did not pin PostgreSQL 16'
+grep -F -- '--env POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password' "${success_directory}/docker.log" >/dev/null || fail 'separate credential file missing'
+grep -F -- 'PGOPTIONS=-c\ statement_timeout=20000\ -c\ lock_timeout=5000' "${success_directory}/docker.log" >/dev/null || fail 'validation SQL was not bounded'
+if grep -F -- '--publish' "${success_directory}/docker.log" >/dev/null || grep -F 'fukurou-postgres' "${success_directory}/docker.log" >/dev/null; then
+  fail 'restore shared a production identity or host port'
+fi
+assert_no_owned_resources "${success_directory}"
+
+profile_directory="$(run_fixture profile-failure RESTORE_PROFILE_FAILED FIXTURE_INVARIANT_FAIL=true)"
+grep -F 'RESTORE_PROFILE_FAILED ' "${profile_directory}/publish.log" >/dev/null || fail 'profile failure was not published'
+grep -F ' false' "${profile_directory}/publish.log" >/dev/null || fail 'profile failure advanced evidence'
+assert_no_owned_resources "${profile_directory}"
+
+snapshot_directory="$(run_fixture snapshot-failure RESTORE_SNAPSHOT_FAILED FIXTURE_RESTIC_FAIL=true)"
+if grep -F 'unsafe-child-detail' "${snapshot_directory}/stderr" >/dev/null; then
+  fail 'restore exposed unsafe child detail'
+fi
+assert_no_owned_resources "${snapshot_directory}"
+
+timeout_directory="$(run_fixture timeout RESTORE_TIMEOUT FIXTURE_RESTIC_SLEEP=5)"
+assert_no_owned_resources "${timeout_directory}"
+
+cleanup_directory="$(run_fixture cleanup-failure RESTORE_CLEANUP_FAILED FIXTURE_CLEANUP_FAIL=true)"
+grep -F 'RESTORE_CLEANUP_FAILED ' "${cleanup_directory}/publish.log" >/dev/null || fail 'cleanup failure was not published'
+rm -f -- "${cleanup_directory}"/state/{containers,networks,volumes}/*
+
+signal_directory="$(run_fixture signal RESTORE_SIGNALLED FIXTURE_SIGNAL_ON_READY=true)"
+grep -F 'RESTORE_SIGNALLED ' "${signal_directory}/publish.log" >/dev/null || fail 'signal attempt was not published'
+assert_no_owned_resources "${signal_directory}"
+
+printf 'RESTORE_SELFTEST_OK exact-snapshot=selected isolation=postgres16-owned-only invariants=fail-closed timeout=cleaned signal=cleaned cleanup=reported owned-resources=zero\n'
