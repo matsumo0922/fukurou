@@ -24,6 +24,7 @@
 - [x] 4.1 Add root-only install and verification commands for fixed backup/restore entrypoints, validation profiles, status/secret/repository directories, and disabled-by-default unit installation.
 - [x] 4.2 Add hardened root oneshot services and persistent randomized daily/weekly timers with bounded execution and no embedded secret.
 - [x] 4.3 Verify that the change does not modify `github-runner` sudoers, deploy executor/workflow, Ktor routes, production compose, or database schema.
+- [x] 4.4 Require successful latest backup retention and restore attempts, current-repository exact snapshot evidence, and bounded zero-resource cleanup inventory before rollout enablement.
 
 ## 5. Documentation
 
@@ -35,5 +36,5 @@
 
 - [x] 6.1 Pass strict OpenSpec validation, `bash -n`, deterministic backup/restore selftests, JSON schema/profile validation, and Docker integration selftest.
 - [x] 6.2 Through the shared validation lease, pass `make test`, `make detekt`, and `make build` at one exact HEAD and confirm a clean worktree apart from intended changes.
-- [x] 6.3 Pass clean-context design falsification and final G1-G5 implementation review, resolving every blocking finding before PR approval.
+- [ ] 6.3 Pass clean-context design falsification and final G1-G5 implementation review, resolving every blocking finding before PR approval.
 - [x] 6.4 Record the NAS root rollout as HANDOFF: install restic/artifacts, create and recoverably store the password, initialize repository, run first backup and exact-snapshot restore drill, verify modes/status/cleanup, then enable timers.
