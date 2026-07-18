@@ -109,7 +109,7 @@ For every accepted non-fresh deploy, the executor MUST persist validated intent,
 
 #### Scenario: Repository checkout differs from the running revision
 - **WHEN** a previous roll-forward-only failure left repository HEAD at another revision
-- **THEN** rollback compose is captured from the accepted running revision Git object and candidate compose is rendered from the signed target Git object
+- **THEN** rollback compose is captured from the accepted running revision Git object, the signed target compose is snapshot and render-validated before mutation, and candidate preflight uses the unchanged production compose with the deny overlay
 
 #### Scenario: Post-deploy identity disagrees
 - **WHEN** running digest or `/revision` differs from the signed target, or readiness does not succeed within the deadline
