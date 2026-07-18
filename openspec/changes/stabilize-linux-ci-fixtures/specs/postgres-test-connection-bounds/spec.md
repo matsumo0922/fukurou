@@ -1,0 +1,46 @@
+## MODIFIED Requirements
+
+### Requirement: Testcontainers PostgreSQL connections are time bounded
+
+Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture は module-local な bounded base container を MUST 継承し、生成する全 JDBC URL に connection establishment と socket read の有限 timeout を設定する。large population test は socket timeout を test oracle にせず、normal population と oversized rejection を独立 fixture で bounded time に検証しなければならない。
+
+#### Scenario: Every fixture inherits bounded connection settings
+
+- **WHEN** test source に Testcontainers PostgreSQL fixture を定義する
+- **THEN** fixture は module-local な bounded base container を継承し、fixture ごとの timeout helper 呼び出しを必要としない
+
+#### Scenario: Every test consumer receives bounded JDBC settings
+
+- **WHEN** Testcontainers PostgreSQL fixture が HikariCP、Exposed、`DriverManager`、または production composition test へ JDBC URL を渡す
+- **THEN** URL は `connectTimeout` が 10 秒以下、`loginTimeout` が 30 秒以下、`socketTimeout` が 300 秒以下の正の整数値をそれぞれちょうど 1 個含む
+
+#### Scenario: Consumer uses a stricter timeout
+
+- **WHEN** 接続失敗を検証する consumer が既定値より短い timeout を必要とする
+- **THEN** URL helper は既存 query parameter を key 単位で上書きし、重複 key や複数の `?` を生成しない
+
+#### Scenario: Authentication response stops arriving
+
+- **WHEN** PostgreSQL JDBC connection が socket を確立した後、authentication response を受信できない
+- **THEN** driver は設定した login timeout 以内に connection failure を返し、test worker は無期限に停止しない
+
+#### Scenario: First pool initialization hits a transient socket failure
+
+- **WHEN** `runPostgresTest` の test body 開始前に最初の DataSource construction が socket/connect cause または SQLSTATE `08001` の connection attempt failure で失敗する
+- **THEN** fixture は接続を最大 2 回再試行し、成功すれば test body を 1 回だけ実行する
+
+#### Scenario: Retry does not mask a persistent or non-network failure
+
+- **WHEN** 3 回目の DataSource construction が失敗する、または最初の失敗が retryable SQLSTATE `08001` を持たない（SQLSTATE がない場合は socket/connect cause を持たない）
+- **THEN** fixture は失敗を呼び出し元へ伝播し、test body を実行しない
+
+#### Scenario: Wrong-password assertion rejects URL configuration failures
+
+- **WHEN** MCP integration test が誤った password で PostgreSQL 接続失敗を検証する
+- **THEN** test は任意の例外ではなく invalid-password SQLSTATE `28P01` を確認する
+
+#### Scenario: Large population rejection remains typed and bounded
+
+- **WHEN** evaluation repository test が entity limit を超える scoped population を作る
+- **THEN** JDBC socket timeout 前に `EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT` を返す
+- **AND** normal scoped aggregation は独立した最小 population で成功を確認する
