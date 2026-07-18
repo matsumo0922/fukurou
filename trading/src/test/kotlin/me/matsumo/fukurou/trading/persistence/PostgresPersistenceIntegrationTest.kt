@@ -7421,7 +7421,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun evaluation_repository_bounds_large_scoped_populations_and_aggregates_prior_pnl() = runPostgresTest {
+    fun evaluation_repository_bounds_global_population_with_one_scoped_trade() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedEvaluationRepository(database)
         val scope = repository.resolveScope(null, "CURRENT").getOrThrow()

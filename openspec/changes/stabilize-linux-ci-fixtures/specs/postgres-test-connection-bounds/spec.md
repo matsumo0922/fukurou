@@ -2,7 +2,7 @@
 
 ### Requirement: Testcontainers PostgreSQL connections are time bounded
 
-Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture は module-local な bounded base container を MUST 継承し、生成する全 JDBC URL に connection establishment と socket read の有限 timeout を設定する。large population test は socket timeout を test oracle にせず、normal population と oversized rejection を独立 fixture で bounded time に検証しなければならない。
+Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture は module-local な bounded base container を MUST 継承し、生成する全 JDBC URL に connection establishment と socket read の有限 timeout を設定する。large population test は socket timeout を test oracle にせず、同じ period に1件 scoped + 20,001件 scope外を作り、normal scoped aggregation と global oversized rejection を別々の assertion で bounded time に検証しなければならない。
 
 #### Scenario: Every fixture inherits bounded connection settings
 
@@ -39,8 +39,8 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 - **WHEN** MCP integration test が誤った password で PostgreSQL 接続失敗を検証する
 - **THEN** test は任意の例外ではなく invalid-password SQLSTATE `28P01` を確認する
 
-#### Scenario: Large population rejection remains typed and bounded
+#### Scenario: One scoped trade remains queryable inside a global oversized population
 
-- **WHEN** evaluation repository test が entity limit を超える scoped population を作る
-- **THEN** JDBC socket timeout 前に `EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT` を返す
-- **AND** normal scoped aggregation は独立した最小 population で成功を確認する
+- **WHEN** evaluation repository test が同じ period に1件 scoped + 20,001件 scope外を作る
+- **THEN** scoped trade query は1件だけを返し、prior PnL aggregation は正常に成功する
+- **AND** 同じ20,002件の global population に対する別の assertion は JDBC socket timeout 前に `EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT` を返す

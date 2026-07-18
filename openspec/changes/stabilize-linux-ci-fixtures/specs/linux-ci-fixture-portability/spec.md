@@ -20,10 +20,10 @@ Deploy-gated test fixture は Linux 上で production と同じ supervisor compl
 ### Requirement: Fixture waits are bounded and non-racy
 OS process または file の観測待機は monotonic deadline と最後の observation を MUST 持ち、対象を観測した時点で終了しなければならない。
 
-#### Scenario: PID file appears before deadline
-- **WHEN** child PID file が deadline 前に作成される
+#### Scenario: Valid positive PID appears before deadline
+- **WHEN** child PID file が deadline 前に正の整数 PID として parse 可能になる
 - **THEN** wait は直ちに PID を返し、process timeout 時刻まで固定反復を継続しない
 
-#### Scenario: PID file does not appear
-- **WHEN** child PID file が deadline まで作成されない
-- **THEN** test は bounded time で最後の path state を含む失敗を返す
+#### Scenario: Valid positive PID does not become observable
+- **WHEN** child PID file が deadline まで存在しない、read できない、または正の整数 PID として parse できない
+- **THEN** test は bounded time で path、existence、最後の bounded content と parse state を含む失敗を返す

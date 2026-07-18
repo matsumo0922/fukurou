@@ -4,7 +4,7 @@
 
 ## What Changes
 
-- evaluation population bound test から全件 scope 更新と20,002件の scoped trade materializationを除き、1件の scoped 集計と同じ period にある20,002件の global population rejectionを独立して証明する。
+- evaluation population bound test は同じ period に1件 scoped + 20,001件 scope外を作り、正常な scoped 集計と20,002件の global oversized population rejectionを別々の assertion で証明する。
 - Linux process-tree recovery test の child fixture を production supervisor protocol に合わせ、PID 観測を timeout と競合しない bounded wait にする。
 - gateway-start failure test が production と同じ socket path selection を使って exact path を妨害し、成功・失敗のどちらでも artifact を cleanup する。
 - product/runtime code、production JDBC timeout、deploy authority は変更しない。
@@ -18,7 +18,7 @@
 ### Modified Capabilities
 
 - `postgres-test-connection-bounds`: large population test は JDBC socket timeout を test oracle にせず、entity limit の意味を bounded time で検証する。
-- `deploy-quality-gate`: exact target の正しい test suite が platform-specific fixture assumption ではなく product regression の有無を判定する。
+- `deploy-quality-gate`: exact target の正しい test suite は Linux supervisor fixture を Linux CI で実検証し、gateway socket fixture を Linux と macOS で実検証する。利用できない platform fixture の skip は実検証の証拠に数えない。
 
 ## Impact
 
