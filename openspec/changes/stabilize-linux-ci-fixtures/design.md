@@ -32,14 +32,14 @@ fixture は root process が timeout signal を受けたときに supervisor ACK
 
 ### D3: production と同じ socket path を test が導出する（agent 仮決め）
 
-gateway-start fixture は manifest sibling と `/tmp` fallback の選択規則を test-only helper に独立 oracle として持ち、oracle が選ぶ exact path を妨害する。production helper は共有せず、runtime code も test helper に依存させない。production selection と oracle が drift すると test は誤った path を妨害し、standard process が launch inventory に現れるため、risk-reduction-only の standard-launch absence assertion が失敗する。fallback まで起動する形の drift では launch-count assertion も失敗する。artifact cleanup は `try/finally` に置く。
+gateway-start fixture は manifest sibling と `/tmp` fallback の選択規則を test-only helper に独立 oracle として持ち、oracle が選ぶ exact path を妨害する。production helper は共有せず、runtime code も test helper に依存させない。production selection と oracle が異なる有効な socket path を選ぶ drift では、test は production path を妨害できず standard process が launch inventory に現れるため、risk-reduction-only の standard-launch absence assertion が失敗する。fallback まで起動する形の drift では launch-count assertion も失敗する。一方、production selector が invalid な 103 bytes 超の sibling path を選び gateway startup 自体が失敗する drift まで、independent oracle の launch assertion が必ず検知する保証とはしない。artifact cleanup は `try/finally` に置く。
 
 代案の temp directory 名を意図的に長くする方法は fallback branch しか検証せず、Linux の通常 sibling branch を再び未検証にするため採用しない。
 
 ## Risks / Trade-offs
 
 - [Risk] 全件 scope 更新の除去で filter coverage を失う → 1件 scoped + 20,001件 scope外を維持し、正常 scoped 集計と oversized typed rejection を独立 assertion として確認する。
-- [Risk] test-only path oracle が production path logic から drift する → oracle は意図的に独立させ、drift 時は standard launch absence または launch-count assertion が失敗することを回帰検知にする。production helper 共有は test-only / runtime non-goal 境界を崩すため行わない。
+- [Risk] test-only path oracle が production path logic から drift する → oracle は意図的に独立させ、production と test が異なる有効な socket path を選ぶ drift は standard launch absence または launch-count assertion の失敗で回帰検知する。production selector が invalid path を選んで gateway startup 自体が失敗する drift まで oracle の launch assertion が必ず検知する保証とはしない。production helper 共有は test-only / runtime non-goal 境界を崩すため行わない。
 - [Risk] shell fixture が production supervisor より単純になる → ACK exit と descendant reap という当該 test の契約だけを明示して検証する。
 
 ## Migration Plan
