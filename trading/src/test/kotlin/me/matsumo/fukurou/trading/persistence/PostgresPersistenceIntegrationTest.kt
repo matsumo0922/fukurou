@@ -7954,7 +7954,7 @@ class PostgresPersistenceIntegrationTest {
                 phase = "falsifier",
                 provider = "codex",
                 occurredAt = fixedInstant().plusMillis(3),
-                stdout = "codex text output",
+                detailsJson = """{"configuredModel":"gpt-5.5","usage":{"usage":{"inputTokens":1000,"outputTokens":100,"reasoningOutputTokens":80,"cacheReadInputTokens":400}}}""",
             ),
         ).getOrThrow()
         eventLog.append(
@@ -7990,7 +7990,8 @@ class PostgresPersistenceIntegrationTest {
         )
         assertEquals("0.01", usageResult.facts.first().usage?.totalCostUsd?.toPlainString())
         assertEquals("0.20", usageResult.facts[1].usage?.totalCostUsd?.toPlainString())
-        assertEquals(null, usageResult.facts[2].usage)
+        assertEquals("gpt-5.5", usageResult.facts[2].configuredModel)
+        assertEquals(1_000, usageResult.facts[2].usage?.usage?.inputTokens)
         assertEquals("0.10", usageResult.facts[3].usage?.totalCostUsd?.toPlainString())
     }
 
@@ -13726,12 +13727,13 @@ private fun runnerPhaseEvent(
     provider: String?,
     occurredAt: Instant,
     stdout: String? = null,
+    detailsJson: String? = null,
 ): CommandEvent {
     val escapedStdout = stdout?.replace("\"", "\\\"")
-    val details = if (escapedStdout == null) {
-        "{}"
-    } else {
-        """{"stdout":"$escapedStdout"}"""
+    val details = when {
+        detailsJson != null -> detailsJson
+        escapedStdout != null -> """{"stdout":"$escapedStdout"}"""
+        else -> "{}"
     }
 
     return CommandEvent(

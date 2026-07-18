@@ -29,6 +29,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
+import me.matsumo.fukurou.trading.evaluation.LlmApiListPriceCatalog
 import me.matsumo.fukurou.trading.evaluation.LlmModelTokenStats
 import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
 import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
@@ -490,13 +491,18 @@ private fun Route.registerEvaluationCostsRoute(dependencies: EvaluationRouteDepe
                 unpricedPhaseCount = costs.unpricedPhaseCount,
                 unattributedTokenPhaseCount = costs.unattributedTokenPhaseCount,
                 knownCostUsd = costs.knownCostUsd?.toDecimalString(),
+                apiListPriceEquivalentUsd = costs.apiListPriceEquivalentUsd?.toDecimalString(),
+                apiListPriceCoveredPhaseCount = costs.apiListPriceCoveredPhaseCount,
+                apiListPriceUnpricedPhaseCount = costs.apiListPriceUnpricedPhaseCount,
+                subscriptionActualCostUsd = null,
+                pricingCatalog = EvaluationPricingCatalogResponse.fromCatalog(),
                 byProvider = costs.byProvider.map { stats -> EvaluationProviderCostResponse.fromStats(stats) },
                 byModel = costs.byModel.map { stats -> EvaluationModelTokenResponse.fromStats(stats) },
             ),
         )
     }.describe {
         summary = "LLM cost と usage を取得する"
-        description = "runner phase audit に保存された provider usage と取得済み cost を集計し、usage・cost・model attribution の coverage を返します。"
+        description = "runner phase audit の provider cost と Codex API list-price 相当額を別々に集計します。subscription 実費は観測できないため null です。"
         tag(EVALUATION_TAG)
         parameters {
             query("epochId") {
@@ -1245,6 +1251,11 @@ data class EvaluationCostsResponse(
     val unpricedPhaseCount: Int,
     val unattributedTokenPhaseCount: Int,
     val knownCostUsd: String?,
+    val apiListPriceEquivalentUsd: String?,
+    val apiListPriceCoveredPhaseCount: Int,
+    val apiListPriceUnpricedPhaseCount: Int,
+    val subscriptionActualCostUsd: String?,
+    val pricingCatalog: EvaluationPricingCatalogResponse,
     val byProvider: List<EvaluationProviderCostResponse>,
     val byModel: List<EvaluationModelTokenResponse>,
 )
@@ -1263,6 +1274,9 @@ data class EvaluationCostsResponse(
 data class EvaluationProviderCostResponse(
     val provider: String,
     val knownCostUsd: String?,
+    val apiListPriceEquivalentUsd: String?,
+    val apiListPriceCoveredPhaseCount: Int,
+    val apiListPriceUnpricedPhaseCount: Int,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
     val unpricedPhaseCount: Int,
@@ -1273,6 +1287,9 @@ data class EvaluationProviderCostResponse(
             return EvaluationProviderCostResponse(
                 provider = stats.provider,
                 knownCostUsd = stats.knownCostUsd?.toDecimalString(),
+                apiListPriceEquivalentUsd = stats.apiListPriceEquivalentUsd?.toDecimalString(),
+                apiListPriceCoveredPhaseCount = stats.apiListPriceCoveredPhaseCount,
+                apiListPriceUnpricedPhaseCount = stats.apiListPriceUnpricedPhaseCount,
                 phaseCount = stats.phaseCount,
                 missingUsagePhaseCount = stats.missingUsagePhaseCount,
                 unpricedPhaseCount = stats.unpricedPhaseCount,
@@ -1310,6 +1327,30 @@ data class EvaluationModelTokenResponse(
                 reasoningOutputTokens = stats.reasoningOutputTokens,
                 cacheCreationInputTokens = stats.cacheCreationInputTokens,
                 cacheReadInputTokens = stats.cacheReadInputTokens,
+            )
+        }
+    }
+}
+
+/** API list-price catalog の公開 metadata。 */
+@Serializable
+data class EvaluationPricingCatalogResponse(
+    val version: String,
+    val asOf: String,
+    val basis: String,
+    val sourceUrl: String,
+    val maxPhaseInputTokensExclusive: Long,
+) {
+    companion object {
+        fun fromCatalog(): EvaluationPricingCatalogResponse {
+            val metadata = LlmApiListPriceCatalog.metadata
+
+            return EvaluationPricingCatalogResponse(
+                version = metadata.version,
+                asOf = metadata.asOf,
+                basis = metadata.basis,
+                sourceUrl = metadata.sourceUrl,
+                maxPhaseInputTokensExclusive = metadata.maxPhaseInputTokensExclusive,
             )
         }
     }

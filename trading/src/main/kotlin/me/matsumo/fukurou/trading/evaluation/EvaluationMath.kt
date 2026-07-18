@@ -268,21 +268,8 @@ object EvaluationMath {
         val unpricedCount = llmFacts.count { fact -> fact.usage?.totalCostUsd == null }
         val unattributedTokenCount = llmFacts.count { fact -> fact.hasUnattributedTokens() }
         val knownCost = llmFacts.mapNotNull { fact -> fact.usage?.totalCostUsd }.knownCostSumOrNull()
-        val byProvider = llmFacts
-            .groupBy { fact -> fact.provider ?: UNKNOWN_PROVIDER }
-            .map { (provider, providerFacts) ->
-                LlmProviderCostStats(
-                    provider = provider,
-                    knownCostUsd = providerFacts
-                        .mapNotNull { fact -> fact.usage?.totalCostUsd }
-                        .knownCostSumOrNull(),
-                    phaseCount = providerFacts.size,
-                    missingUsagePhaseCount = providerFacts.count { fact -> fact.usage == null },
-                    unpricedPhaseCount = providerFacts.count { fact -> fact.usage?.totalCostUsd == null },
-                    unattributedTokenPhaseCount = providerFacts.count { fact -> fact.hasUnattributedTokens() },
-                )
-            }
-            .sortedBy { stats -> stats.provider }
+        val apiListPriceFacts = llmFacts.filter { fact -> fact.provider == "codex" && fact.usage != null }
+        val byProvider = llmFacts.toProviderCostStats()
         val byModel = llmFacts
             .flatMap { fact -> fact.usage?.modelUsages.orEmpty() }
             .groupBy { usage -> usage.model }
@@ -295,10 +282,43 @@ object EvaluationMath {
             unpricedPhaseCount = unpricedCount,
             unattributedTokenPhaseCount = unattributedTokenCount,
             knownCostUsd = knownCost,
+            apiListPriceEquivalentUsd = llmFacts
+                .mapNotNull(LlmApiListPriceCatalog::calculate)
+                .knownCostSumOrNull(),
+            apiListPriceCoveredPhaseCount = apiListPriceFacts.count { fact ->
+                LlmApiListPriceCatalog.calculate(fact) != null
+            },
+            apiListPriceUnpricedPhaseCount = apiListPriceFacts.count { fact ->
+                LlmApiListPriceCatalog.calculate(fact) == null
+            },
             byProvider = byProvider,
             byModel = byModel,
         )
     }
+}
+
+private fun List<LlmPhaseUsageFact>.toProviderCostStats(): List<LlmProviderCostStats> {
+    return groupBy { fact -> fact.provider ?: UNKNOWN_PROVIDER }
+        .map { (provider, facts) ->
+            LlmProviderCostStats(
+                provider = provider,
+                knownCostUsd = facts.mapNotNull { fact -> fact.usage?.totalCostUsd }.knownCostSumOrNull(),
+                apiListPriceEquivalentUsd = facts
+                    .mapNotNull(LlmApiListPriceCatalog::calculate)
+                    .knownCostSumOrNull(),
+                apiListPriceCoveredPhaseCount = facts.count { fact ->
+                    LlmApiListPriceCatalog.calculate(fact) != null
+                },
+                apiListPriceUnpricedPhaseCount = facts.count { fact ->
+                    fact.provider == "codex" && fact.usage != null && LlmApiListPriceCatalog.calculate(fact) == null
+                },
+                phaseCount = facts.size,
+                missingUsagePhaseCount = facts.count { fact -> fact.usage == null },
+                unpricedPhaseCount = facts.count { fact -> fact.usage?.totalCostUsd == null },
+                unattributedTokenPhaseCount = facts.count { fact -> fact.hasUnattributedTokens() },
+            )
+        }
+        .sortedBy { stats -> stats.provider }
 }
 
 private fun Map<String, List<EvaluatedTrade>>.toRidgeGroups(): List<OutcomeRidgeGroup> {

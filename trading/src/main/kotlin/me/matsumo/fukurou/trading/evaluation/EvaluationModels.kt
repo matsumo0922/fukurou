@@ -491,6 +491,7 @@ data class LlmUsageDetails(
  * @param decisionRunId decision run ID
  * @param provider LLM provider
  * @param phase runner phase 名
+ * @param configuredModel 実行時に指定された exact model。CLI default は null
  * @param occurredAt phase 完了時刻
  * @param usage 抽出済み usage。欠落時は null
  */
@@ -498,6 +499,7 @@ data class LlmPhaseUsageFact(
     val decisionRunId: String?,
     val provider: String?,
     val phase: String?,
+    val configuredModel: String? = null,
     val occurredAt: Instant,
     val usage: LlmUsageDetails?,
     val populationStatus: EvaluationPopulationStatus = EvaluationPopulationStatus.ATTRIBUTION_MISSING,
@@ -517,6 +519,9 @@ data class LlmPhaseUsageFact(
 data class LlmProviderCostStats(
     val provider: String,
     val knownCostUsd: BigDecimal?,
+    val apiListPriceEquivalentUsd: BigDecimal?,
+    val apiListPriceCoveredPhaseCount: Int,
+    val apiListPriceUnpricedPhaseCount: Int,
     val phaseCount: Int,
     val missingUsagePhaseCount: Int,
     val unpricedPhaseCount: Int,
@@ -559,6 +564,9 @@ data class LlmCostStats(
     val unpricedPhaseCount: Int,
     val unattributedTokenPhaseCount: Int,
     val knownCostUsd: BigDecimal?,
+    val apiListPriceEquivalentUsd: BigDecimal?,
+    val apiListPriceCoveredPhaseCount: Int,
+    val apiListPriceUnpricedPhaseCount: Int,
     val byProvider: List<LlmProviderCostStats>,
     val byModel: List<LlmModelTokenStats>,
 )

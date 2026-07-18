@@ -417,6 +417,7 @@ class EvaluationRouteTest {
 
         val summaryBody = client.get("/evaluation/summary").bodyAsText()
         val costsBody = client.get("/evaluation/costs").bodyAsText()
+        val costsJson = Json.parseToJsonElement(costsBody).jsonObject
 
         assertTrue(summaryBody.contains("\"killCriterion\""))
         assertTrue(summaryBody.contains("\"falseSuppressionCount\":0"))
@@ -429,8 +430,22 @@ class EvaluationRouteTest {
         assertTrue(costsBody.contains("\"knownCostUsd\":\"0.01\""))
         assertTrue(costsBody.contains("\"knownCostUsd\":null"))
         assertTrue(costsBody.contains("\"unpricedPhaseCount\":1"))
-        assertTrue(costsBody.contains("\"unattributedTokenPhaseCount\":1"))
-        assertTrue(costsBody.contains("\"reasoningOutputTokens\":2"))
+        assertTrue(costsBody.contains("\"apiListPriceEquivalentUsd\":\"0.0001475\""))
+        assertTrue(costsBody.contains("\"apiListPriceCoveredPhaseCount\":1"))
+        assertTrue(costsBody.contains("\"apiListPriceUnpricedPhaseCount\":0"))
+        assertTrue(costsBody.contains("\"subscriptionActualCostUsd\":null"))
+        assertTrue(costsBody.contains("\"version\":\"openai-gpt-5.5-2026-07-17\""))
+        assertTrue(costsBody.contains("\"basis\":\"STANDARD_API\""))
+        assertTrue(costsBody.contains("\"maxPhaseInputTokensExclusive\":272000"))
+        assertEquals("2", costsJson.getValue("unattributedTokenPhaseCount").jsonPrimitive.content)
+        assertEquals(
+            listOf("claude-test"),
+            costsJson.getValue("byModel").jsonArray.map { element ->
+                val model = element.jsonObject
+                assertTrue("apiListPriceEquivalentUsd" !in model)
+                model.getValue("model").jsonPrimitive.content
+            },
+        )
     }
 
     @Test
@@ -725,6 +740,7 @@ private object FakeEvaluationRepository : EvaluationRepository {
                         decisionRunId = "codex-run",
                         provider = "codex",
                         phase = "falsifier",
+                        configuredModel = "gpt-5.5",
                         occurredAt = Instant.parse("2026-07-02T00:01:00Z"),
                         usage = LlmUsageDetails(
                             totalCostUsd = null,
@@ -737,18 +753,7 @@ private object FakeEvaluationRepository : EvaluationRepository {
                                 cacheCreationInputTokens = null,
                                 cacheReadInputTokens = 5,
                             ),
-                            modelUsages = listOf(
-                                LlmModelUsage(
-                                    model = "gpt-test",
-                                    usage = LlmTokenUsage(
-                                        inputTokens = 10,
-                                        outputTokens = 4,
-                                        reasoningOutputTokens = 2,
-                                        cacheCreationInputTokens = null,
-                                        cacheReadInputTokens = 5,
-                                    ),
-                                ),
-                            ),
+                            modelUsages = emptyList(),
                         ),
                         populationStatus = EvaluationPopulationStatus.ELIGIBLE,
                     ),

@@ -10,6 +10,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * EvaluationMath の数式 contract を検証するテスト。
@@ -397,6 +398,39 @@ class EvaluationMathTest {
         assertEquals(10, stats.byModel.single().outputTokens)
         assertEquals(4, stats.byModel.single().reasoningOutputTokens)
     }
+
+    @Test
+    fun summarizeLlmCostsKeepsProviderCostSeparateFromApiListPriceCoverage() {
+        val usage = LlmTokenUsage(1_000, 100, 80, null, 400)
+        val stats = EvaluationMath.summarizeLlmCosts(
+            listOf(
+                llmUsageFact(
+                    phase = "falsifier",
+                    provider = "codex",
+                    configuredModel = "gpt-5.5",
+                    usage = LlmUsageDetails(BigDecimal("0.25"), null, null, usage, emptyList()),
+                ),
+                llmUsageFact(
+                    phase = "proposer",
+                    provider = "codex",
+                    configuredModel = "gpt-5.4",
+                    usage = LlmUsageDetails(null, null, null, usage, emptyList()),
+                ),
+            ),
+        )
+
+        assertEquals("0.25", stats.knownCostUsd?.stripTrailingZeros()?.toPlainString())
+        assertEquals("0.0062", stats.apiListPriceEquivalentUsd?.stripTrailingZeros()?.toPlainString())
+        assertEquals(1, stats.unpricedPhaseCount)
+        assertEquals(1, stats.apiListPriceCoveredPhaseCount)
+        assertEquals(1, stats.apiListPriceUnpricedPhaseCount)
+        assertEquals(2, stats.unattributedTokenPhaseCount)
+        assertEquals(
+            "0.0062",
+            stats.byProvider.single().apiListPriceEquivalentUsd?.stripTrailingZeros()?.toPlainString(),
+        )
+        assertTrue(stats.byModel.isEmpty())
+    }
 }
 
 private fun trade(
@@ -428,12 +462,14 @@ private fun trade(
 private fun llmUsageFact(
     phase: String?,
     provider: String?,
+    configuredModel: String? = null,
     usage: LlmUsageDetails?,
 ): LlmPhaseUsageFact {
     return LlmPhaseUsageFact(
         decisionRunId = "run-1",
         provider = provider,
         phase = phase,
+        configuredModel = configuredModel,
         occurredAt = Instant.parse("2026-07-02T00:00:00Z"),
         usage = usage,
     )
