@@ -10,6 +10,8 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import java.time.Duration
 import java.time.Instant
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -20,6 +22,15 @@ import kotlin.test.assertTrue
  * LLM 起動予約の既定 hourly / daily 境界を検証するテスト。
  */
 class LlmLaunchReservationRepositoryTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun parallelEconomicEventReservation_hasOneAttemptAndFailureDoesNotReopenIt() = runBlocking {

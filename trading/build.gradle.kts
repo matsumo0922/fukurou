@@ -1,4 +1,5 @@
 plugins {
+    `java-test-fixtures`
     id("matsumo.primitive.kotlin.jvm")
     id("matsumo.primitive.detekt")
 }
@@ -13,6 +14,8 @@ dependencies {
     implementation(libs.postgresql)
     implementation(libs.exposed.core)
     implementation(libs.exposed.jdbc)
+
+    testFixturesImplementation(platform(libs.kotlin.bom))
 
     testImplementation(kotlin("test"))
     testImplementation(libs.testcontainers.postgresql)

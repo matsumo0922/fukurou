@@ -12,12 +12,25 @@ import java.sql.DriverManager
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.SocketFactory
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** application poolのcold initialization contractを検証する。 */
 class DatabaseColdStartTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
     @Test
     fun coldPoolStartsProductionApplicationAndBootstrapsRuntimeAndTradingSchemas() {
         if (!DockerClientFactory.instance().isDockerAvailable) return
@@ -27,12 +40,19 @@ class DatabaseColdStartTest {
             container.start()
             val delayedUrl = container.jdbcUrl.withSocketFactory(ColdStartSocketFactory::class.java.name)
             val startedAt = System.nanoTime()
+            val tradingConfig = me.matsumo.fukurou.trading.config.TradingBotConfig()
+            val shutdownResult = ApplicationShutdownResultCapture()
+
+            assertFalse(tradingConfig.daemon.enabled)
+            assertFalse(tradingConfig.obsidian.enabled)
 
             testApplication {
                 application {
                     module(
                         revision = COLD_START_REVISION,
+                        tradingConfig = tradingConfig,
                         databaseConfig = DatabaseConfig(delayedUrl, container.username, container.password),
+                        shutdownResultObserver = shutdownResult.observer,
                     )
                 }
 
@@ -41,6 +61,7 @@ class DatabaseColdStartTest {
                 assertEquals(HttpStatusCode.OK, response.status)
                 assertEquals(COLD_START_REVISION, response.body<String>())
             }
+            shutdownResult.assertSucceeded()
             val elapsed = Duration.ofNanos(System.nanoTime() - startedAt)
 
             assertTrue(elapsed > Duration.ofMillis(DATABASE_CONNECTION_TIMEOUT_MILLIS))

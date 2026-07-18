@@ -204,6 +204,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -902,6 +904,15 @@ private const val INSERT_OBSIDIAN_EXECUTION_SQL = """
  * Exposed/Postgres 実装の DB 契約を実 Postgres で検証するテスト。
  */
 class PostgresPersistenceIntegrationTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun terminalEvidenceActivation_bootstrapsOnceWithoutRewritingTimestamp() = runPostgresTest {

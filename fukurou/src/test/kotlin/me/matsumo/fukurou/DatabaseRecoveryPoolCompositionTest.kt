@@ -16,6 +16,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -25,6 +27,16 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /** Application production poolとrecovery worker compositionのdeadlineを検証する。 */
 class DatabaseRecoveryPoolCompositionTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        resetAdmissionHealthForTest()
+    }
+
     @Test
     fun exhaustedApplicationPoolFailsTickWithinBudgetAndSameServiceRetryConverges() = runBlocking {
         if (!isDockerAvailable()) return@runBlocking
@@ -64,7 +76,11 @@ class DatabaseRecoveryPoolCompositionTest {
                 )
 
                 assertEquals(1, service.tick().getOrThrow())
-                assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+                awaitMonotonicObservation(
+                    description = "direct recovery admission health",
+                    observe = LlmExecutionAdmissionHealth::isHealthy,
+                    completed = { healthy -> healthy },
+                )
                 assertEquals(
                     LlmLaunchReservationStatus.FAILED,
                     repository.findExecutionClaim(RECOVERY_INVOCATION_ID).getOrThrow()?.status,

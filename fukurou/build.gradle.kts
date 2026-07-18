@@ -32,6 +32,22 @@ dependencies {
     implementation(libs.logback.classic)
 
     testImplementation(libs.ktor.server.test.host)
+    testImplementation(testFixtures(project(":trading")))
     testImplementation(kotlin("test"))
     testImplementation(libs.testcontainers.postgresql)
+}
+
+tasks.named<Test>("test") {
+    exclude("**/AdmissionHealthIsolationRegressionSuite.class")
+}
+
+tasks.register<Test>("admissionHealthIsolationRegressionTest") {
+    group = "verification"
+    description = "Runs the historical admission-health isolation sequence in one JUnit 4 worker."
+    dependsOn(tasks.named("testClasses"))
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    include("**/AdmissionHealthIsolationRegressionSuite.class")
+    maxParallelForks = 1
+    forkEvery = 0
 }

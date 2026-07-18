@@ -9,7 +9,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -35,6 +38,7 @@ class LlmExecutionRecoveryWorker(
     availableStaleAfter: Duration = Duration.ofMinutes(30),
     private val interval: Duration = policy.heartbeatInterval,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    private val terminationTimeout: Duration = RECOVERY_WORKER_TERMINATION_TIMEOUT,
 ) : AutoCloseable {
     private val recoveryService = LlmExecutionRecoveryService(
         repository = repository,
@@ -72,8 +76,24 @@ class LlmExecutionRecoveryWorker(
     }
 
     override fun close() {
-        job?.cancel()
-        scope.cancel()
+        val runningJob = job
+        runningJob?.cancel()
+
+        try {
+            if (runningJob != null) {
+                runBlocking {
+                    try {
+                        withTimeout(terminationTimeout.toMillis()) {
+                            joinAll(runningJob)
+                        }
+                    } catch (throwable: kotlinx.coroutines.TimeoutCancellationException) {
+                        throw LlmExecutionRecoveryShutdownTimeoutException(terminationTimeout, throwable)
+                    }
+                }
+            }
+        } finally {
+            scope.cancel()
+        }
     }
 
     private suspend fun appendStartupAudit() {
@@ -89,6 +109,13 @@ class LlmExecutionRecoveryWorker(
         ).getOrThrow()
     }
 }
+
+/** recovery worker が shutdown deadline 内に終了しなかったことを表す。 */
+class LlmExecutionRecoveryShutdownTimeoutException(
+    /** shutdown が待機した上限。 */
+    val timeout: Duration,
+    cause: Throwable,
+) : IllegalStateException("LLM execution recovery worker did not terminate within $timeout.", cause)
 
 /** secret を含まない one-shot execution policy の startup audit payload。 */
 internal fun startupPayload(policy: OneShotExecutionPolicy): String = buildJsonObject {
@@ -125,4 +152,5 @@ private fun startupPhasePayload(policy: OneShotExecutionPolicy) = buildJsonArray
 }
 
 private const val RECOVERY_TOOL_NAME = "llm_execution_recovery"
+private val RECOVERY_WORKER_TERMINATION_TIMEOUT: Duration = Duration.ofSeconds(6)
 private val RECOVERY_WORKER_LOGGER = Logger.getLogger(LlmExecutionRecoveryWorker::class.java.name)

@@ -161,7 +161,7 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(application.contains("llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker("))
         assertTrue(application.contains("private fun startLlmAuditMaintenanceWorker("))
         assertTrue(application.contains("ExposedLlmDecisionReconstructionRepository(database)"))
-        assertTrue(application.contains("backgroundWorkers.llmAuditMaintenanceWorker?.close()"))
+        assertTrue(application.contains("backgroundWorkers.llmAuditMaintenanceWorker?.let { worker -> worker::close }"))
         assertTrue(canary.contains("llm_tool_evidence_activation_boundaries"))
         assertTrue(canary.contains("TERMINAL_BUNDLE_CAPTURED"))
         assertFalse(releaseBarrier.contains("PREFILTER_ACTIVATION_RELEASED"))

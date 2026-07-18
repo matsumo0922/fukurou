@@ -19,6 +19,8 @@ import me.matsumo.fukurou.trading.evaluation.LlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.LlmRunStart
 import java.time.Duration
 import java.time.Instant
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -27,6 +29,15 @@ import kotlin.test.assertTrue
  * 週次 PromptCandidates の低優先 LLM 起動 budget を検証するテスト。
  */
 class ReflectionLaunchBudgetTest {
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealth.resetForTest()
+    }
 
     @Test
     fun generate_defersWhenFreshTradingReservationIsRunning() = runBlocking {
