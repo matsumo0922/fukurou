@@ -11,6 +11,7 @@ readonly BACKUP_HOST=fukurou-production
 readonly BACKUP_STDIN_PATH=/postgres.dump
 readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
 readonly DOCKER_LIST_TIMEOUT_SECONDS=30
+readonly JOURNAL_QUERY_TIMEOUT_SECONDS=30
 readonly ROLLOUT_MAX_EVIDENCE_AGE_SECONDS=86400
 readonly SERVICE_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 readonly STATUS_DIR=/srv/fukurou/monitoring
@@ -148,6 +149,26 @@ verify_no_restore_owned_resources() {
     identifiers=$(timeout --signal=TERM --kill-after=5 "${DOCKER_LIST_TIMEOUT_SECONDS}" \
         docker volume ls -q --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null) || return 1
     [[ -z ${identifiers} ]]
+}
+
+verify_rollout_service_journal_evidence() {
+    local status_file=$1 job unit invocation_id evidence
+
+    for job in backup restore; do
+        case ${job} in
+            backup) unit=fukurou-postgres-backup.service ;;
+            restore) unit=fukurou-postgres-restore-drill.service ;;
+        esac
+        invocation_id=$(jq -er ".${job}.lastAttempt.serviceInvocationId" "${status_file}") || return 1
+        evidence=$(timeout --signal=TERM --kill-after=5 "${JOURNAL_QUERY_TIMEOUT_SECONDS}" \
+            journalctl --unit="${unit}" --boot=0 --output=json --no-pager \
+            --grep='^fukurou-backup: result=' --lines=1 2>/dev/null) || return 1
+        jq -se --arg invocation_id "${invocation_id}" '
+            length == 1 and
+            ((.[0]._SYSTEMD_INVOCATION_ID // "") | ascii_downcase) == $invocation_id and
+            .[0].MESSAGE == "fukurou-backup: result=SUCCESS"
+        ' <<<"${evidence}" >/dev/null || return 1
+    done
 }
 
 installed_artifact_paths() {
@@ -321,6 +342,7 @@ verify_rollout() {
     command -v restic >/dev/null || die "restic is unavailable" 69
     command -v jq >/dev/null || die "jq is unavailable" 69
     command -v docker >/dev/null || die "docker is unavailable" 69
+    command -v journalctl >/dev/null || die "journalctl is unavailable" 69
     command -v timeout >/dev/null || die "timeout is unavailable" 69
 
     [[ -f ${PASSWORD_FILE} ]] || die "restic password file is not a regular file" 66
@@ -335,6 +357,8 @@ verify_rollout() {
     boot_id=$(current_boot_id) || die "current boot identity is unavailable" 65
     verify_rollout_status "${STATUS_FILE}" "${boot_id}" ||
         die "latest backup retention and restore attempts are not successful exact-snapshot evidence" 65
+    verify_rollout_service_journal_evidence "${STATUS_FILE}" ||
+        die "latest current-boot systemd journal result does not match successful status evidence" 65
     snapshot_id=$(jq -er '.backup.lastSuccess.snapshotId' "${STATUS_FILE}") ||
         die "backup snapshot identity is unavailable" 65
 

@@ -159,11 +159,26 @@ if verify_rollout_freshness_epochs 100 115 125 130 100 140; then
 fi
 
 leaked_resource_kind=""
+journal_result_code=SUCCESS
+journal_invocation_override=""
 docker() {
     printf '%s\n' "$*" >>"${SELFTEST_ROOT}/docker.log"
     if [[ $1 == "${leaked_resource_kind}" ]]; then
         printf '%s\n' leaked-resource-id
     fi
+}
+journalctl() {
+    local invocation_id
+    [[ $* == *'--boot=0'* && $* == *'--output=json'* && $* == *'--grep=^fukurou-backup: result='* && $* == *'--lines=1'* ]] ||
+        fail 'journal query did not select the latest stable result from the current boot'
+    case $* in
+        *'--unit=fukurou-postgres-backup.service'*) invocation_id=${BACKUP_INVOCATION_ID} ;;
+        *'--unit=fukurou-postgres-restore-drill.service'*) invocation_id=${RESTORE_INVOCATION_ID} ;;
+        *) return 1 ;;
+    esac
+    [[ -z ${journal_invocation_override} ]] || invocation_id=${journal_invocation_override}
+    jq -cn --arg invocation_id "${invocation_id}" --arg message "fukurou-backup: result=${journal_result_code}" \
+        '{_SYSTEMD_INVOCATION_ID:$invocation_id,MESSAGE:$message}'
 }
 timeout() {
     [[ $1 == --signal=TERM && $2 == --kill-after=5 && $3 == 30 ]] ||
@@ -193,5 +208,16 @@ fi
 if timestamp_epoch ''; then
     fail 'empty timestamp was accepted as midnight'
 fi
+verify_rollout_service_journal_evidence "${status_fixture}" ||
+    fail 'matching latest successful service journal evidence was rejected'
+journal_result_code=STATUS_PUBLICATION_FAILED
+if verify_rollout_service_journal_evidence "${status_fixture}"; then
+    fail 'old status success survived a later publication failure in the same boot'
+fi
+journal_result_code=SUCCESS
+journal_invocation_override=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+if verify_rollout_service_journal_evidence "${status_fixture}"; then
+    fail 'status evidence was accepted when it did not match the latest service invocation'
+fi
 
-printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed marker=hash-bound freshness=post-install snapshot=current-repository-exact latest-attempts=required resources=zero service-evidence=durable-current-boot\n'
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed marker=hash-bound freshness=post-install snapshot=current-repository-exact latest-attempts=required resources=zero service-evidence=durable-current-boot-journal-bound\n'
