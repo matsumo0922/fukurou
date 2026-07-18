@@ -51,12 +51,42 @@ installed_hash="$(printf '%s' "${installed_catalog}" | sha256sum | awk '{print $
 [[ "$(jq -er '.capabilityCatalogHash' "${SCRIPT_DIRECTORY}/deploy-contract-v1.json")" == "${installed_hash}" ]] || \
   fail_selftest "static contract catalog hash is stale"
 jq -e '
+  .title == "Fukurou signed deploy bundle v2" and
+  (.required | index("bundleSchemaVersion")) != null and
+  (.required | index("workflowEvent")) != null and
+  (.required | index("deployIntent")) != null and
+  (.required | index("operatorReason")) != null and
+  (.required | index("migrationRollbackMode")) != null and
+  (.required | index("schemaSensitivePathsSha256")) != null and
   (.required | index("foundationHarnessSha256")) != null and
+  (.allOf[0].oneOf | length) == 4 and
+  any(.allOf[0].oneOf[];
+    .properties.workflowEvent.const == "push" and
+    .properties.deployIntent.const == "FORWARD" and
+    .properties.operatorReason.const == "" and
+    .properties.migrationRollbackMode.const == "AUTO_IMAGE_ROLLBACK") and
+  any(.allOf[0].oneOf[];
+    .properties.workflowEvent.const == "workflow_dispatch" and
+    .properties.deployIntent.const == "FORWARD" and
+    .properties.operatorReason.const == "" and
+    .properties.migrationRollbackMode.const == "AUTO_IMAGE_ROLLBACK") and
+  any(.allOf[0].oneOf[];
+    .properties.workflowEvent.const == "workflow_dispatch" and
+    .properties.deployIntent.const == "FORWARD" and
+    .properties.operatorReason.minLength == 1 and
+    .properties.migrationRollbackMode.enum == ["BACKWARD_COMPATIBLE", "ROLL_FORWARD_ONLY"]) and
+  any(.allOf[0].oneOf[];
+    .properties.workflowEvent.const == "workflow_dispatch" and
+    .properties.deployIntent.const == "AUTHORIZED_ROLLBACK" and
+    .properties.operatorReason.minLength == 1) and
+  .properties.bundleSchemaVersion.const == 2 and
+  .properties.minimumContractVersion.const == 2 and
+  .properties.operatorReason.pattern == "^(?:$|\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?)$" and
   .properties.foundationHarnessSha256.pattern == "^[0-9a-f]{64}$"
 ' "${SCRIPT_DIRECTORY}/deploy-bundle.schema.json" >/dev/null || \
   fail_selftest "bundle schema does not require the signed foundation harness hash"
 baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
-  {minimumContractVersion:1,
+  {minimumContractVersion:2,
    requiredCapabilities:[$catalog.builtInCapabilities[].capabilityId],
    requiredHooks:["FOUNDATION_PREFLIGHT_V1"],
    operations:[$catalog.operations[] |
@@ -64,6 +94,49 @@ baseline_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
      {capability:.capabilityId,operationId:.operationId}]}
 ')"
 validate_typed_operation_set "${baseline_bundle}" "${installed_catalog}" || fail_selftest "baseline rejected"
+
+intent_bundle="$(jq -cS -n --argjson catalog "${installed_catalog}" '
+  {deploymentId:"selftest",bundleSchemaVersion:2,workflowEvent:"push",deployIntent:"FORWARD",operatorReason:"",
+   migrationRollbackMode:"AUTO_IMAGE_ROLLBACK",schemaSensitivePathsSha256:("a" * 64),
+   candidateSha:("b" * 40),candidateImageDigest:("sha256:" + ("c" * 64)),minimumContractVersion:2,
+   requiredCapabilities:[],requiredHooks:[],capabilityCatalog:$catalog,capabilityCatalogHash:("d" * 64),
+   executorSha256:("e" * 64),foundationHarnessSha256:("f" * 64),publicKeySha256:("0" * 64),operations:[]}
+')"
+validate_deploy_intent_fields "${intent_bundle}" || fail_selftest "valid push intent rejected"
+expect_rejected push-authorized-rollback validate_deploy_intent_fields \
+  "$(jq -cS '.deployIntent="AUTHORIZED_ROLLBACK" | .operatorReason="operator approved"' <<<"${intent_bundle}")"
+expect_rejected explicit-mode-empty-reason validate_deploy_intent_fields \
+  "$(jq -cS '.workflowEvent="workflow_dispatch" | .migrationRollbackMode="ROLL_FORWARD_ONLY"' <<<"${intent_bundle}")"
+for secret_reason in \
+  'password=correct-horse-battery-staple' \
+  'Bearer abcdefghijklmnopqrstuvwxyz' \
+  'postgresql://user:password@example.invalid/db' \
+  '-----BEGIN PRIVATE KEY-----' \
+  'github_pat_abcdefghijklmnopqrstuvwxyz123456'; do
+  expect_rejected secret-like-reason validate_deploy_intent_fields \
+    "$(jq -cS --arg reason "${secret_reason}" '.workflowEvent="workflow_dispatch" | .deployIntent="AUTHORIZED_ROLLBACK" | .operatorReason=$reason' <<<"${intent_bundle}")"
+done
+manual_rollback_bundle="$(jq -cS '
+  .workflowEvent="workflow_dispatch" | .deployIntent="AUTHORIZED_ROLLBACK" | .operatorReason="incident rollback"
+' <<<"${intent_bundle}")"
+validate_deploy_intent_fields "${manual_rollback_bundle}" || fail_selftest "valid authorized rollback rejected"
+expect_rejected tampered-intent-field validate_deploy_intent_fields \
+  "$(jq -cS '.workflowEvent="push"' <<<"${manual_rollback_bundle}")"
+
+validate_schema_sensitive_inventory "${SCRIPT_DIRECTORY}/deploy-schema-sensitive-paths-v1.txt" || \
+  fail_selftest "repository schema-sensitive inventory rejected"
+inventory_hash="$(schema_sensitive_inventory_hash "${SCRIPT_DIRECTORY}/deploy-schema-sensitive-paths-v1.txt")"
+[[ "${inventory_hash}" =~ ^[0-9a-f]{64}$ ]] || \
+  fail_selftest "schema-sensitive inventory hash is invalid"
+inventory_copy="$(mktemp)"
+cp "${SCRIPT_DIRECTORY}/deploy-schema-sensitive-paths-v1.txt" "${inventory_copy}"
+validate_schema_sensitive_inventory_agreement \
+  "${inventory_hash}" "${SCRIPT_DIRECTORY}/deploy-schema-sensitive-paths-v1.txt" "${inventory_copy}" false || \
+  fail_selftest "matching schema-sensitive inventories rejected"
+printf 'tampered/path\n' >> "${inventory_copy}"
+expect_rejected inventory-hash-mismatch validate_schema_sensitive_inventory_agreement \
+  "${inventory_hash}" "${SCRIPT_DIRECTORY}/deploy-schema-sensitive-paths-v1.txt" "${inventory_copy}" false
+rm -f "${inventory_copy}"
 
 superset_catalog="$(jq -cS --arg parent "${installed_hash}" '
   .catalogVersion=2 | .parentCatalogHash=$parent |

@@ -139,7 +139,7 @@ npm --prefix web run generate:api
 
 Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy scaffold を用意しています。
 
-production deploy は Ed25519 signed typed bundle、parent-hash付きcumulative capability catalog、candidate executableのmutation前operation probe、hash固定したinstalled foundation harness、durable dispatch ledger、canonical fence/PID registration、DB maintenance/drain、isolated Compose `CANARY_ONLY` preflightを通過したimmutable image digestだけを切り替えます。deploy gapはappend-only OPEN/CLOSE factとして残り、6 entity共通のcausal projectionがstrategy KPIからaffected/missing recordを除外します。`PREFILTER_ACTIVATION_RELEASED=false` は active DB config より優先されます。
+production deploy は Ed25519 signed typed bundle v2、event-derived `FORWARD` / `AUTHORIZED_ROLLBACK` intent、production lock内revision ancestry、hash-bound schema-sensitive path inventoryとmigration recovery mode、parent-hash付きcumulative capability catalog、candidate executableのmutation前operation probe、hash固定したinstalled foundation harness、durable dispatch ledger、canonical fence/PID registration、DB maintenance/drain、isolated Compose `CANARY_ONLY` preflightを通過したimmutable image digestだけを切り替えます。すべてのforward/rollback targetにexact-SHA JVM quality gateを適用し、queued old forward deployはproduction mutation前に拒否します。deploy gapはappend-only OPEN/CLOSE factとして残り、6 entity共通のcausal projectionがstrategy KPIからaffected/missing recordを除外します。`PREFILTER_ACTIVATION_RELEASED=false` は active DB config より優先されます。
 
 - `Dockerfile`
 - `docker-compose.yml`
@@ -148,6 +148,7 @@ production deploy は Ed25519 signed typed bundle、parent-hash付きcumulative 
 - `.github/workflows/deploy.yml`
 - `.github/workflows/deploy-queue-watchdog.yml`
 - `scripts/deploy/deploy-fukurou`
+- `scripts/deploy/deploy-schema-sensitive-paths-v1.txt`
 - `scripts/deploy/fukurou-deploy-db`
 - `scripts/deploy/deploy-contract-v1.json`
 - `scripts/deploy/sudoers-fukurou`

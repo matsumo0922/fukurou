@@ -81,7 +81,7 @@ The workflow and root executor MUST classify changes using the same hash-bound c
 - **THEN** the executor rejects the bundle before candidate mutation
 
 ### Requirement: Deploy evidence and recovery remain durable
-For every accepted non-fresh deploy, the executor MUST persist validated intent, reason, current and target revisions, migration mode, inventory hash, and schema-sensitive result in the root-only rollback state and first current-format journal entry. Existing digest, revision, liveness, readiness, journal CAS, and bounded recovery checks MUST remain authoritative.
+For every accepted non-fresh deploy, the executor MUST persist validated intent, reason, current and target revisions, migration mode, inventory hash, schema-sensitive result, and the probed candidate image digest in the root-only rollback state and first current-format journal entry. V2 recovery MUST cross-check the state, first journal entry, and installed inventory, and MUST use only the interrupted deployment's persisted candidate digest for recovery operations. Existing digest, revision, liveness, readiness, journal CAS, and bounded recovery checks MUST remain authoritative.
 
 #### Scenario: Candidate succeeds at exact identity
 - **WHEN** intent admission succeeds and candidate digest, revision, liveness, and readiness agree before the deadline
@@ -97,11 +97,19 @@ For every accepted non-fresh deploy, the executor MUST persist validated intent,
 
 #### Scenario: Roll-forward-only candidate fails after safety mutation
 - **WHEN** a candidate with `ROLL_FORWARD_ONLY` fails at or after `SAFETY_MUTATION_STARTED`
-- **THEN** the executor re-establishes the existing maintenance/fence safe boundary, records `MANUAL_RECOVERY_REQUIRED`, and does not restore the previous image or database
+- **THEN** the executor records `MANUAL_RECOVERY_REQUIRED` only after re-establishing the maintenance/fence/OPEN-gap safe boundary and revoking the canary; otherwise it leaves retryable unfinished recovery and does not restore the previous image or database
 
 #### Scenario: Roll-forward-only recovery resumes after restart
 - **WHEN** startup finds a non-terminal `ROLL_FORWARD_ONLY` journal
 - **THEN** it applies the same origin-state policy as live recovery and never falls through to previous image startup
+
+#### Scenario: V2 recovery evidence is incomplete or inconsistent
+- **WHEN** state version, accepted evidence, first journal details, installed inventory hash, or interrupted candidate digest is missing, invalid, or inconsistent
+- **THEN** recovery remains non-terminal and fails closed without applying legacy automatic rollback or using the incoming bundle image
+
+#### Scenario: Repository checkout differs from the running revision
+- **WHEN** a previous roll-forward-only failure left repository HEAD at another revision
+- **THEN** rollback compose is captured from the accepted running revision Git object and candidate compose is rendered from the signed target Git object
 
 #### Scenario: Post-deploy identity disagrees
 - **WHEN** running digest or `/revision` differs from the signed target, or readiness does not succeed within the deadline

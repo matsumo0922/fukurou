@@ -32,11 +32,15 @@ docker compose pull && docker compose up -d
 - GitHub 管理の deploy script source は `scripts/deploy/` に置くが、NAS root への反映は手動
 - production compose は `docker-compose.prod.yml` で管理し、deploy script が指定 SHA のものだけを使う
 
-`.github/workflows/deploy.yml` は GitHub-hosted の `resolve`、`quality`、`build` と、self-hosted の `deploy` に分かれる。`resolve` は対象 SHA が `origin/main` から到達可能であることを確認し、`quality` と `build` は同じ SHA を checkout して `HEAD` 一致を検証する。automatic main push と最新 main SHA の手動 deploy は、`quality` の `make test`、`make detekt`、clean-tree 検査が成功するまで、GHCR login、image build/push、signed bundle 作成、NAS deployへ進まない。
+`.github/workflows/deploy.yml` は GitHub-hosted の `resolve`、`quality`、`build` と、self-hosted の `deploy` に分かれる。`resolve` は対象 SHA が `origin/main` から到達可能であることを確認し、`quality` と `build` は同じ SHA を checkout して `HEAD` 一致を検証する。automatic main push、最新 main SHA の手動 deploy、過去の main SHA を対象にした authorized rollback のすべてが、`quality` の `make test`、`make detekt`、clean-tree 検査に成功するまで、GHCR login、image build/push、signed bundle 作成、NAS deployへ進まない。quality bypass は存在しない。
 
-過去の main SHA を明示した `workflow_dispatch` は recovery 経路として `quality` を skip し、既存どおり image build/deployへ進む。`build` は resolved SHA 単位の concurrency group（`cancel-in-progress: true`）で並列 build 同士の重複トリガーだけをキャンセルする。`deploy` は `fukurou-production-deploy` group（`cancel-in-progress: false`）で直列化し、production deploy が同時実行されないようにする。異なる SHA の `build` job は並列実行できるため、1 件の `deploy` job が runner 割り当て待ちで滞留しても後続 push の quality/build 開始を塞がない。`deploy` job には `timeout-minutes: 35` を設定し、25分のexecutor watchdogとrecoveryを収容しつつrunner上のハングを停止する。
+automatic push は署名 bundle v2 に `push`、`FORWARD`、空の operator reason、`AUTO_IMAGE_ROLLBACK` を固定する。`workflow_dispatch` で過去の main SHA を指定すると workflow が `AUTHORIZED_ROLLBACK` を導出し、240文字以内の `rollback_reason` を必須にする。`BACKWARD_COMPATIBLE` または `ROLL_FORWARD_ONLY` を選ぶ場合も、manual dispatch と理由が必須になる。reasonは監査用の非secret説明だけを受け入れ、control character、secret-like assignment、Bearer credential、credential入りURI、private-key header、既知のtoken prefixをworkflowとroot executorの両方で拒否する。入力から deploy intent を直接指定する経路はない。
 
-異なる SHA の `build` job が並列に走ると、古い commit の build が新しい commit の build より遅れて完了し、`deploy` job が一時的に古い commit へ後退する場合がある。この場合は次の通常 push、または対象 SHA を明示指定した `workflow_dispatch` の再実行でロールフォワードする。
+`build` は resolved SHA 単位の concurrency group（`cancel-in-progress: true`）で並列 build 同士の重複トリガーだけをキャンセルする。`deploy` は `fukurou-production-deploy` group（`cancel-in-progress: false`）で直列化する。異なる SHA の build が逆順で完了しても、root executor は production lock 内で稼働 revision を再観測し、queued old `FORWARD` を rollback capture、maintenance、fence、DB、Compose mutationより前に拒否する。revisionを後退させる経路は理由付き `AUTHORIZED_ROLLBACK` だけである。
+
+`scripts/deploy/deploy-schema-sensitive-paths-v1.txt` はDB migration/bootstrap、deploy DB helper、application/trading persistence schema ownerのcode-owned inventoryである。automatic push の `before` から target までの差分がinventoryに一致すると、resolve jobがimage publication前にmanual compatibility reviewを要求する。comparison baseを安全に確定できない場合とmanual dispatchでは早期判定をadmissionに使わず、root executorがlock内のobserved current-to-target diffを同じinstalled inventoryで必ず再分類する。schema-sensitive diffは`BACKWARD_COMPATIBLE`または`ROLL_FORWARD_ONLY`、非schema-sensitive diffは`AUTO_IMAGE_ROLLBACK`だけを受け入れる。
+
+schema ownerを追加、移動、削除するときは、同じcommitでinventoryを更新する。各entryはrepository rootからの相対pathまたはdirectory prefixを1行で記述し、glob、絶対path、`..`を使わない。変更時は、DB migration/bootstrap、deploy DB helper、application persistence、trading persistenceの4区分を見直し、移動元entryを残していないこと、新しいownerを漏らしていないこと、`scripts/deploy/deploy-intent-resolver-selftest`と`ReleaseDeployFoundationContractTest`が通ることを確認する。
 
 runner 割り当て待ち（`queued` 状態）の滞留は `timeout-minutes` の対象外のため、`.github/workflows/deploy-queue-watchdog.yml` が 10 分間隔の `schedule` cron で別途検知する。詳細は [トラブルシュート](#deploy-queue-watchdog-が-issue-を作成した) を参照。
 
@@ -154,6 +158,7 @@ sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/sql/mcp-role.sql /usr/loca
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1.sql /usr/local/share/fukurou/deploy-foundation-v1.sql
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1-indexes.sql /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
 sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/deploy-capability-catalog-v1.json /usr/local/share/fukurou/deploy-capability-catalog-v1.json
+sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/deploy-schema-sensitive-paths-v1.txt /usr/local/share/fukurou/deploy-schema-sensitive-paths-v1.txt
 sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/deploy-public-key.pem /usr/local/share/fukurou/deploy-public-key.pem
 sudo cc -std=c17 -O2 -Wall -Wextra -Werror -I/srv/fukurou/repo/scripts/runtime \
   /srv/fukurou/repo/scripts/runtime/fukurou-runtime-supervisor.c -lcrypto \
@@ -171,15 +176,50 @@ sudo visudo -cf /etc/sudoers.d/fukurou-deploy
 
 deploy script や sudoers template を変更した場合も、`/usr/local/sbin` と `/etc/sudoers.d` への反映は管理者が手動で行う。GitHub Actions から root-owned script を自動更新しない。
 
-root executor、DB helper、foundation harness、foundation SQL、public key は同じ commit から一組で反映する。workflow は installed contract version と、署名 bundle 内の executor/public-key/foundation-harness hash が repository artifact と一致しない場合に typed operation を一件も実行しない。repository 側の変更だけでは root-owned artifact は変わらないため、artifact を変更する PR では production を safe-stop し、管理者が同じ merge SHA の一組を反映してから同じ SHA/digest の workflow を再実行する。
+root executor、DB helper、foundation harness、foundation SQL、public key、schema-sensitive inventory は同じcommitから一組で反映する。workflowはinstalled contract version `2`、installed inventory hash、署名bundle内のexecutor/public-key/foundation-harness/inventory hashを検証し、不一致ではcandidate image pullやtyped operationを開始しない。
+
+bundle v2を導入するPRは、merge前のreview済みexact HEADでroot executorとinventoryを先にinstallする。この作業を始める前に進行中deployとunfinished journalがないことを確認し、完了までproduction deployと、executor、public key、foundation harness/SQL、capability catalog、schema-sensitive inventoryへ触れる他PRのmergeをfreezeする。production checkout `/srv/fukurou/repo` のbranch、HEAD、working treeは変更せず、review HEAD専用の一時detached worktreeからinstallとselftestを行う。
+
+```sh
+production_head="$(sudo git -C /srv/fukurou/repo rev-parse HEAD)"
+production_branch="$(sudo git -C /srv/fukurou/repo symbolic-ref --short HEAD 2>/dev/null || true)"
+production_status="$(sudo git -C /srv/fukurou/repo status --porcelain=v1)"
+sudo git -C /srv/fukurou/repo fetch --no-tags origin
+sudo install -d -o root -g root -m 0700 /srv/fukurou/preinstall
+sudo git -C /srv/fukurou/repo worktree add --detach \
+  /srv/fukurou/preinstall/deploy-v2-review \
+  <reviewed-pr-head-sha>
+cd /srv/fukurou/preinstall/deploy-v2-review
+
+sudo install -o root -g root -m 0755 scripts/deploy/deploy-fukurou /usr/local/sbin/deploy-fukurou
+sudo install -o root -g root -m 0444 scripts/deploy/deploy-schema-sensitive-paths-v1.txt /usr/local/share/fukurou/deploy-schema-sensitive-paths-v1.txt
+
+test "$(sudo /usr/local/sbin/deploy-fukurou --print-contract-version)" = 2
+test "$(sudo /usr/local/sbin/deploy-fukurou --print-schema-sensitive-paths-sha256)" = \
+  "$(sha256sum scripts/deploy/deploy-schema-sensitive-paths-v1.txt | awk '{print $1}')"
+sudo stat -c '%U:%G:%a %n' \
+  /usr/local/sbin/deploy-fukurou \
+  /usr/local/share/fukurou/deploy-schema-sensitive-paths-v1.txt
+bash -n scripts/deploy/deploy-fukurou
+scripts/deploy/deploy-contract-selftest
+scripts/deploy/deploy-runtime-selftest
+
+cd /
+sudo git -C /srv/fukurou/repo worktree remove /srv/fukurou/preinstall/deploy-v2-review
+test "$(sudo git -C /srv/fukurou/repo rev-parse HEAD)" = "${production_head}"
+test "$(sudo git -C /srv/fukurou/repo symbolic-ref --short HEAD 2>/dev/null || true)" = "${production_branch}"
+test "$(sudo git -C /srv/fukurou/repo status --porcelain=v1)" = "${production_status}"
+```
+
+一時worktreeを削除した後、production checkoutのbranch、HEAD、working treeが作業前と同じであることを上記のexact比較で確認する。verification後にreview HEADとmerge予定treeのexecutor/inventory hashが同一であることを再確認する。このpre-installと対象hash一致、targeted selftest、CI、clean-context approvalが揃うまでPR-2をmergeしない。pre-install後からmergeまで旧bundle v1 workflowはcontract mismatchでfail closedするため、この期間は意図したcontrolled deploy freezeになる。
 
 GitHub Actions の `DEPLOY_SIGNING_PRIVATE_KEY` secret は、repository の `deploy-public-key.pem` と対になる Ed25519 private key を PEM 形式で保持する。private key は NAS `.env`、repository、workflow artifact、rollback bundleへ保存しない。
 
 ## release / deploy safety foundation
 
-deploy workflow は candidate SHA/image digest、contract version、versioned capability catalog、executor/public-key/foundation-harness hashを canonical JSON bundle に固定し、Ed25519 署名を付ける。executorはrollback directory、catalog、maintenanceを変更する前にexact digestのcandidate PID 1へrequired hook tupleをprobeし、candidate executableが未実装のoperationを拒否する。実際にdispatchしたoperation IDはhash chain付きroot-only ledgerへ永続化する。削除、再定義、version downgrade、parent fork、duplicate ID、未知schema/profile/entrypoint、candidate未実装operationではmutationを開始しない。
+deploy workflow は candidate SHA/image digest、bundle schema/contract version、workflow event、deploy intent、operator reason、migration rollback mode、schema-sensitive inventory hash、versioned capability catalog、executor/public-key/foundation-harness hashをcanonical JSON bundle v2に固定し、Ed25519署名を付ける。executorは署名、closed value、exact target、repository/installed inventory hashを検証し、production lock内でunfinished recoveryを完了してからrevision ancestryとactual diffを判定する。その後、rollback directory、catalog、maintenanceを変更する前にexact digestのcandidate PID 1へrequired hook tupleをprobeする。
 
-検証後の最初の deploy state mutation は `/srv/fukurou/deploy-state/<deployment-id>/` の rollback bundle capture である。bundle は `FRESH` / `PRE_FOUNDATION` / `FOUNDATION_V1`、previous repository SHA、全compose source/hash、configured image reference/image ID/repo digest/revision、runtime config、maintenance tuple、raw fence hash、foundation fingerprint、PID registration summary、installed artifact hash、DB capture時刻をroot-onlyで保持する。render済み compose、`.env`、credential、key bytesは保持しない。
+検証後の最初の deploy state mutation は `/srv/fukurou/deploy-state/<deployment-id>/` の rollback bundle capture である。bundleはaccepted current/target revision、intent、検証済みreason、migration mode、inventory hash、actual schema-sensitive result、probe済みcandidate image digestに加え、従来のruntime/rollback evidenceをroot-onlyで保持する。rollback用composeは可変なrepository HEADではなくaccepted current revisionのGit objectから保存し、candidate composeもtarget revisionのGit objectをrenderするため、RFO中断後にrepository HEADとrunning revisionが分離していても別revisionのcomposeをrollback evidenceへ混ぜない。container不在をfresh installとして扱うのは、read-only DB snapshotが`PRE_FOUNDATION`でpublished deployment directoryが0件の場合だけである。container revisionの欠損・不正、commit object不在、main外、divergent history、prior deployment historyを伴うcontainer欠損はunknown current revisionとしてmutation前に拒否する。
 
 LLM reservation は同じ transaction で `SPAWN_RESERVED` registration を作る。PID 1 は child を start gate で停止したまま container instance、PID namespace inode、PID、process start ticks を採取し、`ACTIVE` への exact CAS が成功した場合だけ exec を許可する。provider が起動する MCP も同じ invocation/reservation lineage へ別 role で登録し、通常完了、current-process stale recovery、previous-generation recoveryはいずれもreservationと同じtransactionで全 role を `TERMINAL` にする。PID registrationを持たないlegacy reservationも回収できる。terminal row は24時間経過後に最大1,000件ずつ削除する。registration、DB、process identity の不一致や観測不能は launch socket を閉じたままにする。
 
@@ -189,9 +229,11 @@ deploy maintenance は durable disable ACK、同generationのDB maintenance comm
 
 candidate hookはproduction fenceを開かない。`CANARY_ONLY` tokenをcandidate SHA/image digest/catalog hashへ固定し、root-generated Compose projectのinternal fixture networkで同じimage、PID 1、read-only、tmpfs、capability条件を使う。署名bundleへhash固定したinstalled foundation harnessが、同じdigestの一時PID 1に対してproviderとMCPのtyped launch、fixture auth、required tool/output schema、failure cleanupを実行し、repository checkout内のscriptは実行しない。終了時は一時container、internal network、volumeが0件であることを確認する。production DB credential、endpoint、mutation toolは渡さない。
 
-deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。新しいdeploy journalはrollback state directoryを公開する前かつ最初のsafety mutation前に`PREPARED`、launch disable開始前に`SAFETY_MUTATION_STARTED`を永続化する。`CAPTURED`から始まる旧形式の正当なhash chainはversion-aware validatorで読み取り、terminal historyは再実行せず、unfinished historyは記録済みstateに対応するstartup recoveryへ入る。hash改ざんと形式ごとの不正なtransitionは拒否する。
+deploy journal と canary audit は sequence、previous state、previous hash、canonical payload hash、現在の末尾 sequence に対するCASを持つappend historyである。新しいv2 deploy journalはrollback state directoryを公開する前かつ最初のsafety mutation前に`PREPARED`、launch disable開始前に`SAFETY_MUTATION_STARTED`を永続化する。v1 journalの正当なhash chainはversion-aware validatorで読み、unfinished recoveryへ入る。v1 historyにv2専用`CANDIDATE_ABORTED`を混在させず、v2 executorがv1 recoveryをterminalへ進める。
 
-live errorとstartup recoveryはいずれもmaintenance再確立、active reservation 0、disable fence、OPEN gapを再確認してから保存済みrollbackを実行する。観測したgap stateが`MISSING`なら永続化済みOPEN eventを再送し、存在しない場合はrecovery-owned gapを開く。`OPEN`は同じdeployment gapを継続し、`CLOSED`はrecovery-owned gapを開いてrollback区間を記録する。`ROLLED_BACK`を永続化できた場合だけ次のdeployへ進む。
+`AUTO_IMAGE_ROLLBACK`と`BACKWARD_COMPATIBLE`のlive error/startup recoveryは既存のprevious-image rollbackを使う。previous imageはmaintenance中のため、まずlivenessを確認し、maintenance clearとfence enableの後でreadinessを確認してからgapを閉じる。readinessを確認できなければmaintenance/fenceを再びdisabledへ戻してmanual recoveryとする。`ROLL_FORWARD_ONLY`が`PREPARED`/`CAPTURED`で失敗した場合はproduction、checkout、maintenance、fenceを変更せず`CANDIDATE_ABORTED`を記録する。`SAFETY_MUTATION_STARTED`以後の失敗はmaintenance/disable fence/OPEN gapの再確立とcanary revokeが両方成功した場合だけ`MANUAL_RECOVERY_REQUIRED`を記録し、途中で証明できなければ`RECOVERY_STARTED`を残して次回起動で再試行する。previous imageの起動、previous checkoutへの復元、DB restoreは行わない。operatorは署名targetへのroll-forwardまたは別途監査したmanual recoveryで解消する。
+
+v2 recoveryは`stateVersion: 2`、`acceptedDeploy`、最初の`PREPARED` details、installed inventory hashを完全照合し、そこへ保存した中断deploy自身のcandidate digestだけをfence recovery codecに使う。mode、digest、accepted evidenceの欠損・不一致をlegacy `AUTO_IMAGE_ROLLBACK`へ読み替えず、journalを未終端のままfail closedする。legacy AUTO policyを適用するのは、`stateVersion`と`acceptedDeploy`が存在せず、journal versionが1である既存v1 stateだけである。
 
 deadlineはdeploy lock取得時の`/proc/uptime`を共通の起点にする。startup recovery、candidate operation probe、rollback captureを含むforward処理は起点から20分、recoveryは同じ起点から25分をabsolute deadlineとし、Docker、Git、DB helperの全callを残りbudget以下へ制限する。TERM/INT/HUP/deadlineはrollback capture前も処理し、外部commandは独立process groupへTERM/KILLを伝播する。
 
@@ -411,9 +453,11 @@ rotation 後は旧 image で LLM phase を再有効化しない。障害時は d
 
 ## Rollback
 
-rollback は過去の commit SHA tag を指定して workflow_dispatch を再実行する。指定できるのは `origin/main` から到達可能で、かつ `docker-compose.prod.yml` を含む commit に限る。
+application rollback は過去のcommit SHAを`workflow_dispatch`の`image_sha`に指定し、空でない`rollback_reason`を記入して再実行する。対象がcurrent revisionのstrict ancestorである場合だけworkflow/root executorが`AUTHORIZED_ROLLBACK`として受け入れる。同一SHA、新しいSHA、divergent/main外SHAは拒否する。historical targetも現在のCI環境で`make test`、`make detekt`、clean-tree検査を通す必要があり、quality bypassはない。
 
-deploy script は指定 SHA が `origin/main` から到達可能か確認してから checkout するため、任意 branch や未レビュー commit を NAS に流し込まない。
+schema-sensitive diffでは、旧imageを起動できるとreviewした場合だけ`BACKWARD_COMPATIBLE`、旧imageへ戻せない場合は`ROLL_FORWARD_ONLY`を選び、判断理由を同じmanual dispatchへ残す。非schema-sensitive diffへexplicit modeを付けることと、schema-sensitive diffへ`AUTO_IMAGE_ROLLBACK`を付けることはroot再分類で拒否される。
+
+workflow/application codeを前版へ戻す場合も、root-owned `/usr/local/sbin/deploy-fukurou`、installed schema-sensitive inventory、v2 audit historyは維持する。先にv2 executorでv1/v2 unfinished journalをterminalへ収束させ、v2 bundleを発行できるworkflow経路から前版applicationをdeployする。contract v1 executorへのdowngradeは、v2の`ROLL_FORWARD_ONLY`、`CANDIDATE_ABORTED`、retained terminal historyを解釈できないためunsupportedである。root executor downgradeが必要な場合は、v2 audit historyを保持したまま読める別のcompatibility designを先に用意する。
 
 ## トラブルシュート
 

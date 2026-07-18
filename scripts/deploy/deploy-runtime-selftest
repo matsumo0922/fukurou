@@ -6,9 +6,11 @@ trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
 
 export FUKUROU_DEPLOY_ROOT="${SELFTEST_ROOT}/deploy"
 export FUKUROU_DEPLOY_DB_HELPER="${SELFTEST_ROOT}/fake-db"
+export FUKUROU_DEPLOY_SCHEMA_SENSITIVE_PATHS="${SELFTEST_ROOT}/installed-schema-sensitive-paths-v1.txt"
 mkdir -p "${FUKUROU_DEPLOY_ROOT}/deploy-state" "${FUKUROU_DEPLOY_ROOT}/repo/.git"
 touch "${FUKUROU_DEPLOY_ROOT}/.env" "${FUKUROU_DEPLOY_DB_HELPER}"
 chmod +x "${FUKUROU_DEPLOY_DB_HELPER}"
+printf 'schema/owner.sql\n' > "${FUKUROU_DEPLOY_SCHEMA_SENSITIVE_PATHS}"
 
 # shellcheck source=deploy-fukurou
 source "$(dirname "$0")/deploy-fukurou"
@@ -18,6 +20,7 @@ boottime_seconds() { printf '1\n'; }
 
 DB_CALLS="${SELFTEST_ROOT}/db-calls"
 DOCKER_CALLS="${SELFTEST_ROOT}/docker-calls"
+GIT_CALLS="${SELFTEST_ROOT}/git-calls"
 DB_STATE_ROOT="${SELFTEST_ROOT}/db-state"
 mkdir -p "${DB_STATE_ROOT}/gaps"
 OBSERVATION_MODE=stopped
@@ -31,7 +34,13 @@ timeout() {
     [[ "${DB_MODE}" == success ]] || return 1
     case "${1:-}" in
       timestamp) printf '2026-01-01T00:00:00.000000Z\n' ;;
-      snapshot) printf '{"runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture"}\n' ;;
+      snapshot)
+        if [[ -n "${DB_RUNTIME_SNAPSHOT:-}" ]]; then
+          printf '%s\n' "${DB_RUNTIME_SNAPSHOT}"
+        else
+          printf '{"runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture"}\n'
+        fi
+        ;;
       active-launch-count) printf '%s\n' "${ACTIVE_LAUNCH_COUNT_MODE:-0}" ;;
       gap-state)
         [[ -f "${DB_STATE_ROOT}/gaps/${2}" ]] && cat "${DB_STATE_ROOT}/gaps/${2}" || printf 'MISSING\n'
@@ -57,10 +66,17 @@ timeout() {
   "$@"
 }
 
-git() { return 0; }
+git() {
+  printf '%s|%s\n' "${DEPLOYMENT_ID:-}" "$*" >> "${GIT_CALLS}"
+  if [[ "${USE_REAL_GIT:-false}" == true ]]; then
+    command git "$@"
+  else
+    return 0
+  fi
+}
 docker() {
   local operation="${1:-}" argument="${2:-}" control="" generation=""
-  printf '%s\n' "$*" >> "${DOCKER_CALLS}"
+  printf '%s|%s\n' "${DEPLOYMENT_ID:-}" "$*" >> "${DOCKER_CALLS}"
   case "${operation}" in
     exec)
       if [[ "$*" == *" test -x "* ]]; then
@@ -71,6 +87,9 @@ docker() {
         if [[ "$1" == --control ]]; then control="$2"; generation="$3"; break; fi
         shift
       done
+      if [[ -n "${control}" && "${DEPLOYMENT_ID:-}" == fixture-rfo-* ]]; then
+        return 1
+      fi
       [[ -z "${control}" ]] || printf 'ACK %s %s\n' "${control}" "${generation}"
       ;;
     top)
@@ -81,6 +100,7 @@ docker() {
       ;;
     inspect)
       [[ "${OBSERVATION_MODE}" != failed ]] || return 1
+      [[ "${OBSERVATION_MODE}" != absent ]] || return 1
       case "${3:-}" in
         *State.Running*)
           case "${OBSERVATION_MODE}" in
@@ -90,7 +110,7 @@ docker() {
           esac
           ;;
         *Config.Image*) printf 'ghcr.io/matsumo0922/fukurou@sha256:%064d\n' 0 ;;
-        *Config.Env*) printf 'FUKUROU_REVISION=%040d\n' 0 ;;
+        *Config.Env*) printf 'FUKUROU_REVISION=%s\n' "${CURRENT_REVISION:-$(printf '%040d' 0)}" ;;
         *) printf 'fixture\n' ;;
       esac
       ;;
@@ -100,6 +120,7 @@ docker() {
       printf 'fukurou-ktor\n'
       ;;
     compose)
+      [[ "${CANARY_REVOKE_MODE:-success}" != fail || "$*" != *" down "* ]] || return 1
       [[ "${FUKUROU_IMAGE_REFERENCE:-}" =~ ^ghcr.io/matsumo0922/fukurou@sha256:[0-9a-f]{64}$ ]]
       [[ "${FUKUROU_IMAGE_TAG:-}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
       ;;
@@ -115,6 +136,123 @@ if validate_runtime_snapshot "$(jq 'del(.maintenance.enabled)' <<<"${runtime_sna
   echo "deploy-runtime-selftest: missing maintenance flag was accepted" >&2
   exit 1
 fi
+
+ACTUAL_SCHEMA_SENSITIVE=true
+MIGRATION_ROLLBACK_MODE=BACKWARD_COMPATIBLE
+validate_migration_rollback_mode
+MIGRATION_ROLLBACK_MODE=ROLL_FORWARD_ONLY
+validate_migration_rollback_mode
+MIGRATION_ROLLBACK_MODE=AUTO_IMAGE_ROLLBACK
+
+rm -rf "${REPO_DIR}/.git"
+origin_repo="${SELFTEST_ROOT}/origin.git"
+command git init --quiet --bare "${origin_repo}"
+command git -C "${REPO_DIR}" init --quiet -b main
+command git -C "${REPO_DIR}" config user.name selftest
+command git -C "${REPO_DIR}" config user.email selftest@example.invalid
+mkdir -p "${REPO_DIR}/schema"
+printf 'v1\n' > "${REPO_DIR}/schema/owner.sql"
+printf 'base\n' > "${REPO_DIR}/normal.txt"
+printf 'services:\n  ktor:\n    image: base\n' > "${REPO_DIR}/docker-compose.prod.yml"
+command git -C "${REPO_DIR}" add schema/owner.sql normal.txt docker-compose.prod.yml
+command git -C "${REPO_DIR}" commit --quiet -m base
+base_revision="$(command git -C "${REPO_DIR}" rev-parse HEAD)"
+printf 'forward\n' >> "${REPO_DIR}/normal.txt"
+command git -C "${REPO_DIR}" commit --quiet -am forward
+forward_revision="$(command git -C "${REPO_DIR}" rev-parse HEAD)"
+printf 'v2\n' > "${REPO_DIR}/schema/owner.sql"
+command git -C "${REPO_DIR}" commit --quiet -am schema-sensitive
+sensitive_revision="$(command git -C "${REPO_DIR}" rev-parse HEAD)"
+command git -C "${REPO_DIR}" remote add origin "${origin_repo}"
+command git -C "${REPO_DIR}" push --quiet -u origin main
+
+USE_REAL_GIT=true
+compose_snapshot="${SELFTEST_ROOT}/compose-at-current.yml"
+snapshot_compose_at_revision "${base_revision}" "${compose_snapshot}"
+grep -Fq 'image: base' "${compose_snapshot}"
+[[ "$(command git -C "${REPO_DIR}" rev-parse HEAD)" == "${sensitive_revision}" ]]
+
+DB_RUNTIME_SNAPSHOT="${runtime_snapshot}"
+DEPLOY_INTENT=FORWARD
+WORKFLOW_EVENT=push
+OPERATOR_REASON=""
+MIGRATION_ROLLBACK_MODE=AUTO_IMAGE_ROLLBACK
+OBSERVATION_MODE=absent
+DEPLOY_SHA="${sensitive_revision}"
+observe_and_admit_deploy
+[[ "${OBSERVED_FRESH_INSTALL}" == true && "${ACTUAL_SCHEMA_SENSITIVE}" == false ]]
+
+OBSERVATION_MODE=running
+CURRENT_REVISION="${base_revision}"
+DEPLOY_SHA="${forward_revision}"
+observe_and_admit_deploy
+[[ "${ACCEPTED_CURRENT_REVISION}" == "${base_revision}" && "${ACTUAL_SCHEMA_SENSITIVE}" == false ]]
+
+DEPLOY_SHA="${sensitive_revision}"
+if observe_and_admit_deploy >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: schema-sensitive AUTO_IMAGE_ROLLBACK admission succeeded" >&2
+  exit 1
+fi
+WORKFLOW_EVENT=workflow_dispatch
+OPERATOR_REASON="compatible migration review"
+MIGRATION_ROLLBACK_MODE=ROLL_FORWARD_ONLY
+observe_and_admit_deploy
+[[ "${ACTUAL_SCHEMA_SENSITIVE}" == true ]]
+
+CURRENT_REVISION="${sensitive_revision}"
+DEPLOY_SHA="${forward_revision}"
+DEPLOY_INTENT=FORWARD
+if observe_and_admit_deploy >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: queued older FORWARD target was accepted" >&2
+  exit 1
+fi
+
+DEPLOY_SHA="${base_revision}"
+DEPLOY_INTENT=AUTHORIZED_ROLLBACK
+MIGRATION_ROLLBACK_MODE=BACKWARD_COMPATIBLE
+observe_and_admit_deploy
+
+command git -C "${REPO_DIR}" checkout --quiet -b divergent "${base_revision}"
+printf 'divergent\n' > "${REPO_DIR}/divergent.txt"
+command git -C "${REPO_DIR}" add divergent.txt
+command git -C "${REPO_DIR}" commit --quiet -m divergent
+CURRENT_REVISION="$(command git -C "${REPO_DIR}" rev-parse HEAD)"
+command git -C "${REPO_DIR}" checkout --quiet main
+DEPLOY_SHA="${sensitive_revision}"
+DEPLOY_INTENT=FORWARD
+MIGRATION_ROLLBACK_MODE=AUTO_IMAGE_ROLLBACK
+if observe_and_admit_deploy >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: divergent current revision was accepted" >&2
+  exit 1
+fi
+CURRENT_REVISION="${sensitive_revision}"
+
+mkdir -p "${STATE_ROOT}/published-history"
+OBSERVATION_MODE=absent
+DEPLOY_INTENT=FORWARD
+MIGRATION_ROLLBACK_MODE=AUTO_IMAGE_ROLLBACK
+DEPLOY_SHA="${sensitive_revision}"
+if observe_and_admit_deploy >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: prior installation with missing container was accepted as fresh" >&2
+  exit 1
+fi
+rm -rf "${STATE_ROOT}/published-history"
+
+USE_REAL_GIT=false
+OBSERVATION_MODE=stopped
+unset DB_RUNTIME_SNAPSHOT CURRENT_REVISION
+if validate_migration_rollback_mode >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: schema-sensitive AUTO_IMAGE_ROLLBACK was accepted" >&2
+  exit 1
+fi
+ACTUAL_SCHEMA_SENSITIVE=false
+validate_migration_rollback_mode
+MIGRATION_ROLLBACK_MODE=BACKWARD_COMPATIBLE
+if validate_migration_rollback_mode >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: non-sensitive explicit migration mode was accepted" >&2
+  exit 1
+fi
+MIGRATION_ROLLBACK_MODE=AUTO_IMAGE_ROLLBACK
 if read_maintenance_enabled "$(jq '.maintenance.enabled="false"' <<<"${runtime_snapshot}")" >/dev/null 2>&1; then
   echo "deploy-runtime-selftest: string maintenance flag was accepted" >&2
   exit 1
@@ -138,6 +276,8 @@ cleanup_stale_pending_states
 [[ ! -e "${STATE_ROOT}/.stale-one.tmp.1" && ! -e "${STATE_ROOT}/.stale-two.tmp.2" ]]
 capture_body="$(declare -f capture_rollback_state)"
 [[ "${capture_body}" == *"journal_state PREPARED"*'mv "${temporary_dir}" "${state_dir}"'* ]]
+rollback_body="$(declare -f rollback_on_error)"
+[[ "${rollback_body}" == *"health/live"*'maintenance-cas'*"enable_restored_runtime"*"health/ready"* ]]
 
 write_recovery_state() {
   local state_dir="$1" deployment_id="$2"
@@ -148,6 +288,53 @@ write_recovery_state() {
 {"deploymentId":"${deployment_id}","installKind":"FOUNDATION_V1","previousRepoSha":"1111111111111111111111111111111111111111","runtimeConfigVersion":"fixture","runtimeConfigHash":"fixture","launchMaintenance":{"generation":6},"runningContainer":{"configuredImageReference":"${configured_reference}","repoDigests":${repo_digests},"revision":"0000000000000000000000000000000000000000"}}
 JSON
   printf 'services:\n  ktor:\n    image: ${FUKUROU_IMAGE_REFERENCE:?}\n    environment:\n      FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_TAG:?}\n' > "${state_dir}/docker-compose.prod.yml"
+}
+
+write_v2_recovery_state() {
+  local state_dir="$1" deployment_id="$2" mode="${3:-AUTO_IMAGE_ROLLBACK}"
+  local schema_sensitive="${4:-false}" operator_reason="${5:-}"
+  local inventory_hash candidate_digest
+  inventory_hash="$(sha256sum "${INSTALLED_SCHEMA_SENSITIVE_PATHS}" | awk '{print $1}')"
+  candidate_digest="sha256:$(printf '5%.0s' {1..64})"
+  write_recovery_state "${state_dir}" "${deployment_id}"
+  jq \
+    --arg currentRevision "$(printf '0%.0s' {1..40})" \
+    --arg targetRevision "$(printf '1%.0s' {1..40})" \
+    --arg operatorReason "${operator_reason}" \
+    --arg migrationRollbackMode "${mode}" \
+    --arg inventoryHash "${inventory_hash}" \
+    --arg candidateImageDigest "${candidate_digest}" \
+    --argjson schemaSensitive "${schema_sensitive}" '
+      . + {
+        stateVersion:2,
+        acceptedDeploy:{
+          currentRevision:$currentRevision,targetRevision:$targetRevision,intent:"FORWARD",
+          operatorReason:$operatorReason,migrationRollbackMode:$migrationRollbackMode,
+          schemaSensitivePathsSha256:$inventoryHash,schemaSensitive:$schemaSensitive,
+          candidateImageDigest:$candidateImageDigest
+        },
+        installed:{schemaSensitivePathsSha256:$inventoryHash}
+      }
+    ' "${state_dir}/state.json" > "${state_dir}/state.tmp"
+  mv "${state_dir}/state.tmp" "${state_dir}/state.json"
+}
+
+v2_prepared_details() {
+  local mode="${1:-AUTO_IMAGE_ROLLBACK}" schema_sensitive="${2:-false}" operator_reason="${3:-}"
+  local inventory_hash
+  inventory_hash="$(sha256sum "${INSTALLED_SCHEMA_SENSITIVE_PATHS}" | awk '{print $1}')"
+  jq -cS -n \
+    --arg currentRevision "$(printf '0%.0s' {1..40})" \
+    --arg targetRevision "$(printf '1%.0s' {1..40})" \
+    --arg operatorReason "${operator_reason}" \
+    --arg migrationRollbackMode "${mode}" \
+    --arg inventoryHash "${inventory_hash}" \
+    --arg candidateImageDigest "sha256:$(printf '5%.0s' {1..64})" \
+    --argjson schemaSensitive "${schema_sensitive}" \
+    '{forwardBudgetSeconds:1200,recoveryBudgetSeconds:300,currentRevision:$currentRevision,
+      targetRevision:$targetRevision,intent:"FORWARD",operatorReason:$operatorReason,
+      migrationRollbackMode:$migrationRollbackMode,schemaSensitivePathsSha256:$inventoryHash,
+      schemaSensitive:$schemaSensitive,candidateImageDigest:$candidateImageDigest}'
 }
 
 fresh_state_dir="${STATE_ROOT}/fresh-image-binding"
@@ -214,10 +401,10 @@ create_recovery_fixture() {
   local expected_state="${terminal_state}"
   local state_dir="${STATE_ROOT}/${deployment_id}"
   mkdir -p "${state_dir}"
-  write_recovery_state "${state_dir}" "${deployment_id}"
+  write_v2_recovery_state "${state_dir}" "${deployment_id}"
   printf 'OPEN\n' > "${DB_STATE_ROOT}/gaps/${deployment_id}"
   ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
-  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
+  journal_state PREPARED "$(v2_prepared_details)"
   journal_state CAPTURED '{"fixture":true}'
   journal_state SAFETY_MUTATION_STARTED
   journal_state LAUNCHES_DISABLED
@@ -247,9 +434,9 @@ create_recovery_fixture fixture-close GAP_CLOSED
 create_disable_crash_fixture() {
   local deployment_id="$1" crash_point="$2" state_dir="${STATE_ROOT}/$1"
   mkdir -p "${state_dir}"
-  write_recovery_state "${state_dir}" "${deployment_id}"
+  write_v2_recovery_state "${state_dir}" "${deployment_id}"
   ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
-  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
+  journal_state PREPARED "$(v2_prepared_details)"
   journal_state CAPTURED '{"fixture":true}'
   FENCE_GENERATION=6; TARGET_GENERATION=7; MAINTENANCE_ACTIVE=false; MAINTENANCE_DEPLOYMENT_ID=""
   DISPATCHED_OPERATION_IDS=""
@@ -304,6 +491,60 @@ create_legacy_fixture fixture-legacy-captured CAPTURED
 create_legacy_fixture fixture-legacy-disabled LAUNCHES_DISABLED
 printf 'OPEN\n' > "${DB_STATE_ROOT}/gaps/fixture-legacy-disabled"
 
+create_roll_forward_only_fixture() {
+  local deployment_id="$1" origin_state="$2" state_dir="${STATE_ROOT}/$1"
+  mkdir -p "${state_dir}"
+  write_v2_recovery_state "${state_dir}" "${deployment_id}" ROLL_FORWARD_ONLY true "migration review"
+  ROLLBACK_STATE_DIR="${state_dir}"; DEPLOYMENT_ID="${deployment_id}"
+  journal_state PREPARED "$(v2_prepared_details ROLL_FORWARD_ONLY true "migration review")"
+  journal_state CAPTURED
+  if [[ "${origin_state}" == SAFETY_MUTATION_STARTED ]]; then
+    journal_state SAFETY_MUTATION_STARTED
+    printf 'OPEN\n' > "${DB_STATE_ROOT}/gaps/${deployment_id}"
+  fi
+}
+
+create_roll_forward_only_fixture fixture-rfo-captured CAPTURED
+create_roll_forward_only_fixture fixture-rfo-safety SAFETY_MUTATION_STARTED
+create_roll_forward_only_fixture fixture-rfo-canary SAFETY_MUTATION_STARTED
+touch "${STATE_ROOT}/fixture-rfo-canary/canary-compose.yml"
+
+# v2 policy evidence is fail-closed and never falls back to legacy AUTO semantics.
+invalid_policy_dir="${STATE_ROOT}/fixture-invalid-policy"
+mkdir -p "${invalid_policy_dir}"
+write_v2_recovery_state "${invalid_policy_dir}" fixture-invalid-policy ROLL_FORWARD_ONLY true "migration review"
+ROLLBACK_STATE_DIR="${invalid_policy_dir}"; DEPLOYMENT_ID=fixture-invalid-policy
+journal_state PREPARED "$(v2_prepared_details ROLL_FORWARD_ONLY true "migration review")"
+journal_state CAPTURED
+jq 'del(.acceptedDeploy.candidateImageDigest)' "${invalid_policy_dir}/state.json" > "${invalid_policy_dir}/state.tmp"
+mv "${invalid_policy_dir}/state.tmp" "${invalid_policy_dir}/state.json"
+if load_recovery_policy >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: v2 recovery accepted missing candidate digest" >&2
+  exit 1
+fi
+rm -rf "${invalid_policy_dir}"
+
+# A failed safe-boundary proof or canary revoke remains retryable RECOVERY_STARTED.
+ROLLBACK_STATE_DIR="${STATE_ROOT}/fixture-rfo-safety"; DEPLOYMENT_ID=fixture-rfo-safety
+DB_MODE=fail
+set +e
+(set +e; trap - ERR; false; rollback_on_error)
+rfo_boundary_status="$?"
+set -e
+DB_MODE=success
+[[ "${rfo_boundary_status}" -ne 0 ]]
+[[ "$(tail -n 1 "${ROLLBACK_STATE_DIR}/journal.jsonl" | jq -r '.state')" == RECOVERY_STARTED ]]
+
+ROLLBACK_STATE_DIR="${STATE_ROOT}/fixture-rfo-canary"; DEPLOYMENT_ID=fixture-rfo-canary
+CANARY_REVOKE_MODE=fail
+set +e
+(set +e; trap - ERR; false; rollback_on_error)
+rfo_canary_status="$?"
+set -e
+CANARY_REVOKE_MODE=success
+[[ "${rfo_canary_status}" -ne 0 ]]
+[[ "$(tail -n 1 "${ROLLBACK_STATE_DIR}/journal.jsonl" | jq -r '.state')" == RECOVERY_STARTED ]]
+
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do validate_journal_history "${journal}"; done
 cp "${STATE_ROOT}/fixture-clear/journal.jsonl" "${STATE_ROOT}/fixture-clear/journal-corrupt.jsonl"
 jq -c 'if .sequence==2 then .details={tampered:true} else . end' \
@@ -317,6 +558,13 @@ cp "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" "${STATE_ROOT}/fixture-
 append_legacy_journal_entry "${STATE_ROOT}/fixture-legacy-captured/journal-illegal.jsonl" ENABLE_ACKED
 if validate_journal_history "${STATE_ROOT}/fixture-legacy-captured/journal-illegal.jsonl" >/dev/null 2>&1; then
   echo "deploy-runtime-selftest: illegal legacy transition was accepted" >&2
+  exit 1
+fi
+cp "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" "${STATE_ROOT}/fixture-legacy-captured/journal-v2-terminal-illegal.jsonl"
+append_legacy_journal_entry "${STATE_ROOT}/fixture-legacy-captured/journal-v2-terminal-illegal.jsonl" RECOVERY_STARTED
+append_legacy_journal_entry "${STATE_ROOT}/fixture-legacy-captured/journal-v2-terminal-illegal.jsonl" CANDIDATE_ABORTED
+if validate_journal_history "${STATE_ROOT}/fixture-legacy-captured/journal-v2-terminal-illegal.jsonl" >/dev/null 2>&1; then
+  echo "deploy-runtime-selftest: v1 journal accepted the v2 CANDIDATE_ABORTED terminal" >&2
   exit 1
 fi
 cp "${STATE_ROOT}/fixture-legacy-disabled/journal.jsonl" "${STATE_ROOT}/fixture-legacy-disabled/journal-corrupt.jsonl"
@@ -336,6 +584,7 @@ set -e
 [[ "${early_signal_status}" == 143 ]]
 
 DEPLOYMENT_ID=new-candidate
+CANDIDATE_DIGEST="sha256:$(printf '6%.0s' {1..64})"
 unset FUKUROU_IMAGE_REFERENCE FUKUROU_IMAGE_TAG
 # production と同じく ERR trap を装着した状態で resume する。subshell recovery の
 # 非ゼロ終了へ trap が再発火して executor を終了させる回帰をここで捕捉する。
@@ -351,12 +600,27 @@ if [[ -n "${GAP_DEPLOYMENT_ID:-}" ]]; then
 fi
 for journal in "${STATE_ROOT}"/*/journal.jsonl; do
   [[ "$(tail -n 1 "${journal}" | jq -r '.state')" == ROLLED_BACK || \
-     "$(tail -n 1 "${journal}" | jq -r '.state')" == COMPLETE ]]
+     "$(tail -n 1 "${journal}" | jq -r '.state')" == COMPLETE || \
+     "$(tail -n 1 "${journal}" | jq -r '.state')" == CANDIDATE_ABORTED || \
+     "$(tail -n 1 "${journal}" | jq -r '.state')" == MANUAL_RECOVERY_REQUIRED ]]
   validate_journal_history "${journal}"
 done
 [[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-terminal/journal.jsonl" | jq -r '.state')" == COMPLETE ]]
 [[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-captured/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
 [[ "$(tail -n 1 "${STATE_ROOT}/fixture-legacy-disabled/journal.jsonl" | jq -r '.state')" == ROLLED_BACK ]]
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-rfo-captured/journal.jsonl" | jq -r '.state')" == CANDIDATE_ABORTED ]]
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-rfo-safety/journal.jsonl" | jq -r '.state')" == MANUAL_RECOVERY_REQUIRED ]]
+[[ "$(tail -n 1 "${STATE_ROOT}/fixture-rfo-canary/journal.jsonl" | jq -r '.state')" == MANUAL_RECOVERY_REQUIRED ]]
+if grep -E '^fixture-rfo-(captured|safety|canary)\|.*checkout --detach' "${GIT_CALLS}"; then
+  echo "deploy-runtime-selftest: roll-forward-only recovery restored a previous checkout" >&2
+  exit 1
+fi
+grep -Fq "fixture-rfo-safety|run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges=true --mount type=bind,src=${FENCE_ROOT},dst=/var/lib/fukurou/launch-fence --entrypoint ${SUPERVISOR_BINARY} ${IMAGE_REPOSITORY}@sha256:$(printf '5%.0s' {1..64})" "${DOCKER_CALLS}"
+if grep -Fq "fixture-rfo-safety|" "${DOCKER_CALLS}" && \
+  grep -F "fixture-rfo-safety|" "${DOCKER_CALLS}" | grep -Fq "@sha256:$(printf '6%.0s' {1..64})"; then
+  echo "deploy-runtime-selftest: startup recovery used the incoming candidate digest" >&2
+  exit 1
+fi
 grep -Fq 'ensure-maintenance 7 fixture-clear' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-enable' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-close-append' "${DB_CALLS}"
@@ -364,6 +628,11 @@ grep -Fq 'ensure-maintenance 7 fixture-close' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-maintenance-cas' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-gap-open' "${DB_CALLS}"
 grep -Fq 'ensure-maintenance 7 fixture-legacy-disabled' "${DB_CALLS}"
+grep -Fq 'ensure-maintenance 7 fixture-rfo-safety' "${DB_CALLS}"
+if grep -Fq 'ensure-maintenance 7 fixture-rfo-captured' "${DB_CALLS}"; then
+  echo "deploy-runtime-selftest: pre-safety roll-forward-only recovery crossed the safety boundary" >&2
+  exit 1
+fi
 if grep -Fq 'ensure-maintenance 7 fixture-legacy-captured' "${DB_CALLS}"; then
   echo "deploy-runtime-selftest: legacy CAPTURED recovery crossed the safety boundary" >&2
   exit 1
@@ -503,4 +772,4 @@ if command -v flock >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && comm
   }
 fi
 
-echo "DEPLOY_RUNTIME_SELFTEST_OK snapshot=false-preserved-invalid-rejected pending-state=safe-and-stale-cleanup journal=hash-chain-transition-cas recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated watchdog=lock-closed-processes-reaped-deadline-signaled"
+echo "DEPLOY_RUNTIME_SELFTEST_OK admission=fresh-forward-queued-old-authorized-rollback-schema-mode-prior-history journal=v1-v2-hash-chain-rfo-terminals recovery=db-clear-enable-gap-close-production rollback=external-boundary-fakes canary=replay-rejected pid0=fail-closed resume=enable-failure-restored process-group=signal-propagated watchdog=lock-closed-processes-reaped-deadline-signaled"

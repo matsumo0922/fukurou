@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly CONTRACT_VERSION=1
+readonly CONTRACT_VERSION=2
 readonly DEPLOY_ROOT="${FUKUROU_DEPLOY_ROOT:-/srv/fukurou}"
 readonly REPO_DIR="${DEPLOY_ROOT}/repo"
 readonly ENV_FILE="${DEPLOY_ROOT}/.env"
@@ -13,6 +13,7 @@ readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
 readonly IMAGE_REPOSITORY="${FUKUROU_IMAGE_REPOSITORY:-ghcr.io/matsumo0922/fukurou}"
 readonly PUBLIC_KEY="${FUKUROU_DEPLOY_PUBLIC_KEY:-/usr/local/share/fukurou/deploy-public-key.pem}"
 readonly INSTALLED_CATALOG="${FUKUROU_DEPLOY_CATALOG:-/usr/local/share/fukurou/deploy-capability-catalog-v1.json}"
+readonly INSTALLED_SCHEMA_SENSITIVE_PATHS="${FUKUROU_DEPLOY_SCHEMA_SENSITIVE_PATHS:-/usr/local/share/fukurou/deploy-schema-sensitive-paths-v1.txt}"
 readonly CATALOG_LEDGER="${FUKUROU_DEPLOY_CATALOG_LEDGER:-${DEPLOY_ROOT}/deploy-catalog-ledger}"
 readonly DB_HELPER="${FUKUROU_DEPLOY_DB_HELPER:-/usr/local/libexec/fukurou-deploy-db}"
 readonly SUPERVISOR_BINARY="/usr/local/libexec/fukurou-runtime-supervisor"
@@ -176,7 +177,7 @@ validate_typed_operation_set() {
       "INSTALL_SECRET_REF_V1", "RUN_COMPOSE_PROJECT_V1", "SMOKE_HOOK_V1"
     ];
     . as $bundle |
-    .minimumContractVersion == 1 and
+    .minimumContractVersion == 2 and
     unique_items(.requiredCapabilities) and unique_items(.requiredHooks) and
     unique_items([.operations[].operationId]) and
     contains_all(.requiredCapabilities; baseline_capabilities) and
@@ -304,6 +305,81 @@ verify_bundle_signature() {
     -in "${bundle_path}" -sigfile "${signature_path}" >/dev/null 2>&1
 }
 
+validate_schema_sensitive_inventory() {
+  local inventory="$1" require_installed_metadata="${2:-false}"
+  [[ -f "${inventory}" && ! -L "${inventory}" ]] || {
+    fail "SCHEMA_SENSITIVE_PATHS_MISSING:${inventory}"
+    return 1
+  }
+  [[ "$(wc -c < "${inventory}" | tr -d ' ')" -le 16384 ]] || {
+    fail "SCHEMA_SENSITIVE_PATHS_TOO_LARGE"
+    return 1
+  }
+  if [[ "${require_installed_metadata}" == true ]]; then
+    [[ "$(stat -c '%u:%g:%a' "${inventory}")" == "0:0:444" ]] || {
+      fail "INSTALLED_SCHEMA_SENSITIVE_PATHS_METADATA_MISMATCH"
+      return 1
+    }
+  fi
+  awk '
+    /^[[:space:]]*($|#)/ { next }
+    !/^[A-Za-z0-9_.\/-]+$/ || /^\// || /(^|\/)\.\.($|\/)/ || /^-/ { exit 1 }
+    { count++ }
+    END { if (count == 0) exit 1 }
+  ' "${inventory}" || {
+    fail "INVALID_SCHEMA_SENSITIVE_PATHS_INVENTORY"
+    return 1
+  }
+}
+
+schema_sensitive_inventory_hash() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+validate_schema_sensitive_inventory_agreement() {
+  local expected_hash="$1" repository_inventory="$2" installed_inventory="$3"
+  local require_installed_metadata="${4:-true}" repository_hash installed_hash
+  validate_schema_sensitive_inventory "${repository_inventory}" || return 1
+  validate_schema_sensitive_inventory "${installed_inventory}" "${require_installed_metadata}" || return 1
+  repository_hash="$(schema_sensitive_inventory_hash "${repository_inventory}")"
+  installed_hash="$(schema_sensitive_inventory_hash "${installed_inventory}")"
+  [[ "${expected_hash}" == "${repository_hash}" && "${expected_hash}" == "${installed_hash}" ]] || {
+    fail "SCHEMA_SENSITIVE_PATHS_HASH_MISMATCH"
+    return 1
+  }
+}
+
+validate_deploy_intent_fields() {
+  local bundle_json="$1"
+  jq -e '
+    (keys | sort) == ([
+      "bundleSchemaVersion", "candidateImageDigest", "candidateSha", "capabilityCatalog",
+      "capabilityCatalogHash", "deploymentId", "deployIntent", "executorSha256",
+      "foundationHarnessSha256", "migrationRollbackMode", "minimumContractVersion",
+      "operations", "operatorReason", "publicKeySha256", "requiredCapabilities",
+      "requiredHooks", "schemaSensitivePathsSha256", "workflowEvent"
+    ] | sort) and
+    .bundleSchemaVersion == 2 and .minimumContractVersion == 2 and
+    (.workflowEvent | IN("push", "workflow_dispatch")) and
+    (.deployIntent | IN("FORWARD", "AUTHORIZED_ROLLBACK")) and
+    (.migrationRollbackMode | IN("AUTO_IMAGE_ROLLBACK", "BACKWARD_COMPATIBLE", "ROLL_FORWARD_ONLY")) and
+    (.operatorReason | type == "string" and length <= 240 and
+      (test("[\u0000-\u001f\u007f]") | not) and
+      (test("(?i)(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|(?:password|passwd|pwd|secret|token|api[_ -]?key|private[_ -]?key|authorization|credential)\\s*[:=]\\s*\\S+|bearer\\s+[A-Za-z0-9._~+/=-]{8,}|(?:postgres(?:ql)?|jdbc:postgresql|mysql|https?)://[^\\s/:]+:[^\\s/@]+@|(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}))") | not)) and
+    .operatorReason == (.operatorReason | gsub("^\\s+|\\s+$"; "")) and
+    (.schemaSensitivePathsSha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (
+      (.workflowEvent == "push" and .deployIntent == "FORWARD" and .operatorReason == "" and
+        .migrationRollbackMode == "AUTO_IMAGE_ROLLBACK") or
+      (.workflowEvent == "workflow_dispatch" and .deployIntent == "AUTHORIZED_ROLLBACK" and
+        (.operatorReason | length > 0)) or
+      (.workflowEvent == "workflow_dispatch" and .deployIntent == "FORWARD" and
+        ((.migrationRollbackMode == "AUTO_IMAGE_ROLLBACK" and .operatorReason == "") or
+         (.migrationRollbackMode != "AUTO_IMAGE_ROLLBACK" and (.operatorReason | length > 0))))
+    )
+  ' <<<"${bundle_json}" >/dev/null || fail "INVALID_DEPLOY_INTENT_FIELDS"
+}
+
 validate_signed_bundle() {
   [[ -f "${BUNDLE_PATH}" && -f "${SIGNATURE_PATH}" ]] || fail "bundle or signature is missing"
   [[ -f "${PUBLIC_KEY}" ]] || fail "installed deploy public key is missing"
@@ -365,6 +441,8 @@ validate_signed_bundle() {
   fi
   SIGNED_BUNDLE_JSON="${bundle_json}"
 
+  validate_deploy_intent_fields "${bundle_json}" || return 1
+
   local candidate_sha minimum_version executor_hash public_key_hash harness_hash self_hash installed_key_hash
   candidate_sha="$(jq -er '.candidateSha' <<<"${bundle_json}")"
   minimum_version="$(jq -er '.minimumContractVersion' <<<"${bundle_json}")"
@@ -375,6 +453,11 @@ validate_signed_bundle() {
   harness_hash="$(jq -er '.foundationHarnessSha256' <<<"${bundle_json}")"
   DEPLOYMENT_ID="$(jq -er '.deploymentId' <<<"${bundle_json}")"
   CANDIDATE_DIGEST="$(jq -er '.candidateImageDigest' <<<"${bundle_json}")"
+  WORKFLOW_EVENT="$(jq -er '.workflowEvent' <<<"${bundle_json}")"
+  DEPLOY_INTENT="$(jq -er '.deployIntent' <<<"${bundle_json}")"
+  OPERATOR_REASON="$(jq -er '.operatorReason' <<<"${bundle_json}")"
+  MIGRATION_ROLLBACK_MODE="$(jq -er '.migrationRollbackMode' <<<"${bundle_json}")"
+  SIGNED_SCHEMA_SENSITIVE_PATHS_SHA256="$(jq -er '.schemaSensitivePathsSha256' <<<"${bundle_json}")"
 
   [[ "${candidate_sha}" == "${DEPLOY_SHA}" ]] || fail "BUNDLE_SHA_MISMATCH"
   [[ "${minimum_version}" == "${CONTRACT_VERSION}" ]] || fail "CONTRACT_VERSION_MISMATCH"
@@ -387,6 +470,13 @@ validate_signed_bundle() {
   [[ "${executor_hash}" == "${self_hash}" ]] || fail "INSTALLED_EXECUTOR_HASH_MISMATCH"
   [[ "${public_key_hash}" == "${installed_key_hash}" ]] || fail "INSTALLED_PUBLIC_KEY_HASH_MISMATCH"
   validate_foundation_harness_hash "${harness_hash}" || return 1
+
+  local repository_schema_sensitive_paths
+  repository_schema_sensitive_paths="$(dirname -- "${BUNDLE_PATH}")/deploy-schema-sensitive-paths-v1.txt"
+  validate_schema_sensitive_inventory_agreement \
+    "${SIGNED_SCHEMA_SENSITIVE_PATHS_SHA256}" \
+    "${repository_schema_sensitive_paths}" \
+    "${INSTALLED_SCHEMA_SENSITIVE_PATHS}" || return 1
 
   validate_typed_operation_set "${bundle_json}" "${CANDIDATE_CATALOG}" || fail "INVALID_TYPED_OPERATION_SET"
   REQUIRED_HOOKS_JSON="$(jq -cS '.requiredHooks' <<<"${bundle_json}")"
@@ -418,10 +508,29 @@ probe_candidate_operations() {
   done < <(required_operation_plan CANDIDATE_HOOK_V1)
 }
 
+snapshot_compose_at_revision() {
+  local revision="$1" target="$2"
+  [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || return 1
+  timeout 30 git -C "${REPO_DIR}" show "${revision}:docker-compose.prod.yml" > "${target}" || return 1
+  [[ -s "${target}" ]]
+}
+
 validate_production_compose() {
+  local candidate_compose
+  candidate_compose="$(mktemp)" || fail "CANDIDATE_COMPOSE_SNAPSHOT_FAILED"
+  snapshot_compose_at_revision "${DEPLOY_SHA}" "${candidate_compose}" || {
+    rm -f "${candidate_compose}"
+    fail "CANDIDATE_COMPOSE_SNAPSHOT_FAILED"
+    return 1
+  }
   bind_image_reference "${IMAGE_REPOSITORY}@${CANDIDATE_DIGEST}"
-  timeout 30 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config --quiet || \
+  if ! timeout 30 docker compose --project-directory "${REPO_DIR}" --env-file "${ENV_FILE}" \
+    -f "${candidate_compose}" config --quiet; then
+    rm -f "${candidate_compose}"
     fail "PRODUCTION_COMPOSE_DERIVATION_FAILED"
+    return 1
+  fi
+  rm -f "${candidate_compose}"
 }
 
 bind_image_reference() {
@@ -483,6 +592,145 @@ require_initial_state() {
   [[ -x "${SUPERVISOR_BINARY}" ]] || fail "installed canonical fence codec is missing"
 }
 
+load_schema_sensitive_paths() {
+  SCHEMA_SENSITIVE_PATHS=()
+  local schema_sensitive_path
+  while IFS= read -r schema_sensitive_path; do
+    [[ -n "${schema_sensitive_path}" ]] || continue
+    SCHEMA_SENSITIVE_PATHS[${#SCHEMA_SENSITIVE_PATHS[@]}]="${schema_sensitive_path}"
+  done < <(awk 'NF && $1 !~ /^#/' "${INSTALLED_SCHEMA_SENSITIVE_PATHS}")
+  [[ "${#SCHEMA_SENSITIVE_PATHS[@]}" -gt 0 ]] || fail "SCHEMA_SENSITIVE_PATHS_EMPTY"
+}
+
+classify_actual_schema_sensitive_diff() {
+  ACTUAL_SCHEMA_SENSITIVE=false
+  [[ "${OBSERVED_FRESH_INSTALL}" == false && "${OBSERVED_CURRENT_REVISION}" != "${DEPLOY_SHA}" ]] || return 0
+
+  load_schema_sensitive_paths || return 1
+  if timeout 30 git -C "${REPO_DIR}" diff --quiet \
+    "${OBSERVED_CURRENT_REVISION}" "${DEPLOY_SHA}" -- "${SCHEMA_SENSITIVE_PATHS[@]}"; then
+    ACTUAL_SCHEMA_SENSITIVE=false
+  else
+    local diff_status="$?"
+    [[ "${diff_status}" == 1 ]] || {
+      fail "SCHEMA_SENSITIVE_DIFF_UNAVAILABLE"
+      return 1
+    }
+    ACTUAL_SCHEMA_SENSITIVE=true
+  fi
+}
+
+validate_migration_rollback_mode() {
+  if [[ "${ACTUAL_SCHEMA_SENSITIVE}" == true ]]; then
+    case "${MIGRATION_ROLLBACK_MODE}" in
+      BACKWARD_COMPATIBLE|ROLL_FORWARD_ONLY) return 0 ;;
+      *) fail "SCHEMA_SENSITIVE_MODE_MISMATCH:AUTO_IMAGE_ROLLBACK"; return 1 ;;
+    esac
+  else
+    [[ "${MIGRATION_ROLLBACK_MODE}" == "AUTO_IMAGE_ROLLBACK" ]] || {
+      fail "SCHEMA_SENSITIVE_MODE_MISMATCH:NON_SENSITIVE_EXPLICIT_MODE"
+      return 1
+    }
+  fi
+}
+
+observe_and_admit_deploy() {
+  timeout 180 git -C "${REPO_DIR}" fetch --prune origin +refs/heads/main:refs/remotes/origin/main || {
+    fail "REVISION_AUTHORITY_FETCH_FAILED"
+    return 1
+  }
+  timeout 30 git -C "${REPO_DIR}" cat-file -e "${DEPLOY_SHA}^{commit}" || {
+    fail "TARGET_REVISION_UNAVAILABLE"
+    return 1
+  }
+  timeout 30 git -C "${REPO_DIR}" merge-base --is-ancestor "${DEPLOY_SHA}" "${MAIN_REF}" || {
+    fail "TARGET_REVISION_NOT_ON_MAIN"
+    return 1
+  }
+
+  local container_id runtime_snapshot install_kind published_state
+  container_id="$(inspect_optional_application '{{.Id}}')" || return 1
+  OBSERVED_FRESH_INSTALL=false
+  OBSERVED_CURRENT_REVISION=""
+  if [[ -z "${container_id}" ]]; then
+    runtime_snapshot="$(timeout 30 "${DB_HELPER}" snapshot)" || {
+      fail "CURRENT_REVISION_DB_EVIDENCE_UNAVAILABLE"
+      return 1
+    }
+    validate_runtime_snapshot "${runtime_snapshot}" || {
+      fail "INVALID_RUNTIME_SNAPSHOT"
+      return 1
+    }
+    install_kind="$(jq -er '.installKind' <<<"${runtime_snapshot}")" || {
+      fail "INVALID_RUNTIME_SNAPSHOT"
+      return 1
+    }
+    published_state="$(find "${STATE_ROOT}" -xdev -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print -quit)" || {
+      fail "DEPLOYMENT_HISTORY_OBSERVATION_FAILED"
+      return 1
+    }
+    if [[ "${install_kind}" == "PRE_FOUNDATION" && -z "${published_state}" ]]; then
+      OBSERVED_FRESH_INSTALL=true
+    else
+      fail "UNKNOWN_CURRENT_REVISION:CONTAINER_MISSING_WITH_PRIOR_INSTALLATION"
+      return 1
+    fi
+  else
+    OBSERVED_CURRENT_REVISION="$(inspect_optional_application '{{range .Config.Env}}{{println .}}{{end}}' | \
+      awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" || return 1
+    [[ "${OBSERVED_CURRENT_REVISION}" =~ ^[0-9a-f]{40}$ ]] || {
+      fail "UNKNOWN_CURRENT_REVISION:MALFORMED"
+      return 1
+    }
+    timeout 30 git -C "${REPO_DIR}" cat-file -e "${OBSERVED_CURRENT_REVISION}^{commit}" || {
+      fail "UNKNOWN_CURRENT_REVISION:COMMIT_UNAVAILABLE"
+      return 1
+    }
+    timeout 30 git -C "${REPO_DIR}" merge-base --is-ancestor "${OBSERVED_CURRENT_REVISION}" "${MAIN_REF}" || {
+      fail "UNKNOWN_CURRENT_REVISION:NOT_ON_MAIN"
+      return 1
+    }
+  fi
+
+  case "${DEPLOY_INTENT}" in
+    FORWARD)
+      if [[ "${OBSERVED_FRESH_INSTALL}" == false && "${OBSERVED_CURRENT_REVISION}" != "${DEPLOY_SHA}" ]]; then
+        timeout 30 git -C "${REPO_DIR}" merge-base --is-ancestor \
+          "${OBSERVED_CURRENT_REVISION}" "${DEPLOY_SHA}" || {
+          if timeout 30 git -C "${REPO_DIR}" merge-base --is-ancestor "${DEPLOY_SHA}" "${OBSERVED_CURRENT_REVISION}"; then
+            fail "FORWARD_REVISION_REGRESSION:current=${OBSERVED_CURRENT_REVISION}:target=${DEPLOY_SHA}"
+            return 1
+          else
+            fail "REVISION_HISTORY_DIVERGED:current=${OBSERVED_CURRENT_REVISION}:target=${DEPLOY_SHA}"
+            return 1
+          fi
+        }
+      fi
+      ;;
+    AUTHORIZED_ROLLBACK)
+      [[ "${WORKFLOW_EVENT}" == "workflow_dispatch" && -n "${OPERATOR_REASON}" ]] || {
+        fail "INVALID_AUTHORIZED_ROLLBACK_SOURCE"
+        return 1
+      }
+      [[ "${OBSERVED_FRESH_INSTALL}" == false && "${OBSERVED_CURRENT_REVISION}" != "${DEPLOY_SHA}" ]] || {
+        fail "AUTHORIZED_ROLLBACK_TARGET_NOT_OLDER"
+        return 1
+      }
+      timeout 30 git -C "${REPO_DIR}" merge-base --is-ancestor \
+        "${DEPLOY_SHA}" "${OBSERVED_CURRENT_REVISION}" || {
+        fail "AUTHORIZED_ROLLBACK_TARGET_NOT_OLDER"
+        return 1
+      }
+      ;;
+    *) fail "INVALID_DEPLOY_INTENT"; return 1 ;;
+  esac
+
+  classify_actual_schema_sensitive_diff || return 1
+  validate_migration_rollback_mode || return 1
+  ACCEPTED_CURRENT_REVISION="${OBSERVED_CURRENT_REVISION}"
+  ACCEPTED_TARGET_REVISION="${DEPLOY_SHA}"
+}
+
 inspect_optional_application() {
   local format="$1" inspection existing_names
   if inspection="$(timeout 10 docker inspect --format "${format}" fukurou-ktor 2>/dev/null)"; then
@@ -508,14 +756,27 @@ capture_rollback_state() {
   PENDING_STATE_DIR="${temporary_dir}"
 
   local previous_sha compose_hash runtime_snapshot install_kind configured_image image_id image_digest revision
-  local fence_hash="" fence_bytes="" executor_hash public_key_hash installed_catalog_hash
-  previous_sha="$(timeout 30 git -C "${REPO_DIR}" rev-parse HEAD)"
+  local fence_hash="" fence_bytes="" executor_hash public_key_hash installed_catalog_hash installed_inventory_hash
+  if [[ -n "${ACCEPTED_CURRENT_REVISION}" ]]; then
+    previous_sha="${ACCEPTED_CURRENT_REVISION}"
+  else
+    previous_sha="$(timeout 30 git -C "${REPO_DIR}" rev-parse HEAD)"
+  fi
   configured_image="$(inspect_optional_application '{{.Config.Image}}')"
   image_id="$(inspect_optional_application '{{.Image}}')"
   image_digest=""
   [[ -z "${image_id}" ]] || image_digest="$(timeout 10 docker image inspect --format '{{join .RepoDigests "|"}}' "${image_id}")"
   revision="$(inspect_optional_application '{{range .Config.Env}}{{println .}}{{end}}' | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')"
-  compose_hash="$(sha256sum "${COMPOSE_FILE}" | awk '{print $1}')"
+  if [[ -n "${ACCEPTED_CURRENT_REVISION}" ]]; then
+    [[ "${revision}" == "${ACCEPTED_CURRENT_REVISION}" ]] || fail "CURRENT_REVISION_CHANGED_AFTER_ADMISSION"
+  else
+    [[ -z "${configured_image}" ]] || fail "CURRENT_REVISION_CHANGED_AFTER_ADMISSION"
+  fi
+  snapshot_compose_at_revision "${previous_sha}" "${temporary_dir}/docker-compose.prod.yml" || \
+    fail "ROLLBACK_COMPOSE_SNAPSHOT_FAILED"
+  chown root:root "${temporary_dir}/docker-compose.prod.yml"
+  chmod 0600 "${temporary_dir}/docker-compose.prod.yml"
+  compose_hash="$(sha256sum "${temporary_dir}/docker-compose.prod.yml" | awk '{print $1}')"
   runtime_snapshot="$(timeout 30 "${DB_HELPER}" snapshot)"
   validate_runtime_snapshot "${runtime_snapshot}" || fail "INVALID_RUNTIME_SNAPSHOT"
   install_kind="$(jq -er '.installKind' <<<"${runtime_snapshot}")"
@@ -538,8 +799,8 @@ capture_rollback_state() {
   executor_hash="$(sha256sum "$(readlink -f "$0")" | awk '{print $1}')"
   public_key_hash="$(sha256sum "${PUBLIC_KEY}" | awk '{print $1}')"
   installed_catalog_hash="$(jq -cS . "${INSTALLED_CATALOG}" | tr -d '\n' | sha256sum | awk '{print $1}')"
+  installed_inventory_hash="$(schema_sensitive_inventory_hash "${INSTALLED_SCHEMA_SENSITIVE_PATHS}")"
 
-  install -o root -g root -m 0600 "${COMPOSE_FILE}" "${temporary_dir}/docker-compose.prod.yml"
   jq -n \
     --arg deploymentId "${DEPLOYMENT_ID}" \
     --arg installKind "${install_kind}" \
@@ -563,21 +824,48 @@ capture_rollback_state() {
     --arg executorSha256 "${executor_hash}" \
     --arg publicKeySha256 "${public_key_hash}" \
     --arg capabilityCatalogHash "${installed_catalog_hash}" \
+    --arg acceptedCurrentRevision "${ACCEPTED_CURRENT_REVISION}" \
+    --arg acceptedTargetRevision "${ACCEPTED_TARGET_REVISION}" \
+    --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
+    --arg deployIntent "${DEPLOY_INTENT}" \
+    --arg operatorReason "${OPERATOR_REASON}" \
+    --arg migrationRollbackMode "${MIGRATION_ROLLBACK_MODE}" \
+    --arg schemaSensitivePathsSha256 "${installed_inventory_hash}" \
+    --argjson schemaSensitive "${ACTUAL_SCHEMA_SENSITIVE}" \
     --argjson pidRegistrations "$(jq -c '.pidRegistrations' <<<"${runtime_snapshot}")" \
-    '{deploymentId:$deploymentId,installKind:$installKind,captureDbTimestamp:$captureDbTimestamp,previousRepoSha:$previousRepoSha,
+    '{stateVersion:2,deploymentId:$deploymentId,installKind:$installKind,captureDbTimestamp:$captureDbTimestamp,previousRepoSha:$previousRepoSha,
       composeSourceCommit:$composeSourceCommit,composeSources:{"docker-compose.prod.yml":$composeSha256},
       runningContainer:{configuredImageReference:$configuredImageReference,imageId:$imageId,repoDigests:($imageRepoDigests|split("|")|map(select(length>0))),revision:$revision},runtimeConfigVersion:$runtimeConfigVersion,
       runtimeConfigHash:$runtimeConfigHash,preFilterActive:$preFilterActive,
       launchMaintenance:{generation:$generation,enabled:$maintenanceActive,deploymentId:$maintenanceDeploymentId},
       launchFence:{bytesBase64:$fenceBytesBase64,sha256:$fenceSha256},foundationCatalogFingerprint:$foundationCatalogFingerprint,
-      pidRegistrations:$pidRegistrations,installed:{executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,capabilityCatalogHash:$capabilityCatalogHash}}' \
+      acceptedDeploy:{currentRevision:$acceptedCurrentRevision,targetRevision:$acceptedTargetRevision,intent:$deployIntent,
+        operatorReason:$operatorReason,migrationRollbackMode:$migrationRollbackMode,
+        schemaSensitivePathsSha256:$schemaSensitivePathsSha256,schemaSensitive:$schemaSensitive,
+        candidateImageDigest:$candidateImageDigest},
+      pidRegistrations:$pidRegistrations,installed:{executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,
+        capabilityCatalogHash:$capabilityCatalogHash,schemaSensitivePathsSha256:$schemaSensitivePathsSha256}}' \
     > "${temporary_dir}/state.json"
   chmod 0600 "${temporary_dir}/state.json"
 
   sync -f "${temporary_dir}/docker-compose.prod.yml"
   sync -f "${temporary_dir}/state.json"
   ROLLBACK_STATE_DIR="${temporary_dir}"
-  journal_state PREPARED '{"forwardBudgetSeconds":1200,"recoveryBudgetSeconds":300}'
+  local prepared_details
+  prepared_details="$(jq -cS -n \
+    --arg currentRevision "${ACCEPTED_CURRENT_REVISION}" \
+    --arg targetRevision "${ACCEPTED_TARGET_REVISION}" \
+    --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
+    --arg intent "${DEPLOY_INTENT}" \
+    --arg operatorReason "${OPERATOR_REASON}" \
+    --arg migrationRollbackMode "${MIGRATION_ROLLBACK_MODE}" \
+    --arg schemaSensitivePathsSha256 "${installed_inventory_hash}" \
+    --argjson schemaSensitive "${ACTUAL_SCHEMA_SENSITIVE}" \
+    '{forwardBudgetSeconds:1200,recoveryBudgetSeconds:300,currentRevision:$currentRevision,
+      targetRevision:$targetRevision,intent:$intent,operatorReason:$operatorReason,
+      migrationRollbackMode:$migrationRollbackMode,schemaSensitivePathsSha256:$schemaSensitivePathsSha256,
+      schemaSensitive:$schemaSensitive,candidateImageDigest:$candidateImageDigest}')"
+  journal_state PREPARED "${prepared_details}"
   ROLLBACK_STATE_DIR="${state_dir}"
   mv "${temporary_dir}" "${state_dir}"
   PENDING_STATE_DIR=""
@@ -599,6 +887,30 @@ rollback_on_error() {
   [[ "${RECOVERY_ALREADY_STARTED:-false}" == true ]] || journal_state RECOVERY_STARTED "{\"failedExitCode\":${exit_code}}" || true
   local origin_state
   origin_state="$(recovery_origin_state "${ROLLBACK_STATE_DIR}/journal.jsonl")"
+  load_recovery_policy || {
+    echo "deploy-fukurou: RECOVERY_POLICY_EVIDENCE_INVALID" >&2
+    exit "${exit_code}"
+  }
+  if [[ "${MIGRATION_ROLLBACK_MODE}" == ROLL_FORWARD_ONLY ]]; then
+    if [[ "${origin_state}" == PREPARED || "${origin_state}" == CAPTURED ]]; then
+      journal_state CANDIDATE_ABORTED '{"reason":"roll-forward-only-before-safety-mutation"}' || true
+      echo "deploy-fukurou: CANDIDATE_ABORTED_ROLL_FORWARD_ONLY" >&2
+      exit "${exit_code}"
+    fi
+
+    reassert_recovery_safe_boundary "${origin_state}" || {
+      echo "deploy-fukurou: MANUAL_RECOVERY_PENDING_SAFE_BOUNDARY_ROLL_FORWARD_ONLY" >&2
+      exit "${exit_code}"
+    }
+    revoke_active_canary || {
+      echo "deploy-fukurou: MANUAL_RECOVERY_PENDING_CANARY_REVOCATION_ROLL_FORWARD_ONLY" >&2
+      exit "${exit_code}"
+    }
+    journal_state MANUAL_RECOVERY_REQUIRED \
+      '{"reason":"roll-forward-only-after-safety-mutation","safeBoundaryReestablished":true,"canaryRevoked":true}' || true
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_ROLL_FORWARD_ONLY" >&2
+    exit "${exit_code}"
+  fi
   bind_recovery_image_reference || {
     journal_state MANUAL_RECOVERY_REQUIRED '{"reason":"image-reference"}' || true
     echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_IMAGE_REFERENCE" >&2
@@ -648,13 +960,19 @@ rollback_on_error() {
   timeout 120 docker compose --env-file "${ENV_FILE}" -f "${ROLLBACK_STATE_DIR}/docker-compose.prod.yml" up -d --no-build || exit "${exit_code}"
   [[ "$(timeout 10 docker inspect --format '{{.Config.Image}}' fukurou-ktor)" == "${previous_reference}" ]] || exit "${exit_code}"
   [[ "$(timeout 10 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' fukurou-ktor | awk -F= '$1=="FUKUROU_REVISION"{sub(/^[^=]*=/,"");print;exit}')" == "${previous_revision}" ]] || exit "${exit_code}"
-  timeout "${APPLICATION_HEALTH_TIMEOUT}" bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null && docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done' || exit "${exit_code}"
+  timeout "${APPLICATION_HEALTH_TIMEOUT}" bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/live >/dev/null; do sleep 2; done' || exit "${exit_code}"
   timeout 30 "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}" || exit "${exit_code}"
   if ! enable_restored_runtime; then
     timeout 30 "${DB_HELPER}" maintenance-cas "${TARGET_GENERATION}" false "${DEPLOYMENT_ID}" \
       "${TARGET_GENERATION}" true "${DEPLOYMENT_ID}" || true
     journal_state MANUAL_RECOVERY_REQUIRED "{\"reason\":\"restored-runtime-enable-failed\",\"method\":\"${RESTORED_ENABLE_METHOD}\"}" || true
     echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_RESTORED_RUNTIME_ENABLE" >&2
+    exit "${exit_code}"
+  fi
+  if ! timeout "${APPLICATION_HEALTH_TIMEOUT}" bash -c 'until docker exec --user 10001 fukurou-ktor curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do sleep 2; done'; then
+    restore_disabled_after_resume_failure || true
+    journal_state MANUAL_RECOVERY_REQUIRED '{"reason":"restored-runtime-readiness-failed"}' || true
+    echo "deploy-fukurou: MANUAL_RECOVERY_REQUIRED_RESTORED_RUNTIME_READINESS" >&2
     exit "${exit_code}"
   fi
   prepare_gap_event CLOSE || exit "${exit_code}"
@@ -709,6 +1027,52 @@ reassert_recovery_safe_boundary() {
 
 recovery_origin_state() {
   jq -sr '[.[] | select(.state != "SIGNAL_RECEIVED" and .state != "RECOVERY_STARTED")][-1].state' "$1"
+}
+
+load_recovery_policy() {
+  local state_file="${ROLLBACK_STATE_DIR}/state.json" journal_file="${ROLLBACK_STATE_DIR}/journal.jsonl"
+  local state_version
+  state_version="$(jq -er 'if has("stateVersion") then .stateVersion else 1 end' "${state_file}")" || return 1
+  if [[ "${state_version}" == 1 ]]; then
+    jq -e '(has("stateVersion") | not) and (has("acceptedDeploy") | not)' "${state_file}" >/dev/null || return 1
+    jq -e 'select(.version == 1)' < <(head -n 1 "${journal_file}") >/dev/null || return 1
+    MIGRATION_ROLLBACK_MODE=AUTO_IMAGE_ROLLBACK
+    return 0
+  fi
+  [[ "${state_version}" == 2 ]] || return 1
+
+  jq -e --slurpfile journal "${journal_file}" '
+    .stateVersion == 2 and
+    (.acceptedDeploy | keys | sort) == ([
+      "candidateImageDigest", "currentRevision", "intent", "migrationRollbackMode",
+      "operatorReason", "schemaSensitive", "schemaSensitivePathsSha256", "targetRevision"
+    ] | sort) and
+    (.acceptedDeploy.currentRevision | type == "string" and (. == "" or test("^[0-9a-f]{40}$"))) and
+    (.acceptedDeploy.targetRevision | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.acceptedDeploy.intent | IN("FORWARD", "AUTHORIZED_ROLLBACK")) and
+    (.acceptedDeploy.operatorReason | type == "string") and
+    (.acceptedDeploy.migrationRollbackMode |
+      IN("AUTO_IMAGE_ROLLBACK", "BACKWARD_COMPATIBLE", "ROLL_FORWARD_ONLY")) and
+    (.acceptedDeploy.schemaSensitivePathsSha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    .acceptedDeploy.schemaSensitivePathsSha256 == .installed.schemaSensitivePathsSha256 and
+    (.acceptedDeploy.schemaSensitive | type == "boolean") and
+    (.acceptedDeploy.candidateImageDigest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+    ($journal | length > 0) and $journal[0].version == 2 and $journal[0].state == "PREPARED" and
+    $journal[0].details == {
+      forwardBudgetSeconds:1200,
+      recoveryBudgetSeconds:300,
+      currentRevision:.acceptedDeploy.currentRevision,
+      targetRevision:.acceptedDeploy.targetRevision,
+      intent:.acceptedDeploy.intent,
+      operatorReason:.acceptedDeploy.operatorReason,
+      migrationRollbackMode:.acceptedDeploy.migrationRollbackMode,
+      schemaSensitivePathsSha256:.acceptedDeploy.schemaSensitivePathsSha256,
+      schemaSensitive:.acceptedDeploy.schemaSensitive,
+      candidateImageDigest:.acceptedDeploy.candidateImageDigest
+    }
+  ' "${state_file}" >/dev/null || return 1
+  MIGRATION_ROLLBACK_MODE="$(jq -er '.acceptedDeploy.migrationRollbackMode' "${state_file}")"
+  CANDIDATE_DIGEST="$(jq -er '.acceptedDeploy.candidateImageDigest' "${state_file}")"
 }
 
 provision_fence_root() {
@@ -816,25 +1180,43 @@ write_fence_fallback() {
 journal_state() {
   local state="$1" details="${2:-}" target="${ROLLBACK_STATE_DIR}/journal.jsonl"
   [[ -n "${details}" ]] || details='{}'
-  local previous_state="" previous_sequence=0 previous_hash=""
+  local previous_state="" previous_sequence=0 previous_hash="" journal_version=2 first_state=""
   if [[ -f "${target}" ]]; then
     previous_state="$(tail -n 1 "${target}" | jq -er '.state')" || { fail "JOURNAL_CORRUPT"; return 1; }
     previous_sequence="$(tail -n 1 "${target}" | jq -er '.sequence')" || { fail "JOURNAL_CORRUPT"; return 1; }
     previous_hash="$(tail -n 1 "${target}" | jq -er '.payloadHash')" || { fail "JOURNAL_CORRUPT"; return 1; }
+    journal_version="$(tail -n 1 "${target}" | jq -er '.version')" || { fail "JOURNAL_CORRUPT"; return 1; }
+    first_state="$(head -n 1 "${target}" | jq -er '.state')" || { fail "JOURNAL_CORRUPT"; return 1; }
     if [[ "${previous_state}" == "${state}" ]]; then
       jq -e --argjson details "${details}" '.details == $details' < <(tail -n 1 "${target}") >/dev/null || \
         { fail "JOURNAL_NON_IDEMPOTENT_REPLAY"; return 1; }
       return 0
     fi
   fi
-  journal_transition_allowed "${previous_state}" "${state}" || { fail "JOURNAL_TRANSITION_REJECTED:${previous_state}:${state}"; return 1; }
+  if [[ "${journal_version}" == 1 && "${first_state}" == CAPTURED ]]; then
+    legacy_journal_transition_allowed "${previous_state}" "${state}" || {
+      fail "JOURNAL_TRANSITION_REJECTED:${previous_state}:${state}"
+      return 1
+    }
+  elif [[ "${journal_version}" == 1 ]]; then
+    v1_current_journal_transition_allowed "${previous_state}" "${state}" || {
+      fail "JOURNAL_TRANSITION_REJECTED:${previous_state}:${state}"
+      return 1
+    }
+  else
+    [[ "${journal_version}" == 2 ]] && journal_transition_allowed "${previous_state}" "${state}" || {
+      fail "JOURNAL_TRANSITION_REJECTED:${previous_state}:${state}"
+      return 1
+    }
+  fi
   local next_sequence=$((previous_sequence + 1))
   local entry="${target}.entry.$$" replacement="${target}.tmp.$$"
   local payload payload_hash
   payload="$(jq -cS -n --arg state "${state}" --arg previousState "${previous_state}" --arg previousHash "${previous_hash}" \
+    --argjson version "${journal_version}" \
     --argjson sequence "${next_sequence}" --argjson details "${details}" \
     --arg at "$(timeout 10 "${DB_HELPER}" timestamp 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S.000000Z)" \
-    '{version:1,sequence:$sequence,previousState:$previousState,previousHash:$previousHash,state:$state,at:$at,details:$details}')"
+    '{version:$version,sequence:$sequence,previousState:$previousState,previousHash:$previousHash,state:$state,at:$at,details:$details}')"
   payload_hash="$(printf '%s' "${payload}" | sha256sum | awk '{print $1}')"
   jq -cS --arg payloadHash "${payload_hash}" '. + {payloadHash:$payloadHash}' <<<"${payload}" > "${entry}"
   chmod 0600 "${entry}"; sync -f "${entry}"
@@ -847,6 +1229,24 @@ journal_state() {
 }
 
 journal_transition_allowed() {
+  case "$1:$2" in
+    :PREPARED|PREPARED:CAPTURED|CAPTURED:SAFETY_MUTATION_STARTED|SAFETY_MUTATION_STARTED:LAUNCHES_DISABLED|\
+    LAUNCHES_DISABLED:CANDIDATE_HEALTHY|\
+    CANDIDATE_HEALTHY:DB_MAINTENANCE_CLEARED|DB_MAINTENANCE_CLEARED:ENABLE_ACKED|\
+    ENABLE_ACKED:GAP_CLOSED|GAP_CLOSED:COMPLETE|\
+    PREPARED:RECOVERY_STARTED|CAPTURED:RECOVERY_STARTED|SAFETY_MUTATION_STARTED:RECOVERY_STARTED|\
+    LAUNCHES_DISABLED:RECOVERY_STARTED|CANDIDATE_HEALTHY:RECOVERY_STARTED|\
+    DB_MAINTENANCE_CLEARED:RECOVERY_STARTED|ENABLE_ACKED:RECOVERY_STARTED|GAP_CLOSED:RECOVERY_STARTED|\
+    PREPARED:SIGNAL_RECEIVED|CAPTURED:SIGNAL_RECEIVED|SAFETY_MUTATION_STARTED:SIGNAL_RECEIVED|\
+    LAUNCHES_DISABLED:SIGNAL_RECEIVED|CANDIDATE_HEALTHY:SIGNAL_RECEIVED|\
+    DB_MAINTENANCE_CLEARED:SIGNAL_RECEIVED|ENABLE_ACKED:SIGNAL_RECEIVED|GAP_CLOSED:SIGNAL_RECEIVED|\
+    SIGNAL_RECEIVED:RECOVERY_STARTED|RECOVERY_STARTED:ROLLED_BACK|RECOVERY_STARTED:CANDIDATE_ABORTED|\
+    RECOVERY_STARTED:MANUAL_RECOVERY_REQUIRED) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+v1_current_journal_transition_allowed() {
   case "$1:$2" in
     :PREPARED|PREPARED:CAPTURED|CAPTURED:SAFETY_MUTATION_STARTED|SAFETY_MUTATION_STARTED:LAUNCHES_DISABLED|\
     LAUNCHES_DISABLED:CANDIDATE_HEALTHY|\
@@ -883,23 +1283,28 @@ validate_journal_history() {
     . as $entries |
     length > 0 and
     all(range(0; $entries | length); . as $index | $entries[$index] as $entry |
-      $entry.version == 1 and $entry.sequence == ($index + 1) and
+      ($entry.version | IN(1, 2)) and $entry.version == $entries[0].version and
+      $entry.sequence == ($index + 1) and
       $entry.previousState == (if $index == 0 then "" else $entries[$index - 1].state end) and
       $entry.previousHash == (if $index == 0 then "" else $entries[$index - 1].payloadHash end) and
       ($entry.payloadHash | test("^[0-9a-f]{64}$")))
   ' "${target}" >/dev/null
-  local previous_state="" previous_hash="" line canonical observed_hash calculated_hash state journal_format=""
+  local previous_state="" previous_hash="" line canonical observed_hash calculated_hash state journal_format="" version
   while IFS= read -r line; do
     state="$(jq -er '.state' <<<"${line}")"
+    version="$(jq -er '.version' <<<"${line}")"
     if [[ -z "${journal_format}" ]]; then
-      case "${state}" in
-        PREPARED) journal_format=current ;;
-        CAPTURED) journal_format=legacy ;;
+      case "${version}:${state}" in
+        1:PREPARED) journal_format=current-v1 ;;
+        1:CAPTURED) journal_format=legacy-v1 ;;
+        2:PREPARED) journal_format=current-v2 ;;
         *) return 1 ;;
       esac
     fi
-    if [[ "${journal_format}" == legacy ]]; then
+    if [[ "${journal_format}" == legacy-v1 ]]; then
       legacy_journal_transition_allowed "${previous_state}" "${state}" || return 1
+    elif [[ "${journal_format}" == current-v1 ]]; then
+      v1_current_journal_transition_allowed "${previous_state}" "${state}" || return 1
     else
       journal_transition_allowed "${previous_state}" "${state}" || return 1
     fi
@@ -913,13 +1318,13 @@ validate_journal_history() {
 
 recover_unfinished_deployments() {
   local state_dir journal last_state recovered_state origin_state
-  local candidate_deployment_id="${DEPLOYMENT_ID}"
+  local candidate_deployment_id="${DEPLOYMENT_ID}" candidate_digest="${CANDIDATE_DIGEST}"
   shopt -s nullglob
   for journal in "${STATE_ROOT}"/*/journal.jsonl; do
     validate_journal_history "${journal}" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
     last_state="$(tail -n 1 "${journal}" | jq -er '.state')" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
     [[ "${last_state}" == "COMPLETE" || "${last_state}" == "ROLLED_BACK" || \
-       "${last_state}" == "MANUAL_RECOVERY_REQUIRED" ]] && continue
+       "${last_state}" == "CANDIDATE_ABORTED" || "${last_state}" == "MANUAL_RECOVERY_REQUIRED" ]] && continue
 
     state_dir="$(dirname "${journal}")"
     [[ -f "${state_dir}/state.json" ]] || fail "RECOVERY_STATE_MISSING:${state_dir}"
@@ -931,10 +1336,25 @@ recover_unfinished_deployments() {
     RUNTIME_CONFIG_HASH="$(jq -er '.runtimeConfigHash' "${state_dir}/state.json")"
     FENCE_GENERATION="$(jq -er '.launchMaintenance.generation' "${state_dir}/state.json")"
     TARGET_GENERATION="$((FENCE_GENERATION + 1))"
-    bind_recovery_image_reference || fail "RECOVERY_IMAGE_REFERENCE_INVALID:${DEPLOYMENT_ID}"
+    load_recovery_policy || fail "RECOVERY_POLICY_EVIDENCE_INVALID:${DEPLOYMENT_ID}"
 
     echo "deploy-fukurou: recovering unfinished deployment ${DEPLOYMENT_ID} from ${last_state}" >&2
     origin_state="$(recovery_origin_state "${journal}")"
+    if [[ "${MIGRATION_ROLLBACK_MODE}" == ROLL_FORWARD_ONLY ]]; then
+      [[ "${last_state}" != RECOVERY_STARTED ]] || RECOVERY_ALREADY_STARTED=true
+      (set +e; trap - ERR; false; rollback_on_error) || true
+      RECOVERY_ALREADY_STARTED=false
+      recovered_state="$(tail -n 1 "${journal}" | jq -er '.state')" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
+      case "${origin_state}:${recovered_state}" in
+        PREPARED:CANDIDATE_ABORTED|CAPTURED:CANDIDATE_ABORTED|\
+        SAFETY_MUTATION_STARTED:MANUAL_RECOVERY_REQUIRED|LAUNCHES_DISABLED:MANUAL_RECOVERY_REQUIRED|\
+        CANDIDATE_HEALTHY:MANUAL_RECOVERY_REQUIRED|DB_MAINTENANCE_CLEARED:MANUAL_RECOVERY_REQUIRED|\
+        ENABLE_ACKED:MANUAL_RECOVERY_REQUIRED|GAP_CLOSED:MANUAL_RECOVERY_REQUIRED) ;;
+        *) fail "ROLL_FORWARD_ONLY_RECOVERY_FAILED:${DEPLOYMENT_ID}:${origin_state}:${recovered_state}" ;;
+      esac
+      continue
+    fi
+    bind_recovery_image_reference || fail "RECOVERY_IMAGE_REFERENCE_INVALID:${DEPLOYMENT_ID}"
     if [[ "${origin_state}" == PREPARED || "${origin_state}" == CAPTURED ]]; then
       journal_state RECOVERY_STARTED '{"reason":"startup-captured"}'
       timeout 30 git -C "${REPO_DIR}" checkout --detach "${PREVIOUS_REPO_SHA}" >/dev/null
@@ -957,6 +1377,7 @@ recover_unfinished_deployments() {
   done
   shopt -u nullglob
   DEPLOYMENT_ID="${candidate_deployment_id}"
+  CANDIDATE_DIGEST="${candidate_digest}"
   # recovery が束縛した gap 対象を残すと、この後の forward path の OPEN が
   # 旧 deployment の immutable boundary へ衝突する。
   GAP_DEPLOYMENT_ID=""
@@ -1299,11 +1720,21 @@ main() {
     printf '%s\n' "${CONTRACT_VERSION}"
     exit 0
   fi
+  if [[ "${1:-}" == "--print-schema-sensitive-paths-sha256" && -z "${2:-}" ]]; then
+    DEPLOY_STAGE=PRINT_SCHEMA_SENSITIVE_PATHS_SHA256
+    require_root
+    for command in awk sha256sum stat; do require_command "${command}"; done
+    validate_schema_sensitive_inventory "${INSTALLED_SCHEMA_SENSITIVE_PATHS}" true
+    schema_sensitive_inventory_hash "${INSTALLED_SCHEMA_SENSITIVE_PATHS}"
+    exit 0
+  fi
 
   DEPLOY_STAGE=PRECHECK
   PENDING_STATE_DIR=""
   require_root
-  for command in base64 cat docker find flock git jq md5sum openssl sha256sum sync timeout; do require_command "${command}"; done
+  for command in awk base64 cat dirname docker find flock git jq md5sum openssl sha256sum stat sync timeout tr wc; do
+    require_command "${command}"
+  done
   parse_arguments "$@"
   DEPLOY_STAGE=VALIDATE_SIGNED_BUNDLE
   validate_signed_bundle
@@ -1331,6 +1762,9 @@ main() {
   recover_unfinished_deployments
   ROLLBACK_STATE_DIR=""
   start_forward_deadline_watchdog
+  check_forward_deadline
+  DEPLOY_STAGE=OBSERVE_AND_ADMIT_DEPLOY
+  observe_and_admit_deploy
   check_forward_deadline
   DEPLOY_STAGE=PROBE_CANDIDATE_OPERATIONS
   probe_candidate_operations

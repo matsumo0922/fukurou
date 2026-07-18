@@ -60,7 +60,7 @@ path listを workflow と shell functionへ二重記述する案は drift を生
 - diff が schema-sensitive の場合、`AUTO_IMAGE_ROLLBACK` を拒否し、manual dispatch が署名した `BACKWARD_COMPATIBLE` または `ROLL_FORWARD_ONLY` と理由を要求する。
 - `BACKWARD_COMPATIBLE` は既存 durable rollbackを使う。
 - `ROLL_FORWARD_ONLY` が `PREPARED` / `CAPTURED` の safety mutation 前に失敗した場合、running production、repository checkout、maintenance/fenceを変更せず、candidateを破棄して新terminal `CANDIDATE_ABORTED` を記録する。存在しないsafe boundaryを新設しない。
-- `ROLL_FORWARD_ONLY` が `SAFETY_MUTATION_STARTED` 以降に失敗した場合だけ、previous image/repositoryを復元せず、既存 recovery primitive で maintenance/fenceとOPEN gapを再確立して `MANUAL_RECOVERY_REQUIRED` terminalを記録する。DB restoreは実行しない。
+- `ROLL_FORWARD_ONLY` が `SAFETY_MUTATION_STARTED` 以降に失敗した場合だけ、previous image/repositoryを復元せず、既存 recovery primitive で maintenance/fenceとOPEN gapを再確立する。safe boundaryとcanary revokeの両方を証明できた場合だけ`MANUAL_RECOVERY_REQUIRED` terminalを記録し、証明不能なら`RECOVERY_STARTED`を残して次回起動で再試行する。DB restoreは実行しない。
 
 live errorの`rollback_on_error`とstartupの`recover_unfinished_deployments`は、どちらもstate.jsonのsigned migration modeとrecovery origin stateから同じpolicyを選ぶ。`CANDIDATE_ABORTED`をterminal/valid journal transitionとして追加し、restart後にprevious checkoutやimage起動へ流れないようにする。
 
@@ -68,7 +68,9 @@ live errorの`rollback_on_error`とstartupの`recover_unfinished_deployments`は
 
 ### 5. Accepted intent evidence は rollback state と journal の最初の entry に保存する
 
-accepted current/target、intent、redacted operator reason、migration mode、inventory hash、schema-sensitive判定を root-only `state.json` と `PREPARED` journal details に保存する。reason は長さを制限し、制御文字を拒否し、secret patternを受け付けない。mutation前 rejection は state directoryを作らず、stable reason codeと current/targetだけを stderrへ出す。
+accepted current/target、intent、redacted operator reason、migration mode、inventory hash、schema-sensitive判定、probe済みcandidate image digestを root-only `state.json` と `PREPARED` journal details に保存する。v2 recoveryはstateと最初のjournal detailsを完全照合し、installed inventory hashとも一致した場合だけmodeを採用する。中断deploy自身の保存済みdigestだけをfence recovery codecとして使い、次にqueueされた未admission bundleのdigestを流用しない。reason は長さを制限し、制御文字を拒否し、secret patternを受け付けない。mutation前 rejection は state directoryを作らず、stable reason codeと current/targetだけを stderrへ出す。
+
+rollback composeは可変なrepository HEADからcopyせず、accepted current revisionのGit objectからsnapshotする。candidate composeもtarget revisionのGit objectをrenderする。これによりRFO failureがcandidate checkout後に止まりrepository HEADとrunning revisionが分離しても、次のroll-forwardが誤ったcompose/revision pairをrollback evidenceへ保存しない。
 
 current SHA を workflow bundleへ入れる案は、GitHub-hosted runner が production currentを観測できず偽の authorityになるため採らない。observed current は root executor が署名済み intentと組み合わせて記録する。
 
@@ -76,7 +78,7 @@ current SHA を workflow bundleへ入れる案は、GitHub-hosted runner が pro
 
 executor は contract v2を返し、新 workflow は `--print-contract-version == 2` を要求する。v1 bundle/journal validatorは既存 unfinished recoveryを読むため残すが、v2 workflowだけが新 deployを発行する。
 
-PR merge 前に operator が PR HEAD の executor と schema-sensitive inventoryをroot-owned pathへ一組で installし、contract/selftestを確認する。pre-install後から mergeまで旧 main workflowはcontract/hash mismatchでfail closedするため、短い controlled deploy freezeとする。このfreezeではproduction deployだけでなく、executor、public key、foundation harness/SQL、capability catalog、schema-sensitive inventoryへ触れる他PRのmergeも止める。pre-install後にreview HEADとmerge予定treeの対象file hashを再照合する。PR はこの手動作業前に mergeしない。
+PR merge 前に operator がproduction checkoutを変更しない一時detached worktreeから、PR HEAD の executor と schema-sensitive inventoryをroot-owned pathへ一組で installし、contract/selftestを確認する。pre-install後から mergeまで旧 main workflowはcontract/hash mismatchでfail closedするため、短い controlled deploy freezeとする。このfreezeではproduction deployだけでなく、executor、public key、foundation harness/SQL、capability catalog、schema-sensitive inventoryへ触れる他PRのmergeも止める。pre-install後にreview HEADとmerge予定treeの対象file hashを再照合する。PR はこの手動作業前に mergeしない。
 
 v2 rollout後はroot executorをv1へdowngradeしない。v1 binaryはv2の`ROLL_FORWARD_ONLY`と`CANDIDATE_ABORTED` journal transitionを理解できず、terminal済みv2 audit historyが存在するだけで後続deployを`RECOVERY_JOURNAL_CORRUPT`として止めうる。application/workflowを前版へ戻す場合も、root deploy foundationはv1 journalを読めるv2 executorのまま維持する。root executor downgradeが必要なら、v2 audit historyを保持したまま読む専用互換設計を別changeで用意する。
 
@@ -90,6 +92,8 @@ v2 rollout後はroot executorをv1へdowngradeしない。v1 binaryはv2の`ROLL
 - [queued workflow の comparison base が production current と異なる] → workflow判定は早期停止用に限定し、root lock内のactual current-to-target diffをauthorityにする。
 - [container欠損を fresh install と誤認する] → `PRE_FOUNDATION` snapshotとpublished deployment directory 0件の両方を要求し、可変なrepo HEADを証拠にせず、既存installのcontainer欠損はunknownとして拒否する。
 - [`ROLL_FORWARD_ONLY` failureでproductionが停止したままになる] → 意図したfail-closedとしてmaintenance/fence/journalを保持し、signed targetへのroll-forwardまたはoperator recoveryを要求する。
+- [v2 recovery evidence欠損をlegacy AUTOとして扱う] → version/evidence/journal/inventoryを完全照合し、legacy fallbackはstateVersion/acceptedDeployなしのv1 journalだけへ限定する。
+- [RFO後のrepository HEADとrunning revisionが分離する] → accepted current/targetのGit objectからrollback/candidate composeをそれぞれsnapshotする。
 - [reasonにsecretや制御文字が入る] → bounded printable UTF-8、空白trim、known secret pattern拒否をworkflow/executorで行い、journalには検証済み文字列だけを保存する。
 - [executor pre-install中にdeployが走る] → production deploy concurrencyを確認し、controlled freeze中はv1 workflowがcontract/hash mismatchでmutation前に停止する。
 - [historical targetのqualityが現在のCIで失敗しrollback不能になる] → bypassしないことを受容し、test/tooling修復またはqualityを満たすforward fixを復旧経路にする。
