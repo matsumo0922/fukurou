@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerTest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceTest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerMainTest
+import org.junit.Assume.assumeTrue
 import org.junit.runner.RunWith
 import org.junit.runners.Suite
 import kotlin.test.Test
@@ -46,7 +47,22 @@ class TradingAdmissionHealthIsolationRegressionSuite {
 }
 
 private fun leaveAdmissionUnhealthy() {
+    assumeTrue(
+        "Poisoning admission health is allowed only in the dedicated ordered task.",
+        System.getProperty(ORDERED_REGRESSION_PROPERTY) == "true",
+    )
+
+    LlmExecutionAdmissionHealth.setHeartbeatHealthy(false)
     LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+    LlmExecutionAdmissionHealth.registerAmbiguous("ordered-regression-ambiguous", "ambiguous-token")
+    LlmExecutionAdmissionHealth.registerRecoveryBlocker("ordered-regression-blocker", "blocker-token")
+    LlmExecutionAdmissionHealth.recordHeartbeatResult(
+        invocationId = "ordered-regression-heartbeat-failure",
+        claimantToken = "heartbeat-failure-token",
+        healthy = false,
+    )
 
     assertFalse(LlmExecutionAdmissionHealth.isHealthy())
 }
+
+private const val ORDERED_REGRESSION_PROPERTY = "fukurou.test.admission-health-isolation-regression"

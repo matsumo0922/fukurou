@@ -83,7 +83,8 @@ The change MUST provide module-local Gradle `Test` tasks for ordered JUnit 4 app
 #### Scenario: Historical order runs
 - **WHEN** both module-local `admissionHealthIsolationRegressionTest` tasks run
 - **THEN** implicated application classes execute in declared order in one worker
-- **AND** each inventoried trading path executes immediately after an unhealthy predecessor in one worker
+- **AND** each inventoried trading path executes immediately after a predecessor that poisons every admission-health state category in one worker
+- **AND** the poison helper skips before mutation unless the dedicated ordered task supplies its guard property
 - **AND** all pass without residual global state
 
 #### Scenario: Ordinary full suite runs

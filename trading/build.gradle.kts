@@ -41,6 +41,7 @@ tasks.register<Test>("admissionHealthIsolationRegressionTest") {
     testClassesDirs = sourceSets.test.get().output.classesDirs
     classpath = sourceSets.test.get().runtimeClasspath
     include("**/TradingAdmissionHealthIsolationRegressionSuite.class")
+    systemProperty("fukurou.test.admission-health-isolation-regression", "true")
     maxParallelForks = 1
     forkEvery = 0
 }

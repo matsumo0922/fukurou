@@ -19,6 +19,6 @@
 
 ## 4. Regression And Quality Validation
 
-- [x] 4.1 Add module-local ordered regression tasks for the historical application sequence and unhealthy-predecessor trading paths, exclude duplicate default discovery, and wire both into `make test`.
-- [x] 4.2 Run lifecycle tests, both ordered tasks, fresh deploy-gate tests with task evidence, detekt, build, runtime dependency inspection, and strict OpenSpec validation.
+- [x] 4.1 Add module-local ordered regression tasks for the historical application sequence and complete-state unhealthy-predecessor trading paths; guard poison mutation with an ordered-task property, exclude duplicate default discovery, and wire both into `make test`.
+- [x] 4.2 Run lifecycle tests, both ordered tasks, property-free poison skip proof, fresh deploy-gate tests with task evidence, detekt, build, runtime dependency inspection, and strict OpenSpec validation.
 - [x] 4.3 Search README, docs, and KDoc for affected shutdown/admission/readiness descriptions, keep one current-state documentation authority, and record PR documentation impact.
