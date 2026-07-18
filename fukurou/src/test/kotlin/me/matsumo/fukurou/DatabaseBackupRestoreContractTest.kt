@@ -171,6 +171,9 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(workflow.contains("scripts/backup/backup-postgres-selftest"))
         assertTrue(workflow.contains("scripts/backup/install-selftest"))
         assertTrue(workflow.contains("postgresql-client restic"))
+        assertTrue(workflow.contains("TradingTables.kt"))
+        assertTrue(workflow.contains("TradingPersistenceBootstrap.kt"))
+        assertTrue(workflow.contains("deploy-foundation-v1.sql"))
     }
 
     @Test
@@ -219,7 +222,13 @@ class DatabaseBackupRestoreContractTest {
             root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/TradingTables.kt"),
         )
         val foundation = Files.readString(root.resolve("scripts/deploy/sql/deploy-foundation-v1.sql"))
-        val schemaTables = parseExposedSchemaTables(exposed) + parseSqlSchemaTables(foundation)
+        val bootstrap = Files.readString(
+            root.resolve("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/TradingPersistenceBootstrap.kt"),
+        )
+        val exposedTables = parseExposedSchemaTables(exposed)
+        val foundationTables = parseSqlSchemaTables(foundation)
+        val bootstrapTables = parseSqlSchemaTables(bootstrap)
+        val schemaTables = exposedTables + foundationTables
         val invariantSql = Files.readString(backupDirectory.resolve("restore-readonly-invariants-v1.sql"))
         val invariantReferences = parseQualifiedInvariantReferences(invariantSql)
         val expectedInvariantReferences = setOf(
@@ -249,7 +258,31 @@ class DatabaseBackupRestoreContractTest {
             .map { line -> line.substringAfterLast(' ') }
         criticalTables.forEach { table ->
             assertTrue(schemaTables.getValue(table).hasPrimaryKey, "$table has no primary key in schema authority")
+            if (foundationTables.containsKey(table)) {
+                assertTrue(
+                    bootstrapTables.getValue(table).hasPrimaryKey,
+                    "$table has no primary key in bootstrap schema authority",
+                )
+            }
         }
+        assertFalse(
+            parseExposedSchemaTables(
+                """object FixtureTable : Table("fixture") {
+                    |    val id = uuid("id")
+                    |    // override val primaryKey = PrimaryKey(id)
+                    |}
+                """.trimMargin(),
+            ).getValue("fixture").hasPrimaryKey,
+        )
+        assertFalse(
+            parseSqlSchemaTables(
+                """CREATE TABLE fixture (
+                    |    id UUID,
+                    |    -- id UUID PRIMARY KEY
+                    |);
+                """.trimMargin(),
+            ).getValue("fixture").hasPrimaryKey,
+        )
     }
 
     @Test
@@ -295,22 +328,27 @@ private fun parseExposedSchemaTables(source: String): Map<String, SchemaTableCon
         val body = match.groupValues[2]
         match.groupValues[1] to SchemaTableContract(
             columns = column.findAll(body).map { it.groupValues[1] }.toSet(),
-            hasPrimaryKey = body.contains("override val primaryKey = PrimaryKey("),
+            hasPrimaryKey = Regex(
+                """(?m)^\s*override\s+val\s+primaryKey\s*=\s*PrimaryKey\s*\(""",
+            ).containsMatchIn(body),
         )
     }
 }
 
 private fun parseSqlSchemaTables(source: String): Map<String, SchemaTableContract> {
     val tableBlocks = Regex(
-        """(?ims)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z][a-z0-9_]*)\s*\((.*?)^\);""",
+        """(?ims)^[ \t]*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z][a-z0-9_]*)\s*\((.*?)^[ \t]*\)[ \t]*;?[ \t]*$""",
     )
-    val column = Regex("""(?m)^\s{4}([a-z][a-z0-9_]*)\s+[A-Z]""")
+    val column = Regex("""(?m)^[ \t]+([a-z][a-z0-9_]*)\s+[A-Z]""")
+    val primaryKey = Regex(
+        """(?im)^[ \t]*(?:[a-z][a-z0-9_]*\s+[^,\n]*\bPRIMARY\s+KEY\b|PRIMARY\s+KEY\s*\()""",
+    )
 
     return tableBlocks.findAll(source).associate { match ->
         val body = match.groupValues[2]
         match.groupValues[1] to SchemaTableContract(
             columns = column.findAll(body).map { it.groupValues[1] }.toSet(),
-            hasPrimaryKey = body.contains("PRIMARY KEY", ignoreCase = true),
+            hasPrimaryKey = primaryKey.containsMatchIn(body),
         )
     }
 }

@@ -8,8 +8,12 @@ on:
       - "docker-compose.prod.yml"
       - "scripts/deploy/**"
       - "scripts/backup/**"
+      - "scripts/deploy/sql/deploy-foundation-v1.sql"
       - "fukurou/src/test/kotlin/me/matsumo/fukurou/ReleaseDeployFoundationContractTest.kt"
       - "fukurou/src/test/kotlin/me/matsumo/fukurou/DatabaseBackupRestoreContractTest.kt"
+      - "fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt"
+      - "trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/TradingPersistenceBootstrap.kt"
+      - "trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence/TradingTables.kt"
       - "docs/deploy.md"
   workflow_dispatch:
 
