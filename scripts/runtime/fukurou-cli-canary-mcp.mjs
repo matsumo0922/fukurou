@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
-
-const nonce = process.env.FUKUROU_CLI_CANARY_NONCE;
-if (!nonce || !/^[0-9a-f-]{16,64}$/i.test(nonce)) process.exit(2);
+import { appendFileSync } from "node:fs";
 
 const commonTools = [
   "calc_indicator", "get_account_status", "get_balance", "get_candles", "get_open_orders",
@@ -11,12 +9,12 @@ const commonTools = [
   "knowledge_get_recent_lessons", "knowledge_search_similar_setups",
 ];
 const manifestId = process.argv[2] ?? "";
-const tools = manifestId.includes("-proposer-")
-  ? [...commonTools, "submit_decision"]
-  : manifestId.includes("-falsifier-")
-    ? [...commonTools, "preview_order", "submit_falsification"]
-    : [];
+const phase = manifestId.includes("-proposer-") ? "PROPOSER" : manifestId.includes("-falsifier-") ? "FALSIFIER" : "";
+const tools = phase === "PROPOSER" ? [...commonTools, "submit_decision"]
+  : phase === "FALSIFIER" ? [...commonTools, "preview_order", "submit_falsification"] : [];
 if (tools.length === 0) process.exit(2);
+const recordPath = process.env.FUKUROU_CLI_CANARY_RECORD_PATH;
+if (recordPath !== `/tmp/${manifestId}.calls`) process.exit(2);
 const toolDefinitions = tools.map((name) => ({
   name,
   description: "Data-free CLI compatibility probe.",
@@ -58,9 +56,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       if (!tools.includes(request.params?.name)) {
         fail(request.id, -32602, "Unknown fixture tool.");
       } else {
+        appendFileSync(recordPath, `${phase}\t${request.params.name}\n`, { mode: 0o600 });
         respond(request.id, {
-          content: [{ type: "text", text: nonce }],
-          structuredContent: { nonce },
+          content: [{ type: "text", text: "FUKUROU_CLI_CANARY_OK" }],
+          structuredContent: { marker: "FUKUROU_CLI_CANARY_OK" },
           isError: false,
         });
       }

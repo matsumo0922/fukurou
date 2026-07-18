@@ -24,10 +24,10 @@ The canary MUST render `PRE_FILTER` and `REFLECTION` with an empty canonical too
 
 #### Scenario: MCP phase resolves a canonical tool
 - **WHEN** the canary executes `PROPOSER` or `FALSIFIER`
-- **THEN** the provider resolves a canonical fixture tool, invokes it at least once, and returns a run-specific nonce without receiving production DB or market data
+- **THEN** Claude Proposer invokes `get_account_status` and Codex Falsifier invokes auto-approved `submit_falsification` at least once, and the fixture records each phase and canonical tool name independently from the fixed response marker without receiving production DB or market data
 
 #### Scenario: Tool policy or fixture call drifts
-- **WHEN** enabled tools differ from the phase canonical policy, an unknown tool is requested, the required probe call is absent, or the returned nonce differs
+- **WHEN** enabled tools differ from the phase canonical policy, an unknown tool is requested, the required phase/tool call record is absent, or the response marker differs
 - **THEN** the image is not provider-qualified
 
 ### Requirement: Canary credentials are isolated from production credentials
@@ -63,6 +63,10 @@ The exact-image harness MUST support only a one-run operator smoke and a three-r
 #### Scenario: Mutable image reference is requested
 - **WHEN** merge qualification receives a tag, bare image ID, unresolved digest, or a resolved identity different from the requested repository digest
 - **THEN** it exits before foundation or provider execution and emits no qualification result
+
+#### Scenario: Production qualification retains test overrides
+- **WHEN** Docker or foundation harness override environment remains set without explicit selftest mode
+- **THEN** qualification exits before image inspection, credential mount, foundation, or provider execution
 
 ### Requirement: Acceptance evidence composes with foundation evidence
 Merge qualification MUST bind the offline foundation result and the real-provider acceptance result to the single immutable image digest resolved by the same harness invocation, while keeping their security responsibilities distinct.

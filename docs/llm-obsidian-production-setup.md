@@ -102,6 +102,7 @@ ssh dxp4800plus \
 Production の Codex login state は `llm-auth` volume の auth source に対して確認する。provider invocation compatibility は
 production credential を使った direct CLI ではなく、[セルフホストデプロイ手順](deploy.md#pinned-cli-acceptance-qualification)の
 専用 `llm-canary-auth` と exact-image acceptance で確認する。
+acceptance が検証するのは Codex の configured `-m gpt-5.5` と CLI/image pin であり、provider が実際に serve した model identity は Codex JSONL に含まれないため未検証のままとする。
 
 ```sh
 ssh dxp4800plus \

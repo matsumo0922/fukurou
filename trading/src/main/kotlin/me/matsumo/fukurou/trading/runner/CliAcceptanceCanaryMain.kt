@@ -39,6 +39,7 @@ internal enum class CliAcceptanceFailureCode {
     CONFIGURED_MODEL,
     OBSERVED_MODEL,
     PROBE_MARKER,
+    TOOL_CALL,
     INVOCATION,
     IDENTITY,
 }
@@ -51,9 +52,7 @@ internal class CliAcceptanceFailure(
     private val adapter: String,
 ) : IllegalStateException("CLI acceptance failed closed.") {
     /** allowlist field だけの operator 向け結果。 */
-    fun safeMessage(): String {
-        return "CLI_ACCEPTANCE_V1 FAIL code=$code phase=$phase iteration=$iteration adapter=$adapter"
-    }
+    fun safeMessage() = "CLI_ACCEPTANCE_V1 FAIL code=$code phase=$phase iteration=$iteration adapter=$adapter"
 }
 
 /** production invocation components を通して pinned CLI phase matrix を検証する driver。 */
@@ -62,7 +61,7 @@ internal class CliAcceptanceCanary(
     private val workingDirectory: Path,
     private val environment: Map<String, String>,
     private val fixtureCommand: String,
-    private val nonceFactory: (LlmInvocationPhase, Int) -> String = { _, _ -> UUID.randomUUID().toString() },
+    private val tokenFactory: () -> String = { UUID.randomUUID().toString() },
 ) {
     /** complete matrix を1回または3回だけ直列実行する。 */
     suspend fun run(repetitions: Int): Result<Unit> {
@@ -71,42 +70,53 @@ internal class CliAcceptanceCanary(
         repeat(repetitions) { index ->
             val iteration = index + 1
             CANARY_PHASE_MATRIX.forEach { phase ->
-                val nonce = nonceFactory(phase.phase, iteration)
-                val request = runCatching { phase.toRequest(iteration, nonce) }.getOrElse {
+                val invocation = runCatching { phase.toInvocation(iteration, tokenFactory()) }.getOrElse {
                     return Result.failure(failure(CliAcceptanceFailureCode.INVOCATION, phase, iteration))
                 }
-                val result = invoker.invoke(request).getOrElse { throwable ->
-                    val code = (throwable as? LlmProviderContractException)
-                        ?.providerFailure
-                        ?.category
-                        ?.toCanaryCode()
-                        ?: CliAcceptanceFailureCode.INVOCATION
+                val result = invoker.invoke(invocation.request).getOrElse { throwable ->
+                    val cleanupFailed = cleanupRecord(invocation.recordPath)
+                    val code = if (cleanupFailed) {
+                        CliAcceptanceFailureCode.CLEANUP
+                    } else {
+                        (throwable as? LlmProviderContractException)
+                            ?.providerFailure
+                            ?.category
+                            ?.toCanaryCode()
+                            ?: CliAcceptanceFailureCode.INVOCATION
+                    }
                     return Result.failure(failure(code, phase, iteration))
                 }
-                validate(result, phase, iteration, nonce)?.let { failure -> return Result.failure(failure) }
+                val validationFailure = validate(result, phase, iteration, invocation.recordPath)
+                val recordCleanupFailed = cleanupRecord(invocation.recordPath)
+                if (recordCleanupFailed) {
+                    return Result.failure(failure(CliAcceptanceFailureCode.CLEANUP, phase, iteration))
+                }
+                validationFailure?.let { failure -> return Result.failure(failure) }
             }
         }
 
         return Result.success(Unit)
     }
 
-    private fun CanaryPhase.toRequest(iteration: Int, nonce: String): LlmInvocationRequest {
-        val invocationId = "cli-canary-${phase.name.lowercase()}-$iteration-${nonce.take(8)}"
+    private fun CanaryPhase.toInvocation(iteration: Int, token: String): CanaryInvocation {
+        val invocationId = "cli-canary-${phase.name.lowercase()}-$iteration-${token.take(8)}"
         val enabledTools = McpToolContractCatalog.toolsFor(phase)
             .sorted()
             .map { tool -> "mcp__${CANARY_MCP_SERVER_NAME}__$tool" }
+        val recordPath = if (phase in CANARY_MCP_PHASES) workingDirectory.resolve("$invocationId.calls") else null
         val mcpServer = if (phase in CANARY_MCP_PHASES) {
             LlmMcpServerConfig(
                 name = CANARY_MCP_SERVER_NAME,
                 command = fixtureCommand,
                 manifestId = invocationId,
                 manifestPath = Path.of(System.getProperty("java.io.tmpdir"), "$invocationId.manifest"),
+                autoApprovedTools = if (provider == LlmProvider.CODEX) listOf(CODEX_FALSIFIER_WRITE_TOOL) else emptyList(),
             )
         } else {
             null
         }
 
-        return LlmInvocationRequest(
+        val request = LlmInvocationRequest(
             invocationId = invocationId,
             provider = provider,
             phase = phase,
@@ -115,12 +125,13 @@ internal class CliAcceptanceCanary(
             workingDirectory = workingDirectory,
             decisionRunContext = DecisionRunContext.EMPTY,
             mcpServer = mcpServer,
-            environment = environment + (CLI_CANARY_NONCE_ENV to nonce),
+            environment = recordPath?.let { environment + (CLI_CANARY_RECORD_PATH_ENV to it.toString()) } ?: environment,
             toolPolicy = McpToolContractCatalog.canonicalPolicy(phase, enabledTools),
             model = model,
             effort = effort,
             useConfiguredModelFallback = false,
         )
+        return CanaryInvocation(request, recordPath)
     }
 
     @Suppress("CyclomaticComplexMethod", "LongMethod")
@@ -128,7 +139,7 @@ internal class CliAcceptanceCanary(
         result: LlmInvocationResult,
         phase: CanaryPhase,
         iteration: Int,
-        nonce: String,
+        recordPath: Path?,
     ): CliAcceptanceFailure? {
         result.providerFailure?.let { providerFailure ->
             return failure(providerFailure.category.toCanaryCode(), phase, iteration)
@@ -155,33 +166,41 @@ internal class CliAcceptanceCanary(
         if (!observedModelMatches) {
             return failure(CliAcceptanceFailureCode.OBSERVED_MODEL, phase, iteration)
         }
-        val expectedMarker = if (phase.phase in CANARY_MCP_PHASES) nonce else NO_TOOL_MARKER
-        if (result.responseText.trim() != expectedMarker) {
+        if (result.responseText.trim() != RESPONSE_MARKER) {
             return failure(CliAcceptanceFailureCode.PROBE_MARKER, phase, iteration)
+        }
+        if (recordPath != null && !hasCanonicalProbeCall(recordPath, phase.phase)) {
+            return failure(CliAcceptanceFailureCode.TOOL_CALL, phase, iteration)
         }
 
         return null
     }
 
+    private fun hasCanonicalProbeCall(recordPath: Path, phase: LlmInvocationPhase): Boolean {
+        val expected = "${phase.name}\t${cliCanaryProbeTool(phase)}"
+        return runCatching { Files.readAllLines(recordPath).any { line -> line == expected } }.getOrDefault(false)
+    }
+
+    private fun cleanupRecord(recordPath: Path?) =
+        recordPath?.let { path -> runCatching { Files.deleteIfExists(path) }.isFailure } ?: false
+
     private fun failure(
         code: CliAcceptanceFailureCode,
         phase: CanaryPhase,
         iteration: Int,
-    ): CliAcceptanceFailure {
-        return CliAcceptanceFailure(
-            code = code,
-            phase = phase.phase,
-            iteration = iteration,
-            adapter = phase.adapter,
-        )
-    }
+    ) = CliAcceptanceFailure(
+        code = code,
+        phase = phase.phase,
+        iteration = iteration,
+        adapter = phase.adapter,
+    )
 }
 
 /** canary を container entrypoint として安全に実行する。 */
 fun main(args: Array<String>) = runBlocking {
     val repetitions = args.singleOrNull()?.toIntOrNull()
     if (!canStartCanary(repetitions)) {
-        System.err.println(
+        println(
             CliAcceptanceFailure(
                 code = CliAcceptanceFailureCode.IDENTITY,
                 phase = LlmInvocationPhase.PRE_FILTER,
@@ -205,14 +224,21 @@ fun main(args: Array<String>) = runBlocking {
             outputParser = DefaultLlmOutputParser(),
         ),
         workingDirectory = Path.of("/tmp"),
-        environment = System.getenv(),
+        environment = cliCanaryEnvironment(System.getenv()),
         fixtureCommand = FIXTURE_MCP_COMMAND,
     ).run(repetitions)
-    val failure = result.exceptionOrNull() as? CliAcceptanceFailure
+    val failure = (result.exceptionOrNull() as? CliAcceptanceFailure) ?: result.exceptionOrNull()?.let {
+        CliAcceptanceFailure(
+            code = CliAcceptanceFailureCode.INVOCATION,
+            phase = LlmInvocationPhase.PRE_FILTER,
+            iteration = 0,
+            adapter = CLAUDE_OUTPUT_ADAPTER_VERSION,
+        )
+    }
     if (failure == null) {
         println("CLI_ACCEPTANCE_V1 OK runs=$repetitions phases=${CANARY_PHASE_MATRIX.size}")
     } else {
-        System.err.println(failure.safeMessage())
+        println(failure.safeMessage())
         exitProcess(1)
     }
 }
@@ -226,6 +252,18 @@ private data class CanaryPhase(
     val adapter: String,
     val prompt: String,
 )
+
+private data class CanaryInvocation(val request: LlmInvocationRequest, val recordPath: Path?)
+
+/** production child process と同じ curated allowlist だけを canary CLI へ渡す。 */
+internal fun cliCanaryEnvironment(environment: Map<String, String>) =
+    environment.filterKeys(CHILD_ENV_ALLOWLIST::contains)
+
+internal fun cliCanaryProbeTool(phase: LlmInvocationPhase): String = when (phase) {
+    LlmInvocationPhase.PROPOSER -> CANARY_READ_PROBE_TOOL
+    LlmInvocationPhase.FALSIFIER -> CODEX_FALSIFIER_WRITE_TOOL
+    else -> error("CLI canary probe tool is only defined for MCP phases.")
+}
 
 private fun canStartCanary(repetitions: Int?): Boolean {
     if (repetitions == null) return false
@@ -259,8 +297,8 @@ internal const val CLAUDE_CANARY_MODEL = "claude-haiku-4-5-20251001"
 /** acceptance対象のCodex model pin。 */
 internal const val CODEX_CANARY_MODEL = "gpt-5.5"
 
-/** data-free MCP fixtureが返すrun固有nonceの環境変数。 */
-internal const val CLI_CANARY_NONCE_ENV = "FUKUROU_CLI_CANARY_NONCE"
+/** data-free MCP fixture の call record path を渡す環境変数。 */
+internal const val CLI_CANARY_RECORD_PATH_ENV = "FUKUROU_CLI_CANARY_RECORD_PATH"
 
 /** fixture MCPを有効化するphase。 */
 internal val CANARY_MCP_PHASES = setOf(LlmInvocationPhase.PROPOSER, LlmInvocationPhase.FALSIFIER)
@@ -268,7 +306,9 @@ private const val CANARY_MCP_SERVER_NAME = "canary"
 private const val PINNED_CLAUDE_COMMAND = "/usr/local/bin/claude"
 private const val PINNED_CODEX_COMMAND = "/usr/local/bin/codex"
 private const val FIXTURE_MCP_COMMAND = "/usr/local/libexec/fukurou-cli-canary-mcp.mjs"
-private const val NO_TOOL_MARKER = "FUKUROU_CLI_CANARY_OK"
+private const val RESPONSE_MARKER = "FUKUROU_CLI_CANARY_OK"
+private const val CANARY_READ_PROBE_TOOL = "get_account_status"
+private const val CODEX_FALSIFIER_WRITE_TOOL = "submit_falsification"
 private val PHASE_TIMEOUT = Duration.ofSeconds(120)
 private val CANARY_PHASE_MATRIX = listOf(
     CanaryPhase(
@@ -277,7 +317,7 @@ private val CANARY_PHASE_MATRIX = listOf(
         CLAUDE_CANARY_MODEL,
         LlmEffort.DEFAULT,
         CLAUDE_OUTPUT_ADAPTER_VERSION,
-        "Return exactly $NO_TOOL_MARKER. Do not use tools.",
+        "Return exactly $RESPONSE_MARKER. Do not use tools.",
     ),
     CanaryPhase(
         LlmInvocationPhase.PROPOSER,
@@ -285,7 +325,7 @@ private val CANARY_PHASE_MATRIX = listOf(
         CLAUDE_CANARY_MODEL,
         LlmEffort.DEFAULT,
         CLAUDE_OUTPUT_ADAPTER_VERSION,
-        "Call get_account_status once, then return only the nonce from its result.",
+        "Call $CANARY_READ_PROBE_TOOL at least once, then return exactly $RESPONSE_MARKER.",
     ),
     CanaryPhase(
         LlmInvocationPhase.FALSIFIER,
@@ -293,7 +333,7 @@ private val CANARY_PHASE_MATRIX = listOf(
         CODEX_CANARY_MODEL,
         LlmEffort.LOW,
         CODEX_OUTPUT_ADAPTER_VERSION,
-        "Call get_account_status once, then return only the nonce from its result.",
+        "Call $CODEX_FALSIFIER_WRITE_TOOL at least once, then return exactly $RESPONSE_MARKER.",
     ),
     CanaryPhase(
         LlmInvocationPhase.REFLECTION,
@@ -301,6 +341,6 @@ private val CANARY_PHASE_MATRIX = listOf(
         CLAUDE_CANARY_MODEL,
         LlmEffort.DEFAULT,
         CLAUDE_OUTPUT_ADAPTER_VERSION,
-        "Return exactly $NO_TOOL_MARKER. Do not use tools.",
+        "Return exactly $RESPONSE_MARKER. Do not use tools.",
     ),
 )

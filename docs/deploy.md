@@ -82,10 +82,10 @@ scripts/mcp-credential-isolation-check --qualification --runs 3 --reuse-image "$
 scripts/mcp-credential-isolation-check --cli-acceptance --runs 1 --reuse-image "$IMAGE"
 ```
 
-結果には digest と allowlist 済み status だけを残し、prompt、credential、provider stdout/stderr は含めない。
+結果には digest と allowlist 済み status だけを残し、prompt、credential、provider stdout/stderr は含めない。production qualification は harness override env を拒否し、明示的な selftest mode だけ fake Docker / foundation harness を許可する。
 acceptance container は dedicated auth を read-only mount し、production auth、DB、vault、Docker socket、
 production network を持たない。deploy executor はこの acceptance を required hook として呼び出さないため、
-deploy-time smoke の完了条件は別 change まで未達のままとする。
+deploy-time smoke の完了条件は別 change まで未達のままとする。Codex は configured `-m gpt-5.5` を検証するが、CLI output が served model を報告しないため provider-observed model identity は未検証である。
 
 ## NAS 側の初期セットアップ
 

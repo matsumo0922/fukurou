@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory
 import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -32,7 +33,6 @@ class CliAcceptanceCanaryTest {
     fun `four phase matrix uses pinned models and canonical tool policies`() = runBlocking {
         val invoker = RecordingCanaryInvoker(::successfulResult)
         val result = canary(invoker).run(1)
-
         assertTrue(result.isSuccess)
         assertEquals(
             listOf(
@@ -49,14 +49,19 @@ class CliAcceptanceCanaryTest {
             assertFalse(request.useConfiguredModelFallback)
             assertEquals(McpToolContractCatalog.toolsFor(request.phase), request.allowedTools.map(::shortTool).toSet())
             assertEquals(request.phase in CANARY_MCP_PHASES, request.mcpServer != null)
+            assertEquals(request.phase in CANARY_MCP_PHASES, CLI_CANARY_RECORD_PATH_ENV in request.environment)
         }
-        assertEquals(LlmEffort.LOW, invoker.requests.single { it.phase == LlmInvocationPhase.FALSIFIER }.effort)
+        val falsifier = invoker.requests.single { it.phase == LlmInvocationPhase.FALSIFIER }
+        assertEquals(LlmEffort.LOW, falsifier.effort)
+        assertEquals(listOf("submit_falsification"), falsifier.mcpServer?.autoApprovedTools)
+        assertTrue(falsifier.prompt.contains("submit_falsification"))
+        invoker.requests.mapNotNull { it.environment[CLI_CANARY_RECORD_PATH_ENV] }
+            .forEach { path -> assertFalse(Files.exists(Path.of(path))) }
     }
 
     @Test
     fun `three repetitions execute each phase exactly three times`() = runBlocking {
         val invoker = RecordingCanaryInvoker(::successfulResult)
-
         assertTrue(canary(invoker).run(3).isSuccess)
         assertEquals(12, invoker.requests.size)
         assertFailsWith<IllegalArgumentException> { canary(invoker).run(2) }
@@ -68,9 +73,7 @@ class CliAcceptanceCanaryTest {
         val invoker = RecordingCanaryInvoker { request ->
             successfulResult(request).copy(observedModelIdentity = LlmObservedModelIdentity("wrong", "fixture"))
         }
-
         val failure = canary(invoker).run(1).exceptionOrNull() as CliAcceptanceFailure
-
         assertEquals(CliAcceptanceFailureCode.OBSERVED_MODEL, failure.code)
         assertEquals(LlmInvocationPhase.PRE_FILTER, failure.phase)
         assertFalse(failure.safeMessage().contains("wrong"))
@@ -79,7 +82,6 @@ class CliAcceptanceCanaryTest {
     @Test
     fun `Codex unavailable observed model remains valid`() = runBlocking {
         val invoker = RecordingCanaryInvoker(::successfulResult)
-
         assertTrue(canary(invoker).run(1).isSuccess)
         assertNull(invoker.results.single { it.request.provider == LlmProvider.CODEX }.observedModelIdentity)
     }
@@ -101,13 +103,12 @@ class CliAcceptanceCanaryTest {
         }
 
         val failure = canary(invoker).run(1).exceptionOrNull() as CliAcceptanceFailure
-
         assertEquals(CliAcceptanceFailureCode.AUTHENTICATION, failure.code)
         assertFalse(failure.safeMessage().contains("SOURCE_MISSING"))
     }
 
     @Test
-    fun `schema timeout exit cleanup and nonce failures are typed`() = runBlocking {
+    fun `schema timeout exit cleanup marker and tool call failures are typed`() = runBlocking {
         val failures = listOf(
             CliAcceptanceFailureCode.OUTPUT_CONTRACT to { request: LlmInvocationRequest ->
                 successfulResult(request).copy(
@@ -130,6 +131,13 @@ class CliAcceptanceCanaryTest {
             CliAcceptanceFailureCode.PROBE_MARKER to { request ->
                 successfulResult(request).copy(responseText = "missing")
             },
+            CliAcceptanceFailureCode.TOOL_CALL to { request ->
+                successfulResult(request).also {
+                    request.environment[CLI_CANARY_RECORD_PATH_ENV]?.let { path ->
+                        Files.writeString(Path.of(path), "${request.phase.name}\tget_balance\n")
+                    }
+                }
+            },
         )
 
         failures.forEach { (expected, resultFactory) ->
@@ -139,15 +147,20 @@ class CliAcceptanceCanaryTest {
         }
     }
 
-    private fun canary(invoker: LlmInvoker): CliAcceptanceCanary {
-        return CliAcceptanceCanary(
-            invoker = invoker,
-            workingDirectory = Path.of("/tmp"),
-            environment = mapOf("HOME" to "/canary-auth", "CODEX_HOME" to "/canary-auth/.codex"),
-            fixtureCommand = "/fixture-mcp",
-            nonceFactory = { phase, iteration -> "nonce-${phase.name.lowercase()}-$iteration" },
+    @Test
+    fun `CLI environment uses the production child allowlist`() {
+        val filtered = cliCanaryEnvironment(
+            mapOf("HOME" to "/canary-auth", "CODEX_HOME" to "/canary-auth/.codex", "DB_PASSWORD" to "secret"),
         )
+        assertEquals(setOf("HOME", "CODEX_HOME"), filtered.keys)
     }
+
+    private fun canary(invoker: LlmInvoker) = CliAcceptanceCanary(
+        invoker = invoker,
+        workingDirectory = Path.of("/tmp"),
+        environment = mapOf("HOME" to "/canary-auth", "CODEX_HOME" to "/canary-auth/.codex"),
+        fixtureCommand = "/fixture-mcp",
+    )
 }
 
 private class RecordingCanaryInvoker(
@@ -166,14 +179,15 @@ private class RecordingCanaryInvoker(
 }
 
 private fun successfulResult(request: LlmInvocationRequest): LlmInvocationResult {
-    val nonce = request.environment.getValue(CLI_CANARY_NONCE_ENV)
     val model = requireNotNull(request.model)
-    val response = if (request.phase in CANARY_MCP_PHASES) nonce else "FUKUROU_CLI_CANARY_OK"
+    request.environment[CLI_CANARY_RECORD_PATH_ENV]?.let { recordPath ->
+        Files.writeString(Path.of(recordPath), "${request.phase.name}\t${cliCanaryProbeTool(request.phase)}\n")
+    }
 
     return LlmInvocationResult(
         request = request,
         processResult = process(ProcessRunStatus.EXITED, 0),
-        responseText = response,
+        responseText = "FUKUROU_CLI_CANARY_OK",
         configuredModelIdentity = LlmConfiguredModelIdentity(model, LlmConfiguredModelSource.REQUEST),
         observedModelIdentity = if (request.provider == LlmProvider.CLAUDE) {
             LlmObservedModelIdentity(model, "CLAUDE_RESULT")
@@ -183,9 +197,8 @@ private fun successfulResult(request: LlmInvocationRequest): LlmInvocationResult
     )
 }
 
-private fun process(status: ProcessRunStatus, exitCode: Int?): ProcessRunResult {
-    return ProcessRunResult(status, exitCode, "raw-output", "raw-error")
-}
+private fun process(status: ProcessRunStatus, exitCode: Int?) =
+    ProcessRunResult(status, exitCode, "raw-output", "raw-error")
 
 private fun adapter(request: LlmInvocationRequest): String = when (request.provider) {
     LlmProvider.CLAUDE -> CLAUDE_OUTPUT_ADAPTER_VERSION
