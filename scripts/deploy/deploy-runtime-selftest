@@ -585,6 +585,8 @@ set -e
 
 DEPLOYMENT_ID=new-candidate
 CANDIDATE_DIGEST="sha256:$(printf '6%.0s' {1..64})"
+MIGRATION_ROLLBACK_MODE=ROLL_FORWARD_ONLY
+[[ "$(jq -r '.acceptedDeploy.migrationRollbackMode' "${STATE_ROOT}/fixture-clear/state.json")" == AUTO_IMAGE_ROLLBACK ]]
 unset FUKUROU_IMAGE_REFERENCE FUKUROU_IMAGE_TAG
 # production と同じく ERR trap を装着した状態で resume する。subshell recovery の
 # 非ゼロ終了へ trap が再発火して executor を終了させる回帰をここで捕捉する。
@@ -593,6 +595,7 @@ trap 'echo "deploy-runtime-selftest: parent ERR trap fired during resume" >&2; e
 recover_unfinished_deployments
 trap - ERR
 set +E
+[[ "${MIGRATION_ROLLBACK_MODE}" == ROLL_FORWARD_ONLY ]]
 [[ "${FUKUROU_IMAGE_TAG}" == "${FUKUROU_IMAGE_REFERENCE}" ]]
 if [[ -n "${GAP_DEPLOYMENT_ID:-}" ]]; then
   echo "deploy-runtime-selftest: resume leaked GAP_DEPLOYMENT_ID=${GAP_DEPLOYMENT_ID}" >&2

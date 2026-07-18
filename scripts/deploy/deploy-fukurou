@@ -1319,6 +1319,7 @@ validate_journal_history() {
 recover_unfinished_deployments() {
   local state_dir journal last_state recovered_state origin_state
   local candidate_deployment_id="${DEPLOYMENT_ID}" candidate_digest="${CANDIDATE_DIGEST}"
+  local candidate_migration_rollback_mode="${MIGRATION_ROLLBACK_MODE}"
   shopt -s nullglob
   for journal in "${STATE_ROOT}"/*/journal.jsonl; do
     validate_journal_history "${journal}" || fail "RECOVERY_JOURNAL_CORRUPT:${journal}"
@@ -1378,6 +1379,7 @@ recover_unfinished_deployments() {
   shopt -u nullglob
   DEPLOYMENT_ID="${candidate_deployment_id}"
   CANDIDATE_DIGEST="${candidate_digest}"
+  MIGRATION_ROLLBACK_MODE="${candidate_migration_rollback_mode}"
   # recovery が束縛した gap 対象を残すと、この後の forward path の OPEN が
   # 旧 deployment の immutable boundary へ衝突する。
   GAP_DEPLOYMENT_ID=""

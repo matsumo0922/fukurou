@@ -70,7 +70,7 @@ live errorの`rollback_on_error`とstartupの`recover_unfinished_deployments`は
 
 accepted current/target、intent、redacted operator reason、migration mode、inventory hash、schema-sensitive判定、probe済みcandidate image digestを root-only `state.json` と `PREPARED` journal details に保存する。v2 recoveryはstateと最初のjournal detailsを完全照合し、installed inventory hashとも一致した場合だけmodeを採用する。中断deploy自身の保存済みdigestだけをfence recovery codecとして使い、次にqueueされた未admission bundleのdigestを流用しない。reason は長さを制限し、制御文字を拒否し、secret patternを受け付けない。mutation前 rejection は state directoryを作らず、stable reason codeと current/targetだけを stderrへ出す。
 
-rollback composeは可変なrepository HEADからcopyせず、accepted current revisionのGit objectからsnapshotする。candidate composeもtarget revisionのGit objectをrenderする。これによりRFO failureがcandidate checkout後に止まりrepository HEADとrunning revisionが分離しても、次のroll-forwardが誤ったcompose/revision pairをrollback evidenceへ保存しない。
+rollback composeは可変なrepository HEADからcopyせず、accepted current revisionのGit objectからsnapshotする。target revisionのcomposeはmutation前に一時fileへsnapshotしてrender可能性を検証する。safety mutation後のcandidate preflightはcheckoutを変更せず、現在のproduction composeとdeny overlayへcandidate digestを束縛し、成功後にtargetをcheckoutしてproduction composeを切り替える。これによりRFO failureがcandidate checkout後に止まりrepository HEADとrunning revisionが分離しても、次のroll-forwardが誤ったcompose/revision pairをrollback evidenceへ保存しない。
 
 current SHA を workflow bundleへ入れる案は、GitHub-hosted runner が production currentを観測できず偽の authorityになるため採らない。observed current は root executor が署名済み intentと組み合わせて記録する。
 

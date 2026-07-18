@@ -35,6 +35,7 @@ jobs:
           scripts/deploy/deploy-db-selftest
           scripts/deploy/deploy-postgres-selftest
           scripts/deploy/canary-compose-selftest
+          scripts/deploy/deploy-e2e-selftest
 
       - name: Run deploy semantic selftests
         run: |
