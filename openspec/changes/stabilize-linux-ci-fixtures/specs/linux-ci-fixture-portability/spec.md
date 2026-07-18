@@ -15,7 +15,7 @@ Deploy-gated test fixture は Linux 上で production と同じ supervisor compl
 
 #### Scenario: Fixture exits through failure
 - **WHEN** assertion または gateway startup が途中で失敗する
-- **THEN** socket blocker と一時 artifact は `finally` 境界で削除される
+- **THEN** fixture が作成した socket blocker とその child artifact は `finally` 境界で削除される
 
 ### Requirement: Fixture waits are bounded and non-racy
 OS process または file の観測待機は monotonic deadline と最後の observation を MUST 持ち、対象を観測した時点で終了しなければならない。

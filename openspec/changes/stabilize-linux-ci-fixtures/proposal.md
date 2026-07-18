@@ -4,7 +4,7 @@
 
 ## What Changes
 
-- evaluation population bound test を、20,002 件の full report 集計を成功させてから同じ全行を更新する構成から、正常な scoped 集計と過大 population rejection を独立した安価な fixture で証明する構成へ変える。
+- evaluation population bound test から全件 scope 更新と20,002件の scoped trade materializationを除き、1件の scoped 集計と同じ period にある20,002件の global population rejectionを独立して証明する。
 - Linux process-tree recovery test の child fixture を production supervisor protocol に合わせ、PID 観測を timeout と競合しない bounded wait にする。
 - gateway-start failure test が production と同じ socket path selection を使って exact path を妨害し、成功・失敗のどちらでも artifact を cleanup する。
 - product/runtime code、production JDBC timeout、deploy authority は変更しない。
