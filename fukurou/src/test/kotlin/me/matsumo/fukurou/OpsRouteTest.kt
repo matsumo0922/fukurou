@@ -813,6 +813,7 @@ class OpsRouteTest {
                 )
             }
 
+            startApplication()
             assertAdmissionHealthyForTest()
             val configResponse = client.get("/ops/runtime-config")
             val triggerResponse = client.post("/ops/trigger") {
@@ -973,6 +974,7 @@ class OpsRouteTest {
                 )
             }
 
+            startApplication()
             assertAdmissionHealthyForTest()
             val unavailableReadyResponse = client.get("/health/ready")
             val unavailableTriggerResponse = client.post("/ops/trigger") {

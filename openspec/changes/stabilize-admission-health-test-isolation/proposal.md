@@ -12,7 +12,7 @@ Production must remain fail-closed, so the test harness needs explicit isolation
 - Make recovery-worker shutdown await cancellation with a bounded failure instead of returning while a JDBC tick can still mutate global health.
 - Preserve every application resource close attempt and expose Ktor's swallowed shutdown result to tests through an injected observer while production emits an error report.
 - Make intentionally unavailable readiness assertions prove admission health is healthy first, so the tested failure cause remains unambiguous.
-- Add an explicit JUnit 4 suite for the previously failing class sequence and run the full deploy quality commands.
+- Add explicit JUnit 4 suites for the previously failing application sequence and unhealthy-predecessor trading paths, exclude duplicate default discovery, and execute both from `make test`.
 
 ## Capabilities
 

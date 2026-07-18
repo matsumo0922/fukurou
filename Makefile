@@ -17,6 +17,7 @@ build:
 # テスト
 test:
 	./gradlew test
+	./gradlew :fukurou:admissionHealthIsolationRegressionTest :trading:admissionHealthIsolationRegressionTest
 
 # ローカル開発用 PostgreSQL 起動
 dev-db:

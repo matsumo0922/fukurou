@@ -68,6 +68,8 @@ import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.io.File
 import java.time.Clock
+import java.util.logging.Level
+import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
 /**
@@ -968,7 +970,7 @@ internal fun closeApplicationResources(closeOperations: List<() -> Unit>): Resul
             val existingFailure = firstFailure
             if (existingFailure == null) {
                 firstFailure = failure
-            } else {
+            } else if (existingFailure !== failure) {
                 existingFailure.addSuppressed(failure)
             }
         }
@@ -977,17 +979,33 @@ internal fun closeApplicationResources(closeOperations: List<() -> Unit>): Resul
     return firstFailure?.let(Result.Companion::failure) ?: Result.success(Unit)
 }
 
-/** cleanup 結果を observer へそのまま渡し、subscriber 内で失敗を error report する。 */
+/** cleanup 結果を observer へ1回渡し、primary/fallback の独立境界で失敗を report する。 */
 internal fun reportApplicationShutdown(
     cleanupResult: Result<Unit>,
     shutdownResultObserver: (Result<Unit>) -> Unit,
     reportError: (String, Throwable) -> Unit,
 ) {
+    val observerFailure = runCatching { shutdownResultObserver(cleanupResult) }.exceptionOrNull()
+
     cleanupResult.exceptionOrNull()?.let { throwable ->
-        reportError("Application resource cleanup failed.", throwable)
+        reportApplicationShutdownFailure("Application resource cleanup failed.", throwable, reportError)
     }
-    runCatching { shutdownResultObserver(cleanupResult) }
-        .onFailure { throwable -> reportError("Application shutdown result observer failed.", throwable) }
+    observerFailure?.let { throwable ->
+        reportApplicationShutdownFailure("Application shutdown result observer failed.", throwable, reportError)
+    }
+}
+
+private fun reportApplicationShutdownFailure(
+    message: String,
+    throwable: Throwable,
+    reportError: (String, Throwable) -> Unit,
+) {
+    val reporterFailure = runCatching { reportError(message, throwable) }.exceptionOrNull() ?: return
+
+    runCatching {
+        APPLICATION_SHUTDOWN_FALLBACK_LOGGER.log(Level.SEVERE, "$message Primary error reporter failed.", throwable)
+        APPLICATION_SHUTDOWN_FALLBACK_LOGGER.log(Level.SEVERE, "Application shutdown error reporter failed.", reporterFailure)
+    }
 }
 
 internal fun sharedTradingPersistenceBootstrap(
@@ -1189,6 +1207,9 @@ private data class ApplicationBackgroundWorkers(
     val obsidianWriterWorker: ObsidianWriterWorker? = null,
     val reflectionRunnerWorker: ReflectionRunnerWorker? = null,
 )
+
+/** primary error reporter 自体が失敗した場合の shutdown fallback logger。 */
+private val APPLICATION_SHUTDOWN_FALLBACK_LOGGER: Logger = Logger.getLogger("fukurou.application.shutdown")
 
 /**
  * runtime config が利用できないときの manual trigger 拒否理由。

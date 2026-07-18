@@ -37,7 +37,7 @@ Repository-local probes established:
 
 ### Select affected tests by behavior and reset at method boundaries
 
-The inventory predicate is: a test starts `module` with non-null `databaseConfig`, directly references `LlmExecutionAdmissionHealth`, or invokes an admission path whose result depends on it. All matches in `:fukurou` and `:trading` are reviewed; indirect `EvaluationReportPersistenceTest` is included. Method-level `@BeforeTest`/`@AfterTest` is used because `OpsRouteTest` owns multiple application lifecycles. Existing partial flag restoration is replaced with the complete reset.
+The inventory predicate is: a test starts `module` with non-null `databaseConfig`, directly references `LlmExecutionAdmissionHealth`, or invokes an admission path whose result depends on it. All matches in `:fukurou` and `:trading` are reviewed. Indirect paths include `EvaluationReportPersistenceTest`, `LlmDaemonSchedulerTest`, `ManualLlmLaunchServiceTest`, and `OneShotRunnerMainTest`. Method-level `@BeforeTest`/`@AfterTest` is used because `OpsRouteTest` owns multiple application lifecycles. Existing partial flag restoration is replaced with the complete reset.
 
 Application tests inject a result observer into `module`, assert the recorded cleanup `Result` after `testApplication` returns, and then reset health in `finally`. The cleanup result—not `isHealthy()`—is the shutdown-success authority because cancelling a healthy in-flight tick can legitimately leave recovery health false. Direct and indirect admission tests without an application use reset-only teardown. If shutdown times out, its observed `Result.failure` makes the suite red before reset; no green isolation claim is made for that run.
 
@@ -45,7 +45,9 @@ Application tests inject a result observer into `module`, assert the recorded cl
 
 `LlmExecutionRecoveryWorker.close()` cancels its job and uses `runBlocking` with `withTimeout` to await termination for 6 seconds, always cancelling its scope. Six seconds is an empirical margin over the existing five-second cooperative tick budget and is the total added bound for this one synchronous worker; a non-cooperative JDBC section falls into the explicit timeout path below. Injected test scopes must not share the caller's single-thread dispatcher. Timeout throws a dedicated exception and never reports successful termination.
 
-Application shutdown delegates to an internal cleanup helper returning `Result<Unit>`. It attempts every close in dependency-safe order, keeps the datasource alive until recovery close completes or times out, retains the first failure, and attaches later failures with `addSuppressed`. `module` accepts a shutdown-result observer used by tests to capture this exact result. The `ApplicationStopped` subscriber cannot propagate failure through Ktor, so it invokes the observer after cleanup and emits failures at error level. Worker/helper unit tests inspect exceptions/results directly; application tests assert their captured result before resetting admission health.
+Application shutdown delegates to an internal cleanup helper returning `Result<Unit>`. It attempts every close in dependency-safe order, keeps the datasource alive until recovery close completes or times out, retains the first failure, attaches later distinct failures with `addSuppressed`, and skips self-suppression when multiple closes throw the same instance. `module` accepts a shutdown-result observer used by tests to capture this exact result. Observer delivery and error reporting use independent guarded boundaries, so a throwing primary reporter cannot prevent one observer delivery; a JDK logger records both the cleanup failure and reporter failure as fallback. The `ApplicationStopped` subscriber cannot propagate failure through Ktor. Worker/helper unit tests inspect exceptions/results directly; application tests assert their captured result before resetting admission health.
+
+`docs/design.md` is the current-state documentation authority for this application shutdown contract; runtime docs do not duplicate the same paragraph.
 
 On timeout, a non-cooperative JDBC call may still finish after the boundary. The design makes that residual path a visible red test and fail-closed runtime state; it does not claim the coroutine vanished.
 
@@ -57,17 +59,17 @@ DB-backed module tests start PostgreSQL before entering `testApplication`, close
 
 Recovered-ready assertions use a shared monotonic bounded poll. Route tests poll `/health/ready`; non-route tests observe `isHealthy()` or equivalent state. Timeout includes the last observation.
 
-Before intentional runtime-config 503 assertions, tests establish and re-check healthy admission so the config gate is the unique cause. Cases invalid at module initialization do not start background workers, so that observation is immediate. `OpsRouteTest.moduleKeepsReadinessAndManualRecoveryAvailableWhenActiveFomcCalendarIsMissing` starts a valid runtime and polls ready because recovery startup is asynchronous.
+Before intentional runtime-config 503 assertions, tests explicitly start the lazy Ktor test application, then establish and re-check healthy admission so the config gate is the unique cause. Cases invalid at module initialization do not start background workers, so that observation is immediate. `OpsRouteTest.moduleKeepsReadinessAndManualRecoveryAvailableWhenActiveFomcCalendarIsMissing` starts a valid runtime and polls ready because recovery startup is asynchronous.
 
-### Use a dedicated ordered-suite Gradle task
+### Use deploy-gated ordered-suite Gradle tasks
 
-`AdmissionHealthIsolationRegressionSuite` lists the implicated classes in observed order. Default `test` excludes the suite class. A separate `admissionHealthIsolationRegressionTest` Gradle `Test` task depends on test classes, uses the same output/runtime classpath, and includes only the suite, preventing double execution in the ordinary full suite.
+`:fukurou` `AdmissionHealthIsolationRegressionSuite` lists the implicated classes in observed order. `:trading` `TradingAdmissionHealthIsolationRegressionSuite` puts an unhealthy predecessor immediately before each newly inventoried admission-dependent class. Each module excludes its suite and nested predecessor classes from default `test` discovery, and exposes a module-local `admissionHealthIsolationRegressionTest` using one worker. `make test` completes ordinary tests first, then invokes both fully-qualified ordered tasks in a separate Gradle command. This makes the regression part of the deploy gate without duplicate suite execution or concurrent container load from the ordinary and ordered tasks.
 
 ## Risks / Trade-offs
 
 - [Risk] Recovery close delays shutdown. → Normal cancellation is immediate; the single 6-second bound caps added delay.
-- [Risk] One close failure skips later cleanup or loses evidence. → The helper attempts all closes and stores later failures as suppressed.
-- [Risk] Ktor swallows shutdown exceptions. → The subscriber forwards the exact cleanup result to an injected observer and error-logs failures; tests assert the result rather than infer from health.
+- [Risk] One close failure skips later cleanup or loses evidence. → The helper attempts all closes, stores later distinct failures as suppressed, and ignores repeated identity for suppression only.
+- [Risk] Ktor or the primary reporter swallows shutdown evidence. → The subscriber forwards the exact cleanup result once through an independent observer boundary and uses a JDK fallback logger when primary reporting fails.
 - [Risk] A reset masks the state under test. → Reset occurs only at method boundaries after assertions/resources; direct unhealthy tests use reset-only teardown.
 - [Risk] Optional daemon/reflection work has a similar broader lifetime risk when enabled. → Inventory records that affected module tests keep both flags false; enabling either in a future module test requires expanding the ownership design rather than silently reusing this guarantee.
 - [Risk] New tests bypass inventory. → Keep the behavioral predicate beside the fixture and repeat the usage inventory during review.
@@ -77,7 +79,7 @@ Before intentional runtime-config 503 assertions, tests establish and re-check h
 1. Add and compile the test fixture and test-only consumer.
 2. Implement bounded recovery termination and result-bearing cleanup.
 3. Apply method isolation, resource ownership, and cause-specific readiness observation.
-4. Run worker/helper tests, the ordered task, full tests, detekt, build, dependency inspection, and strict OpenSpec validation.
+4. Run worker/helper tests, both ordered tasks, the deploy-gated full test command, detekt, build, dependency inspection, and strict OpenSpec validation.
 5. Roll back fixture, shutdown, and tests together if validation regresses; no data/config migration is required.
 
 ## Open Questions

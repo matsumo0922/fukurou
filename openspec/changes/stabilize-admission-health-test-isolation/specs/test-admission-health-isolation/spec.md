@@ -32,8 +32,9 @@ Recovery-worker close MUST cancel and await its job for at most six seconds and 
 #### Scenario: Application resource close fails
 - **WHEN** one or more owned closes fail
 - **THEN** the cleanup helper attempts remaining closes in dependency-safe order
-- **AND** returns the first failure with later failures suppressed
-- **AND** the Ktor subscriber forwards that exact result to the observer and error-logs the failure
+- **AND** returns the first failure with later distinct failures suppressed without self-suppression
+- **AND** the Ktor subscriber forwards that exact result once to the observer independently of error reporting
+- **AND** a primary reporter failure falls back to logging without replacing the cleanup failure
 
 #### Scenario: Application test shutdown fails
 - **WHEN** the Ktor subscriber cannot propagate a cleanup failure
@@ -68,17 +69,23 @@ A test asserting intentional 503 readiness MUST establish unrelated admission he
 
 #### Scenario: Runtime configuration is unavailable
 - **WHEN** a test expects runtime-config readiness rejection
-- **THEN** it proves execution admission is healthy
+- **THEN** it starts the lazy test application and proves execution admission is healthy
 - **AND** the 503 has the intended unique cause
 
 ### Requirement: Regression validation covers shared-worker ordering
-The change MUST provide a dedicated Gradle `Test` task for the ordered JUnit 4 regression suite and MUST pass ordinary deployment quality commands in default discovery order.
+The change MUST provide module-local Gradle `Test` tasks for ordered JUnit 4 application and trading regressions, MUST execute both from `make test`, and MUST pass ordinary deployment quality commands in default discovery order.
+
+#### Scenario: Deploy gate sequences full and ordered tests
+- **WHEN** `make test` runs
+- **THEN** ordinary tests complete before either ordered regression task starts
+- **AND** both ordered tasks run without overlapping ordinary test container load
 
 #### Scenario: Historical order runs
-- **WHEN** `admissionHealthIsolationRegressionTest` runs
-- **THEN** implicated classes execute in declared order in one worker
+- **WHEN** both module-local `admissionHealthIsolationRegressionTest` tasks run
+- **THEN** implicated application classes execute in declared order in one worker
+- **AND** each inventoried trading path executes immediately after an unhealthy predecessor in one worker
 - **AND** all pass without residual global state
 
 #### Scenario: Ordinary full suite runs
-- **WHEN** full tests, static analysis, build, dependency inspection, and strict OpenSpec validation run
+- **WHEN** deploy-gated full tests, static analysis, build, dependency inspection, and strict OpenSpec validation run
 - **THEN** all succeed without duplicate ordered-suite discovery

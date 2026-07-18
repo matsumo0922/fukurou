@@ -30,6 +30,21 @@ dependencies {
     }
 }
 
+tasks.named<Test>("test") {
+    exclude("**/TradingAdmissionHealthIsolationRegressionSuite*.class")
+}
+
+tasks.register<Test>("admissionHealthIsolationRegressionTest") {
+    group = "verification"
+    description = "Runs admission-dependent trading tests after unhealthy predecessors in one JUnit 4 worker."
+    dependsOn(tasks.named("testClasses"))
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    include("**/TradingAdmissionHealthIsolationRegressionSuite.class")
+    maxParallelForks = 1
+    forkEvery = 0
+}
+
 tasks.register<JavaExec>("runOneShotLlm") {
     val mcpJarPath = rootProject.layout.projectDirectory
         .file("mcp/build/libs/fukurou-mcp-all.jar")

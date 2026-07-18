@@ -212,8 +212,6 @@ Reflection Runner の PromptCandidates は完了済み前週を対象に `REFLEC
 
 Reflection と evaluation report は `NOT_REQUIRED` reservation の ownership と process-local health を child start 直前に再検証する。Reflection は `llm_runs` 開始失敗を含む失敗経路で reservation を terminal 化し、片側の terminal persistence だけが一時失敗した場合も同じ invocation identity で再入して restart なしに残りを閉じる。
 
-application shutdown は current-process recovery worker を cancel 後6秒上限で termination まで待ち、timeout を成功として扱わない。resource cleanup は後続 close を継続し、最初の failure へ後続 failure を suppressed として保持して error log へ記録する。
-
 ## config
 
 runtime config の既定値は code-owned `RuntimeConfigCatalog` が持ち、DB bootstrap が `runtime_config_versions` / `runtime_config_values` に初期 active version を作成する。active snapshot に不足する code-owned catalog key がある場合、bootstrap は既存値を保持した complete snapshot を新しい active version として作成する。明示的に退役した key は新しい active version から除去し、それ以外の unknown key、不正値、validation failure は fail closed する。active DB config が `RUNTIME` key の正本で、`.env.example` と compose は runtime default を列挙しない。`.env` は secret / deployment / bootstrap 値に使う。

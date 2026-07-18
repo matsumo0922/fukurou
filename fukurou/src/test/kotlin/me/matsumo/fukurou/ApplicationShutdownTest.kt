@@ -3,6 +3,7 @@ package me.matsumo.fukurou
 import io.ktor.client.request.get
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -37,6 +38,30 @@ class ApplicationShutdownTest {
     }
 
     @Test
+    fun cleanup_skipsSelfSuppressionAndContinuesClosing() {
+        val closeOrder = mutableListOf<String>()
+        val repeatedFailure = IllegalStateException("repeated")
+
+        val result = closeApplicationResources(
+            listOf(
+                {
+                    closeOrder += "first"
+                    throw repeatedFailure
+                },
+                {
+                    closeOrder += "second"
+                    throw repeatedFailure
+                },
+                { closeOrder += "last" },
+            ),
+        )
+
+        assertEquals(listOf("first", "second", "last"), closeOrder)
+        assertSame(repeatedFailure, result.exceptionOrNull())
+        assertTrue(repeatedFailure.suppressed.isEmpty())
+    }
+
+    @Test
     fun report_forwardsExactCleanupFailureAndReportsIt() {
         val cleanupFailure = IllegalStateException("cleanup")
         val cleanupResult = Result.failure<Unit>(cleanupFailure)
@@ -49,6 +74,34 @@ class ApplicationShutdownTest {
             reportError = { _, throwable -> reportedFailure.set(throwable) },
         )
 
+        assertSame(cleanupFailure, observedResult.get().exceptionOrNull())
+        assertSame(cleanupFailure, reportedFailure.get())
+    }
+
+    @Test
+    fun report_forwardsCleanupExactlyOnceWhenPrimaryReporterThrows() {
+        val cleanupFailure = IllegalStateException("cleanup")
+        val cleanupResult = Result.failure<Unit>(cleanupFailure)
+        val observedResult = AtomicReference<Result<Unit>>()
+        val reportedFailure = AtomicReference<Throwable>()
+        val observerCalls = AtomicInteger()
+        val reporterCalls = AtomicInteger()
+
+        reportApplicationShutdown(
+            cleanupResult = cleanupResult,
+            shutdownResultObserver = { result ->
+                observerCalls.incrementAndGet()
+                observedResult.set(result)
+            },
+            reportError = { _, throwable ->
+                reporterCalls.incrementAndGet()
+                reportedFailure.set(throwable)
+                error("primary reporter unavailable")
+            },
+        )
+
+        assertEquals(1, observerCalls.get())
+        assertEquals(1, reporterCalls.get())
         assertSame(cleanupFailure, observedResult.get().exceptionOrNull())
         assertSame(cleanupFailure, reportedFailure.get())
     }

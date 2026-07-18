@@ -4,6 +4,7 @@ import io.ktor.client.call.body
 import io.ktor.client.request.get
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
+import me.matsumo.fukurou.trading.config.TradingBotConfig
 import org.testcontainers.DockerClientFactory
 import java.net.InetAddress
 import java.net.Socket
@@ -40,7 +41,7 @@ class DatabaseColdStartTest {
             container.start()
             val delayedUrl = container.jdbcUrl.withSocketFactory(ColdStartSocketFactory::class.java.name)
             val startedAt = System.nanoTime()
-            val tradingConfig = me.matsumo.fukurou.trading.config.TradingBotConfig()
+            val tradingConfig = TradingBotConfig()
             val shutdownResult = ApplicationShutdownResultCapture()
 
             assertFalse(tradingConfig.daemon.enabled)
