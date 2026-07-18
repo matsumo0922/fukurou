@@ -1,14 +1,17 @@
 package me.matsumo.fukurou
 
+import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -843,7 +846,7 @@ class OpsRouteTest {
                 contentType(ContentType.Application.Json)
                 setBody("""{"reason":"operator restored runtime config"}""")
             }
-            val recoveredReadyResponse = client.get("/health/ready")
+            val recoveredReadyResponse = client.awaitReadyResponse()
             val recoveredBody = Json.parseToJsonElement(recoveredConfigResponse.bodyAsText()).jsonObject
             val recoveredWarnings = recoveredBody.getValue("warnings").jsonArray.map { element ->
                 element.jsonObject.getValue("code").jsonPrimitive.content
@@ -921,7 +924,7 @@ class OpsRouteTest {
             }
 
             val configResponse = client.get("/ops/runtime-config")
-            val readyResponse = client.get("/health/ready")
+            val readyResponse = client.awaitReadyResponse()
             val triggerResponse = client.post("/ops/trigger") {
                 contentType(ContentType.Application.Json)
                 setBody("""{"reason":"calendar recovery"}""")
@@ -993,7 +996,7 @@ class OpsRouteTest {
 
             insertRuntimeConfigDefaultValues(database)
 
-            val recoveredReadyResponse = client.get("/health/ready")
+            val recoveredReadyResponse = client.awaitReadyResponse()
             val recoveredTriggerResponse = client.post("/ops/trigger") {
                 contentType(ContentType.Application.Json)
                 setBody("""{"reason":"operator confirms transient recovery"}""")
@@ -1944,6 +1947,25 @@ private fun assertNoSecretLikeText(responseText: String) {
     }
 }
 
+/**
+ * readiness が OK を返すまで bounded polling で待ち、最後の response を返す。
+ *
+ * recovery scan は tick ごとに readiness をいったん fail-closed へ倒し、scan 成功時にだけ healthy へ戻す。
+ * module 起動直後と tick 実行中の readiness は not_ready であるため、単発 GET では確立済み readiness を判定できない。
+ * 待機が期限切れになった場合も最後の response を返し、呼び出し側の assertion が実際の status と body を報告できるようにする。
+ */
+private suspend fun HttpClient.awaitReadyResponse(): HttpResponse {
+    val deadlineMillis = System.currentTimeMillis() + READINESS_AWAIT_TIMEOUT_MILLIS
+    var response = get("/health/ready")
+
+    while (response.status != HttpStatusCode.OK && System.currentTimeMillis() < deadlineMillis) {
+        delay(READINESS_POLL_INTERVAL_MILLIS)
+        response = get("/health/ready")
+    }
+
+    return response
+}
+
 private fun assertConfigItem(
     group: JsonObject,
     key: String,
@@ -2238,6 +2260,12 @@ private class MutableClock(
 }
 
 private const val DUMMY_AUTH_CODE = "DUMMY-CODE"
+
+/** readiness 確立を待つ上限。負荷の高い full suite 実行でも recovery scan 成功を待てる長さにする。 */
+private const val READINESS_AWAIT_TIMEOUT_MILLIS = 15_000L
+
+/** readiness polling 間隔。 */
+private const val READINESS_POLL_INTERVAL_MILLIS = 50L
 
 /**
  * fukurou module integration test 用 Postgres image。
