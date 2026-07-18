@@ -81,6 +81,8 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(common.contains("FUKUROU_BACKUP_SHARE_DIRECTORY"))
         assertTrue(common.contains("FUKUROU_BACKUP_STDIN_PATH:-/postgres.dump"))
         assertFalse(backup.contains("readonly BACKUP_STDIN_PATH="))
+        assertTrue(backup.contains("df -B1 --output=avail"))
+        assertFalse(backup.contains("df -PB1 --output=avail"))
         assertTrue(restore.contains("dump \"\${snapshot_id}\" \"\${BACKUP_STDIN_PATH}\""))
         assertTrue(installer.contains("FUKUROU_BACKUP_SHARE_DIRECTORY=\"\${SHARE_DIR}\""))
         val validationWorkflow = root.resolve(".github/workflows/deploy-validation.yml").readText()

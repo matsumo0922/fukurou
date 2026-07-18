@@ -246,7 +246,7 @@ validate_capacity_floor() {
   [[ "${database_bytes}" =~ ^[0-9]+$ ]] || return 1
   repository_parent="$(dirname "${RESTIC_REPOSITORY}")"
   [[ -d "${repository_parent}" ]] || return 1
-  available_bytes="$(df -PB1 --output=avail "${repository_parent}" | tail -n 1 | tr -d ' ')" || return 1
+  available_bytes="$(df -B1 --output=avail "${repository_parent}" | tail -n 1 | tr -d ' ')" || return 1
   [[ "${available_bytes}" =~ ^[0-9]+$ ]] || return 1
   (( available_bytes >= database_bytes + BACKUP_RESERVE_BYTES ))
 }
