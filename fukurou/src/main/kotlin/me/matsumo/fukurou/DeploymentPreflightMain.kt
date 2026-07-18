@@ -16,6 +16,11 @@ import java.util.Base64
 
 /** deploy candidate が production mutation 前に実行する unprivileged preflight。 */
 object DeploymentPreflightMain {
+    private val hooksBySlug = mapOf(
+        "cli-auth" to "CLI_AUTH_PREFLIGHT_V1",
+        "foundation" to "FOUNDATION_PREFLIGHT_V1",
+    )
+
     /** allowlist 済み hook と signed one-shot token だけを実行する。 */
     @JvmStatic
     fun main(args: Array<String>) {
@@ -101,11 +106,6 @@ object DeploymentPreflightMain {
             "EXPIRED_CANARY_TOKEN"
         }
     }
-
-    private val hooksBySlug = mapOf(
-        "cli-auth" to "CLI_AUTH_PREFLIGHT_V1",
-        "foundation" to "FOUNDATION_PREFLIGHT_V1",
-    )
 }
 
 private const val MAX_TOKEN_LIFETIME_SECONDS = 15 * 60L

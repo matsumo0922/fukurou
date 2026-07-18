@@ -65,10 +65,7 @@ class DeploymentPreflightMainTest {
         }
     }
 
-    private fun token(
-        expiresAt: Long,
-        hookIds: List<String> = listOf("FOUNDATION_PREFLIGHT_V1"),
-    ): ByteArray = """
+    private fun token(expiresAt: Long, hookIds: List<String> = listOf("FOUNDATION_PREFLIGHT_V1")): ByteArray = """
         {
           "profile":"CANARY_ONLY",
           "namespaceId":"canary-fixture",
