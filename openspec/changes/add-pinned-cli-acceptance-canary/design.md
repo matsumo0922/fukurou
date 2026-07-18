@@ -50,11 +50,11 @@ phase matrixは次のとおりとする。
 - `FALSIFIER`: Codex、`gpt-5.5`、fixture MCP、canonical Falsifier policy、LOW effort
 - `REFLECTION`: Claude、`claude-haiku-4-5-20251001`、no-MCP、empty canonical policy
 
-各requestをrender、run、parseし、provider failure、非0終了、timeout、schema drift、semantic marker不一致、cleanup failureをrun失敗とする。Claudeはsupported outputが報告するobserved modelもpinと一致させる。Codex 0.142.5はobserved modelを報告しないため、configured `-m gpt-5.5` とexact CLI/image pinだけを保証し、observed identityは `NOT_REPORTED_BY_PROVIDER` のままとする。
+各requestをrender、run、parseし、provider failure、非0終了、timeout、schema drift、semantic marker不一致、cleanup failureをrun失敗とする。primary failure codeとcleanup statusは直交させ、同時失敗でもsemantic/process原因を上書きしない。Claudeはsupported outputが報告するobserved modelもpinと一致させる。Codex 0.142.5はobserved modelを報告しないため、configured `-m gpt-5.5` とexact CLI/image pinだけを保証し、observed identityは `NOT_REPORTED_BY_PROVIDER` のままとする。
 
 ### 4. MCP validationはdata-free fixtureに限定する
 
-image内のstdio MCP fixture serverはProposer/Falsifierのcanonical tool名を列挙し、副作用や外部I/Oを持たないprobe結果を返す。nonceはCLI environmentへ渡さない。fixtureだけがphaseと実call tool名をside-channel recordへ追記し、driverは固定response markerとは独立にProposerの`get_account_status`とCodex Falsifierのauto-approved `submit_falsification`が各1回以上あることを検証する。これはtool resolution、call completion、Codex tool単位approval経路の互換性probeであり、悪意あるmodelに対するproofやexact call countは保証しない。
+image内のstdio MCP fixture serverはProposer/Falsifierのcanonical tool名とproduction相当のread/write annotationを列挙し、副作用や外部I/Oを持たないprobe結果を返す。nonceはCLI environmentへ渡さない。fixtureだけがphaseと実call tool名をside-channel recordへ追記し、driverは固定response markerとは独立にProposerの`submit_decision`とCodex Falsifierのproduction承認ロジックでauto-approvedになる`submit_falsification`が各1回以上あることを検証する。これはprovider別write tool approval、call completionの互換性probeであり、悪意あるmodelに対するproofやexact call countは保証しない。
 
 production fixed MCP launcher、phase manifest、DB role、全required callはfoundation canaryが検証する。merge qualification evidenceは同一exact digestについてfoundation successと実provider acceptance successを併記する。
 
@@ -62,7 +62,7 @@ production fixed MCP launcher、phase manifest、DB role、全required callはfo
 
 acceptance containerはread-only rootfs、cap-drop ALL、no-new-privileges、private tmpfs、pids limit、provider outbound用の通常bridge networkだけを持つ。credential volume以外のhost mountとproduction networkを禁止する。matrix全体のdeadlineは30分、各phaseは120秒とし、`--runs 3` の最大12 invocationを直列実行する。
 
-raw stdout/stderrはdriver内でversioned parserへ渡すだけで出力しない。top-level failureはallowlist済みcodeへ変換し、safe stdout protocolだけへ出力する。harnessは厳格一致したtyped failure 1行だけをoperator stderrへ転記し、JVM stderr noiseとraw outputは転記しない。credential path/content/digest、prompt、provider response、exception messageは表示しない。phase上限120秒に対しouter guardは40分の余裕を持ち、終了時はper-run config/homeとcall recordを削除する。
+raw stdout/stderrはdriver内でversioned parserへ渡すだけで出力しない。top-level failureはallowlist済みcodeへ変換し、safe stdout protocolだけへ出力する。harnessはadapter versionを固定値照合せず安全な文字集合・長さで検証し、typed failureだけをoperator stderrへ転記する。失敗時は0700のlocal harness artifactを保持してpathを表示し、成功時は削除する。credential path/content/digest、prompt、provider response、exception messageは表示しない。phase上限120秒に対しouter guardは40分の余裕を持つ。
 
 ### 6. 差分hard stopを機械的に守る
 

@@ -15,4 +15,4 @@
 - [x] 3.3 Validate OpenSpec and run targeted Kotlin, script contract, safe-output, and exact-image offline tests.
 - [x] 3.4 Check that the implementation code/test/script/docs diff excludes pre-implementation OpenSpec artifacts and remains at or below the 1,100-line hard stop; STOP and stage out work if it exceeds the limit.
 - [ ] 3.5 Build the final immutable image and use one qualification invocation to run foundation once plus the four-phase real-provider matrix three consecutive times, recording only the single safe digest-bound result.
-- [ ] 3.6 Run final `make test`, `make detekt`, and `make build` at one exact HEAD.
+- [x] 3.6 Run final `make test`, `make detekt`, and `make build` at one exact HEAD.

@@ -9,7 +9,7 @@ The qualification process MUST execute Claude Code 2.1.199 and Codex 0.142.5 fro
 
 #### Scenario: Provider contract is incompatible
 - **WHEN** authentication, process exit, output schema, configured model, supported observed model, semantic marker, timeout, or cleanup validation fails for any phase
-- **THEN** the canary fails closed with a typed safe reason and the image is not provider-qualified
+- **THEN** the canary preserves that primary typed reason, reports cleanup independently as `COMPLETED` or `FAILED`, and the image is not provider-qualified
 
 #### Scenario: Codex omits observed model identity
 - **WHEN** pinned Codex returns its supported complete JSONL contract without a model field
@@ -24,7 +24,7 @@ The canary MUST render `PRE_FILTER` and `REFLECTION` with an empty canonical too
 
 #### Scenario: MCP phase resolves a canonical tool
 - **WHEN** the canary executes `PROPOSER` or `FALSIFIER`
-- **THEN** Claude Proposer invokes `get_account_status` and Codex Falsifier invokes auto-approved `submit_falsification` at least once, and the fixture records each phase and canonical tool name independently from the fixed response marker without receiving production DB or market data
+- **THEN** Claude Proposer invokes `submit_decision` and Codex Falsifier invokes auto-approved `submit_falsification` at least once with production-equivalent tool annotations, and the fixture records each phase and canonical tool name independently from the fixed response marker without receiving production DB or market data
 
 #### Scenario: Tool policy or fixture call drifts
 - **WHEN** enabled tools differ from the phase canonical policy, an unknown tool is requested, the required phase/tool call record is absent, or the response marker differs

@@ -23,6 +23,9 @@ private class LlmProviderFailureMarker(
     }
 }
 
+/** suppressed failure が provider 分類用の非cleanup markerか判定する。 */
+internal fun Throwable.isLlmProviderFailureMarker(): Boolean = this is LlmProviderFailureMarker
+
 /**
  * Codex の場合だけ、元の例外と cleanup failure を維持したまま provider 分類を付ける。
  */

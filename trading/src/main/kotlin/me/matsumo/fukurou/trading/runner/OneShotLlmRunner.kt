@@ -2107,7 +2107,7 @@ private class OneShotLlmRequestFactory(
                 manifestId = capability.id,
                 manifestPath = capability.path,
                 terminalEvidenceCaptureEnabled = capability.terminalEvidenceCaptureEnabled,
-                autoApprovedTools = autoApprovedTools(provider, allowedTools),
+                autoApprovedTools = productionAutoApprovedTools(provider, allowedTools),
             )
         } catch (throwable: Throwable) {
             runCatching { Files.deleteIfExists(capability.path) }
@@ -2203,16 +2203,15 @@ private class OneShotLlmRequestFactory(
             LlmInvocationPhase.EVALUATION_REPORT -> emptyList()
         }
     }
+}
 
-    private fun autoApprovedTools(provider: LlmProvider, allowedTools: List<String>): List<String> {
-        if (provider != LlmProvider.CODEX) {
-            return emptyList()
-        }
+/** production と canary が共有する Codex MCP tool 承認決定。 */
+internal fun productionAutoApprovedTools(provider: LlmProvider, allowedTools: List<String>): List<String> {
+    if (provider != LlmProvider.CODEX) return emptyList()
 
-        return shortMcpToolNames(allowedTools)
-            .filter { toolName -> toolName in CODEX_AUTO_APPROVED_WRITE_TOOL_NAMES }
-            .distinct()
-    }
+    return shortMcpToolNames(allowedTools)
+        .filter(CODEX_AUTO_APPROVED_WRITE_TOOL_NAMES::contains)
+        .distinct()
 }
 
 /**

@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.runner
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.invoker.CLAUDE_OUTPUT_ADAPTER_VERSION
 import me.matsumo.fukurou.trading.invoker.CODEX_OUTPUT_ADAPTER_VERSION
+import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupException
 import me.matsumo.fukurou.trading.invoker.LlmConfiguredModelIdentity
 import me.matsumo.fukurou.trading.invoker.LlmConfiguredModelSource
 import me.matsumo.fukurou.trading.invoker.LlmEffort
@@ -18,6 +19,7 @@ import me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory
 import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
+import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.Test
@@ -50,7 +52,11 @@ class CliAcceptanceCanaryTest {
             assertEquals(McpToolContractCatalog.toolsFor(request.phase), request.allowedTools.map(::shortTool).toSet())
             assertEquals(request.phase in CANARY_MCP_PHASES, request.mcpServer != null)
             assertEquals(request.phase in CANARY_MCP_PHASES, CLI_CANARY_RECORD_PATH_ENV in request.environment)
+            request.mcpServer?.let { server -> assertEquals(Path.of("/tmp"), server.manifestPath.parent) }
         }
+        val proposer = invoker.requests.single { it.phase == LlmInvocationPhase.PROPOSER }
+        assertEquals(emptyList(), proposer.mcpServer?.autoApprovedTools)
+        assertTrue(proposer.prompt.contains("submit_decision"))
         val falsifier = invoker.requests.single { it.phase == LlmInvocationPhase.FALSIFIER }
         assertEquals(LlmEffort.LOW, falsifier.effort)
         assertEquals(listOf("submit_falsification"), falsifier.mcpServer?.autoApprovedTools)
@@ -104,7 +110,53 @@ class CliAcceptanceCanaryTest {
 
         val failure = canary(invoker).run(1).exceptionOrNull() as CliAcceptanceFailure
         assertEquals(CliAcceptanceFailureCode.AUTHENTICATION, failure.code)
+        assertEquals(CliAcceptanceCleanupStatus.COMPLETED, failure.cleanupStatus)
         assertFalse(failure.safeMessage().contains("SOURCE_MISSING"))
+    }
+
+    @Test
+    fun `semantic failure remains primary when cleanup also fails`() = runBlocking {
+        val invoker = RecordingCanaryInvoker { request ->
+            successfulResult(request).copy(
+                providerFailure = LlmProviderFailure(
+                    LlmProviderFailureCategory.AUTHENTICATION,
+                    "AUTH_SECRET",
+                    adapter(request),
+                ),
+                cleanupFailure = IllegalStateException("cleanup/secret"),
+            )
+        }
+
+        val failure = canary(invoker).run(1).exceptionOrNull() as CliAcceptanceFailure
+        assertEquals(CliAcceptanceFailureCode.AUTHENTICATION, failure.code)
+        assertEquals(CliAcceptanceCleanupStatus.FAILED, failure.cleanupStatus)
+        assertTrue(failure.safeMessage().endsWith("cleanup=FAILED"))
+        assertFalse(failure.safeMessage().contains("secret", ignoreCase = true))
+    }
+
+    @Test
+    fun `render cleanup failure preserves suppressed provider reason`() = runBlocking {
+        val primary = LlmProviderContractException(
+            LlmProviderFailure(LlmProviderFailureCategory.AUTHENTICATION, "secret", CLAUDE_OUTPUT_ADAPTER_VERSION),
+        )
+        val cleanup = LlmArtifactCleanupException(IllegalStateException("cleanup"))
+        cleanup.addSuppressed(primary)
+        val failure = canary(object : LlmInvoker {
+            override suspend fun invoke(request: LlmInvocationRequest) = Result.failure<LlmInvocationResult>(cleanup)
+        }).run(1).exceptionOrNull() as CliAcceptanceFailure
+
+        assertEquals(CliAcceptanceFailureCode.AUTHENTICATION, failure.code)
+        assertEquals(CliAcceptanceCleanupStatus.FAILED, failure.cleanupStatus)
+    }
+
+    @Test
+    fun `Codex classification marker is not cleanup failure`() = runBlocking {
+        val classified = IllegalStateException("secret").classifyLlmFailure(LlmProvider.CODEX)
+        val failure = canary(object : LlmInvoker {
+            override suspend fun invoke(request: LlmInvocationRequest) = Result.failure<LlmInvocationResult>(classified)
+        }).run(1).exceptionOrNull() as CliAcceptanceFailure
+
+        assertEquals(CliAcceptanceCleanupStatus.COMPLETED, failure.cleanupStatus)
     }
 
     @Test
@@ -143,6 +195,9 @@ class CliAcceptanceCanaryTest {
         failures.forEach { (expected, resultFactory) ->
             val failure = canary(RecordingCanaryInvoker(resultFactory)).run(1).exceptionOrNull()
             assertEquals(expected, (failure as CliAcceptanceFailure).code)
+            if (expected == CliAcceptanceFailureCode.CLEANUP) {
+                assertEquals(CliAcceptanceCleanupStatus.FAILED, failure.cleanupStatus)
+            }
             assertFalse(failure.safeMessage().contains("secret"))
         }
     }

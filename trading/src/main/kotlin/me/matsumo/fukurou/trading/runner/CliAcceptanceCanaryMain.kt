@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.invoker.CLAUDE_OUTPUT_ADAPTER_VERSION
 import me.matsumo.fukurou.trading.invoker.CODEX_OUTPUT_ADAPTER_VERSION
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.DefaultLlmOutputParser
+import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupException
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.LlmConfiguredModelSource
 import me.matsumo.fukurou.trading.invoker.LlmEffort
@@ -14,6 +15,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
+import me.matsumo.fukurou.trading.invoker.LlmProcessStartedMarker
 import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.LlmProviderContractException
 import me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory
@@ -21,6 +23,7 @@ import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
+import me.matsumo.fukurou.trading.invoker.isLlmProviderFailureMarker
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -44,15 +47,23 @@ internal enum class CliAcceptanceFailureCode {
     IDENTITY,
 }
 
+/** provider/process failure と独立した artifact cleanup 結果。 */
+internal enum class CliAcceptanceCleanupStatus {
+    COMPLETED,
+    FAILED,
+}
+
 /** raw provider output や例外 message を保持しない acceptance failure。 */
 internal class CliAcceptanceFailure(
     val code: CliAcceptanceFailureCode,
     val phase: LlmInvocationPhase,
     private val iteration: Int,
     private val adapter: String,
+    val cleanupStatus: CliAcceptanceCleanupStatus,
 ) : IllegalStateException("CLI acceptance failed closed.") {
     /** allowlist field だけの operator 向け結果。 */
-    fun safeMessage() = "CLI_ACCEPTANCE_V1 FAIL code=$code phase=$phase iteration=$iteration adapter=$adapter"
+    fun safeMessage() =
+        "CLI_ACCEPTANCE_V1 FAIL code=$code phase=$phase iteration=$iteration adapter=$adapter cleanup=$cleanupStatus"
 }
 
 /** production invocation components を通して pinned CLI phase matrix を検証する driver。 */
@@ -74,24 +85,33 @@ internal class CliAcceptanceCanary(
                     return Result.failure(failure(CliAcceptanceFailureCode.INVOCATION, phase, iteration))
                 }
                 val result = invoker.invoke(invocation.request).getOrElse { throwable ->
-                    val cleanupFailed = cleanupRecord(invocation.recordPath)
-                    val code = if (cleanupFailed) {
-                        CliAcceptanceFailureCode.CLEANUP
-                    } else {
-                        (throwable as? LlmProviderContractException)
-                            ?.providerFailure
-                            ?.category
-                            ?.toCanaryCode()
-                            ?: CliAcceptanceFailureCode.INVOCATION
-                    }
-                    return Result.failure(failure(code, phase, iteration))
+                    val primary = throwable.suppressed
+                        .filterNot { failure -> failure === LlmProcessStartedMarker }
+                        .filterIsInstance<LlmProviderContractException>()
+                        .firstOrNull() ?: throwable
+                    val code = (primary as? LlmProviderContractException)
+                        ?.providerFailure
+                        ?.category
+                        ?.toCanaryCode()
+                        ?: if (throwable is LlmArtifactCleanupException) {
+                            CliAcceptanceFailureCode.CLEANUP
+                        } else {
+                            CliAcceptanceFailureCode.INVOCATION
+                        }
+                    val cleanupFailed = throwable is LlmArtifactCleanupException ||
+                        throwable.suppressed.any { failure ->
+                            failure !== LlmProcessStartedMarker && !failure.isLlmProviderFailureMarker()
+                        } ||
+                        cleanupRecord(invocation.recordPath)
+                    return Result.failure(failure(code, phase, iteration, cleanupFailed))
                 }
-                val validationFailure = validate(result, phase, iteration, invocation.recordPath)
-                val recordCleanupFailed = cleanupRecord(invocation.recordPath)
-                if (recordCleanupFailed) {
-                    return Result.failure(failure(CliAcceptanceFailureCode.CLEANUP, phase, iteration))
+                val code = validationFailureCode(result, phase, invocation.recordPath)
+                val cleanupFailed = result.cleanupFailure != null || cleanupRecord(invocation.recordPath)
+                if (code != null || cleanupFailed) {
+                    return Result.failure(
+                        failure(code ?: CliAcceptanceFailureCode.CLEANUP, phase, iteration, cleanupFailed),
+                    )
                 }
-                validationFailure?.let { failure -> return Result.failure(failure) }
             }
         }
 
@@ -109,8 +129,8 @@ internal class CliAcceptanceCanary(
                 name = CANARY_MCP_SERVER_NAME,
                 command = fixtureCommand,
                 manifestId = invocationId,
-                manifestPath = Path.of(System.getProperty("java.io.tmpdir"), "$invocationId.manifest"),
-                autoApprovedTools = if (provider == LlmProvider.CODEX) listOf(CODEX_FALSIFIER_WRITE_TOOL) else emptyList(),
+                manifestPath = workingDirectory.resolve("$invocationId.manifest"),
+                autoApprovedTools = productionAutoApprovedTools(provider, enabledTools),
             )
         } else {
             null
@@ -134,43 +154,43 @@ internal class CliAcceptanceCanary(
         return CanaryInvocation(request, recordPath)
     }
 
-    @Suppress("CyclomaticComplexMethod", "LongMethod")
-    private fun validate(
+    private fun validationFailureCode(
         result: LlmInvocationResult,
         phase: CanaryPhase,
-        iteration: Int,
         recordPath: Path?,
-    ): CliAcceptanceFailure? {
-        result.providerFailure?.let { providerFailure ->
-            return failure(providerFailure.category.toCanaryCode(), phase, iteration)
-        }
-        if (result.processResult.status == ProcessRunStatus.TIMED_OUT) {
-            return failure(CliAcceptanceFailureCode.TIMEOUT, phase, iteration)
-        }
-        if (result.processResult.exitCode != 0) {
-            return failure(CliAcceptanceFailureCode.PROCESS_EXIT, phase, iteration)
-        }
-        if (result.cleanupFailure != null) {
-            return failure(CliAcceptanceFailureCode.CLEANUP, phase, iteration)
-        }
+    ): CliAcceptanceFailureCode? = processFailureCode(result)
+        ?: modelFailureCode(result, phase)
+        ?: semanticFailureCode(result, phase, recordPath)
+
+    private fun processFailureCode(result: LlmInvocationResult): CliAcceptanceFailureCode? {
+        result.providerFailure?.let { return it.category.toCanaryCode() }
+        if (result.processResult.status == ProcessRunStatus.TIMED_OUT) return CliAcceptanceFailureCode.TIMEOUT
+        if (result.processResult.exitCode != 0) return CliAcceptanceFailureCode.PROCESS_EXIT
+
+        return null
+    }
+
+    private fun modelFailureCode(result: LlmInvocationResult, phase: CanaryPhase): CliAcceptanceFailureCode? {
         val configuredModelMatches = result.configuredModelIdentity.source == LlmConfiguredModelSource.REQUEST &&
             result.configuredModelIdentity.name == phase.model
-        if (!configuredModelMatches) {
-            return failure(CliAcceptanceFailureCode.CONFIGURED_MODEL, phase, iteration)
-        }
+        if (!configuredModelMatches) return CliAcceptanceFailureCode.CONFIGURED_MODEL
+
         val observedModelMatches = if (phase.provider == LlmProvider.CLAUDE) {
             result.observedModelIdentity?.name == phase.model
         } else {
             result.observedModelIdentity == null
         }
-        if (!observedModelMatches) {
-            return failure(CliAcceptanceFailureCode.OBSERVED_MODEL, phase, iteration)
-        }
-        if (result.responseText.trim() != RESPONSE_MARKER) {
-            return failure(CliAcceptanceFailureCode.PROBE_MARKER, phase, iteration)
-        }
+        return if (observedModelMatches) null else CliAcceptanceFailureCode.OBSERVED_MODEL
+    }
+
+    private fun semanticFailureCode(
+        result: LlmInvocationResult,
+        phase: CanaryPhase,
+        recordPath: Path?,
+    ): CliAcceptanceFailureCode? {
+        if (result.responseText.trim() != RESPONSE_MARKER) return CliAcceptanceFailureCode.PROBE_MARKER
         if (recordPath != null && !hasCanonicalProbeCall(recordPath, phase.phase)) {
-            return failure(CliAcceptanceFailureCode.TOOL_CALL, phase, iteration)
+            return CliAcceptanceFailureCode.TOOL_CALL
         }
 
         return null
@@ -188,11 +208,13 @@ internal class CliAcceptanceCanary(
         code: CliAcceptanceFailureCode,
         phase: CanaryPhase,
         iteration: Int,
+        cleanupFailed: Boolean = false,
     ) = CliAcceptanceFailure(
         code = code,
         phase = phase.phase,
         iteration = iteration,
         adapter = phase.adapter,
+        cleanupStatus = if (cleanupFailed) CliAcceptanceCleanupStatus.FAILED else CliAcceptanceCleanupStatus.COMPLETED,
     )
 }
 
@@ -206,6 +228,7 @@ fun main(args: Array<String>) = runBlocking {
                 phase = LlmInvocationPhase.PRE_FILTER,
                 iteration = 0,
                 adapter = CLAUDE_OUTPUT_ADAPTER_VERSION,
+                cleanupStatus = CliAcceptanceCleanupStatus.COMPLETED,
             ).safeMessage(),
         )
         exitProcess(2)
@@ -233,6 +256,7 @@ fun main(args: Array<String>) = runBlocking {
             phase = LlmInvocationPhase.PRE_FILTER,
             iteration = 0,
             adapter = CLAUDE_OUTPUT_ADAPTER_VERSION,
+            cleanupStatus = CliAcceptanceCleanupStatus.COMPLETED,
         )
     }
     if (failure == null) {
@@ -253,6 +277,7 @@ private data class CanaryPhase(
     val prompt: String,
 )
 
+/** renderer request とfixture call recordを同じ invocation に束縛する。 */
 private data class CanaryInvocation(val request: LlmInvocationRequest, val recordPath: Path?)
 
 /** production child process と同じ curated allowlist だけを canary CLI へ渡す。 */
@@ -260,7 +285,7 @@ internal fun cliCanaryEnvironment(environment: Map<String, String>) =
     environment.filterKeys(CHILD_ENV_ALLOWLIST::contains)
 
 internal fun cliCanaryProbeTool(phase: LlmInvocationPhase): String = when (phase) {
-    LlmInvocationPhase.PROPOSER -> CANARY_READ_PROBE_TOOL
+    LlmInvocationPhase.PROPOSER -> PROPOSER_WRITE_TOOL
     LlmInvocationPhase.FALSIFIER -> CODEX_FALSIFIER_WRITE_TOOL
     else -> error("CLI canary probe tool is only defined for MCP phases.")
 }
@@ -277,6 +302,7 @@ private fun hasAppIdentity(): Boolean {
     val uid = fields.firstOrNull { it.startsWith("Uid:") }?.split(Regex("\\s+"))?.getOrNull(2)
     val gid = fields.firstOrNull { it.startsWith("Gid:") }?.split(Regex("\\s+"))?.getOrNull(2)
 
+    // Dockerfile の runtime APP_UID / LLM_SHARED_GID と同じ identity を要求する。
     return uid == "10001" && gid == "10004"
 }
 
@@ -307,7 +333,7 @@ private const val PINNED_CLAUDE_COMMAND = "/usr/local/bin/claude"
 private const val PINNED_CODEX_COMMAND = "/usr/local/bin/codex"
 private const val FIXTURE_MCP_COMMAND = "/usr/local/libexec/fukurou-cli-canary-mcp.mjs"
 private const val RESPONSE_MARKER = "FUKUROU_CLI_CANARY_OK"
-private const val CANARY_READ_PROBE_TOOL = "get_account_status"
+private const val PROPOSER_WRITE_TOOL = "submit_decision"
 private const val CODEX_FALSIFIER_WRITE_TOOL = "submit_falsification"
 private val PHASE_TIMEOUT = Duration.ofSeconds(120)
 private val CANARY_PHASE_MATRIX = listOf(
@@ -325,7 +351,7 @@ private val CANARY_PHASE_MATRIX = listOf(
         CLAUDE_CANARY_MODEL,
         LlmEffort.DEFAULT,
         CLAUDE_OUTPUT_ADAPTER_VERSION,
-        "Call $CANARY_READ_PROBE_TOOL at least once, then return exactly $RESPONSE_MARKER.",
+        "Call $PROPOSER_WRITE_TOOL at least once, then return exactly $RESPONSE_MARKER.",
     ),
     CanaryPhase(
         LlmInvocationPhase.FALSIFIER,
