@@ -13,6 +13,6 @@
 
 ## 3. Validation and documentation
 
-- [ ] 3.1 `make test`、`make detekt`、`make build` を最終 HEAD で直列実行する
-- [ ] 3.2 OpenSpec strict validation と docs/README の影響検索を実行する
+- [x] 3.1 `make test`、`make detekt`、`make build` を最終 HEAD で直列実行する
+- [x] 3.2 OpenSpec strict validation と docs/README の影響検索を実行する
 - [ ] 3.3 deploy quality workflow で exact target の clean-green を確認する
