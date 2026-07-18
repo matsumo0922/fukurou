@@ -13,6 +13,9 @@ const phase = manifestId.includes("-proposer-") ? "PROPOSER" : manifestId.includ
 const tools = phase === "PROPOSER" ? [...commonTools, "submit_decision"]
   : phase === "FALSIFIER" ? [...commonTools, "preview_order", "submit_falsification"] : [];
 const writeTools = new Set(["submit_decision", "submit_falsification"]);
+const openWorldTools = new Set([
+  "calc_indicator", "get_candles", "get_orderbook", "get_symbol_rules", "get_ticker", "get_trades",
+]);
 if (tools.length === 0) process.exit(2);
 const recordPath = process.env.FUKUROU_CLI_CANARY_RECORD_PATH;
 if (recordPath !== `/tmp/${manifestId}.calls`) process.exit(2);
@@ -20,7 +23,7 @@ const toolDefinitions = tools.map((name) => ({
   name,
   description: "Data-free CLI compatibility probe.",
   inputSchema: { type: "object", additionalProperties: true },
-  annotations: { readOnlyHint: !writeTools.has(name), openWorldHint: false },
+  annotations: { readOnlyHint: !writeTools.has(name), openWorldHint: openWorldTools.has(name) },
 }));
 
 function respond(id, result) {

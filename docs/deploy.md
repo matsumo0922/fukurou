@@ -82,6 +82,8 @@ scripts/mcp-credential-isolation-check --qualification --runs 3 --reuse-image "$
 scripts/mcp-credential-isolation-check --cli-acceptance --runs 1 --reuse-image "$IMAGE"
 ```
 
+foundation harness を変更した image の deploy 前には、`sudo install -m 0555 /srv/fukurou/repo/scripts/mcp-credential-isolation-check /usr/local/libexec/fukurou-mcp-credential-isolation-check` を再実行し、signed bundle の harness hash と installed copy を一致させる。一致しない deploy は `INSTALLED_FOUNDATION_HARNESS_HASH_MISMATCH` で停止する。
+
 結果には digest と allowlist 済み status だけを残し、prompt、credential、provider stdout/stderr は含めない。production qualification は harness override env を拒否し、明示的な selftest mode だけ fake Docker / foundation harness を許可する。
 acceptance container は dedicated auth を read-only mount し、production auth、DB、vault、Docker socket、
 production network を持たない。deploy executor はこの acceptance を required hook として呼び出さないため、
