@@ -7,10 +7,10 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.PreparedStatement
 import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
-import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 private const val MONITORING_STATEMENT_TIMEOUT_SECONDS = 2
@@ -47,7 +47,10 @@ internal data class MonitoringGapAggregate(
 /** monitoring DB read の狭い境界。 */
 internal interface MonitoringRepository {
     suspend fun latestDaemonTerminal(): Result<MonitoringDaemonTerminal?>
-    suspend fun providerOutcomes(fromInclusive: Instant, toExclusive: Instant): Result<List<MonitoringProviderOutcomeResponse>>
+    suspend fun providerOutcomes(
+        fromInclusive: Instant,
+        toExclusive: Instant,
+    ): Result<List<MonitoringProviderOutcomeResponse>>
     suspend fun unresolvedGaps(): Result<MonitoringGapAggregate>
 }
 
@@ -216,32 +219,11 @@ internal fun aggregateProviderOutcomes(payloads: List<String>): List<MonitoringP
     val aggregates = linkedMapOf<String, IntArray>()
 
     payloads.forEach { payload ->
-        val root = payload.toJsonObjectOrMalformed()
-        val phase = root.requiredString("phase")
-        val details = root["details"]?.let { element ->
-            runCatching { element.jsonObject }.getOrElse { throw MonitoringMalformedEventException() }
-        } ?: throw MonitoringMalformedEventException()
-        val provider = details.optionalString("provider")
-
-        if (provider == null && phase !in KnownProviderPhases) return@forEach
-        if (provider !in KnownProviders) throw MonitoringMalformedEventException()
-        val knownProvider = requireNotNull(provider)
-
-        val status = details.requiredString("status")
-        if (status !in KnownProviderStatuses) throw MonitoringMalformedEventException()
-        val exitCode = details.requiredString("exitCode")
-        val parsedExitCode = if (exitCode == "null") null else exitCode.toIntOrNull()
-            ?: throw MonitoringMalformedEventException()
-        val authFailure = when (val raw = details.optionalString("authFailureSuspected")) {
-            null, "false" -> false
-            "true" -> true
-            else -> throw MonitoringMalformedEventException()
-        }
-        val failed = status != "EXITED" || parsedExitCode != 0
-        val counts = aggregates.getOrPut(knownProvider) { IntArray(3) }
+        val outcome = payload.toProviderOutcomeOrNull() ?: return@forEach
+        val counts = aggregates.getOrPut(outcome.provider) { IntArray(3) }
         counts[0] += 1
-        if (failed) counts[1] += 1
-        if (authFailure) counts[2] += 1
+        if (outcome.failed) counts[1] += 1
+        if (outcome.authenticationFailed) counts[2] += 1
     }
 
     return aggregates.entries.sortedBy(Map.Entry<String, IntArray>::key).map { (provider, counts) ->
@@ -251,6 +233,47 @@ internal fun aggregateProviderOutcomes(payloads: List<String>): List<MonitoringP
             failureCount = counts[1],
             authenticationFailureCount = counts[2],
         )
+    }
+}
+
+private data class ProviderOutcome(
+    val provider: String,
+    val failed: Boolean,
+    val authenticationFailed: Boolean,
+)
+
+private fun String.toProviderOutcomeOrNull(): ProviderOutcome? {
+    val root = toJsonObjectOrMalformed()
+    val phase = root.requiredString("phase")
+    val details = root["details"]?.let { element ->
+        runCatching { element.jsonObject }.getOrElse { throw MonitoringMalformedEventException() }
+    } ?: throw MonitoringMalformedEventException()
+    val provider = details.optionalString("provider")
+
+    if (provider == null && phase !in KnownProviderPhases) return null
+    if (provider !in KnownProviders) throw MonitoringMalformedEventException()
+    val knownProvider = requireNotNull(provider)
+    val status = details.requiredString("status")
+    if (status !in KnownProviderStatuses) throw MonitoringMalformedEventException()
+    val exitCode = details.requiredString("exitCode").toExitCodeOrMalformed()
+    val authenticationFailed = details.optionalString("authFailureSuspected").toAuthFailureOrMalformed()
+
+    return ProviderOutcome(
+        provider = knownProvider,
+        failed = status != "EXITED" || exitCode != 0,
+        authenticationFailed = authenticationFailed,
+    )
+}
+
+private fun String.toExitCodeOrMalformed(): Int? {
+    return if (this == "null") null else toIntOrNull() ?: throw MonitoringMalformedEventException()
+}
+
+private fun String?.toAuthFailureOrMalformed(): Boolean {
+    return when (this) {
+        null, "false" -> false
+        "true" -> true
+        else -> throw MonitoringMalformedEventException()
     }
 }
 

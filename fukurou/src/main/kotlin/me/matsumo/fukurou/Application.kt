@@ -182,18 +182,32 @@ fun Application.module(
         ),
         runtime = runtime,
     )
-    val monitoringService = opsMonitoringService ?: DefaultMonitoringSnapshotService(
+    val monitoringService = opsMonitoringService ?: createMonitoringService(
         revision = revision,
-        daemonConfig = runtime.tradingConfig.daemon,
-        tickStatusProvider = runtime.daemonTickStatus,
-        reconcilerStatusProvider = runtime.reconcilerStatus,
-        repository = databaseResources.database?.let(::ExposedMonitoringRepository),
-        backupProjectionReader = BackupMonitoringProjectionReader(backupMonitoringProjectionPath),
-        clock = runtime.clock,
+        runtime = runtime,
+        databaseResources = databaseResources,
+        backupMonitoringProjectionPath = backupMonitoringProjectionPath,
     )
 
     installApplicationPlugins(webRoot)
 
+    configureApplicationRoutes(routeResources, reconcilerStatus, revision, monitoringService)
+
+    val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime)
+    subscribeApplicationShutdown(
+        databaseResources = databaseResources,
+        opsResources = routeResources.ops,
+        backgroundWorkers = backgroundWorkers,
+        shutdownResultObserver = shutdownResultObserver,
+    )
+}
+
+private fun Application.configureApplicationRoutes(
+    routeResources: ApplicationRouteResources,
+    reconcilerStatus: MutableReconcilerStatus,
+    revision: String,
+    monitoringService: MonitoringSnapshotService,
+) {
     routing {
         healthRoutes(routeResources.readinessProbe, reconcilerStatus)
         revisionRoute(revision)
@@ -202,13 +216,22 @@ fun Application.module(
         monitoringRoute(monitoringService)
         apiDocumentationRoutes()
     }
+}
 
-    val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime)
-    subscribeApplicationShutdown(
-        databaseResources = databaseResources,
-        opsResources = routeResources.ops,
-        backgroundWorkers = backgroundWorkers,
-        shutdownResultObserver = shutdownResultObserver,
+private fun createMonitoringService(
+    revision: String,
+    runtime: ApplicationRuntimeResources,
+    databaseResources: ApplicationDatabaseResources,
+    backupMonitoringProjectionPath: Path,
+): MonitoringSnapshotService {
+    return DefaultMonitoringSnapshotService(
+        revision = revision,
+        daemonConfig = runtime.tradingConfig.daemon,
+        tickStatusProvider = runtime.daemonTickStatus,
+        reconcilerStatusProvider = runtime.reconcilerStatus,
+        repository = databaseResources.database?.let(::ExposedMonitoringRepository),
+        backupProjectionReader = BackupMonitoringProjectionReader(backupMonitoringProjectionPath),
+        clock = runtime.clock,
     )
 }
 
@@ -899,16 +922,7 @@ private fun startApplicationBackgroundWorkers(
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
             latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         ),
-        llmDaemonWorker = startLlmDaemonSchedulerWorker(
-            dataSource = dataSource,
-            database = database,
-            tradingConfig = runtime.tradingConfig,
-            runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
-            clock = runtime.clock,
-            onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
-            latestMarketQuoteStore = runtime.latestMarketQuoteStore,
-            tickStatus = runtime.daemonTickStatus,
-        ),
+        llmDaemonWorker = startApplicationLlmDaemonWorker(dataSource, database, runtime),
         llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker(database, runtime.clock),
         obsidianWriterWorker = startObsidianWriterWorker(
             database = database,
@@ -922,6 +936,23 @@ private fun startApplicationBackgroundWorkers(
             clock = runtime.clock,
             bootstrap = sharedPersistenceBootstrap,
         ),
+    )
+}
+
+private fun startApplicationLlmDaemonWorker(
+    dataSource: HikariDataSource,
+    database: ExposedDatabase,
+    runtime: ApplicationRuntimeResources,
+): LlmDaemonSchedulerWorker? {
+    return startLlmDaemonSchedulerWorker(
+        dataSource = dataSource,
+        database = database,
+        tradingConfig = runtime.tradingConfig,
+        runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
+        clock = runtime.clock,
+        onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
+        latestMarketQuoteStore = runtime.latestMarketQuoteStore,
+        tickStatus = runtime.daemonTickStatus,
     )
 }
 

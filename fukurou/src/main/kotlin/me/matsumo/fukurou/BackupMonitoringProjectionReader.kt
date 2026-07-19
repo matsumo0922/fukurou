@@ -142,9 +142,10 @@ private fun BackupProjectionJob.validate(publishedAt: Instant) {
         if (successAt.isAfter(publishedAt)) malformedProjection()
     }
 
-    if (lifecycle?.state == MonitoringServiceState.TERMINAL &&
-        lifecycle.terminalSemantic == MonitoringServiceTerminalSemantic.SUCCESS
-    ) {
+    val lifecycleTerminal = lifecycle?.state == MonitoringServiceState.TERMINAL
+    val terminalSuccess = lifecycle?.terminalSemantic == MonitoringServiceTerminalSemantic.SUCCESS
+    val lifecycleSucceeded = lifecycleTerminal && terminalSuccess
+    if (lifecycleSucceeded) {
         if (attempt == null || attempt.resultCode != "SUCCESS") malformedProjection()
         if (attempt.invocationId != lifecycle.invocationId || attempt.bootId != lifecycle.bootId) malformedProjection()
     }
@@ -161,7 +162,9 @@ private fun BackupProjectionService.validate(publishedAt: Instant) {
         }
         MonitoringServiceState.TERMINAL -> {
             val terminal = terminalAt?.parseProjectionInstant() ?: malformedProjection()
-            if (terminalSemantic == null || terminal.isBefore(started) || terminal.isAfter(publishedAt)) malformedProjection()
+            if (terminalSemantic == null) malformedProjection()
+            if (terminal.isBefore(started)) malformedProjection()
+            if (terminal.isAfter(publishedAt)) malformedProjection()
         }
     }
 }
