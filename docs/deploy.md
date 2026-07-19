@@ -624,7 +624,7 @@ scripts/prod-curl "/ops/monitoring"
 
 `backupRestore` componentが`UNKNOWN / BACKUP_PROJECTION_NOT_ACTIVATED`の場合、application imageは固定のempty host directoryをread-only mountして稼働する。root operatorがreview済みinstallerを実行し、manual backupまたはrestore drillをsystemd経由で開始するとprojectionが有効になる。root-only statusをapplication containerへmountして回避しない。
 
-projectionだけをrollbackする場合は両timerと実行中serviceを停止し、`/srv/fukurou/monitoring-public/backup-restore.json`だけを同じpublic directory内のquarantine名へ移す。root-only `/srv/fukurou/monitoring/backup-status.json`、repository、snapshotを削除または編集しない。endpointが`UNKNOWN / BACKUP_PROJECTION_NOT_ACTIVATED`を返すことを確認し、review済みpublisherへ戻した後にmanual backup / restore gateを再実行する。
+projectionだけをrollbackする場合は両timerと実行中serviceを停止し、`/srv/fukurou/monitoring-public/backup-restore.json`だけをpublic directory外のroot-onlyな`/srv/fukurou/monitoring/backup-restore.projection-quarantine.json`へ移す。root-only `/srv/fukurou/monitoring/backup-status.json`、repository、snapshotを削除または編集しない。endpointが`UNKNOWN / BACKUP_PROJECTION_NOT_ACTIVATED`を返すことを確認し、review済みpublisherへ戻した後にmanual backup / restore gateを再実行する。
 
 - `BACKUP_BUSY` / `DEPLOY_IN_PROGRESS`: 競合jobまたはdeploy終了後にmanual再実行する。start-time probe後に始まるdeploy raceまで相互排他とはみなさない。
 - `CAPACITY_FLOOR_NOT_MET`: DB sizeの測定失敗を含む。PostgreSQL connectivityとDB size、free spaceを再測定し、原因を解消するまで再実行しない。

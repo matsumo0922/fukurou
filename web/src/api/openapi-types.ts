@@ -2313,6 +2313,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ops/monitoring": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 運用監視 snapshot を取得する
+         * @description daemon、LLM provider、reconciler、未解決 gap、backup/restore の allowlist 済み snapshot を返します。source の一部が利用できない場合も HTTP 200 と component-local UNKNOWN を返し、readiness や取引判断は変更しません。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description schemaVersion 1 の redacted monitoring snapshot です。 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OpsMonitoringResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3396,6 +3435,91 @@ export interface components {
         /** OpsAuditResponse */
         OpsAuditResponse: {
             events: components["schemas"]["OpsAuditEventResponse"][];
+        };
+        /** MonitoringDaemonResponse */
+        MonitoringDaemonResponse: {
+            /** @enum {string} */
+            state: "AVAILABLE" | "UNKNOWN";
+            /** @enum {string|null} */
+            reason?: "DAEMON_DATABASE_UNAVAILABLE" | "DAEMON_TICK_STATUS_UNAVAILABLE" | "DAEMON_QUERY_FAILED" | "DAEMON_EVENT_MALFORMED" | "PROVIDER_DATABASE_UNAVAILABLE" | "PROVIDER_QUERY_FAILED" | "PROVIDER_QUERY_BOUND_EXCEEDED" | "PROVIDER_EVENT_MALFORMED" | "RECONCILER_STATUS_UNAVAILABLE" | "GAP_DATABASE_UNAVAILABLE" | "GAP_QUERY_FAILED" | "GAP_QUERY_BOUND_EXCEEDED" | "GAP_EVENT_MALFORMED" | "BACKUP_PROJECTION_NOT_ACTIVATED" | "BACKUP_PROJECTION_NOT_REGULAR" | "BACKUP_PROJECTION_OVERSIZED" | "BACKUP_PROJECTION_MALFORMED" | "BACKUP_PROJECTION_STALE" | "BACKUP_PROJECTION_STALE_RUNNING" | null;
+            enabled: boolean;
+            cadenceSeconds: number;
+            lastTickAt?: string | null;
+            lastTickOutcome?: string | null;
+            lastInvocationTerminalAt?: string | null;
+            /** @enum {string|null} */
+            lastInvocationTerminalSemantic?: "NORMAL_COMPLETION" | "NO_TRADE" | "SAFETY_DENIED" | "TIMED_OUT" | "RUNNER_FAILED" | "CALLER_CANCELLED" | "RESTART_INTERRUPTED" | "LEGACY_UNCLASSIFIED" | null;
+        };
+        /** MonitoringProviderOutcomeResponse */
+        MonitoringProviderOutcomeResponse: {
+            provider: string;
+            totalCount: number;
+            failureCount: number;
+            authenticationFailureCount: number;
+        };
+        /** MonitoringProvidersResponse */
+        MonitoringProvidersResponse: {
+            /** @enum {string} */
+            state: "AVAILABLE" | "UNKNOWN";
+            /** @enum {string|null} */
+            reason?: "DAEMON_DATABASE_UNAVAILABLE" | "DAEMON_TICK_STATUS_UNAVAILABLE" | "DAEMON_QUERY_FAILED" | "DAEMON_EVENT_MALFORMED" | "PROVIDER_DATABASE_UNAVAILABLE" | "PROVIDER_QUERY_FAILED" | "PROVIDER_QUERY_BOUND_EXCEEDED" | "PROVIDER_EVENT_MALFORMED" | "RECONCILER_STATUS_UNAVAILABLE" | "GAP_DATABASE_UNAVAILABLE" | "GAP_QUERY_FAILED" | "GAP_QUERY_BOUND_EXCEEDED" | "GAP_EVENT_MALFORMED" | "BACKUP_PROJECTION_NOT_ACTIVATED" | "BACKUP_PROJECTION_NOT_REGULAR" | "BACKUP_PROJECTION_OVERSIZED" | "BACKUP_PROJECTION_MALFORMED" | "BACKUP_PROJECTION_STALE" | "BACKUP_PROJECTION_STALE_RUNNING" | null;
+            windowStartedAt: string;
+            windowEndedAt: string;
+            outcomes?: components["schemas"]["MonitoringProviderOutcomeResponse"][];
+        };
+        /** MonitoringReconcilerResponse */
+        MonitoringReconcilerResponse: {
+            /** @enum {string} */
+            state: "AVAILABLE" | "UNKNOWN";
+            /** @enum {string|null} */
+            reason?: "DAEMON_DATABASE_UNAVAILABLE" | "DAEMON_TICK_STATUS_UNAVAILABLE" | "DAEMON_QUERY_FAILED" | "DAEMON_EVENT_MALFORMED" | "PROVIDER_DATABASE_UNAVAILABLE" | "PROVIDER_QUERY_FAILED" | "PROVIDER_QUERY_BOUND_EXCEEDED" | "PROVIDER_EVENT_MALFORMED" | "RECONCILER_STATUS_UNAVAILABLE" | "GAP_DATABASE_UNAVAILABLE" | "GAP_QUERY_FAILED" | "GAP_QUERY_BOUND_EXCEEDED" | "GAP_EVENT_MALFORMED" | "BACKUP_PROJECTION_NOT_ACTIVATED" | "BACKUP_PROJECTION_NOT_REGULAR" | "BACKUP_PROJECTION_OVERSIZED" | "BACKUP_PROJECTION_MALFORMED" | "BACKUP_PROJECTION_STALE" | "BACKUP_PROJECTION_STALE_RUNNING" | null;
+            lastMaintenanceAt?: string | null;
+            lastTransportActivityAt?: string | null;
+            marketDataState?: string | null;
+        };
+        /** MonitoringGapsResponse */
+        MonitoringGapsResponse: {
+            /** @enum {string} */
+            state: "AVAILABLE" | "UNKNOWN";
+            /** @enum {string|null} */
+            reason?: "DAEMON_DATABASE_UNAVAILABLE" | "DAEMON_TICK_STATUS_UNAVAILABLE" | "DAEMON_QUERY_FAILED" | "DAEMON_EVENT_MALFORMED" | "PROVIDER_DATABASE_UNAVAILABLE" | "PROVIDER_QUERY_FAILED" | "PROVIDER_QUERY_BOUND_EXCEEDED" | "PROVIDER_EVENT_MALFORMED" | "RECONCILER_STATUS_UNAVAILABLE" | "GAP_DATABASE_UNAVAILABLE" | "GAP_QUERY_FAILED" | "GAP_QUERY_BOUND_EXCEEDED" | "GAP_EVENT_MALFORMED" | "BACKUP_PROJECTION_NOT_ACTIVATED" | "BACKUP_PROJECTION_NOT_REGULAR" | "BACKUP_PROJECTION_OVERSIZED" | "BACKUP_PROJECTION_MALFORMED" | "BACKUP_PROJECTION_STALE" | "BACKUP_PROJECTION_STALE_RUNNING" | null;
+            unresolvedMarketDataCount?: number | null;
+            oldestMarketDataOpenedAt?: string | null;
+            unresolvedInfrastructureCount?: number | null;
+            oldestInfrastructureOpenedAt?: string | null;
+        };
+        /** MonitoringBackupJobResponse */
+        MonitoringBackupJobResponse: {
+            /** @enum {string|null} */
+            serviceState?: "RUNNING" | "TERMINAL" | null;
+            serviceStartedAt?: string | null;
+            serviceTerminalAt?: string | null;
+            /** @enum {string|null} */
+            serviceTerminalSemantic?: "SUCCESS" | "FAILURE" | "UNKNOWN" | null;
+            lastAttemptAt?: string | null;
+            lastAttemptResult?: string | null;
+            lastSuccessAt?: string | null;
+        };
+        /** MonitoringBackupRestoreResponse */
+        MonitoringBackupRestoreResponse: {
+            /** @enum {string} */
+            state: "AVAILABLE" | "UNKNOWN";
+            /** @enum {string|null} */
+            reason?: "DAEMON_DATABASE_UNAVAILABLE" | "DAEMON_TICK_STATUS_UNAVAILABLE" | "DAEMON_QUERY_FAILED" | "DAEMON_EVENT_MALFORMED" | "PROVIDER_DATABASE_UNAVAILABLE" | "PROVIDER_QUERY_FAILED" | "PROVIDER_QUERY_BOUND_EXCEEDED" | "PROVIDER_EVENT_MALFORMED" | "RECONCILER_STATUS_UNAVAILABLE" | "GAP_DATABASE_UNAVAILABLE" | "GAP_QUERY_FAILED" | "GAP_QUERY_BOUND_EXCEEDED" | "GAP_EVENT_MALFORMED" | "BACKUP_PROJECTION_NOT_ACTIVATED" | "BACKUP_PROJECTION_NOT_REGULAR" | "BACKUP_PROJECTION_OVERSIZED" | "BACKUP_PROJECTION_MALFORMED" | "BACKUP_PROJECTION_STALE" | "BACKUP_PROJECTION_STALE_RUNNING" | null;
+            projectionPublishedAt?: string | null;
+            backup?: components["schemas"]["MonitoringBackupJobResponse"] | null;
+            restore?: components["schemas"]["MonitoringBackupJobResponse"] | null;
+        };
+        /** OpsMonitoringResponse */
+        OpsMonitoringResponse: {
+            schemaVersion?: number;
+            observedAt: string;
+            revision: string;
+            daemon: components["schemas"]["MonitoringDaemonResponse"];
+            providers: components["schemas"]["MonitoringProvidersResponse"];
+            reconciler: components["schemas"]["MonitoringReconcilerResponse"];
+            gaps: components["schemas"]["MonitoringGapsResponse"];
+            backupRestore: components["schemas"]["MonitoringBackupRestoreResponse"];
         };
     };
     responses: never;
