@@ -385,8 +385,16 @@ private val LLM_FORBIDDEN_ENVIRONMENT_KEYS = setOf(
     "GMO_API_KEY",
     "GMO_SECRET_KEY",
 )
+private val MCP_SENSITIVE_ENVIRONMENT_NAME_PARTS = setOf(
+    "AUTH",
+    "CREDENTIAL",
+    "KEY",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+)
 
-private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort): String {
+private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort, environment: Map<String, String>): String {
     return buildString {
         effort.renderedEffortOrNull()?.let { renderedEffort ->
             append("model_reasoning_effort = ")
@@ -404,6 +412,20 @@ private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort): String {
         append("args = ")
         append(listOf(mcpServer.manifestId).toTomlArray())
         append("\n")
+        append("required = true\n")
+
+        val forwardedEnvironmentVariables = mcpServer.forwardedEnvironmentVariables
+        require(forwardedEnvironmentVariables.all(environment::containsKey)) {
+            "Codex MCP forwarded environment variable is missing."
+        }
+        require(forwardedEnvironmentVariables.none(::isForbiddenMcpEnvironmentVariable)) {
+            "Codex MCP forwarded environment variable is forbidden."
+        }
+        if (forwardedEnvironmentVariables.isNotEmpty()) {
+            append("env_vars = ")
+            append(forwardedEnvironmentVariables.toTomlArray())
+            append("\n")
+        }
 
         mcpServer.autoApprovedTools.forEach { toolName ->
             append("[mcp_servers.")
@@ -414,6 +436,12 @@ private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort): String {
             append("approval_mode = \"approve\"\n")
         }
     }
+}
+
+private fun isForbiddenMcpEnvironmentVariable(name: String): Boolean {
+    if (name in LLM_FORBIDDEN_ENVIRONMENT_KEYS) return true
+
+    return MCP_SENSITIVE_ENVIRONMENT_NAME_PARTS.any { part -> name.contains(part, ignoreCase = true) }
 }
 
 private fun List<String>.toTomlArray(): String {
@@ -451,7 +479,7 @@ private fun writeTemporaryCodexHome(
         val configFile = directory.resolve(CODEX_CONFIG_FILE_NAME)
         Files.writeString(
             configFile,
-            mcpServer.toCodexConfigToml(effort),
+            mcpServer.toCodexConfigToml(effort, environment),
             StandardOpenOption.CREATE_NEW,
             StandardOpenOption.WRITE,
         )

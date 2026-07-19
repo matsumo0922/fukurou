@@ -91,6 +91,7 @@ data class ToolPolicy(
  * @param terminalEvidenceCaptureEnabled immutable manifest が宣言した capture state
  * @param autoApprovedTools codex の MCP 承認ゲートを approve で通す tool 名。
  * write tool を phase 単位で最小限指定する
+ * @param forwardedEnvironmentVariables Codex が MCP subprocess へ明示的に転送する非secret環境変数名
  */
 data class LlmMcpServerConfig(
     val name: String,
@@ -99,6 +100,7 @@ data class LlmMcpServerConfig(
     val manifestPath: Path,
     val terminalEvidenceCaptureEnabled: Boolean = false,
     val autoApprovedTools: List<String> = emptyList(),
+    val forwardedEnvironmentVariables: List<String> = emptyList(),
 )
 
 /**
