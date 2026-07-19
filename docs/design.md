@@ -3690,9 +3690,17 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 
 [確定] root-owned weekly timer は、status が示す exact integrity-checked snapshot をproductionとcontainer、network、volume、credential、host portを共有しない disposable PostgreSQL 16へrestoreする。schema inventory、constraint、critical tableのprimary key、paper account・runtime config・ledger lineageのread-only invariant、owned resource cleanupがすべて成功した場合だけlast verified restore evidenceを更新する。restoreではownerとACLを再生せず、production role/ACLのauthorityはcode-owned deploy foundationとrole bootstrapに残す。
 
-[確定] `/srv/fukurou/monitoring/backup-status.json` はroot-onlyのversioned statusで、各jobのlast attemptとlast-known-good evidenceを分離する。自動alertはこのstatusのproducer contractに含まれず、operatorがsystemd failureとstatusを能動確認する。
+[確定] `/srv/fukurou/monitoring/backup-status.json` はroot-onlyのversioned statusで、各jobのlast attemptとlast-known-good evidenceを分離する。root-owned publisherはservice開始前に`RUNNING`を公開し、同じsystemd invocation / boot identityのterminalだけを受理する。publisherはallowlist fieldとstable result codeだけを`/srv/fukurou/monitoring-public/backup-restore.json`へ同一filesystem上のatomic renameで公開し、root-only status、repository、secretへのauthorityをapplicationへ渡さない。Ktorは固定read-only bind mountからprojectionを読む。自動alertはこのproducer contractに含まれず、operatorがsystemd failure、root-only status、monitoring endpointを能動確認する。
 
 [確定] このbackupは同一NAS内のscheduled attemptと実測restore evidenceだけを提供する。毎暦日の成功、PITR/WAL archive、off-site disaster recovery、NAS-loss protection、保証RPO/RTO、production DBの自動置換を提供しない。deploy rollbackはDB snapshotをreplayしない。production DB replacementはrisk-increasing operationを停止し、exact snapshotのisolated restore evidenceを確認し、別途明示承認を得た後にrole/ACL bootstrapを含む手順として扱う。
+
+### 14.7 Operations monitoring
+
+[確定] `GET /ops/monitoring`はLLM daemon、provider invocation、ProtectionReconciler、market-data gap、backup / restoreをversioned component snapshotとして返す。各componentは自身のsource failureだけを`UNKNOWN`とstable reasonへ変換し、別componentの状態を伝播しない。responseはcredential、provider output、raw error、systemd invocation / boot identityを含めない。このendpointは観測専用であり、`/health/ready`、SafetyFloor、取引admission、scheduler stateを変更しない。
+
+[確定] daemon componentは同一processのscheduler tickとPostgreSQLの最新terminal invocationを分離して返す。no-trigger tickもlive tickを前進させる。provider componentは直近30分のbounded rowsだけを集計し、provider childを起動しないdeterministic phaseを除外する。provider statusのmalformed rowはcomponent全体を`UNKNOWN`にし、認証statusの欠損は`false`として扱う。
+
+[確定] reconciler componentはin-process runtime stateから読み、market-data gap componentはbounded database queryとtransaction-local timeoutを使う。attribution不能またはbound超過を0件へ変換しない。backup / restore componentはpublic projectionだけを読み、未有効化、malformed、stale `RUNNING`をそれぞれstable reason付き`UNKNOWN`として返す。
 
 ## 15. 検証（ペーパー約定シミュレータ）と合格判定
 

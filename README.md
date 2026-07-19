@@ -56,6 +56,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `/evaluation/*`: 既存集計 API と、共通 LLM reservation / audited manual generation / immutable revision / deterministic evidence を扱う Evaluation Report Console API
 - `/ops/*`
 - `GET /ops/runtime-config`
+- `GET /ops/monitoring`
 - `GET /ops/runs`
 - `GET /ops/runs/{invocationId}`
 - `GET /ops/activity/catalog`
@@ -63,6 +64,8 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /openapi.json`
 
 `/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、LLM execution claim の outcome-unknown registry・heartbeat・bounded periodic recovery scan、WebSocket が `CONNECTED`、未回復の market-data gapがないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。DB scan failureまたはtermination fenceを確認できないstale claimがある間はready 503かつ新しいLLM admission 0を維持します。recovery scanは5秒のpage deadline内でentityを独立transactionとして順次処理し、先行commit済みclaimは後続失敗の影響を受けず解放します。cursorとscan healthはpage全体の成功後だけ前進し、retryは未完了claimだけを収束させます。FOMC calendar の空、不正、期限切れは runtime config warning と新規 entry の fail-closed として扱い、readiness と ProtectionReconciler は継続します。trade は正常に無音になり得るため、readiness の必須条件にしません。
+
+`/ops/monitoring` は、LLM daemon、provider invocation、ProtectionReconciler、market-data gap、backup / restore の外形監視 snapshot をversioned componentとして返します。各componentは自身のsourceだけを評価し、取得失敗や未有効化は`UNKNOWN`とstable reasonで表します。別componentの失敗を伝播させず、credential、provider output、raw error、systemd invocation identityを返しません。このendpointは`/health/ready`の判定や取引admissionを変更しません。
 
 ## Local development
 
@@ -141,7 +144,7 @@ Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy sc
 
 production deploy は Ed25519 signed typed bundle v2、event-derived `FORWARD` / `AUTHORIZED_ROLLBACK` intent、production lock内revision ancestry、hash-bound schema-sensitive path inventoryとmigration recovery mode、parent-hash付きcumulative capability catalog、candidate executableのmutation前operation probe、exact digestのpinned CLI acceptance、hash固定したinstalled foundation harness、durable dispatch ledger、canonical fence/PID registration、DB maintenance/drain、isolated Compose `CANARY_ONLY` preflightを通過したimmutable image digestだけを切り替えます。すべてのforward/rollback targetにexact-SHA JVM quality gateを適用し、queued old forward deployはproduction mutation前に拒否します。deploy gapはappend-only OPEN/CLOSE factとして残り、6 entity共通のcausal projectionがstrategy KPIからaffected/missing recordを除外します。`PREFILTER_ACTIVATION_RELEASED=false` は active DB config より優先されます。
 
-production PostgreSQL は、root-owned systemd timer が同一 NAS の restic format v2 repository へ `pg_dump -Fc` の暗号化 logical backup を日次で試行します。integrity を確認した newest 14 daily generations を保持し、週次には exact snapshot を disposable PostgreSQL 16 へ restore して schema・constraint・data invariant・cleanup を実測します。これは daily success、PITR、off-site/NAS-loss protection、role/ACL recovery、保証 RPO/RTO、自動通知を提供するものではありません。timer は root operator が初回 backup と restore drill の成功証跡を確認した後だけ有効にします。手順と復旧境界は [`docs/deploy.md`](docs/deploy.md#postgresql-backup--restore) を参照してください。
+production PostgreSQL は、root-owned systemd timer が同一 NAS の restic format v2 repository へ `pg_dump -Fc` の暗号化 logical backup を日次で試行します。integrity を確認した newest 14 daily generations を保持し、週次には exact snapshot を disposable PostgreSQL 16 へ restore して schema・constraint・data invariant・cleanup を実測します。root-only statusからredacted monitoring projectionを同一filesystem上のatomic renameで公開し、Ktorは固定read-only bind mountから読みます。これは daily success、PITR、off-site/NAS-loss protection、role/ACL recovery、保証 RPO/RTO、自動通知を提供するものではありません。timer は root operator が初回 backup と restore drill の成功証跡を確認した後だけ有効にします。手順と復旧境界は [`docs/deploy.md`](docs/deploy.md#postgresql-backup--restore) を参照してください。
 
 - `Dockerfile`
 - `docker-compose.yml`
@@ -156,6 +159,7 @@ production PostgreSQL は、root-owned systemd timer が同一 NAS の restic fo
 - `scripts/deploy/sudoers-fukurou`
 - `scripts/backup/backup-fukurou`
 - `scripts/backup/restore-fukurou`
+- `scripts/backup/publish-backup-monitoring`
 - `scripts/backup/systemd/`
 - `scripts/prod-curl`
 - [`docs/deploy.md`](docs/deploy.md)
