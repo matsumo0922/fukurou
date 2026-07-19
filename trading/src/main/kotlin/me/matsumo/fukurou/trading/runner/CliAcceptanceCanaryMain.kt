@@ -131,6 +131,11 @@ internal class CliAcceptanceCanary(
                 manifestId = invocationId,
                 manifestPath = workingDirectory.resolve("$invocationId.manifest"),
                 autoApprovedTools = productionAutoApprovedTools(provider, enabledTools),
+                forwardedEnvironmentVariables = if (provider == LlmProvider.CODEX) {
+                    listOf(CLI_CANARY_RECORD_PATH_ENV)
+                } else {
+                    emptyList()
+                },
             )
         } else {
             null
@@ -290,6 +295,10 @@ internal fun cliCanaryProbeTool(phase: LlmInvocationPhase): String = when (phase
     else -> error("CLI canary probe tool is only defined for MCP phases.")
 }
 
+/** pinned CLI の `non_prefixed_mcp_tool_names=false` がmodelへ提示するMCP tool ID。 */
+internal fun cliCanaryQualifiedProbeTool(phase: LlmInvocationPhase): String =
+    "mcp__${CANARY_MCP_SERVER_NAME}__${cliCanaryProbeTool(phase)}"
+
 private fun canStartCanary(repetitions: Int?): Boolean {
     if (repetitions == null) return false
     if (repetitions != 1 && repetitions != 3) return false
@@ -351,7 +360,8 @@ private val CANARY_PHASE_MATRIX = listOf(
         CLAUDE_CANARY_MODEL,
         LlmEffort.DEFAULT,
         CLAUDE_OUTPUT_ADAPTER_VERSION,
-        "Call $PROPOSER_WRITE_TOOL at least once, then return exactly $RESPONSE_MARKER.",
+        "Call ${cliCanaryQualifiedProbeTool(LlmInvocationPhase.PROPOSER)} at least once. " +
+            "Wait for its result, then return exactly $RESPONSE_MARKER.",
     ),
     CanaryPhase(
         LlmInvocationPhase.FALSIFIER,
@@ -359,7 +369,8 @@ private val CANARY_PHASE_MATRIX = listOf(
         CODEX_CANARY_MODEL,
         LlmEffort.LOW,
         CODEX_OUTPUT_ADAPTER_VERSION,
-        "Call $CODEX_FALSIFIER_WRITE_TOOL at least once, then return exactly $RESPONSE_MARKER.",
+        "Call ${cliCanaryQualifiedProbeTool(LlmInvocationPhase.FALSIFIER)} at least once. " +
+            "Wait for its result, then return exactly $RESPONSE_MARKER.",
     ),
     CanaryPhase(
         LlmInvocationPhase.REFLECTION,

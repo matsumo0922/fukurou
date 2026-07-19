@@ -305,6 +305,7 @@ class DefaultLlmCommandRendererTest {
         val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
 
         assertTrue(command.args.contains("--skip-git-repo-check"))
+        assertTrue(configContent.contains("required = true"))
         assertTrue(configContent.contains("[mcp_servers.\"fukurou-mcp\".tools.\"submit_falsification\"]"))
         assertTrue(configContent.contains("approval_mode = \"approve\""))
         assertFalse(configContent.contains("[mcp_servers.\"fukurou-mcp\".tools.\"get_ticker\"]"))
@@ -356,12 +357,56 @@ class DefaultLlmCommandRendererTest {
             |[mcp_servers."custom-mcp"]
             |command = "/usr/local/libexec/fukurou-mcp-launcher"
             |args = ["0123456789abcdef0123456789abcdef0123456789abcdef"]
+            |required = true
             |
         """.trimMargin()
 
         assertEquals(expectedConfigContent, configContent)
 
         command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_requiresMcpAndForwardsOnlyDeclaredEnvironmentVariables() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf("FUKUROU_RECORD_PATH" to "/tmp/record", "IGNORED" to "value"),
+            forwardedEnvironmentVariables = listOf("FUKUROU_RECORD_PATH"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
+
+        assertTrue(configContent.contains("required = true"))
+        assertTrue(configContent.contains("env_vars = [\"FUKUROU_RECORD_PATH\"]"))
+        assertFalse(configContent.contains("IGNORED"))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_rejectsMissingOrSensitiveForwardedEnvironmentVariables() {
+        val renderer = DefaultLlmCommandRenderer()
+        val missing = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            forwardedEnvironmentVariables = listOf("FUKUROU_RECORD_PATH"),
+        )
+        val sensitive = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf("FUKUROU_SESSION_TOKEN" to "value"),
+            forwardedEnvironmentVariables = listOf("FUKUROU_SESSION_TOKEN"),
+        )
+
+        assertTrue(renderer.render(missing).isFailure)
+        assertTrue(renderer.render(sensitive).isFailure)
     }
 
     @Test
@@ -695,6 +740,7 @@ class DefaultLlmCommandRendererTest {
         allowedTools: List<String> = emptyList(),
         environment: Map<String, String> = emptyMap(),
         autoApprovedTools: List<String> = emptyList(),
+        forwardedEnvironmentVariables: List<String> = emptyList(),
     ): LlmInvocationRequest {
         val enabledTools = if (mcpServerName == null) {
             allowedTools
@@ -733,6 +779,7 @@ class DefaultLlmCommandRendererTest {
                     manifestId = "0123456789abcdef0123456789abcdef0123456789abcdef",
                     manifestPath = Files.createTempFile("fukurou-test-manifest-", ".json"),
                     autoApprovedTools = autoApprovedTools,
+                    forwardedEnvironmentVariables = forwardedEnvironmentVariables,
                 )
             },
             environment = effectiveEnvironment,

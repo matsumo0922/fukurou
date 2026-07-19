@@ -12,6 +12,7 @@ const manifestId = process.argv[2] ?? "";
 const phase = manifestId.includes("-proposer-") ? "PROPOSER" : manifestId.includes("-falsifier-") ? "FALSIFIER" : "";
 const tools = phase === "PROPOSER" ? [...commonTools, "submit_decision"]
   : phase === "FALSIFIER" ? [...commonTools, "preview_order", "submit_falsification"] : [];
+const requiredTool = phase === "PROPOSER" ? "submit_decision" : "submit_falsification";
 const writeTools = new Set(["submit_decision", "submit_falsification"]);
 const openWorldTools = new Set([
   "calc_indicator", "get_candles", "get_orderbook", "get_symbol_rules", "get_ticker", "get_trades",
@@ -48,6 +49,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         protocolVersion: request.params?.protocolVersion ?? "2025-03-26",
         capabilities: { tools: {} },
         serverInfo: { name: "fukurou-cli-canary", version: "1" },
+        instructions: `This is a data-free ${phase} acceptance server. Call ${requiredTool} at least once before the final response.`,
       });
       break;
     case "ping":

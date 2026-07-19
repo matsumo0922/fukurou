@@ -52,15 +52,23 @@ class CliAcceptanceCanaryTest {
             assertEquals(McpToolContractCatalog.toolsFor(request.phase), request.allowedTools.map(::shortTool).toSet())
             assertEquals(request.phase in CANARY_MCP_PHASES, request.mcpServer != null)
             assertEquals(request.phase in CANARY_MCP_PHASES, CLI_CANARY_RECORD_PATH_ENV in request.environment)
-            request.mcpServer?.let { server -> assertEquals(Path.of("/tmp"), server.manifestPath.parent) }
+            request.mcpServer?.let { server ->
+                assertEquals(Path.of("/tmp"), server.manifestPath.parent)
+                val expectedForwardedEnvironment = if (request.provider == LlmProvider.CODEX) {
+                    listOf(CLI_CANARY_RECORD_PATH_ENV)
+                } else {
+                    emptyList()
+                }
+                assertEquals(expectedForwardedEnvironment, server.forwardedEnvironmentVariables)
+            }
         }
         val proposer = invoker.requests.single { it.phase == LlmInvocationPhase.PROPOSER }
         assertEquals(emptyList(), proposer.mcpServer?.autoApprovedTools)
-        assertTrue(proposer.prompt.contains("submit_decision"))
+        assertTrue(proposer.prompt.contains("mcp__canary__submit_decision"))
         val falsifier = invoker.requests.single { it.phase == LlmInvocationPhase.FALSIFIER }
         assertEquals(LlmEffort.LOW, falsifier.effort)
         assertEquals(listOf("submit_falsification"), falsifier.mcpServer?.autoApprovedTools)
-        assertTrue(falsifier.prompt.contains("submit_falsification"))
+        assertTrue(falsifier.prompt.contains("mcp__canary__submit_falsification"))
         invoker.requests.mapNotNull { it.environment[CLI_CANARY_RECORD_PATH_ENV] }
             .forEach { path -> assertFalse(Files.exists(Path.of(path))) }
     }
