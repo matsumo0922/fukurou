@@ -144,10 +144,16 @@ private fun JdbcTransaction.selectUnresolvedMarketDataGaps(): Pair<Int, Instant?
     return monitoringStatement(
         """
             SELECT COUNT(*) AS gap_count, MIN(started_at) AS oldest_started_at
-            FROM market_data_gaps
-            WHERE recovered_at IS NULL
+            FROM (
+                SELECT started_at
+                FROM market_data_gaps
+                WHERE recovered_at IS NULL
+                ORDER BY started_at ASC, id ASC
+                LIMIT ?
+            ) bounded_gaps
         """.trimIndent(),
     ).use { statement ->
+        statement.setInt(1, MAX_UNRESOLVED_MARKET_DATA_GAPS + 1)
         statement.executeQuery().use { result ->
             check(result.next())
             val count = result.getLong("gap_count")

@@ -123,6 +123,53 @@ class MonitoringRouteTest {
     }
 
     @Test
+    fun tickProviderFailureMarksOnlyDaemonUnknown() = testApplication {
+        val service = DefaultMonitoringSnapshotService(
+            revision = "0123456789abcdef0123456789abcdef01234567",
+            daemonConfig = LlmDaemonConfig(enabled = true),
+            tickStatusProvider = me.matsumo.fukurou.trading.daemon.LlmDaemonTickStatusProvider {
+                error("tick unavailable")
+            },
+            reconcilerStatusProvider = MutableReconcilerStatus(),
+            repository = FakeMonitoringRepository(),
+            backupProjectionReader = BackupMonitoringProjectionReader(
+                createTempDirectory("monitoring-route").resolve("absent.json"),
+            ),
+            clock = Clock.fixed(Instant.parse("2026-07-19T00:30:00Z"), ZoneOffset.UTC),
+        )
+        application { module(readinessProbe = { true }, opsMonitoringService = service) }
+
+        val root = Json.parseToJsonElement(client.get("/ops/monitoring").bodyAsText()).jsonObject
+
+        assertEquals("UNKNOWN", root.getValue("daemon").jsonObject.getValue("state").jsonPrimitive.content)
+        assertEquals(
+            "DAEMON_TICK_STATUS_UNAVAILABLE",
+            root.getValue("daemon").jsonObject.getValue("reason").jsonPrimitive.content,
+        )
+        assertEquals("AVAILABLE", root.getValue("providers").jsonObject.getValue("state").jsonPrimitive.content)
+    }
+
+    @Test
+    fun oldTerminalProjectionFailsClosedWhenPrePublisherCannotRefreshIt() = testApplication {
+        val observedAt = Instant.parse("2026-07-21T00:00:00Z")
+        val directory = createTempDirectory("stale-terminal-projection")
+        val projection = directory.resolve(BACKUP_MONITORING_PROJECTION_FILE_NAME)
+        Files.writeString(projection, validProjection())
+        val service = monitoringService(
+            repository = FakeMonitoringRepository(),
+            observedAt = observedAt,
+            projectionPath = projection,
+        )
+        application { module(readinessProbe = { true }, opsMonitoringService = service) }
+
+        val backupRestore = Json.parseToJsonElement(client.get("/ops/monitoring").bodyAsText()).jsonObject
+            .getValue("backupRestore").jsonObject
+
+        assertEquals("UNKNOWN", backupRestore.getValue("state").jsonPrimitive.content)
+        assertEquals("BACKUP_PROJECTION_STALE", backupRestore.getValue("reason").jsonPrimitive.content)
+    }
+
+    @Test
     fun preTerminalProcessKillBecomesUnknownAfterRunningProjectionIsStale() = testApplication {
         val observedAt = Instant.parse("2026-07-19T03:00:00Z")
         val directory = createTempDirectory("stale-backup-projection")

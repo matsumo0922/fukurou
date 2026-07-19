@@ -9,6 +9,7 @@ import java.time.Instant
 
 private val PROVIDER_OUTCOME_WINDOW: Duration = Duration.ofMinutes(30)
 private val STALE_BACKUP_RUNNING_AFTER: Duration = Duration.ofHours(2)
+private val STALE_BACKUP_PROJECTION_AFTER: Duration = Duration.ofHours(36)
 
 /** monitoring route が versioned snapshot を作る境界。 */
 fun interface MonitoringSnapshotService {
@@ -42,9 +43,12 @@ internal class DefaultMonitoringSnapshotService(
     }
 
     private suspend fun daemonSnapshot(): MonitoringDaemonResponse {
-        val tick = runCatching(tickStatusProvider::snapshot).getOrNull()
+        val tickResult = runCatching(tickStatusProvider::snapshot)
+        val tick = tickResult.getOrNull()
+        val tickUnavailable = tickResult.isFailure
         val base = MonitoringDaemonResponse(
-            state = MonitoringComponentState.AVAILABLE,
+            state = if (tickUnavailable) MonitoringComponentState.UNKNOWN else MonitoringComponentState.AVAILABLE,
+            reason = if (tickUnavailable) MonitoringUnknownReason.DAEMON_TICK_STATUS_UNAVAILABLE else null,
             enabled = daemonConfig.enabled,
             cadenceSeconds = daemonConfig.pollInterval.seconds,
             lastTickAt = tick?.completedAt?.toString(),
@@ -156,12 +160,19 @@ internal class DefaultMonitoringSnapshotService(
         }
         val publishedAt = runCatching { Instant.parse(projection.publishedAt) }.getOrNull()
         val publishedAtInvalid = publishedAt == null || publishedAt.isAfter(observedAt)
+        val projectionStale = publishedAt?.let { published ->
+            Duration.between(published, observedAt) > STALE_BACKUP_PROJECTION_AFTER
+        } ?: true
         val hasStaleRunningService = projection.jobs().any { job -> job.service.isStaleRunning(observedAt) }
-        val staleRunning = publishedAtInvalid || hasStaleRunningService
+        val reason = when {
+            publishedAtInvalid || projectionStale -> MonitoringUnknownReason.BACKUP_PROJECTION_STALE
+            hasStaleRunningService -> MonitoringUnknownReason.BACKUP_PROJECTION_STALE_RUNNING
+            else -> null
+        }
 
         return MonitoringBackupRestoreResponse(
-            state = if (staleRunning) MonitoringComponentState.UNKNOWN else MonitoringComponentState.AVAILABLE,
-            reason = if (staleRunning) MonitoringUnknownReason.BACKUP_PROJECTION_STALE_RUNNING else null,
+            state = if (reason == null) MonitoringComponentState.AVAILABLE else MonitoringComponentState.UNKNOWN,
+            reason = reason,
             projectionPublishedAt = projection.publishedAt,
             backup = projection.backup.toResponse(),
             restore = projection.restore.toResponse(),

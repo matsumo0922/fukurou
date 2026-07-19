@@ -26,6 +26,10 @@ The system SHALL publish service invocation start evidence before backup or rest
 - **WHEN** the post-execution publisher cannot update the projection
 - **THEN** the prior running evidence becomes stale and the application reports backup/restore monitoring as `UNKNOWN`
 
+#### Scenario: Start publisher cannot replace an older terminal
+- **WHEN** the pre-execution publisher cannot write new running evidence and an older terminal projection remains
+- **THEN** the projection age exceeds its fixed freshness bound and the application reports backup/restore monitoring as `UNKNOWN` instead of treating the old success as current
+
 ### Requirement: Projection activation is fail-closed and deploy-safe
 The production composition SHALL mount a fixed dedicated public monitoring directory read-only at a fixed container path. It SHALL permit Compose to create that empty host directory before root artifact installation, and the application SHALL read only a fixed projection filename from it. The composition SHALL NOT accept an arbitrary host source path.
 
