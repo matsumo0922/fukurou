@@ -205,6 +205,7 @@ class LlmDaemonScheduler(
     private val clock = runtime.clock
     private val idGenerator = runtime.idGenerator
     private val warnLogger = runtime.warnLogger
+    private val tickStatus = runtime.tickStatus
     private val daemonConfig: LlmDaemonConfig = tradingConfig.daemon
     private val preFilterGate = LlmDaemonPreFilterGate(
         daemonConfig = daemonConfig,
@@ -244,7 +245,7 @@ class LlmDaemonScheduler(
         val observedAt = Instant.now(clock)
         val result = runCatching { tickUnsafe(observedAt) }
 
-        return result.getOrElse { throwable ->
+        val tickResult = result.getOrElse { throwable ->
             if (throwable is CancellationException) {
                 throw throwable
             }
@@ -258,6 +259,14 @@ class LlmDaemonScheduler(
 
             LlmDaemonTickResult.Skipped(DAEMON_SKIP_TICK_FAILED, null)
         }
+        tickStatus.record(
+            LlmDaemonTickStatus(
+                completedAt = Instant.now(clock),
+                outcome = tickResult.toTickOutcome(),
+            ),
+        )
+
+        return tickResult
     }
 
     @Suppress("LongMethod", "CyclomaticComplexMethod")
@@ -1146,7 +1155,17 @@ data class LlmDaemonSchedulerRuntime(
         logger = Logger.getLogger(LlmDaemonScheduler::class.java.name),
         clock = clock,
     ),
+    val tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
 )
+
+private fun LlmDaemonTickResult.toTickOutcome(): LlmDaemonTickOutcome {
+    return when (this) {
+        is LlmDaemonTickResult.Launched -> LlmDaemonTickOutcome.LAUNCHED
+        is LlmDaemonTickResult.Failed -> LlmDaemonTickOutcome.FAILED
+        is LlmDaemonTickResult.Skipped -> LlmDaemonTickOutcome.SKIPPED
+        is LlmDaemonTickResult.InfrastructureSuppressed -> LlmDaemonTickOutcome.INFRASTRUCTURE_SUPPRESSED
+    }
+}
 
 private fun daemonDecisionRunContext(
     invocationId: String,

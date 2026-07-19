@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.daemon.HAIKU_PRE_FILTER_MODEL
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.MutableLlmDaemonTickStatus
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceDependencies
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceRuntime
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
@@ -169,6 +170,7 @@ internal fun startLlmDaemonSchedulerWorker(
     clock: Clock = Clock.systemUTC(),
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
     latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
+    tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
 
@@ -189,6 +191,7 @@ internal fun startLlmDaemonSchedulerWorker(
                         runtimeConfigSnapshot = runtimeConfigSnapshot,
                         requestBase = oneShotRequestFromEnvironment(environment),
                         latestMarketQuoteStore = latestMarketQuoteStore,
+                        tickStatus = tickStatus,
                     ),
                 )
             }
@@ -237,6 +240,7 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             launchOneShot = components.launchOneShot,
             preFilter = components.preFilter,
             clock = inputs.clock,
+            tickStatus = inputs.tickStatus,
         ),
     )
 }
@@ -532,6 +536,7 @@ private fun Map<String, String>.requiredString(name: String): String? {
  * @param tradingConfig 取引 bot 全体の typed config
  * @param runtimeConfigSnapshot 起動開始時に固定する runtime config snapshot
  * @param requestBase one-shot runner の固定 request
+ * @param tickStatus application process 内で共有する daemon tick 状態
  */
 private data class LlmLaunchRuntimeInputs(
     val dataSource: HikariDataSource,
@@ -542,6 +547,7 @@ private data class LlmLaunchRuntimeInputs(
     val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
     val requestBase: OneShotRunnerRequest,
     val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
+    val tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
 )
 
 /**

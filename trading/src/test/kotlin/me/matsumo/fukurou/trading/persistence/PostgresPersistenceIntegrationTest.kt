@@ -414,6 +414,8 @@ private const val SELECT_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL = """
         AND indexname IN (
             'idx_evaluation_exclusions_gap_entity_unique',
             'idx_market_data_gaps_session_started',
+            'idx_market_data_gaps_unresolved_started',
+            'idx_infrastructure_gap_events_opened_at',
             'idx_evaluation_exclusions_entity'
         )
 """
@@ -1625,7 +1627,7 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(1, selectOrdersClientRequestIdIndexCount(database))
         assertEquals(1, selectOrdersActivityContextIndexCount(database))
         assertEquals(1, selectMarketDataConnectedSessionIndexCount(database))
-        assertEquals(3, selectMarketDataIntegrityIndexCount(database))
+        assertEquals(5, selectMarketDataIntegrityIndexCount(database))
         assertEquals(1, selectDecisionsInvocationIdIndexCount(database))
         assertEquals(6, selectLlmLaunchReservationIndexCount(database))
         assertEquals(1, selectLlmRunIndexCount(database))

@@ -16,6 +16,8 @@ readonly ROLLOUT_MAX_EVIDENCE_AGE_SECONDS=86400
 readonly SERVICE_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 readonly STATUS_DIR=/srv/fukurou/monitoring
 readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
+readonly PUBLIC_STATUS_DIR=/srv/fukurou/monitoring-public
+readonly PUBLIC_STATUS_FILE=${PUBLIC_STATUS_DIR}/backup-restore.json
 readonly SECRET_DIR=/srv/fukurou/secrets
 readonly PASSWORD_FILE=${SECRET_DIR}/restic-password
 readonly INSTALL_MARKER=${SHARE_DIR}/backup-installation-v1.json
@@ -26,9 +28,11 @@ readonly -a LIBEXEC_ARTIFACTS=(
     backup-common
     backup-fukurou
     restore-fukurou
+    publish-backup-monitoring
 )
 readonly -a SHARE_ARTIFACTS=(
     backup-status.schema.json
+    backup-monitoring-projection.schema.json
     backup-result-codes-v1.txt
     restore-inventory-v1.txt
     restore-critical-tables-v1.txt
@@ -276,6 +280,7 @@ install_artifacts() {
     install -d -o root -g root -m 0555 "${LIBEXEC_DIR}"
     install -d -o root -g root -m 0755 "${SHARE_DIR}"
     install -d -o root -g root -m 0700 "${BACKUP_PARENT}" "${BACKUP_ROOT}" "${STATUS_DIR}" "${SECRET_DIR}"
+    install -d -o root -g root -m 0755 "${PUBLIC_STATUS_DIR}"
 
     for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
         require_regular_source "${SCRIPT_DIR}/${artifact}"
@@ -307,7 +312,14 @@ verify_installation() {
     verify_owner_mode "${BACKUP_PARENT}" 700
     verify_owner_mode "${BACKUP_ROOT}" 700
     verify_owner_mode "${STATUS_DIR}" 700
+    verify_owner_mode "${PUBLIC_STATUS_DIR}" 755
     verify_owner_mode "${SECRET_DIR}" 700
+    if find "${PUBLIC_STATUS_DIR}" -mindepth 1 -maxdepth 1 ! -name backup-restore.json -print -quit | grep -q .; then
+        die "public monitoring directory contains an unexpected artifact" 65
+    fi
+    if [[ -e ${PUBLIC_STATUS_FILE} ]]; then
+        verify_owner_mode "${PUBLIC_STATUS_FILE}" 444
+    fi
 
     for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
         verify_owner_mode "${LIBEXEC_DIR}/${artifact}" 555
