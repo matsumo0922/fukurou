@@ -20,7 +20,14 @@ private const val MAX_UNRESOLVED_MARKET_DATA_GAPS = 1_000
 
 private val MonitoringEventJson = Json
 private val KnownProviders = setOf("claude", "codex")
-private val KnownProviderPhases = setOf("pre_filter", "proposer", "falsifier", "reflection", "evaluation_report")
+private val KnownProviderPhases = setOf(
+    "pre_filter",
+    "proposer",
+    "falsifier",
+    "risk_reduction_only",
+    "reflection",
+    "evaluation_report",
+)
 private val KnownProviderStatuses = setOf("EXITED", "TIMED_OUT", "FAILED_TO_START")
 
 /** 最新 daemon invocation terminal。 */
@@ -190,13 +197,19 @@ private fun JdbcTransaction.selectInfrastructureGapEvents(): List<Infrastructure
 private fun parseDaemonTerminal(occurredAt: Instant, payload: String): MonitoringDaemonTerminal {
     val payloadObject = payload.toJsonObjectOrMalformed()
     val finishedAt = payloadObject.requiredString("finishedAt").parseInstantOrMalformed()
-    val semantic = payloadObject.requiredString("status").let { rawStatus ->
-        MonitoringDaemonTerminalSemantic.entries.firstOrNull { candidate -> candidate.name == rawStatus }
-            ?: throw MonitoringMalformedEventException()
-    }
+    val semantic = parseDaemonTerminalSemantic(payloadObject.requiredString("status"))
     if (finishedAt != occurredAt) throw MonitoringMalformedEventException()
 
     return MonitoringDaemonTerminal(occurredAt, semantic)
+}
+
+internal fun parseDaemonTerminalSemantic(rawStatus: String): MonitoringDaemonTerminalSemantic {
+    return when (rawStatus) {
+        "pre_filter_no_change" -> MonitoringDaemonTerminalSemantic.NO_TRADE
+        "unknown" -> MonitoringDaemonTerminalSemantic.LEGACY_UNCLASSIFIED
+        else -> MonitoringDaemonTerminalSemantic.entries.firstOrNull { candidate -> candidate.name == rawStatus }
+            ?: throw MonitoringMalformedEventException()
+    }
 }
 
 internal fun aggregateProviderOutcomes(payloads: List<String>): List<MonitoringProviderOutcomeResponse> {

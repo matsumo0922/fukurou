@@ -113,6 +113,11 @@ publisher "${NEXT_INVOCATION}" terminal backup success exited 0
 publisher "${KILLED_INVOCATION}" start restore
 [[ $(jq -r '.restore.service.state' "${projection}") == RUNNING ]] ||
     fail 'pre-terminal process kill did not preserve running evidence'
+publisher "${KILLED_INVOCATION}" terminal restore signal killed 9
+[[ $(jq -r '.restore.service.state' "${projection}") == TERMINAL ]] ||
+    fail 'ExecStopPost-style killed process did not become terminal'
+[[ $(jq -r '.restore.service.terminalSemantic' "${projection}") == FAILURE ]] ||
+    fail 'ExecStopPost-style killed process was not classified as failure'
 
 publisher "${FAILED_PUBLICATION_INVOCATION}" start backup
 before_failed_hash=$(file_hash "${projection}")
@@ -142,4 +147,4 @@ if publisher "${FAILED_PUBLICATION_INVOCATION}" terminal backup success exited 0
 fi
 [[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'malformed input replaced running evidence'
 
-printf '%s\n' 'MONITORING_PROJECTION_SELFTEST_OK lifecycle=start-terminal pre-terminal-kill=running-preserved stale-invocation=unknown malformed=fail-closed atomic=rename failed-terminal=running-preserved'
+printf '%s\n' 'MONITORING_PROJECTION_SELFTEST_OK lifecycle=start-terminal killed-process=terminal-failure stale-invocation=unknown malformed=fail-closed atomic=rename failed-terminal=running-preserved'

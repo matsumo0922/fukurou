@@ -111,6 +111,18 @@ class MonitoringRouteTest {
     }
 
     @Test
+    fun daemonTerminalMapsPreFilterSkipToNoTradeSemantic() {
+        assertEquals(
+            MonitoringDaemonTerminalSemantic.NO_TRADE,
+            parseDaemonTerminalSemantic("pre_filter_no_change"),
+        )
+        assertEquals(
+            MonitoringDaemonTerminalSemantic.LEGACY_UNCLASSIFIED,
+            parseDaemonTerminalSemantic("unknown"),
+        )
+    }
+
+    @Test
     fun preTerminalProcessKillBecomesUnknownAfterRunningProjectionIsStale() = testApplication {
         val observedAt = Instant.parse("2026-07-19T03:00:00Z")
         val directory = createTempDirectory("stale-backup-projection")
