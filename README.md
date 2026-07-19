@@ -65,7 +65,7 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 
 `/health/ready` は、Hikari + Exposed による PostgreSQL 接続、runtime config の有効性、startup recovery 完了、LLM execution claim の outcome-unknown registry・heartbeat・bounded periodic recovery scan、WebSocket が `CONNECTED`、未回復の market-data gapがないこと、fresh な transport activity と periodic maintenance をすべて確認して ready を返します。DB scan failureまたはtermination fenceを確認できないstale claimがある間はready 503かつ新しいLLM admission 0を維持します。recovery scanは5秒のpage deadline内でentityを独立transactionとして順次処理し、先行commit済みclaimは後続失敗の影響を受けず解放します。cursorとscan healthはpage全体の成功後だけ前進し、retryは未完了claimだけを収束させます。FOMC calendar の空、不正、期限切れは runtime config warning と新規 entry の fail-closed として扱い、readiness と ProtectionReconciler は継続します。trade は正常に無音になり得るため、readiness の必須条件にしません。
 
-`/ops/monitoring` は、LLM daemon、provider invocation、ProtectionReconciler、market-data gap、backup / restore の外形監視 snapshot をversioned componentとして返します。各componentは自身のsourceだけを評価し、取得失敗や未有効化は`UNKNOWN`とstable reasonで表します。別componentの失敗を伝播させず、credential、provider output、raw error、systemd invocation identityを返しません。このendpointは`/health/ready`の判定や取引admissionを変更しません。
+`/ops/monitoring` は、LLM daemon、provider invocation、ProtectionReconciler、market-data gap、backup / restore の外形監視 snapshot をversioned componentとして返します。各componentは自身のsourceだけを評価し、取得失敗や未有効化は`UNKNOWN`とstable reasonで表します。`backupRestore`が`UNKNOWN`の場合は古いjob成功値を返さず、providerやgapの失敗時も部分集計を返しません。別componentの失敗は伝播させず、credential、provider output、raw error、systemd invocation identityも返しません。このendpointは`/health/ready`の判定や取引admissionを変更しません。
 
 ## Local development
 

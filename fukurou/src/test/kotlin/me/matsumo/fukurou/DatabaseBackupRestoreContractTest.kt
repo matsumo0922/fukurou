@@ -15,6 +15,13 @@ class DatabaseBackupRestoreContractTest {
     private val backupDirectory = root.resolve("scripts/backup")
 
     @Test
+    fun `application backup result allowlist matches installed authority`() {
+        val installedCodes = Files.readAllLines(backupDirectory.resolve("backup-result-codes-v1.txt")).toSet()
+
+        assertEquals(installedCodes, BackupResultCodes)
+    }
+
+    @Test
     fun `backup shell entrypoints have valid syntax and fixed installed paths`() {
         val scripts = listOf(
             "backup-common",

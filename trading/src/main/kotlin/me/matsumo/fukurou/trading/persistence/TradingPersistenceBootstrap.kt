@@ -523,6 +523,20 @@ private const val ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL = """
     ON market_data_gaps (session_id, started_at DESC)
 """
 
+/** unresolved market-data gap monitoring query 用の partial index を作る SQL。 */
+private const val ENSURE_MARKET_DATA_GAPS_UNRESOLVED_STARTED_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_market_data_gaps_unresolved_started
+    ON market_data_gaps (started_at, id)
+    WHERE recovered_at IS NULL
+"""
+
+/** unresolved infrastructure gap monitoring query 用の partial index を作る SQL。 */
+private const val ENSURE_INFRASTRUCTURE_GAP_OPENED_AT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_infrastructure_gap_events_opened_at
+    ON infrastructure_gap_events (occurred_at, event_id)
+    WHERE boundary = 'OPEN'
+"""
+
 /** evaluation exclusion の entity lookup index を作る SQL。 */
 private const val ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL = """
     CREATE INDEX IF NOT EXISTS idx_evaluation_exclusions_entity
@@ -794,10 +808,12 @@ private const val VERIFY_MARKET_DATA_INTEGRITY_INDEX_COUNT_SQL = """
         AND indexname IN (
             'idx_evaluation_exclusions_gap_entity_unique',
             'idx_market_data_gaps_session_started',
+            'idx_market_data_gaps_unresolved_started',
+            'idx_infrastructure_gap_events_opened_at',
             'idx_evaluation_exclusions_entity'
         )
     GROUP BY schemaname
-    HAVING COUNT(*) = 3
+    HAVING COUNT(*) = 5
 """
 
 /**
@@ -1472,6 +1488,7 @@ class TradingPersistenceBootstrap(
                 )
             """.trimIndent(),
         )
+        executeUpdate(ENSURE_INFRASTRUCTURE_GAP_OPENED_AT_INDEX_SQL)
         exec(
             """
                 CREATE TABLE IF NOT EXISTS llm_pid_registrations (
@@ -1685,6 +1702,7 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL)
+    executeUpdate(ENSURE_MARKET_DATA_GAPS_UNRESOLVED_STARTED_INDEX_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_ENTITY_INDEX_SQL)
     executeUpdate(ENSURE_DECISIONS_INVOCATION_ID_CREATED_AT_INDEX_SQL)
     executeUpdate(ENSURE_LLM_LAUNCH_INVOCATION_UNIQUE_INDEX_SQL)

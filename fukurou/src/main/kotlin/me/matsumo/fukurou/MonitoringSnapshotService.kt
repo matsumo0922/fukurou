@@ -174,8 +174,8 @@ internal class DefaultMonitoringSnapshotService(
             state = if (reason == null) MonitoringComponentState.AVAILABLE else MonitoringComponentState.UNKNOWN,
             reason = reason,
             projectionPublishedAt = projection.publishedAt,
-            backup = projection.backup.toResponse(),
-            restore = projection.restore.toResponse(),
+            backup = projection.backup.toResponse().takeIf { reason == null },
+            restore = projection.restore.toResponse().takeIf { reason == null },
         )
     }
 }

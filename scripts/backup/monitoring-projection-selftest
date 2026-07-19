@@ -14,6 +14,7 @@ readonly BACKUP_INVOCATION=0123456789abcdef0123456789abcdef
 readonly NEXT_INVOCATION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 readonly KILLED_INVOCATION=cccccccccccccccccccccccccccccccc
 readonly FAILED_PUBLICATION_INVOCATION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+readonly REAL_FLOCK=$(command -v flock || true)
 trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT INT TERM
 
 fail() {
@@ -82,8 +83,10 @@ file_hash() {
 
 mkdir -p "${PUBLIC_DIRECTORY}"
 mkdir -p "${SELFTEST_BIN}"
-printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"${SELFTEST_BIN}/flock"
-chmod +x "${SELFTEST_BIN}/flock"
+if [[ -z ${REAL_FLOCK} ]]; then
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"${SELFTEST_BIN}/flock"
+    chmod +x "${SELFTEST_BIN}/flock"
+fi
 printf '%s\n' "${BOOT_ID}" >"${BOOT_ID_FILE}"
 write_status "${BACKUP_INVOCATION}"
 
@@ -102,8 +105,21 @@ if find "${PUBLIC_DIRECTORY}" -name '.backup-restore.json.tmp.*' -print -quit | 
     fail 'temporary projection remained visible'
 fi
 
-publisher "${NEXT_INVOCATION}" start backup
+if [[ -n ${REAL_FLOCK} ]]; then
+    exec 8>"${LOCK_FILE}"
+    flock -x 8
+    publisher "${NEXT_INVOCATION}" start backup &
+    blocked_publisher=$!
+    sleep 0.2
+    kill -0 "${blocked_publisher}" 2>/dev/null || fail 'publisher bypassed the held projection lock'
+    flock -u 8
+    wait "${blocked_publisher}"
+else
+    publisher "${NEXT_INVOCATION}" start backup
+fi
 [[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'next invocation did not become running'
+[[ $(jq -r '.backup.service.invocationId' "${projection}") == "${NEXT_INVOCATION}" ]] ||
+    fail 'serialized publisher wrote the wrong invocation'
 [[ $(jq -r '.backup.lastAttempt.invocationId' "${projection}") == "${BACKUP_INVOCATION}" ]] ||
     fail 'historical attempt was erased at start'
 publisher "${NEXT_INVOCATION}" terminal backup success exited 0
@@ -147,4 +163,4 @@ if publisher "${FAILED_PUBLICATION_INVOCATION}" terminal backup success exited 0
 fi
 [[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'malformed input replaced running evidence'
 
-printf '%s\n' 'MONITORING_PROJECTION_SELFTEST_OK lifecycle=start-terminal killed-process=terminal-failure stale-invocation=unknown malformed=fail-closed atomic=rename failed-terminal=running-preserved'
+printf '%s\n' 'MONITORING_PROJECTION_SELFTEST_OK lifecycle=start-terminal killed-process=terminal-failure stale-invocation=unknown malformed=fail-closed atomic=rename lock=serialized-when-supported failed-terminal=running-preserved'

@@ -28,3 +28,4 @@
 - [x] 5.1 Run focused monitoring route/repository/projection tests and backup selftests
 - [x] 5.2 Run OpenSpec validation, `make test`, `make detekt`, and `make build` through the validation lease
 - [x] 5.3 Confirm production compose renders in both fallback and activated configurations without exposing authoritative paths or secret fields
+- [x] 5.4 Add review regressions for millisecond daemon terminals, unresolved-only gap bounds/indexes, stale backup value suppression, enum parity, explicit null, and real flock serialization

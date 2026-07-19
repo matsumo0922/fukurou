@@ -124,6 +124,14 @@ load_projection() {
     printf '%s\n' "${document}"
 }
 
+sync_projection_path() {
+    local path=$1
+
+    # GNU sync -d issues fdatasync for the selected path. BSD variants do not
+    # expose that mode, so retain the existing filesystem-sync fallback.
+    sync -d "${path}" 2>/dev/null || sync -f "${path}"
+}
+
 publish_projection() {
     local candidate=$1 temporary
 
@@ -138,7 +146,7 @@ publish_projection() {
         rm -f -- "${temporary}"
         return 1
     fi
-    if ! sync -f "${temporary}"; then
+    if ! sync_projection_path "${temporary}"; then
         rm -f -- "${temporary}"
         return 1
     fi
@@ -148,7 +156,8 @@ publish_projection() {
         return 1
     fi
     mv -f -- "${temporary}" "${PROJECTION_FILE}" || { rm -f -- "${temporary}"; return 1; }
-    sync -f "${PUBLIC_DIRECTORY}"
+    sync_projection_path "${PUBLIC_DIRECTORY}" || return 1
+    return 0
 }
 
 read_authoritative_status() {

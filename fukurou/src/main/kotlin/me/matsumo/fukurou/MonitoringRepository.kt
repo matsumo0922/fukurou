@@ -3,32 +3,33 @@ package me.matsumo.fukurou
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import java.sql.Connection
 import java.sql.PreparedStatement
 import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.temporal.ChronoUnit
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 private const val MONITORING_STATEMENT_TIMEOUT_SECONDS = 2
 private const val MAX_PROVIDER_EVENT_ROWS = 1_000
-private const val MAX_INFRASTRUCTURE_GAP_EVENT_ROWS = 1_000
+private const val MAX_UNRESOLVED_INFRASTRUCTURE_GAPS = 1_000
 private const val MAX_UNRESOLVED_MARKET_DATA_GAPS = 1_000
 
 private val MonitoringEventJson = Json
-private val KnownProviders = setOf("claude", "codex")
-private val KnownProviderPhases = setOf(
-    "pre_filter",
-    "proposer",
-    "falsifier",
-    "risk_reduction_only",
-    "reflection",
-    "evaluation_report",
-)
-private val KnownProviderStatuses = setOf("EXITED", "TIMED_OUT", "FAILED_TO_START")
+private val KnownProviders = LlmProvider.entries.map { provider -> provider.name.lowercase() }.toSet()
+private val KnownProviderPhases = LlmInvocationPhase.entries.map { phase -> phase.name.lowercase() }.toSet()
+private val KnownProviderStatuses = ProcessRunStatus.entries.map { status -> status.name }.toSet() + "FAILED_TO_START"
 
 /** 最新 daemon invocation terminal。 */
 internal data class MonitoringDaemonTerminal(
@@ -116,8 +117,7 @@ internal class ExposedMonitoringRepository(
 
     override suspend fun unresolvedGaps(): Result<MonitoringGapAggregate> = read {
         val marketData = selectUnresolvedMarketDataGaps()
-        val infrastructureEvents = selectInfrastructureGapEvents()
-        val infrastructure = aggregateInfrastructureGaps(infrastructureEvents)
+        val infrastructure = selectUnresolvedInfrastructureGaps()
 
         MonitoringGapAggregate(
             marketDataCount = marketData.first,
@@ -167,47 +167,42 @@ private fun JdbcTransaction.selectUnresolvedMarketDataGaps(): Pair<Int, Instant?
     }
 }
 
-private data class InfrastructureGapEvent(
-    val gapId: String,
-    val boundary: String,
-    val occurredAt: Instant,
-)
-
-private fun JdbcTransaction.selectInfrastructureGapEvents(): List<InfrastructureGapEvent> {
+private fun JdbcTransaction.selectUnresolvedInfrastructureGaps(): Pair<Int, Instant?> {
     return monitoringStatement(
         """
-            SELECT gap_id::text, boundary, occurred_at
-            FROM infrastructure_gap_events
-            ORDER BY occurred_at DESC, CASE boundary WHEN 'CLOSE' THEN 0 ELSE 1 END, event_id ASC
-            LIMIT ?
+            SELECT COUNT(*) AS gap_count, MIN(occurred_at) AS oldest_occurred_at
+            FROM (
+                SELECT opened.occurred_at
+                FROM infrastructure_gap_events opened
+                WHERE opened.boundary = 'OPEN'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM infrastructure_gap_events closed
+                      WHERE closed.gap_id = opened.gap_id
+                        AND closed.boundary = 'CLOSE'
+                  )
+                ORDER BY opened.occurred_at ASC, opened.event_id ASC
+                LIMIT ?
+            ) bounded_gaps
         """.trimIndent(),
     ).use { statement ->
-        statement.setInt(1, MAX_INFRASTRUCTURE_GAP_EVENT_ROWS + 1)
+        statement.setInt(1, MAX_UNRESOLVED_INFRASTRUCTURE_GAPS + 1)
         statement.executeQuery().use { result ->
-            buildList {
-                while (result.next()) {
-                    add(
-                        InfrastructureGapEvent(
-                            gapId = result.getString(1),
-                            boundary = result.getString(2),
-                            occurredAt = result.getObject(3, java.time.OffsetDateTime::class.java).toInstant(),
-                        ),
-                    )
-                }
-            }.also { events ->
-                if (events.size > MAX_INFRASTRUCTURE_GAP_EVENT_ROWS) {
-                    throw MonitoringQueryBoundExceededException()
-                }
-            }
+            check(result.next())
+            val count = result.getLong("gap_count")
+            if (count > MAX_UNRESOLVED_INFRASTRUCTURE_GAPS) throw MonitoringQueryBoundExceededException()
+
+            val oldest = result.getObject("oldest_occurred_at", OffsetDateTime::class.java)?.toInstant()
+            count.toInt() to oldest
         }
     }
 }
 
-private fun parseDaemonTerminal(occurredAt: Instant, payload: String): MonitoringDaemonTerminal {
+internal fun parseDaemonTerminal(occurredAt: Instant, payload: String): MonitoringDaemonTerminal {
     val payloadObject = payload.toJsonObjectOrMalformed()
     val finishedAt = payloadObject.requiredString("finishedAt").parseInstantOrMalformed()
     val semantic = parseDaemonTerminalSemantic(payloadObject.requiredString("status"))
-    if (finishedAt != occurredAt) throw MonitoringMalformedEventException()
+    if (finishedAt.truncatedTo(ChronoUnit.MILLIS) != occurredAt) throw MonitoringMalformedEventException()
 
     return MonitoringDaemonTerminal(occurredAt, semantic)
 }
@@ -216,8 +211,10 @@ internal fun parseDaemonTerminalSemantic(rawStatus: String): MonitoringDaemonTer
     return when (rawStatus) {
         "pre_filter_no_change" -> MonitoringDaemonTerminalSemantic.NO_TRADE
         "unknown" -> MonitoringDaemonTerminalSemantic.LEGACY_UNCLASSIFIED
-        else -> MonitoringDaemonTerminalSemantic.entries.firstOrNull { candidate -> candidate.name == rawStatus }
-            ?: throw MonitoringMalformedEventException()
+        else -> runCatching {
+            LlmRunTerminalCause.valueOf(rawStatus)
+            MonitoringDaemonTerminalSemantic.valueOf(rawStatus)
+        }.getOrElse { throw MonitoringMalformedEventException() }
     }
 }
 
@@ -283,17 +280,6 @@ private fun String?.toAuthFailureOrMalformed(): Boolean {
     }
 }
 
-private fun aggregateInfrastructureGaps(events: List<InfrastructureGapEvent>): Pair<Int, Instant?> {
-    val latestByGap = linkedMapOf<String, InfrastructureGapEvent>()
-    events.forEach { event ->
-        if (event.boundary !in setOf("OPEN", "CLOSE")) throw MonitoringMalformedEventException()
-        latestByGap.putIfAbsent(event.gapId, event)
-    }
-    val unresolved = latestByGap.values.filter { event -> event.boundary == "OPEN" }
-
-    return unresolved.size to unresolved.minOfOrNull(InfrastructureGapEvent::occurredAt)
-}
-
 private fun String.toJsonObjectOrMalformed(): JsonObject {
     return runCatching { MonitoringEventJson.parseToJsonElement(this).jsonObject }
         .getOrElse { throw MonitoringMalformedEventException() }
@@ -305,6 +291,8 @@ private fun JsonObject.requiredString(key: String): String {
 
 private fun JsonObject.optionalString(key: String): String? {
     val element = this[key] ?: return null
+    if (element is JsonNull) return null
+
     return runCatching { element.jsonPrimitive.contentOrNull }
         .getOrNull()
         ?.takeIf(String::isNotBlank)
@@ -316,7 +304,7 @@ private fun String.parseInstantOrMalformed(): Instant {
 }
 
 private fun JdbcTransaction.monitoringStatement(sql: String): PreparedStatement {
-    val jdbcConnection = connection.connection as java.sql.Connection
+    val jdbcConnection = connection.connection as Connection
 
     return jdbcConnection.prepareStatement(sql).also { statement ->
         statement.queryTimeout = MONITORING_STATEMENT_TIMEOUT_SECONDS

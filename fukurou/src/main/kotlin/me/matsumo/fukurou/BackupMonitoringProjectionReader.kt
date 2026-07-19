@@ -17,7 +17,7 @@ internal val DEFAULT_BACKUP_MONITORING_PROJECTION_PATH: Path = Path.of(
 private const val MAX_BACKUP_MONITORING_PROJECTION_BYTES = 65_536L
 private val InvocationIdPattern = Regex("^[0-9a-f]{32}$")
 private val BootIdPattern = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-private val BackupResultCodes = setOf(
+internal val BackupResultCodes = setOf(
     "BACKUP_BUSY",
     "BACKUP_SIGNALLED",
     "CAPACITY_FLOOR_NOT_MET",

@@ -5,6 +5,7 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -12,6 +13,10 @@ import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickOutcome
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickStatus
 import me.matsumo.fukurou.trading.daemon.MutableLlmDaemonTickStatus
+import me.matsumo.fukurou.trading.evaluation.LlmRunTerminalCause
+import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.reconciler.ReconcilerStatus
@@ -102,6 +107,37 @@ class MonitoringRouteTest {
     }
 
     @Test
+    fun providerAggregationTreatsExplicitNullAuthAsFalse() {
+        val payload =
+            """{"phase":"proposer","details":{"provider":"claude","status":"EXITED","exitCode":"0","authFailureSuspected":null}}"""
+
+        assertEquals(
+            listOf(MonitoringProviderOutcomeResponse("claude", 1, 0, 0)),
+            aggregateProviderOutcomes(listOf(payload)),
+        )
+    }
+
+    @Test
+    fun providerMonitoringEnumsFollowInvocationSources() {
+        LlmProvider.entries.forEach { provider ->
+            val payload = providerPayload(provider.name.lowercase(), null)
+            assertEquals(1, aggregateProviderOutcomes(listOf(payload)).single().totalCount)
+        }
+        LlmInvocationPhase.entries.forEach { phase ->
+            val providerMissing = """{"phase":"${phase.name.lowercase()}","details":{"status":"DONE"}}"""
+            assertFailsWith<MonitoringMalformedEventException> {
+                aggregateProviderOutcomes(listOf(providerMissing))
+            }
+        }
+        ProcessRunStatus.entries.forEach { status ->
+            val payload = providerPayload("claude", null, status.name)
+            assertEquals(1, aggregateProviderOutcomes(listOf(payload)).single().totalCount)
+        }
+        val startFailure = providerPayload("claude", null, status = "FAILED_TO_START", exitCode = "null")
+        assertEquals(1, aggregateProviderOutcomes(listOf(startFailure)).single().failureCount)
+    }
+
+    @Test
     fun malformedProviderEventFailsWholeProviderAggregateClosed() {
         val malformed = providerPayload(provider = "unknown", authFailure = null)
 
@@ -120,6 +156,27 @@ class MonitoringRouteTest {
             MonitoringDaemonTerminalSemantic.LEGACY_UNCLASSIFIED,
             parseDaemonTerminalSemantic("unknown"),
         )
+        assertEquals(
+            LlmRunTerminalCause.entries.map { cause -> cause.name },
+            MonitoringDaemonTerminalSemantic.entries.map { semantic -> semantic.name },
+        )
+    }
+
+    @Test
+    fun daemonTerminalAcceptsPayloadPrecisionBeyondPersistedMilliseconds() {
+        val terminal = parseDaemonTerminal(
+            occurredAt = Instant.parse("2026-07-19T11:55:09.753Z"),
+            payload = """{"status":"NORMAL_COMPLETION","finishedAt":"2026-07-19T11:55:09.753527Z"}""",
+        )
+
+        assertEquals(Instant.parse("2026-07-19T11:55:09.753Z"), terminal.occurredAt)
+        assertEquals(MonitoringDaemonTerminalSemantic.NORMAL_COMPLETION, terminal.semantic)
+        assertFailsWith<MonitoringMalformedEventException> {
+            parseDaemonTerminal(
+                occurredAt = Instant.parse("2026-07-19T11:55:09.753Z"),
+                payload = """{"status":"NORMAL_COMPLETION","finishedAt":"2026-07-19T11:55:09.754Z"}""",
+            )
+        }
     }
 
     @Test
@@ -167,6 +224,8 @@ class MonitoringRouteTest {
 
         assertEquals("UNKNOWN", backupRestore.getValue("state").jsonPrimitive.content)
         assertEquals("BACKUP_PROJECTION_STALE", backupRestore.getValue("reason").jsonPrimitive.content)
+        assertEquals(JsonNull, backupRestore.getValue("backup"))
+        assertEquals(JsonNull, backupRestore.getValue("restore"))
     }
 
     @Test
@@ -197,6 +256,8 @@ class MonitoringRouteTest {
             "BACKUP_PROJECTION_STALE_RUNNING",
             backupRestore.getValue("reason").jsonPrimitive.content,
         )
+        assertEquals(JsonNull, backupRestore.getValue("backup"))
+        assertEquals(JsonNull, backupRestore.getValue("restore"))
     }
 
     private fun monitoringService(

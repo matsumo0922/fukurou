@@ -18,6 +18,8 @@ The system SHALL expose `GET /ops/monitoring` as a versioned read-only contract 
 ### Requirement: Database monitoring reads are finite and fail closed
 The system SHALL derive daemon terminal, 30-minute provider outcome, and unresolved gap facts through fixed-window bounded queries. A truncated, malformed, unknown-enum, or partially parsed result SHALL be reported as `UNKNOWN`, not as a partial aggregate.
 
+Daemon terminal timestamps SHALL be compared at the millisecond precision preserved by `command_event_log.ts`. Resolved gap history SHALL NOT consume the unresolved-gap row bound.
+
 #### Scenario: Provider outcomes are aggregated
 - **WHEN** valid runner terminal events exist within the fixed 30-minute window
 - **THEN** the endpoint returns per-provider total, failure, and authentication-failure counts without returning individual event payloads
