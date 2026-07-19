@@ -514,6 +514,158 @@ rotation 後は旧 image で LLM phase を再有効化しない。障害時は d
 
 この境界はfixed setuid helper 2個とdeployごとのprivilege inventory gateに依存する。merge前にfinal imageでsetuid/setgid、file capability、runtime/root control socket、LLM/MCP process属性のexact checkが通ることを確認する。imageまたはCLIを更新してNode内部FD配置が変わった場合は、差分を監査してから`validate-llm-launcher-probe.mjs`の`liveFds` exact inventoryを更新し、同じfinal imageでcanaryを再実行する。
 
+## PostgreSQL backup / restore
+
+production backup は、同一 NAS の `/srv/fukurou/backups/postgres` に置く暗号化 restic repository へ `pg_dump -Fc -Z0` をstreamするroot-only jobである。日次timerはbackupを毎暦日試行するが、成功を保証しない。integrity-checked tagを持つ固定production groupのnewest 14 daily generationsを保持する。週次restore drillはstatusに記録したexact snapshotをisolated PostgreSQL 16へrestoreし、schema、constraint、critical table、read-only data invariant、owned resource cleanupの実測証跡を更新する。
+
+この運用はPITR/WAL archive、off-site copy、NAS-loss protection、role/ACL recovery、保証RPO/RTO、自動production restoreを提供しない。backup automationには自動alertがないため、operatorはsystemdとroot-only statusを能動確認する。deploy rollbackはdatabaseをrestoreしない。
+
+この節のNAS root rolloutは`HANDOFF`である。repositoryへmergeしただけではscheduled jobは動かず、operatorが以下のsecret/repository作成、初回実測、timer enableを完了する。
+
+### Root prerequisites と repository 初期化
+
+NASでroot operatorが次を確認する。
+
+- `bash`、`docker`、`restic`、`jq`、`openssl`、`systemctl`、`journalctl`、`systemd-analyze`がpersistent pathから利用できる。
+- PostgreSQL client packageの`pg_restore`、GNU coreutilsの`timeout` / `stat` / `df` / `sync` / `sha256sum` / `date` / `install` / `chown` / `chmod` / `mktemp` / `mv` / `rm` / `wc` / `tr` / `sleep`、util-linuxの`flock` / `setsid`、および`awk` / `sed` / `grep`が利用できる。
+- `/srv/fukurou/backups/postgres`を置くfilesystemに、production databaseの実測sizeに運用reserveを加えたfree spaceがある。
+- restic passwordはroot-owned regular file `/srv/fukurou/secrets/restic-password`、mode 0400であり、symlinkではない。
+- passwordのrecovery copyはNASと同時に失われない別管理のsecret managerまたは媒体へ保管する。repositoryだけを残してpasswordを失うとrestoreできない。
+- repositoryはformat version 2で初期化し、backupではrestic compressionを有効にする。
+
+installerはbackup/repository/status/secret directoryをroot:root 0700で作成する。password作成、recovery copy保管、restic repository初期化、statusの成功証跡作成、timer enableはoperatorの責務であり、installerは代行しない。secretとrepositoryはreviewed artifact install後に初期化する。
+
+### Reviewed artifact の install
+
+review済みexact revisionのcheckoutでinstallerを実行する。installerはfixed entrypoint、schema/profile、service/timer unit、root-only directoryだけを配置し、password作成、repository初期化、status成功証跡の作成、timer enableを行わない。install時にtimerが既にenabledなら停止し、operatorが明示的にdisableしてからやり直す。
+
+```sh
+sudo ./scripts/backup/install-fukurou-backup install
+sudo ./scripts/backup/install-fukurou-backup verify-installation
+systemctl is-enabled fukurou-postgres-backup.timer || true
+systemctl is-enabled fukurou-postgres-restore-drill.timer || true
+```
+
+installerがdirectoryを作成した後、root sessionでpasswordとrepositoryを初期化する。secret値をterminal、shell history、journal、PRへ出さない。
+
+```sh
+sudo sh -c 'umask 077; openssl rand -base64 48 > /srv/fukurou/secrets/restic-password'
+sudo chown root:root /srv/fukurou/secrets/restic-password
+sudo chmod 0400 /srv/fukurou/secrets/restic-password
+sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \
+  restic -r /srv/fukurou/backups/postgres init --repository-version 2
+sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \
+  restic -r /srv/fukurou/backups/postgres cat config | jq -e '.version == 2'
+```
+
+password生成後、別管理recovery copyから値を復元できることを確認する。password自体やhashを運用証跡へ貼らない。production database sizeとbackup filesystemのavailable bytesを測り、reserve込みのcapacity floorを満たすことも確認する。
+
+```sh
+sudo docker exec fukurou-postgres sh -ceu \
+  'psql --no-psqlrc --tuples-only --no-align --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --command "SELECT pg_database_size(current_database());"'
+df -B1 --output=avail /srv/fukurou/backups/postgres
+```
+
+`POSTGRES_USER`と`POSTGRES_DB`はcontainer内だけで参照し、database credentialを引数やhost environmentへ渡さない。
+
+install後のentrypointは`/usr/local/libexec/fukurou/{backup-common,backup-fukurou,restore-fukurou}`、profileは`/usr/local/share/fukurou/`、unitは`/etc/systemd/system/`にある。entrypointはroot:root 0555、profileとunitはroot:root 0444、backup/status/secret directoryはroot:root 0700である。`/usr/local/share/fukurou/backup-installation-v1.json`はroot:root 0400で、installed artifact全体のaggregate SHA-256とinstall UTC時刻を保持する。`verify-installation`と`verify-rollout`はmarkerのowner/mode/hashを再検証する。installerはshared backup lockをnon-blockingで取得し、backup/restore serviceとtimerがすべてinactiveである場合だけartifactを置換する。unitにsecretは埋め込まず、`FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou`だけを固定する。`github-runner`のsudo authorityは`/usr/local/sbin/deploy-fukurou`だけであり、backup/restore権限を追加しない。
+
+### 初回 backup / restore gate
+
+timerを有効にする前に、production deployが動いていない時間帯でmanual backupと、そのbackupが記録したexact snapshotのrestore drillを順に実行する。
+
+```sh
+sudo systemctl start fukurou-postgres-backup.service
+sudo systemctl status --no-pager fukurou-postgres-backup.service
+sudo jq . /srv/fukurou/monitoring/backup-status.json
+
+sudo systemctl start fukurou-postgres-restore-drill.service
+sudo systemctl status --no-pager fukurou-postgres-restore-drill.service
+sudo jq . /srv/fukurou/monitoring/backup-status.json
+
+sudo ./scripts/backup/install-fukurou-backup verify-rollout
+```
+
+最新の`backup.lastAttempt`が`SUCCESS`かつ`retentionSucceeded=true`、最新の`restore.lastAttempt`が`SUCCESS`であり、各attemptのsnapshot IDが対応する`lastSuccess`と一致することを確認する。backupとrestoreの`lastSuccess.snapshotId`も同じであり、そのexact IDが現在開いているrepositoryの固定host/pathと`fukurou-postgres,integrity-checked` AND tagsで一意に存在する必要がある。両attemptにはsystemdが付与した相異なる`serviceInvocationId`と現在のkernel boot IDに一致する`serviceBootId`が必要である。さらにcurrent bootの各unit journalにある最新のstable resultが`SUCCESS`であり、その`_SYSTEMD_INVOCATION_ID`がstatusと一致しなければならない。これによりstatus publication failure後に残る旧successをrejectし、garbage collectionされるoneshot unitの`ExecMain*` runtime stateへ依存しない。両attempt時刻、statusの`updatedAt`とfile mtimeはinstall markerより後で、verification時点から24時間以内でなければならない。status publication失敗後の古いsuccess evidence、artifact reinstall前のdrill、再起動前のboot evidence、systemd外で直接実行したattemptを通さない。NAS再起動またはartifact reinstall後はbackupとrestore drillをsystemctlで再実行してからrollout verificationを行う。古い`lastSuccess`が残っていても、最新retentionまたはrestore cleanupが失敗していればgateは失敗する。status directory/fileはroot:root 0700/0600である。bounded Docker inventoryで`me.matsumo.fukurou.restore.attempt` labelを持つcontainer、network、volumeがすべて0件であることも確認する。Docker global pruneは行わない。
+
+初回backupの成功によってcustom dumpが固定60秒bound内に完了したことを確認し、`durationSeconds`はdump、repository write、full-stream integrity readを含むattempt全体の実測時間として記録する。60秒はbackup性能の目標ではなく、backup開始後にdeployが始まるraceでも`pg_dump`のACCESS SHARE lockがDDL/rollbackを長時間止めないためのhard safety capであり、environmentから延長できない。rollout時のdatabase bytesを運用baselineとして記録し、database sizeがbaselineから25%以上増えた場合、または`DUMP_FAILED` / `WATCHDOG_BACKEND_NOT_OBSERVED` / `WATCHDOG_TERMINATION_FAILED`が1回でも発生した場合はtimerをdisableしてdump所要時間とdeploy coordinationを再評価する。60秒へ近づいた状態をenvironment overrideで延命せず、必要なcoordination方式を別changeで設計する。capacity floorを満たさない場合、last-known-good backup/restoreのいずれかがない場合、cleanup failureがある場合もtimerをdisabledのままにする。
+
+gateを満たした後だけtimerを有効にする。
+
+```sh
+sudo systemctl enable --now fukurou-postgres-backup.timer
+sudo systemctl enable --now fukurou-postgres-restore-drill.timer
+systemctl list-timers 'fukurou-postgres-*'
+```
+
+停止時はsnapshot、repository、password、statusを削除せずtimerだけを無効にする。
+
+```sh
+sudo systemctl disable --now fukurou-postgres-backup.timer
+sudo systemctl disable --now fukurou-postgres-restore-drill.timer
+```
+
+### 監視とfailure triage
+
+自動alertがないため、operatorは少なくとも日次attemptと週次drillの後にunit、journal、statusを確認する。statusの`lastAttempt.resultCode`はstable codeだけを公開し、child stderrやsecretを含めない。失敗attemptがlast-known-good evidenceを消していないことと、snapshot age・restore durationを保証RPO/RTOとして読まないことを確認する。
+
+```sh
+systemctl --failed 'fukurou-postgres-*'
+journalctl -u fukurou-postgres-backup.service --since '2 days ago'
+journalctl -u fukurou-postgres-restore-drill.service --since '8 days ago'
+sudo jq '{updatedAt, backup, restore}' /srv/fukurou/monitoring/backup-status.json
+```
+
+- `BACKUP_BUSY` / `DEPLOY_IN_PROGRESS`: 競合jobまたはdeploy終了後にmanual再実行する。start-time probe後に始まるdeploy raceまで相互排他とはみなさない。
+- `CAPACITY_FLOOR_NOT_MET`: DB sizeの測定失敗を含む。PostgreSQL connectivityとDB size、free spaceを再測定し、原因を解消するまで再実行しない。
+- `WATCHDOG_TERMINATION_FAILED`: 対象backendのPID/application identityを確認できていない。timerを止め、production lock影響を調査する。
+- `INTEGRITY_CHECK_FAILED` / `SNAPSHOT_IDENTITY_FAILED`: retention/pruneを行わずrepositoryとattempt-tagged candidateをroot-onlyで調査する。
+- `RETENTION_FAILED`: integrity-checked snapshot evidenceは残るがhousekeepingは失敗している。repositoryを確認してmanual retentionを判断する。
+- `BACKUP_SIGNALLED`: backup serviceがsignalで中断された。`lastSuccess`は維持されるため、候補snapshotとjournalを確認してから再実行する。
+- `RESTORE_CLEANUP_FAILED`: last verified restoreは更新されない。前回の強制終了で残ったものを含め、`me.matsumo.fukurou.restore.attempt` labelを持つresourceだけを次の順で確認する。
+
+```sh
+restore_label='me.matsumo.fukurou.restore.attempt'
+sudo docker ps -a --filter "label=${restore_label}" --format 'container {{.ID}} {{.Names}}'
+sudo docker network ls --filter "label=${restore_label}" --format 'network {{.ID}} {{.Name}}'
+sudo docker volume ls --filter "label=${restore_label}" --format 'volume {{.Name}}'
+
+sudo docker ps -aq --filter "label=${restore_label}" | xargs -r sudo docker rm -f --
+sudo docker network ls -q --filter "label=${restore_label}" | xargs -r sudo docker network rm --
+sudo docker volume ls -q --filter "label=${restore_label}" | xargs -r sudo docker volume rm --
+```
+
+container、network、volumeの順を変えず、各一覧が0件になったことを再確認してからdrillを再実行する。`docker system prune`、`docker volume prune`などのglobal pruneは使わない。restore volumeはrestic repositoryと異なり暗号化されておらず、production DBから復元したcopyを保持する。残留volumeは単なるhousekeeping failureではなくdata-at-rest incidentとして扱い、NASへのアクセスを制限し、削除完了と影響時間を記録する。削除できない場合はtimerをdisabledのままにしてincidentを解消するまでdrillを再開しない。
+- その他の`RESTORE_*`: exact integrity-checked snapshotの存在、`/postgres.dump`のcustom archive、profile/invariantを順に確認する。last verified restoreは更新されない。
+- `INVALID_STATUS` / `STATUS_PUBLICATION_FAILED`: automationを止め、completeな旧status、repository evidence、filesystemを調べる。
+
+### Repository/status repair
+
+statusがmalformedまたはunsupportedな場合はtimerを無効にし、root-only directory内でstatusをquarantineする。repositoryのsnapshot、fixed tag/host/path、last integrity evidenceを確認する。status fileが存在しない状態では次のmanual backupがschema v1を初期化するため、そのbackupとrestore gateをやり直す。破損statusを手編集でsuccessへ変えない。
+
+interrupted attempt-tagged candidateは自動削除しない。対象snapshotをexact IDでfull-stream検証し、必要性を確認してからmanual `restic forget`を`--prune`なしで行う。その後に`restic check`を完了し、orphan packがないことを確認した場合だけchecked pruneを別操作で行う。repository integrityが不確実な間は`forget --prune`や`prune`を行わない。
+statusの`interruptedCandidateCount`が`null`の場合はrepository照合自体が失敗した未知状態であり、0件として扱わない。
+
+```sh
+sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \
+  restic -r /srv/fukurou/backups/postgres check
+sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \
+  restic -r /srv/fukurou/backups/postgres snapshots \
+  --tag fukurou-postgres,integrity-checked
+sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \
+  restic -r /srv/fukurou/backups/postgres prune --dry-run
+```
+
+tagのAND predicateはcomma-separatedの単一`--tag`を使う。複数の`--tag`はOR semanticsになるためretention対象の確認に使わない。
+
+`prune --dry-run`でorphan packと削除候補を確認し、full-stream evidence、repository check、対象snapshotの保持を再確認した後だけ同じcommandから`--dry-run`を外す。repository metadataのrepairが必要な場合はautomationを再開せず、password recovery copyとrepositoryの別copyを確保し、使用中restic versionの`repair index` / `repair snapshots`手順を個別にreviewしてから実行する。repair後は`restic check`と初回backup/restore gateをやり直す。
+
+### Production database replacement boundary
+
+このrepositoryのcommandはproduction databaseを置換しない。corruptionまたはdata lossが疑われる場合はrisk-increasing executionを停止し、exact snapshotをisolated environmentへrestoreして内容と証跡を確認する。production replacementは別途明示承認を必要とする。
+
+replacementを承認した場合もowner/ACLをarchiveから再生しない。application起動前にcode-owned `scripts/deploy/sql/deploy-foundation-v1.sql`、index foundation、`scripts/deploy/sql/mcp-role.sql`を適用し、application role、PUBLIC revoke、MCP role/effective privilegeをbootstrap手順どおり検証する。role/ACL bootstrapが確認できないdatabaseをproductionとして起動しない。
+
 ## Rollback
 
 application rollback は過去のcommit SHAを`workflow_dispatch`の`image_sha`に指定し、空でない`rollback_reason`を記入して再実行する。対象がcurrent revisionのstrict ancestorである場合だけworkflow/root executorが`AUTHORIZED_ROLLBACK`として受け入れる。同一SHA、新しいSHA、divergent/main外SHAは拒否する。historical targetも現在のCI環境で`make test`、`make detekt`、clean-tree検査を通す必要があり、quality bypassはない。

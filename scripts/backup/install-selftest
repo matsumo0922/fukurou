@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT INT TERM
+
+export FUKUROU_BACKUP_LOCK_FILE="${SELFTEST_ROOT}/backup.lock"
+# shellcheck source=scripts/backup/install-fukurou-backup
+source "${SELFTEST_DIRECTORY}/install-fukurou-backup"
+
+fail() {
+    printf 'install-selftest: %s\n' "$1" >&2
+    exit 1
+}
+
+active_unit=""
+systemctl() {
+    if [[ $1 == is-active ]]; then
+        [[ ${3:-} == "${active_unit}" ]]
+        return
+    fi
+    return 1
+}
+
+flock_result=0
+flock() {
+    printf '%s\n' "$*" >"${SELFTEST_ROOT}/flock.log"
+    return "${flock_result}"
+}
+
+all_rollout_units_inactive || fail 'inactive rollout units were rejected'
+active_unit=fukurou-postgres-backup.service
+if all_rollout_units_inactive; then
+    fail 'active backup service was accepted'
+fi
+active_unit=fukurou-postgres-restore-drill.timer
+if all_rollout_units_inactive; then
+    fail 'active restore timer was accepted'
+fi
+
+active_unit=""
+acquire_install_lock || fail 'shared install lock was not acquired'
+[[ $(<"${SELFTEST_ROOT}/flock.log") == '-n 9' ]] || fail 'installer did not request a non-blocking fd lock'
+exec 9>&-
+flock_result=1
+if acquire_install_lock; then fail 'contended shared install lock was accepted'; fi
+exec 9>&-
+
+readonly SNAPSHOT_ID=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+readonly BOOT_ID=01234567-89ab-cdef-0123-456789abcdef
+readonly BACKUP_INVOCATION_ID=0123456789abcdef0123456789abcdef
+readonly RESTORE_INVOCATION_ID=fedcba9876543210fedcba9876543210
+snapshot_fixture='[]'
+restic() {
+    printf '%s\n' "$*" >"${SELFTEST_ROOT}/restic.log"
+    printf '%s\n' "${snapshot_fixture}"
+}
+
+if verify_repository_snapshot "${SNAPSHOT_ID}"; then
+    fail 'missing current-repository snapshot was accepted'
+fi
+snapshot_fixture="[{\"id\":\"${SNAPSHOT_ID}\"}]"
+verify_repository_snapshot "${SNAPSHOT_ID}" || fail 'exact current-repository snapshot was rejected'
+[[ $(<"${SELFTEST_ROOT}/restic.log") == *'--host fukurou-production --path /postgres.dump --tag fukurou-postgres,integrity-checked'* ]] ||
+    fail 'repository snapshot lookup did not use the fixed AND-tag group'
+snapshot_fixture='[{"id":"aaaaaaaa"},{"id":"bbbbbbbb"}]'
+if verify_repository_snapshot "${SNAPSHOT_ID}"; then
+    fail 'ambiguous current-repository snapshot result was accepted'
+fi
+
+status_fixture="${SELFTEST_ROOT}/backup-status.json"
+jq -cn --arg snapshot "${SNAPSHOT_ID}" --arg boot_id "${BOOT_ID}" \
+    --arg backup_invocation "${BACKUP_INVOCATION_ID}" --arg restore_invocation "${RESTORE_INVOCATION_ID}" '
+  {
+    schemaVersion: 1,
+    updatedAt: "2026-07-18T00:02:00Z",
+    backup: {
+      lastAttempt: {
+        attemptedAt: "2026-07-18T00:00:00Z",
+        resultCode: "SUCCESS",
+        durationSeconds: 1,
+        serviceInvocationId: $backup_invocation,
+        serviceBootId: $boot_id,
+        snapshotId: $snapshot,
+        interruptedCandidateCount: 0,
+        retentionSucceeded: true
+      },
+      lastSuccess: {
+        snapshotId: $snapshot,
+        sourceRevision: "0123456789abcdef0123456789abcdef01234567",
+        verifiedAt: "2026-07-18T00:00:00Z",
+        durationSeconds: 1
+      }
+    },
+    restore: {
+      lastAttempt: {
+        attemptedAt: "2026-07-18T00:01:00Z",
+        resultCode: "SUCCESS",
+        durationSeconds: 1,
+        serviceInvocationId: $restore_invocation,
+        serviceBootId: $boot_id,
+        snapshotId: $snapshot,
+        interruptedCandidateCount: 0,
+        retentionSucceeded: null
+      },
+      lastSuccess: {
+        snapshotId: $snapshot,
+        sourceRevision: "0123456789abcdef0123456789abcdef01234567",
+        verifiedAt: "2026-07-18T00:01:00Z",
+        durationSeconds: 1,
+        verificationCount: 1,
+        tableCount: 1,
+        constraintCount: 0
+      }
+    }
+  }
+' >"${status_fixture}"
+
+verify_rollout_status "${status_fixture}" "${BOOT_ID}" || fail 'latest successful rollout evidence was rejected'
+
+jq '.backup.lastAttempt.resultCode="RETENTION_FAILED" | .backup.lastAttempt.retentionSucceeded=false' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/retention-failed.json"
+if verify_rollout_status "${SELFTEST_ROOT}/retention-failed.json" "${BOOT_ID}"; then
+    fail 'old backup lastSuccess was accepted after retention failure'
+fi
+
+jq '.restore.lastAttempt.resultCode="RESTORE_CLEANUP_FAILED"' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/restore-cleanup-failed.json"
+if verify_rollout_status "${SELFTEST_ROOT}/restore-cleanup-failed.json" "${BOOT_ID}"; then
+    fail 'old restore lastSuccess was accepted after cleanup failure'
+fi
+
+jq '.restore.lastAttempt.snapshotId="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/attempt-snapshot-mismatch.json"
+if verify_rollout_status "${SELFTEST_ROOT}/attempt-snapshot-mismatch.json" "${BOOT_ID}"; then
+    fail 'restore attempt and success snapshot mismatch was accepted'
+fi
+
+readonly MARKER_HASH=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+marker_fixture="${SELFTEST_ROOT}/backup-installation-v1.json"
+jq -cn --arg hash "${MARKER_HASH}" \
+    '{schemaVersion:1,installedAt:"2026-07-18T00:00:00Z",artifactAggregateSha256:$hash}' >"${marker_fixture}"
+verify_install_marker "${marker_fixture}" "${MARKER_HASH}" || fail 'matching installation marker was rejected'
+if verify_install_marker "${marker_fixture}" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; then
+    fail 'installation marker hash mismatch was accepted'
+fi
+
+verify_rollout_freshness_epochs 100 115 125 130 130 140 ||
+    fail 'fresh post-install rollout evidence was rejected'
+if verify_rollout_freshness_epochs 120 115 125 130 130 140; then
+    fail 'pre-install backup evidence survived reinstall'
+fi
+if verify_rollout_freshness_epochs 100 115 125 130 130 $((130 + ROLLOUT_MAX_EVIDENCE_AGE_SECONDS + 1)); then
+    fail 'expired rollout evidence was accepted'
+fi
+if verify_rollout_freshness_epochs 100 115 125 130 100 140; then
+    fail 'status file evidence predating installation was accepted'
+fi
+
+leaked_resource_kind=""
+journal_result_code=SUCCESS
+journal_invocation_override=""
+docker() {
+    printf '%s\n' "$*" >>"${SELFTEST_ROOT}/docker.log"
+    if [[ $1 == "${leaked_resource_kind}" ]]; then
+        printf '%s\n' leaked-resource-id
+    fi
+}
+journalctl() {
+    local invocation_id
+    [[ $* == *'--boot=0'* && $* == *'--output=json'* && $* == *'--grep=^fukurou-backup: result='* && $* == *'--lines=1'* ]] ||
+        fail 'journal query did not select the latest stable result from the current boot'
+    case $* in
+        *'--unit=fukurou-postgres-backup.service'*) invocation_id=${BACKUP_INVOCATION_ID} ;;
+        *'--unit=fukurou-postgres-restore-drill.service'*) invocation_id=${RESTORE_INVOCATION_ID} ;;
+        *) return 1 ;;
+    esac
+    [[ -z ${journal_invocation_override} ]] || invocation_id=${journal_invocation_override}
+    jq -cn --arg invocation_id "${invocation_id}" --arg message "fukurou-backup: result=${journal_result_code}" \
+        '{_SYSTEMD_INVOCATION_ID:$invocation_id,MESSAGE:$message}'
+}
+timeout() {
+    [[ $1 == --signal=TERM && $2 == --kill-after=5 && $3 == 30 ]] ||
+        fail 'rollout dependency query was not bounded'
+    shift 3
+    "$@"
+}
+
+verify_no_restore_owned_resources || fail 'empty restore-owned resource inventory was rejected'
+for leaked_resource_kind in ps network volume; do
+    if verify_no_restore_owned_resources; then
+        fail "restore-owned ${leaked_resource_kind} leak was accepted"
+    fi
+done
+if grep -Fv -- "--filter label=${RESTORE_LABEL_KEY}" "${SELFTEST_ROOT}/docker.log" >/dev/null; then
+    fail 'Docker inventory escaped the restore ownership label'
+fi
+
+if verify_rollout_status "${status_fixture}" fedcba98-7654-3210-fedc-ba9876543210; then
+    fail 'evidence from an earlier boot was accepted'
+fi
+jq '.restore.lastAttempt.serviceInvocationId=.backup.lastAttempt.serviceInvocationId' \
+    "${status_fixture}" >"${SELFTEST_ROOT}/duplicate-invocation.json"
+if verify_rollout_status "${SELFTEST_ROOT}/duplicate-invocation.json" "${BOOT_ID}"; then
+    fail 'one service invocation was accepted as both backup and restore evidence'
+fi
+if timestamp_epoch ''; then
+    fail 'empty timestamp was accepted as midnight'
+fi
+verify_rollout_service_journal_evidence "${status_fixture}" ||
+    fail 'matching latest successful service journal evidence was rejected'
+journal_result_code=STATUS_PUBLICATION_FAILED
+if verify_rollout_service_journal_evidence "${status_fixture}"; then
+    fail 'old status success survived a later publication failure in the same boot'
+fi
+journal_result_code=SUCCESS
+journal_invocation_override=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+if verify_rollout_service_journal_evidence "${status_fixture}"; then
+    fail 'status evidence was accepted when it did not match the latest service invocation'
+fi
+
+printf 'INSTALL_SELFTEST_OK lock=exclusive active-units=fail-closed marker=hash-bound freshness=post-install snapshot=current-repository-exact latest-attempts=required resources=zero service-evidence=durable-current-boot-journal-bound\n'

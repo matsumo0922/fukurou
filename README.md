@@ -141,6 +141,8 @@ Docker Compose と GitHub Actions による GHCR image pull 型の NAS deploy sc
 
 production deploy は Ed25519 signed typed bundle v2、event-derived `FORWARD` / `AUTHORIZED_ROLLBACK` intent、production lock内revision ancestry、hash-bound schema-sensitive path inventoryとmigration recovery mode、parent-hash付きcumulative capability catalog、candidate executableのmutation前operation probe、exact digestのpinned CLI acceptance、hash固定したinstalled foundation harness、durable dispatch ledger、canonical fence/PID registration、DB maintenance/drain、isolated Compose `CANARY_ONLY` preflightを通過したimmutable image digestだけを切り替えます。すべてのforward/rollback targetにexact-SHA JVM quality gateを適用し、queued old forward deployはproduction mutation前に拒否します。deploy gapはappend-only OPEN/CLOSE factとして残り、6 entity共通のcausal projectionがstrategy KPIからaffected/missing recordを除外します。`PREFILTER_ACTIVATION_RELEASED=false` は active DB config より優先されます。
 
+production PostgreSQL は、root-owned systemd timer が同一 NAS の restic format v2 repository へ `pg_dump -Fc` の暗号化 logical backup を日次で試行します。integrity を確認した newest 14 daily generations を保持し、週次には exact snapshot を disposable PostgreSQL 16 へ restore して schema・constraint・data invariant・cleanup を実測します。これは daily success、PITR、off-site/NAS-loss protection、role/ACL recovery、保証 RPO/RTO、自動通知を提供するものではありません。timer は root operator が初回 backup と restore drill の成功証跡を確認した後だけ有効にします。手順と復旧境界は [`docs/deploy.md`](docs/deploy.md#postgresql-backup--restore) を参照してください。
+
 - `Dockerfile`
 - `docker-compose.yml`
 - `docker-compose.dev.yml`
@@ -152,6 +154,9 @@ production deploy は Ed25519 signed typed bundle v2、event-derived `FORWARD` /
 - `scripts/deploy/fukurou-deploy-db`
 - `scripts/deploy/deploy-contract-v1.json`
 - `scripts/deploy/sudoers-fukurou`
+- `scripts/backup/backup-fukurou`
+- `scripts/backup/restore-fukurou`
+- `scripts/backup/systemd/`
 - `scripts/prod-curl`
 - [`docs/deploy.md`](docs/deploy.md)
 

@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly BACKUP_SCRIPT="${SCRIPT_DIRECTORY}/backup-fukurou"
+readonly RESTORE_SCRIPT="${SCRIPT_DIRECTORY}/restore-fukurou"
+readonly REQUIRE_INTEGRATION="${FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE:-false}"
+
+dependency_unavailable() {
+  local detail="$1"
+  if [[ "${REQUIRE_INTEGRATION}" == "true" ]]; then
+    printf 'BACKUP_POSTGRES_SELFTEST_FAILED %s\n' "${detail}" >&2
+    exit 1
+  fi
+  printf 'BACKUP_POSTGRES_SELFTEST_SKIPPED %s\n' "${detail}"
+  exit 0
+}
+
+[[ "${REQUIRE_INTEGRATION}" == "true" || "${REQUIRE_INTEGRATION}" == "false" ]] ||
+  dependency_unavailable 'require-flag=invalid'
+
+for command in docker jq openssl python3 restic; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    dependency_unavailable "missing=${command}"
+  fi
+done
+if ! docker info >/dev/null 2>&1; then
+  dependency_unavailable 'docker=unavailable'
+fi
+if [[ "${EUID}" -ne 0 ]]; then
+  dependency_unavailable 'root=required'
+fi
+
+readonly fixture_root="$(mktemp -d)"
+readonly fixture_id="fukurou-backup-integration-$$-$RANDOM"
+readonly fixture_label="me.matsumo.fukurou.backup.integration=${fixture_id}"
+readonly source_container="${fixture_id}-source"
+readonly application_container="${fixture_id}-application"
+readonly source_network="${fixture_id}-network"
+readonly source_volume="${fixture_id}-data"
+readonly source_revision=0123456789abcdef0123456789abcdef01234567
+phase=fixture-setup
+
+report_failure() {
+  local exit_code="$?"
+  printf 'BACKUP_POSTGRES_SELFTEST_FAILED phase=%s\n' "${phase}" >&2
+  if [[ "${phase}" == production-backup-entrypoint && -f "${fixture_root}/backup-stderr" ]]; then
+    grep -E '^fukurou-backup: result=[A-Z_]+$' "${fixture_root}/backup-stderr" >&2 || true
+  fi
+  exit "${exit_code}"
+}
+
+cleanup() {
+  docker rm -f -- "${source_container}" >/dev/null 2>&1 || true
+  docker rm -f -- "${application_container}" >/dev/null 2>&1 || true
+  docker network rm -- "${source_network}" >/dev/null 2>&1 || true
+  docker volume rm -- "${source_volume}" >/dev/null 2>&1 || true
+  if [[ "${FUKUROU_BACKUP_POSTGRES_SELFTEST_KEEP:-false}" == "true" ]]; then
+    printf 'BACKUP_POSTGRES_SELFTEST_FIXTURE=%s\n' "${fixture_root}" >&2
+  else
+    rm -rf -- "${fixture_root}"
+  fi
+}
+trap cleanup EXIT INT TERM
+trap report_failure ERR
+
+mkdir -p "${fixture_root}/profiles" "${fixture_root}/repository" "${fixture_root}/run"
+chmod 0700 "${fixture_root}" "${fixture_root}/repository" "${fixture_root}/run"
+printf 'integration-password\n' >"${fixture_root}/source-password"
+printf 'integration-restic-password\n' >"${fixture_root}/restic-password"
+chmod 0400 "${fixture_root}/source-password" "${fixture_root}/restic-password"
+
+cat >"${fixture_root}/setsid" <<'SETSID'
+#!/usr/bin/env python3
+import os
+import sys
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])
+SETSID
+cat >"${fixture_root}/timeout" <<'TIMEOUT'
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+arguments = sys.argv[1:]
+while arguments and arguments[0].startswith("--"):
+    arguments.pop(0)
+seconds = float(arguments.pop(0))
+process = subprocess.Popen(arguments, start_new_session=True)
+try:
+    sys.exit(process.wait(timeout=seconds))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    sys.exit(124)
+TIMEOUT
+chmod +x "${fixture_root}/setsid" "${fixture_root}/timeout"
+
+cat >"${fixture_root}/profiles/restore-inventory-v1.txt" <<'INVENTORY'
+table public restore_fixture
+view public restore_fixture_view
+sequence public restore_fixture_sequence
+INVENTORY
+cat >"${fixture_root}/profiles/restore-critical-tables-v1.txt" <<'CRITICAL'
+public restore_fixture
+CRITICAL
+cat >"${fixture_root}/profiles/restore-readonly-invariants-v1.sql" <<'INVARIANTS'
+BEGIN TRANSACTION READ ONLY;
+SELECT COUNT(*) FROM public.restore_fixture WHERE payload <> 'restorable';
+SELECT COUNT(*) FROM public.restore_fixture WHERE id <> 1;
+SELECT COUNT(*) FROM public.restore_fixture WHERE payload IS NULL;
+SELECT COUNT(*) FROM public.restore_fixture WHERE length(payload) = 0;
+SELECT COUNT(*) FROM public.restore_fixture WHERE id IS NULL;
+COMMIT;
+INVARIANTS
+
+docker network create --internal --label "${fixture_label}" "${source_network}" >/dev/null
+docker volume create --label "${fixture_label}" "${source_volume}" >/dev/null
+docker run --detach \
+  --name "${source_container}" \
+  --label "${fixture_label}" \
+  --network "${source_network}" \
+  --mount "type=volume,src=${source_volume},dst=/var/lib/postgresql/data" \
+  --mount "type=bind,src=${fixture_root}/source-password,dst=/run/secrets/postgres-password,readonly" \
+  --env POSTGRES_USER=fixture_owner \
+  --env POSTGRES_DB=fixture_database \
+  --env POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password \
+  postgres:16 >/dev/null
+docker run --detach \
+  --name "${application_container}" \
+  --label "${fixture_label}" \
+  --env "FUKUROU_REVISION=${source_revision}" \
+  postgres:16 sleep infinity >/dev/null
+
+deadline=$(( $(date -u '+%s') + 60 ))
+until docker exec "${source_container}" pg_isready --username=fixture_owner --dbname=fixture_database >/dev/null 2>&1; do
+  (( $(date -u '+%s') < deadline )) || { printf 'backup-postgres-selftest: source startup timed out\n' >&2; exit 1; }
+  sleep 1
+done
+
+docker exec -i "${source_container}" psql -X --set=ON_ERROR_STOP=1 \
+  --username=fixture_owner --dbname=fixture_database >/dev/null <<'SQL'
+CREATE SEQUENCE restore_fixture_sequence;
+CREATE TABLE restore_fixture (
+  id BIGINT PRIMARY KEY DEFAULT nextval('restore_fixture_sequence'),
+  payload TEXT NOT NULL CHECK (length(payload) > 0)
+);
+CREATE VIEW restore_fixture_view AS SELECT id, payload FROM restore_fixture;
+INSERT INTO restore_fixture(payload) VALUES ('restorable');
+SQL
+docker exec "${source_container}" pg_dump --username=fixture_owner --dbname=fixture_database \
+  --format=custom --compress=0 --no-owner --no-acl --file=/tmp/fixture.dump
+docker cp "${source_container}:/tmp/fixture.dump" "${fixture_root}/fixture.dump" >/dev/null
+[[ -s "${fixture_root}/fixture.dump" ]]
+docker exec -i "${source_container}" pg_restore --list <"${fixture_root}/fixture.dump" >/dev/null
+
+restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  init --repository-version 2 >/dev/null
+
+# Seed fifteen distinct daily generations. The production entrypoint below must create the
+# newest generation and prune this fixed retention group back to fourteen.
+phase=retention-fixture-seed
+for day_offset in $(seq 15 -1 1); do
+  snapshot_time="$(python3 - "${day_offset}" <<'PY'
+import datetime
+import sys
+
+offset = int(sys.argv[1])
+timestamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=offset)
+print(timestamp.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S"))
+PY
+)"
+  restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+    backup --quiet --stdin --stdin-filename postgres.dump --host fukurou-production \
+    --time "${snapshot_time}" --tag fukurou-postgres --tag integrity-checked \
+    <"${fixture_root}/fixture.dump"
+done
+
+phase=production-backup-entrypoint
+env \
+  INVOCATION_ID=0123456789abcdef0123456789abcdef \
+  FUKUROU_POSTGRES_CONTAINER="${source_container}" \
+  FUKUROU_APPLICATION_CONTAINER="${application_container}" \
+  FUKUROU_BACKUP_SOURCE_REVISION="${source_revision}" \
+  FUKUROU_BACKUP_RESERVE_BYTES=0 \
+  FUKUROU_BACKUP_STATUS_FILE="${fixture_root}/run/backup-status.json" \
+  FUKUROU_BACKUP_LOCK_FILE="${fixture_root}/run/backup.lock" \
+  FUKUROU_DEPLOY_LOCK_FILE="${fixture_root}/run/deploy.lock" \
+  FUKUROU_BACKUP_SHARE_DIRECTORY="${SCRIPT_DIRECTORY}" \
+  RESTIC_REPOSITORY="${fixture_root}/repository" \
+  RESTIC_PASSWORD_FILE="${fixture_root}/restic-password" \
+  "${BACKUP_SCRIPT}" >"${fixture_root}/backup-stdout" 2>"${fixture_root}/backup-stderr"
+
+phase=production-backup-verification
+[[ ! -s "${fixture_root}/backup-stdout" ]]
+[[ "$(<"${fixture_root}/backup-stderr")" == 'fukurou-backup: result=SUCCESS' ]]
+if grep -F -e 'integration-password' -e 'integration-restic-password' \
+  -e "${fixture_root}" -e 'fixture_database' \
+  "${fixture_root}/backup-stdout" "${fixture_root}/backup-stderr" >/dev/null; then
+  printf 'backup-postgres-selftest: production entrypoint leaked fixture detail\n' >&2
+  exit 1
+fi
+
+snapshot_id="$(jq -er '.backup.lastSuccess.snapshotId' "${fixture_root}/run/backup-status.json")"
+[[ "$(jq -er '.backup.lastAttempt.resultCode' "${fixture_root}/run/backup-status.json")" == SUCCESS ]]
+[[ "$(jq -er '.backup.lastAttempt.retentionSucceeded' "${fixture_root}/run/backup-status.json")" == true ]]
+[[ "$(jq -er '.backup.lastAttempt.serviceInvocationId' "${fixture_root}/run/backup-status.json")" == 0123456789abcdef0123456789abcdef ]]
+[[ "$(jq -er '.backup.lastAttempt.serviceBootId' "${fixture_root}/run/backup-status.json")" == "$(</proc/sys/kernel/random/boot_id)" ]]
+snapshot_json="$(restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  snapshots --json --host fukurou-production --path /postgres.dump \
+  --tag fukurou-postgres,integrity-checked)"
+[[ "$(jq -er 'length' <<<"${snapshot_json}")" == 14 ]]
+[[ "$(jq -er --arg snapshot "${snapshot_id}" '[.[] | select(.id == $snapshot)] | length' <<<"${snapshot_json}")" == 1 ]]
+restic --no-cache --repo "${fixture_root}/repository" --password-file "${fixture_root}/restic-password" \
+  dump "${snapshot_id}" /postgres.dump | docker exec -i "${source_container}" pg_restore --list >/dev/null
+
+phase=restore-entrypoint
+cat >"${fixture_root}/backup-common" <<COMMON
+RESTIC_REPOSITORY="\${RESTIC_REPOSITORY}"
+RESTIC_PASSWORD_FILE="\${RESTIC_PASSWORD_FILE}"
+BACKUP_HOST=fukurou-production
+BACKUP_STDIN_PATH=/postgres.dump
+STATUS_FILE=fixture-status
+backup_require_root() { return 0; }
+backup_acquire_shared_lock() { return 0; }
+backup_probe_deploy_lock() { return 0; }
+backup_require_command() { command -v "\$1" >/dev/null 2>&1; }
+backup_load_status() { printf '{"schemaVersion":1}\n'; }
+backup_status_snapshot_id() { printf '${snapshot_id}\n'; }
+backup_publish_restore_attempt() { printf '%s\n' "\$*" >"\${FIXTURE_PUBLISH_LOG}"; }
+backup_emit_result() { printf 'fukurou-backup: result=%s\n' "\$1" >&2; }
+COMMON
+
+production_before="$(docker inspect --format '{{.Id}}' fukurou-postgres 2>/dev/null || true)"
+env \
+  FIXTURE_PUBLISH_LOG="${fixture_root}/publish.log" \
+  FUKUROU_BACKUP_COMMON_PATH="${fixture_root}/backup-common" \
+  FUKUROU_BACKUP_LOCK_FILE="${fixture_root}/backup.lock" \
+  FUKUROU_FLOCK_BIN=true \
+  FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1 \
+  FUKUROU_BACKUP_SHARE_DIRECTORY="${fixture_root}/profiles" \
+  FUKUROU_RESTORE_RUNTIME_DIRECTORY="${fixture_root}/run" \
+  FUKUROU_RESTIC_BIN=restic \
+  FUKUROU_SETSID_BIN="${fixture_root}/setsid" \
+  FUKUROU_TIMEOUT_BIN="${fixture_root}/timeout" \
+  RESTIC_REPOSITORY="${fixture_root}/repository" \
+  RESTIC_PASSWORD_FILE="${fixture_root}/restic-password" \
+  "${RESTORE_SCRIPT}" >"${fixture_root}/stdout" 2>"${fixture_root}/stderr"
+
+grep -F "SUCCESS ${snapshot_id}" "${fixture_root}/publish.log" >/dev/null
+grep -F ' 1 ' "${fixture_root}/publish.log" >/dev/null
+docker inspect "${source_container}" >/dev/null
+production_after="$(docker inspect --format '{{.Id}}' fukurou-postgres 2>/dev/null || true)"
+[[ "${production_after}" == "${production_before}" ]]
+
+phase=complete
+printf 'BACKUP_POSTGRES_SELFTEST_OK backup-entrypoint=real retention=pruned redaction=verified restore=postgres16 profile=validated constraints=preserved production=unchanged cleanup=owned-only\n'

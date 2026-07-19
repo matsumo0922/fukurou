@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELFTEST_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT
+mkdir -p "${SELFTEST_ROOT}/status" "${SELFTEST_ROOT}/repo" "${SELFTEST_ROOT}/bin"
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"${SELFTEST_ROOT}/boot-id"
+
+export FUKUROU_BACKUP_STATUS_FILE="${SELFTEST_ROOT}/status/backup-status.json"
+export FUKUROU_BACKUP_LOCK_FILE="${SELFTEST_ROOT}/backup.lock"
+export FUKUROU_DEPLOY_LOCK_FILE="${SELFTEST_ROOT}/deploy.lock"
+export RESTIC_REPOSITORY="${SELFTEST_ROOT}/repo/repository"
+export RESTIC_PASSWORD_FILE="${SELFTEST_ROOT}/restic-password"
+export FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1
+export FUKUROU_SERVICE_BOOT_ID_FILE="${SELFTEST_ROOT}/boot-id"
+# shellcheck source=backup-fukurou
+source "${SELFTEST_DIRECTORY}/backup-fukurou"
+
+fail_selftest() {
+  printf 'backup-selftest: %s\n' "$*" >&2
+  exit 1
+}
+
+expect_failure() {
+  local name="$1"
+  shift
+  if "$@"; then fail_selftest "${name} unexpectedly succeeded"; fi
+}
+
+assert_contains() {
+  local value="$1" expected="$2" name="$3"
+  [[ "${value}" == *"${expected}"* ]] || fail_selftest "${name}: missing ${expected}"
+}
+
+initial="$(backup_initial_status '2026-07-18T00:00:00Z')"
+backup_validate_status_json "${initial}" || fail_selftest "initial status rejected"
+expect_failure malformed-status backup_validate_status_json '{"schemaVersion":1}'
+expect_failure unsupported-status backup_validate_status_json "$(jq -c '.schemaVersion=2' <<<"${initial}")"
+expect_failure unknown-result backup_validate_status_json "$(jq -c '.backup.lastAttempt={attemptedAt:"2026-07-18T00:00:00Z",resultCode:"PASSWORD=secret",durationSeconds:0,interruptedCandidateCount:0,retentionSucceeded:null}' <<<"${initial}")"
+expect_failure null-attempt-snapshot backup_validate_status_json "$(jq -c '.backup.lastAttempt={attemptedAt:"2026-07-18T00:00:00Z",resultCode:"SUCCESS",durationSeconds:0,snapshotId:null}' <<<"${initial}")"
+
+success='{"snapshotId":"aaaaaaaa","sourceRevision":"0123456789abcdef0123456789abcdef01234567","verifiedAt":"2026-07-18T00:01:00Z","durationSeconds":10,"verificationCount":1}'
+successful="$(backup_merge_attempt "${initial}" backup '2026-07-18T00:00:00Z' SUCCESS 10 0 true "${success}")"
+service_bound="$(INVOCATION_ID=0123456789ABCDEF0123456789ABCDEF \
+  backup_merge_attempt "${initial}" backup '2026-07-18T00:00:00Z' SUCCESS 10 0 true "${success}")"
+[[ "$(jq -r '.backup.lastAttempt.serviceInvocationId' <<<"${service_bound}")" == 0123456789abcdef0123456789abcdef ]] ||
+  fail_selftest "systemd invocation identity was not normalized and persisted"
+[[ "$(jq -r '.backup.lastAttempt.serviceBootId' <<<"${service_bound}")" == 01234567-89ab-cdef-0123-456789abcdef ]] ||
+  fail_selftest "current boot identity was not persisted"
+expect_failure malformed-invocation env INVOCATION_ID=not-an-invocation bash -c \
+  'source "$1"; backup_service_evidence_json' backup-service-evidence "${SELFTEST_DIRECTORY}/backup-common"
+expect_failure null-success-verification-count backup_validate_status_json "$(jq -c '.backup.lastSuccess.verificationCount=null' <<<"${successful}")"
+failed_later="$(backup_merge_attempt "${successful}" backup '2026-07-19T00:00:00Z' REPOSITORY_FAILED 2 1 null null)"
+[[ "$(jq -r '.backup.lastSuccess.snapshotId' <<<"${failed_later}")" == "aaaaaaaa" ]] || fail_selftest "failed attempt erased last success"
+[[ "$(jq -r '.backup.lastAttempt.resultCode' <<<"${failed_later}")" == "REPOSITORY_FAILED" ]] || fail_selftest "failed attempt was not recorded"
+unknown_candidates="$(backup_merge_attempt "${successful}" backup '2026-07-19T00:00:00Z' REPOSITORY_FAILED 2 null null null)"
+backup_validate_status_json "${unknown_candidates}" || fail_selftest "unknown interrupted candidate count was rejected"
+[[ "$(jq -r '.backup.lastAttempt.interruptedCandidateCount' <<<"${unknown_candidates}")" == "null" ]] || fail_selftest "unknown interrupted candidate count was coerced"
+
+backup_publish_status "${successful}" || fail_selftest "atomic status publication failed"
+published_before="$(<"${BACKUP_STATUS_FILE}")"
+STATUS_JSON="${published_before}"
+[[ "$(backup_status_snapshot_id)" == "aaaaaaaa" ]] || fail_selftest "backup snapshot accessor rejected authority"
+backup_publish_restore_attempt SUCCESS aaaaaaaa 1501 7 3 true || fail_selftest "restore success publication failed"
+restore_success="$(backup_load_status)"
+[[ "$(jq -r '.restore.lastSuccess.durationSeconds' <<<"${restore_success}")" == "2" ]] || fail_selftest "restore duration was not rounded up"
+[[ "$(jq -r '.restore.lastSuccess.tableCount' <<<"${restore_success}")" == "7" ]] || fail_selftest "restore table evidence was lost"
+backup_publish_restore_attempt RESTORE_PROFILE_FAILED aaaaaaaa 500 0 0 false || fail_selftest "restore failure publication failed"
+[[ "$(backup_load_status | jq -r '.restore.lastSuccess.snapshotId')" == "aaaaaaaa" ]] || fail_selftest "restore failure erased last success"
+backup_publish_status "${successful}" || fail_selftest "status fixture reset failed"
+printf '{' >"${SELFTEST_ROOT}/status/.backup-status.json.tmp.interrupted"
+[[ "$(<"${BACKUP_STATUS_FILE}")" == "${published_before}" ]] || fail_selftest "pre-rename interruption changed authority"
+ln -s "${SELFTEST_ROOT}/redirect" "${SELFTEST_ROOT}/status/symlink-status"
+
+redacted_output="$(backup_emit_result REPOSITORY_FAILED 2>&1 || true)"
+[[ "${redacted_output}" == 'fukurou-backup: result=REPOSITORY_FAILED' ]] || fail_selftest "result output was not stable and redacted"
+[[ "${redacted_output}" != *password* && "${redacted_output}" != *"${RESTIC_PASSWORD_FILE}"* ]] || fail_selftest "secret detail leaked"
+
+restic_command() {
+  case "$1" in
+    dump) printf 'custom-archive-and-trailing-bytes' ;;
+    *) return 1 ;;
+  esac
+}
+cat >"${SELFTEST_ROOT}/bin/pg_restore" <<'FAKE'
+#!/usr/bin/env bash
+head -c 1 >/dev/null
+exit "${FAKE_PG_RESTORE_STATUS:-0}"
+FAKE
+chmod +x "${SELFTEST_ROOT}/bin/pg_restore"
+PATH="${SELFTEST_ROOT}/bin:${PATH}"
+verify_archive_stream aaaaaaaa || fail_selftest "early list completion did not drain producer"
+FAKE_PG_RESTORE_STATUS=7
+export FAKE_PG_RESTORE_STATUS
+expect_failure consumer-status verify_archive_stream aaaaaaaa
+unset FAKE_PG_RESTORE_STATUS
+restic_command() { [[ "$1" != dump ]] || return 9; }
+expect_failure producer-status verify_archive_stream aaaaaaaa
+
+RESTIC_CALLS="${SELFTEST_ROOT}/restic-calls"
+restic_command() {
+  printf '%s\n' "$*" >>"${RESTIC_CALLS}"
+  if [[ "$1" == snapshots ]]; then
+    printf '%s\n' '[{"id":"bbbbbbbb","tags":["fukurou-postgres","integrity-checked","attempt-fixed"]}]'
+  fi
+}
+ATTEMPT_TAG=attempt-fixed
+authoritative="$(resolve_authoritative_snapshot)"
+[[ "${authoritative}" == "bbbbbbbb" ]] || fail_selftest "tag-induced authoritative ID was not resolved"
+assert_contains "$(<"${RESTIC_CALLS}")" '--tag fukurou-postgres,integrity-checked,attempt-fixed' "authoritative AND tags"
+
+: >"${RESTIC_CALLS}"
+forget_current_partial aaaaaaaa || fail_selftest "partial snapshot forget failed"
+forget_call="$(<"${RESTIC_CALLS}")"
+assert_contains "${forget_call}" 'forget aaaaaaaa' "partial forget"
+[[ "${forget_call}" != *--prune* ]] || fail_selftest "partial forget used prune"
+
+postgres_scalar() { printf '%s\n' 1000; }
+cat >"${SELFTEST_ROOT}/bin/df" <<'FAKE'
+#!/usr/bin/env bash
+printf 'Avail\n%s\n' "${FAKE_AVAILABLE_BYTES:?}"
+FAKE
+chmod +x "${SELFTEST_ROOT}/bin/df"
+FAKE_AVAILABLE_BYTES=$((1000 + BACKUP_RESERVE_BYTES - 1))
+export FAKE_AVAILABLE_BYTES
+expect_failure capacity-floor validate_capacity_floor
+FAKE_AVAILABLE_BYTES=$((1000 + BACKUP_RESERVE_BYTES))
+export FAKE_AVAILABLE_BYTES
+validate_capacity_floor || fail_selftest "capacity floor rejected exact sufficient capacity"
+
+flock() {
+  [[ "${1:-}" == "-u" ]] && return 0
+  if [[ "${2:-}" == "9" && "${FAKE_BACKUP_LOCK_BUSY:-0}" == "1" ]]; then return 1; fi
+  if [[ "${2:-}" == "8" && "${FAKE_DEPLOY_LOCK_BUSY:-0}" == "1" ]]; then return 1; fi
+  return 0
+}
+FAKE_BACKUP_LOCK_BUSY=1
+expect_failure backup-lock-contention backup_acquire_shared_lock
+FAKE_BACKUP_LOCK_BUSY=0
+backup_acquire_shared_lock || fail_selftest "backup lock remained busy"
+flock -u 9
+exec 9>&-
+
+FAKE_DEPLOY_LOCK_BUSY=1
+expect_failure deploy-lock-contention backup_probe_deploy_lock
+FAKE_DEPLOY_LOCK_BUSY=0
+backup_probe_deploy_lock || fail_selftest "deploy lock remained busy"
+
+script_text="$(<"${SELFTEST_DIRECTORY}/backup-fukurou")"
+pre_source_lock_line="$(grep -n 'PRE_SOURCE_FLOCK_BIN.*-n 9' "${SELFTEST_DIRECTORY}/backup-fukurou" | head -n 1 | cut -d: -f1)"
+common_source_line="$(grep -n 'source "${SCRIPT_DIRECTORY}/backup-common"' "${SELFTEST_DIRECTORY}/backup-fukurou" | cut -d: -f1)"
+[[ "${pre_source_lock_line}" =~ ^[0-9]+$ && "${common_source_line}" =~ ^[0-9]+$ ]] || fail_selftest "pre-source lock ordering was not discoverable"
+(( pre_source_lock_line < common_source_line )) || fail_selftest "backup lock was not acquired before common source"
+assert_contains "${script_text}" '--tag fukurou-postgres,integrity-checked --keep-daily 14 --prune' "retention AND predicate"
+assert_contains "${script_text}" "WHERE pid = \${expected_pid} AND application_name = '\${APPLICATION_NAME}'" "exact watchdog recheck"
+assert_contains "${script_text}" 'timeout --signal=KILL --kill-after=1 "${timeout_seconds}"' "bounded watchdog database control"
+assert_contains "${script_text}" 'termination_deadline=$(( hard_deadline - WATCHDOG_TERMINATION_GRACE_SECONDS ))' "watchdog termination reserve"
+assert_contains "${script_text}" '"$((DUMP_DEADLINE_SECONDS - WATCHDOG_TERMINATION_GRACE_SECONDS))"' "dump client hard-deadline fallback"
+assert_contains "${script_text}" 'remaining=$(( WATCHDOG_DEADLINE_EPOCH - $(backup_epoch) ))' "deadline-aware watchdog query"
+assert_contains "${script_text}" 'jobs -pr | grep -Fx -- "${WATCHDOG_PID}"' "completed watchdog reap detection"
+assert_contains "${script_text}" 'kill -TERM "${WATCHDOG_PID}"' "watchdog cancellation"
+assert_contains "${script_text}" 'wait "${WATCHDOG_PID}"' "watchdog reap"
+assert_contains "${script_text}" 'cat >/dev/null' "archive EOF drain"
+assert_contains "${script_text}" '--compression auto' "explicit restic compression"
+assert_contains "${script_text}" 'DUMP_DEADLINE_SECONDS <= 60' "dump deadline cap"
+assert_contains "${script_text}" 'readonly POSTGRES_CONTROL_TIMEOUT_SECONDS=5' "postgres control query tail-latency budget"
+
+cat >"${SELFTEST_ROOT}/bin/flock" <<'FAKE'
+#!/usr/bin/env bash
+exit 1
+FAKE
+chmod +x "${SELFTEST_ROOT}/bin/flock"
+set +e
+pre_source_busy_output="$(PATH="${SELFTEST_ROOT}/bin:${PATH}" FUKUROU_BACKUP_LOCK_FILE="${SELFTEST_ROOT}/pre-source.lock" \
+  "${SELFTEST_DIRECTORY}/backup-fukurou" 2>&1)"
+pre_source_busy_status="$?"
+set -e
+(( pre_source_busy_status != 0 )) || fail_selftest "pre-source lock contention unexpectedly succeeded"
+[[ "${pre_source_busy_output}" == 'fukurou-backup: result=BACKUP_BUSY' ]] || fail_selftest "pre-source lock contention output was not stable"
+rm -f "${SELFTEST_ROOT}/bin/flock"
+
+(
+  bash -c 'trap "" TERM; sleep 30' &
+  WATCHDOG_PID="$!"
+  WATCHDOG_DEADLINE_EPOCH="$(backup_epoch)"
+  cancel_and_reap_dump_watchdog
+  [[ -z "${WATCHDOG_PID}" ]]
+) || fail_selftest "deadline-expired watchdog was not forcibly reaped"
+
+WATCHDOG_EVENTS=""
+WATCHDOG_PID=123
+dump_watchdog_is_running() { return 0; }
+cancel_and_reap_dump_watchdog() { WATCHDOG_EVENTS="${WATCHDOG_EVENTS} cancel"; WATCHDOG_PID=""; }
+wait_for_dump_watchdog() { WATCHDOG_EVENTS="${WATCHDOG_EVENTS} wait"; WATCHDOG_PID=""; }
+dump_backend_count() { printf '%s\n' 1; }
+settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-present"
+[[ "${WATCHDOG_EVENTS}" == " wait" ]] || fail_selftest "producer failure cancelled a watchdog while its backend was present"
+
+WATCHDOG_EVENTS=""
+WATCHDOG_PID=124
+dump_backend_count() { printf '%s\n' 0; }
+settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-absent"
+[[ "${WATCHDOG_EVENTS}" == " cancel" ]] || fail_selftest "zero-backend producer failure did not cancel/reap watchdog"
+
+WATCHDOG_EVENTS=""
+WATCHDOG_PID=125
+dump_backend_count() { printf '%s\n' 2; }
+expect_failure multiple-backends settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-multiple"
+[[ "$(<"${SELFTEST_ROOT}/watchdog-multiple")" == "WATCHDOG_TERMINATION_FAILED" ]] || fail_selftest "multiple backends were not failed closed"
+
+APPLICATION_NAME=fukurou_backup_fixture
+postgres_scalar() { printf 'gone\n'; }
+postgres_scalar_bounded() { printf 'gone\n'; }
+terminate_or_observe_dump_backend 9876 "${SELFTEST_ROOT}/watchdog-gone" "$(( $(backup_epoch) + 5 ))" || fail_selftest "completed backend was treated as termination failure"
+[[ ! -e "${SELFTEST_ROOT}/watchdog-gone" ]] || fail_selftest "completed backend created a failure marker"
+
+postgres_scalar() { printf 'mismatch\n'; }
+postgres_scalar_bounded() { printf 'mismatch\n'; }
+expect_failure pid-reuse terminate_or_observe_dump_backend 9876 "${SELFTEST_ROOT}/watchdog-reused" "$(( $(backup_epoch) + 5 ))"
+[[ "$(<"${SELFTEST_ROOT}/watchdog-reused")" == "WATCHDOG_TERMINATION_FAILED" ]] || fail_selftest "PID reuse was not failed closed"
+
+run_entrypoint_scenario() (
+  local scenario="$1" expected_result="$2" calls output status
+  calls="${SELFTEST_ROOT}/entrypoint-${scenario}.calls"
+  : >"${calls}"
+  backup_publish_status "${initial}" || exit 90
+  ATTEMPT_STARTED_AT=""
+  ATTEMPT_STARTED_EPOCH=""
+  ATTEMPT_TAG=""
+  APPLICATION_NAME=""
+  DATABASE_NAME=""
+  DATABASE_USER=""
+  SOURCE_REVISION=""
+  PRODUCTION_CONTAINER_ID=""
+  APPLICATION_CONTAINER_ID=""
+  INTERRUPTED_CANDIDATE_COUNT=null
+  REPOSITORY_READ_READY=false
+  WATCHDOG_PID=""
+  WATCHDOG_DEADLINE_EPOCH=""
+  WORK_DIRECTORY=""
+  CURRENT_PARTIAL_SNAPSHOT=""
+
+  validate_secret_file() { return 0; }
+  validate_runtime_paths() { return 0; }
+  backup_require_command() { return 0; }
+  backup_acquire_shared_lock() { return 0; }
+  backup_probe_deploy_lock() { return 0; }
+  read_production_identity() {
+    DATABASE_USER=fukurou
+    DATABASE_NAME=fukurou
+    SOURCE_REVISION=0123456789abcdef0123456789abcdef01234567
+    PRODUCTION_CONTAINER_ID="$(printf 'a%.0s' {1..64})"
+    APPLICATION_CONTAINER_ID="$(printf 'b%.0s' {1..64})"
+  }
+  docker() {
+    printf 'docker %s\n' "$*" >>"${calls}"
+    if [[ "$1" == inspect ]]; then
+      local container="${@: -1}" prior_inspections
+      prior_inspections="$(grep -c "^docker inspect .* ${container}$" "${calls}" || true)"
+      if [[ "${scenario}" == identity_change && "${container}" == "${APPLICATION_CONTAINER}" && prior_inspections -gt 0 ]]; then
+        printf 'c%.0s' {1..64}
+      elif [[ "${container}" == "${PRODUCTION_CONTAINER}" ]]; then
+        printf 'a%.0s' {1..64}
+      else
+        printf 'b%.0s' {1..64}
+      fi
+      printf '\n'
+      return 0
+    fi
+    if [[ "$1" == exec && "$2" == "${PRODUCTION_CONTAINER}" ]]; then
+      printf 'fukurou\nfukurou\n'
+      return 0
+    fi
+    if [[ "$1" == exec && "$2" == "${APPLICATION_CONTAINER}" ]]; then
+      printf '0123456789abcdef0123456789abcdef01234567\n'
+      return 0
+    fi
+    return 1
+  }
+  validate_capacity_floor() { return 0; }
+  watch_dump_backend() { return 0; }
+  dump_watchdog_is_running() { return 1; }
+  cancel_and_reap_dump_watchdog() { WATCHDOG_PID=""; }
+  wait_for_dump_watchdog() { WATCHDOG_PID=""; }
+  verify_archive_stream() {
+    printf 'verify\n' >>"${calls}"
+    [[ "${scenario}" != integrity_failure ]]
+  }
+  count_interrupted_candidates() { printf '0\n'; }
+  timeout() {
+    printf 'timeout %s\n' "$*" >>"${calls}"
+    printf 'custom-dump-stream'
+    [[ "${scenario}" != producer_failure && "${scenario}" != timeout_hang ]]
+  }
+  restic_command() {
+    printf 'restic %s\n' "$*" >>"${calls}"
+    case "$1" in
+      cat)
+        printf '{"version":2}\n'
+        ;;
+      check|tag|dump)
+        return 0
+        ;;
+      backup)
+        cat >/dev/null
+        printf '{"message_type":"summary","snapshot_id":"aaaaaaaa"}\n'
+        [[ "${scenario}" != consumer_failure ]]
+        ;;
+      snapshots)
+        if [[ "$*" == *integrity-checked* ]]; then
+          printf '[{"id":"bbbbbbbb","tags":["fukurou-postgres","integrity-checked"]}]\n'
+        else
+          printf '[]\n'
+        fi
+        ;;
+      forget)
+        [[ "${scenario}" != retention_failure && "${scenario}" != retention_publication_failure || "$*" != *--keep-daily* ]]
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+  if [[ "${scenario}" == status_failure || "${scenario}" == retention_publication_failure ]]; then
+    backup_publish_status() {
+      local result_code
+      result_code="$(jq -r '.backup.lastAttempt.resultCode // empty' <<<"$1")"
+      [[ "${scenario}" == status_failure && "${result_code}" != SUCCESS ]] ||
+        [[ "${scenario}" == retention_publication_failure && "${result_code}" != RETENTION_FAILED ]]
+    }
+  fi
+
+  set +e
+  output="$(run_backup 2>&1)"
+  status="$?"
+  set -e
+  if [[ "${scenario}" == success ]]; then
+    (( status == 0 )) || exit 91
+    [[ "${output}" == *"result=SUCCESS"* ]] || exit 92
+    grep -Fx 'restic tag --add integrity-checked aaaaaaaa' "${calls}" >/dev/null || exit 93
+    grep -F -- '--tag fukurou-postgres,integrity-checked --keep-daily 14 --prune' "${calls}" >/dev/null || exit 94
+    status="$(backup_load_status)" || exit 95
+    [[ "$(jq -r '.backup.lastSuccess.snapshotId' <<<"${status}")" == bbbbbbbb ]] || exit 96
+    [[ "$(jq -r '.backup.lastAttempt.snapshotId' <<<"${status}")" == bbbbbbbb ]] || exit 97
+    [[ "$(jq -r '.backup.lastAttempt.resultCode' <<<"${status}")" == SUCCESS ]] || exit 98
+    [[ "$(jq -r '.backup.lastAttempt.retentionSucceeded' <<<"${status}")" == true ]] || exit 99
+    return 0
+  fi
+
+  (( status != 0 )) || exit 100
+  [[ "${output}" == *"result=${expected_result}"* ]] || {
+    printf 'scenario=%s expected=%s output=%s\n' "${scenario}" "${expected_result}" "${output}" >&2
+    sed 's/^/call: /' "${calls}" >&2
+    exit 92
+  }
+
+  case "${scenario}" in
+    producer_failure|consumer_failure|timeout_hang)
+      grep -Fx 'restic forget aaaaaaaa' "${calls}" >/dev/null || exit 93
+      ! grep -F -- '--prune' "${calls}" >/dev/null || exit 94
+      ;;
+    integrity_failure|identity_change)
+      ! grep -F -- '--keep-daily' "${calls}" >/dev/null || exit 95
+      ;;
+  esac
+  if [[ "${scenario}" == identity_change ]]; then
+    ! grep -Fx 'verify' "${calls}" >/dev/null || exit 96
+  fi
+  if [[ "${scenario}" == timeout_hang ]]; then
+    grep -E '^timeout .* 55 docker exec ' "${calls}" >/dev/null || exit 97
+  fi
+)
+
+run_entrypoint_scenario success SUCCESS || fail_selftest "entrypoint success wiring failed"
+run_entrypoint_scenario producer_failure DUMP_FAILED || fail_selftest "entrypoint producer failure wiring failed"
+run_entrypoint_scenario consumer_failure REPOSITORY_FAILED || fail_selftest "entrypoint consumer failure wiring failed"
+run_entrypoint_scenario timeout_hang DUMP_FAILED || fail_selftest "entrypoint timeout wiring failed"
+run_entrypoint_scenario integrity_failure INTEGRITY_CHECK_FAILED || fail_selftest "entrypoint integrity failure wiring failed"
+run_entrypoint_scenario retention_failure RETENTION_FAILED || fail_selftest "entrypoint retention failure wiring failed"
+run_entrypoint_scenario retention_publication_failure STATUS_PUBLICATION_FAILED || fail_selftest "entrypoint retention publication failure wiring failed"
+run_entrypoint_scenario status_failure STATUS_PUBLICATION_FAILED || fail_selftest "entrypoint status publication failure wiring failed"
+run_entrypoint_scenario identity_change SNAPSHOT_IDENTITY_FAILED || fail_selftest "entrypoint identity-change wiring failed"
+
+backup_publish_status "${successful}" || fail_selftest "signal status fixture reset failed"
+ATTEMPT_STARTED_AT='2026-07-19T00:00:00Z'
+ATTEMPT_STARTED_EPOCH="$(backup_epoch)"
+CURRENT_PARTIAL_SNAPSHOT=""
+REPOSITORY_READ_READY=true
+set +e
+(handle_signal 143) >/dev/null 2>&1
+signal_status="$?"
+set -e
+[[ "${signal_status}" == "143" ]] || fail_selftest "signal handler exit status drifted"
+[[ "$(backup_load_status | jq -r '.backup.lastAttempt.resultCode')" == "BACKUP_SIGNALLED" ]] || fail_selftest "signal attempt was not published"
+[[ "$(backup_load_status | jq -r '.backup.lastAttempt.interruptedCandidateCount')" == "null" ]] || fail_selftest "signal handler queried an unbounded repository"
+[[ "$(backup_load_status | jq -r '.backup.lastSuccess.snapshotId')" == "aaaaaaaa" ]] || fail_selftest "signal attempt erased last success"
+
+schema_result="$(jq -r '.properties.schemaVersion.const' "${SELFTEST_DIRECTORY}/backup-status.schema.json")"
+[[ "${schema_result}" == "1" ]] || fail_selftest "status schema version drifted"
+[[ "$(sort "${SELFTEST_DIRECTORY}/backup-result-codes-v1.txt" | uniq -d | wc -l | tr -d ' ')" == "0" ]] || fail_selftest "result-code allowlist has duplicates"
+schema_codes="$(jq -r '.["$defs"].resultCode.enum[]' "${SELFTEST_DIRECTORY}/backup-status.schema.json" | sort)"
+file_codes="$(sort "${SELFTEST_DIRECTORY}/backup-result-codes-v1.txt")"
+[[ "${schema_codes}" == "${file_codes}" ]] || fail_selftest "status schema and result-code allowlist drifted"
+
+printf '%s\n' 'BACKUP_SELFTEST_OK status=atomic-last-good-redacted pipeline=producer-consumer-drained watchdog=exact-cancel-reap retention=and-tags-no-uncertain-prune capacity=fail-closed locks=nonblocking'

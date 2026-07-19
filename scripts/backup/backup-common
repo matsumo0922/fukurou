@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+
+# Sourced by the root-only backup and restore entrypoints.
+
+readonly BACKUP_SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly BACKUP_SHARE_DIRECTORY="${FUKUROU_BACKUP_SHARE_DIRECTORY:-${BACKUP_SCRIPT_DIRECTORY}}"
+readonly BACKUP_RESULT_CODES_FILE="${FUKUROU_BACKUP_RESULT_CODES_FILE:-${BACKUP_SHARE_DIRECTORY}/backup-result-codes-v1.txt}"
+readonly BACKUP_STATUS_SCHEMA="${FUKUROU_BACKUP_STATUS_SCHEMA:-${BACKUP_SHARE_DIRECTORY}/backup-status.schema.json}"
+readonly BACKUP_STATUS_FILE="${FUKUROU_BACKUP_STATUS_FILE:-/srv/fukurou/monitoring/backup-status.json}"
+readonly BACKUP_LOCK_FILE="${FUKUROU_BACKUP_LOCK_FILE:-/var/lock/fukurou-backup.lock}"
+readonly DEPLOY_LOCK_FILE="${FUKUROU_DEPLOY_LOCK_FILE:-/var/lock/fukurou-deploy.lock}"
+readonly RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-/srv/fukurou/backups/postgres}"
+readonly RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE:-/srv/fukurou/secrets/restic-password}"
+readonly BACKUP_HOST="${FUKUROU_BACKUP_HOST:-fukurou-production}"
+readonly BACKUP_STDIN_PATH="${FUKUROU_BACKUP_STDIN_PATH:-/postgres.dump}"
+readonly SERVICE_BOOT_ID_FILE="${FUKUROU_SERVICE_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+readonly STATUS_FILE="${BACKUP_STATUS_FILE}"
+
+backup_now() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+backup_epoch() {
+  date -u '+%s'
+}
+
+backup_result_code_is_allowed() {
+  local code="$1"
+  grep -Fx -- "${code}" "${BACKUP_RESULT_CODES_FILE}" >/dev/null 2>&1
+}
+
+backup_emit_result() {
+  local code="$1"
+  backup_result_code_is_allowed "${code}" || code="INVALID_CONFIGURATION"
+  printf 'fukurou-backup: result=%s\n' "${code}" >&2
+}
+
+backup_require_root() {
+  [[ "$(id -u)" == "0" ]]
+}
+
+backup_require_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+backup_validate_identifier() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]
+}
+
+backup_validate_snapshot_id() {
+  [[ "$1" =~ ^[0-9a-f]{8,64}$ ]]
+}
+
+backup_validate_revision() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+backup_validate_timestamp() {
+  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+}
+
+backup_validate_status_json() {
+  local document="$1"
+  backup_validate_status_schema_contract || return 1
+  jq -e '
+    def timestamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+    def exact_keys($allowed): (keys - $allowed | length) == 0;
+    def attempt:
+      type == "object" and exact_keys(["attemptedAt","resultCode","durationSeconds","serviceInvocationId","serviceBootId","snapshotId","interruptedCandidateCount","retentionSucceeded"]) and
+      has("serviceInvocationId") and has("serviceBootId") and
+      (.attemptedAt | timestamp) and (.resultCode | type == "string") and
+      (.durationSeconds | type == "number" and floor == . and . >= 0) and
+      (.serviceInvocationId == null or (.serviceInvocationId | type == "string" and test("^[0-9a-f]{32}$"))) and
+      (.serviceBootId == null or (.serviceBootId | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))) and
+      ((.serviceInvocationId == null) == (.serviceBootId == null)) and
+      ((has("snapshotId") | not) or (.snapshotId | type == "string" and test("^[0-9a-f]{8,64}$"))) and
+      ((has("interruptedCandidateCount") | not) or .interruptedCandidateCount == null or
+        (.interruptedCandidateCount | type == "number" and floor == . and . >= 0)) and
+      ((has("retentionSucceeded") | not) or .retentionSucceeded == null or (.retentionSucceeded | type == "boolean"));
+    def success:
+      type == "object" and exact_keys(["snapshotId","sourceRevision","verifiedAt","durationSeconds","verificationCount","tableCount","constraintCount"]) and
+      (.snapshotId | type == "string" and test("^[0-9a-f]{8,64}$")) and
+      (.sourceRevision | type == "string" and test("^[0-9a-f]{40}$")) and
+      (.verifiedAt | timestamp) and
+      (.durationSeconds | type == "number" and floor == . and . >= 0) and
+      ((has("verificationCount") | not) or (.verificationCount | type == "number" and floor == . and . >= 0)) and
+      ((has("tableCount") | not) or (.tableCount | type == "number" and floor == . and . >= 0)) and
+      ((has("constraintCount") | not) or (.constraintCount | type == "number" and floor == . and . >= 0));
+    def job:
+      type == "object" and exact_keys(["lastAttempt","lastSuccess"]) and
+      (.lastAttempt == null or (.lastAttempt | attempt)) and
+      (.lastSuccess == null or (.lastSuccess | success));
+    .schemaVersion == 1 and exact_keys(["schemaVersion","updatedAt","backup","restore"]) and
+    (.updatedAt | timestamp) and (.backup | job) and (.restore | job) and
+    ([.backup.lastAttempt?.resultCode, .restore.lastAttempt?.resultCode] | map(select(. != null))) as $codes |
+    ($codes | all(type == "string"))
+  ' <<<"${document}" >/dev/null || return 1
+
+  local code
+  while IFS= read -r code; do
+    backup_result_code_is_allowed "${code}" || return 1
+  done < <(jq -r '.backup.lastAttempt?.resultCode, .restore.lastAttempt?.resultCode | select(. != null)' <<<"${document}")
+}
+
+backup_validate_status_schema_contract() {
+  [[ -f "${BACKUP_STATUS_SCHEMA}" && ! -L "${BACKUP_STATUS_SCHEMA}" ]] || return 1
+  jq -e '
+    .properties.schemaVersion.const == 1 and
+    (.required | sort) == (["schemaVersion","updatedAt","backup","restore"] | sort) and
+    (.properties | keys | sort) == (["schemaVersion","updatedAt","backup","restore"] | sort) and
+    (."$defs".attempt.required | sort) == (["attemptedAt","resultCode","durationSeconds","serviceInvocationId","serviceBootId"] | sort) and
+    (."$defs".attempt.properties | keys | sort) ==
+      (["attemptedAt","resultCode","durationSeconds","serviceInvocationId","serviceBootId","snapshotId","interruptedCandidateCount","retentionSucceeded"] | sort) and
+    ((."$defs".attempt.properties.serviceInvocationId.type | sort) == ["null","string"]) and
+    ((."$defs".attempt.properties.serviceBootId.type | sort) == ["null","string"]) and
+    (."$defs".attempt.properties.serviceInvocationId.pattern == "^[0-9a-f]{32}$") and
+    (."$defs".attempt.properties.serviceBootId.pattern == "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") and
+    (."$defs".attempt.properties.snapshotId."$ref" == "#/$defs/snapshotId") and
+    ((."$defs".attempt.properties.interruptedCandidateCount.anyOf | map(.type) | sort) == ["integer","null"]) and
+    (."$defs".attempt.properties.interruptedCandidateCount.anyOf[] | select(.type == "integer") | .minimum == 0) and
+    ((."$defs".attempt.properties.retentionSucceeded.type | sort) == ["boolean","null"]) and
+    (."$defs".success.required | sort) == (["snapshotId","sourceRevision","verifiedAt","durationSeconds"] | sort) and
+    (."$defs".success.properties | keys | sort) ==
+      (["snapshotId","sourceRevision","verifiedAt","durationSeconds","verificationCount","tableCount","constraintCount"] | sort) and
+    ([."$defs".success.properties.verificationCount,
+      ."$defs".success.properties.tableCount,
+      ."$defs".success.properties.constraintCount] |
+      all(.type == "integer" and .minimum == 0)) and
+    (."$defs".jobStatus.required | sort) == (["lastAttempt","lastSuccess"] | sort) and
+    (."$defs".jobStatus.properties | keys | sort) == (["lastAttempt","lastSuccess"] | sort)
+  ' "${BACKUP_STATUS_SCHEMA}" >/dev/null || return 1
+
+  local schema_codes file_codes
+  schema_codes="$(jq -r '."$defs".resultCode.enum[]' "${BACKUP_STATUS_SCHEMA}" | sort)" || return 1
+  file_codes="$(sort "${BACKUP_RESULT_CODES_FILE}")" || return 1
+  [[ "${schema_codes}" == "${file_codes}" ]]
+}
+
+backup_initial_status() {
+  local now="$1"
+  jq -cn --arg now "${now}" '{schemaVersion:1,updatedAt:$now,backup:{lastAttempt:null,lastSuccess:null},restore:{lastAttempt:null,lastSuccess:null}}'
+}
+
+backup_load_status() {
+  if [[ ! -e "${BACKUP_STATUS_FILE}" ]]; then
+    backup_initial_status "$(backup_now)"
+    return
+  fi
+  [[ -f "${BACKUP_STATUS_FILE}" && ! -L "${BACKUP_STATUS_FILE}" ]] || return 1
+  local document
+  document="$(<"${BACKUP_STATUS_FILE}")" || return 1
+  backup_validate_status_json "${document}" || return 1
+  printf '%s\n' "${document}"
+}
+
+backup_publish_status() {
+  local document="$1"
+  backup_validate_status_json "${document}" || return 1
+
+  local status_directory temporary
+  status_directory="$(dirname "${BACKUP_STATUS_FILE}")"
+  [[ -d "${status_directory}" && ! -L "${status_directory}" ]] || return 1
+  if [[ "${FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST:-0}" != "1" ]]; then
+    [[ "$(stat -c '%U:%G:%a' "${status_directory}")" == "root:root:700" ]] || return 1
+  fi
+  [[ ! -e "${BACKUP_STATUS_FILE}" || ( -f "${BACKUP_STATUS_FILE}" && ! -L "${BACKUP_STATUS_FILE}" ) ]] || return 1
+  temporary="$(mktemp "${status_directory}/.backup-status.json.tmp.XXXXXX")" || return 1
+  chmod 0600 "${temporary}" || { rm -f -- "${temporary}"; return 1; }
+  if ! printf '%s\n' "${document}" >"${temporary}" || ! sync -f "${temporary}"; then
+    rm -f -- "${temporary}"
+    return 1
+  fi
+  mv -f -- "${temporary}" "${BACKUP_STATUS_FILE}" || { rm -f -- "${temporary}"; return 1; }
+  sync -f "${status_directory}"
+}
+
+backup_merge_attempt() {
+  local previous="$1" job="$2" attempted_at="$3" result_code="$4" duration="$5"
+  local interrupted_count="${6:-0}" retention="${7:-null}" success_json="${8:-null}" service_evidence
+  [[ "${job}" == "backup" || "${job}" == "restore" ]] || return 1
+  backup_result_code_is_allowed "${result_code}" || return 1
+  backup_validate_timestamp "${attempted_at}" || return 1
+  [[ "${duration}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${interrupted_count}" == "null" || "${interrupted_count}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${retention}" == "true" || "${retention}" == "false" || "${retention}" == "null" ]] || return 1
+  service_evidence="$(backup_service_evidence_json)" || return 1
+  jq -ce \
+    --arg job "${job}" --arg now "$(backup_now)" --arg attempted "${attempted_at}" \
+    --arg code "${result_code}" --argjson duration "${duration}" \
+    --argjson interrupted "${interrupted_count}" --argjson retention "${retention}" \
+    --argjson service "${service_evidence}" \
+    --argjson success "${success_json}" '
+      .updatedAt=$now |
+      .[$job].lastAttempt={attemptedAt:$attempted,resultCode:$code,durationSeconds:$duration,
+        serviceInvocationId:$service.serviceInvocationId,serviceBootId:$service.serviceBootId,
+        interruptedCandidateCount:$interrupted,retentionSucceeded:$retention} |
+      if $success == null then . else .[$job].lastSuccess=$success end
+    ' <<<"${previous}"
+}
+
+backup_service_evidence_json() {
+  local invocation_id="${INVOCATION_ID:-}" boot_id
+
+  if [[ -z "${invocation_id}" ]]; then
+    printf '%s\n' '{"serviceInvocationId":null,"serviceBootId":null}'
+    return
+  fi
+  invocation_id="$(printf '%s' "${invocation_id}" | tr '[:upper:]' '[:lower:]')" || return 1
+  [[ "${invocation_id}" =~ ^[0-9a-f]{32}$ ]] || return 1
+  [[ -f "${SERVICE_BOOT_ID_FILE}" && ! -L "${SERVICE_BOOT_ID_FILE}" ]] || return 1
+  boot_id="$(<"${SERVICE_BOOT_ID_FILE}")" || return 1
+  boot_id="$(printf '%s' "${boot_id}" | tr '[:upper:]' '[:lower:]')" || return 1
+  [[ "${boot_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+
+  jq -cn --arg invocation_id "${invocation_id}" --arg boot_id "${boot_id}" \
+    '{serviceInvocationId:$invocation_id,serviceBootId:$boot_id}'
+}
+
+backup_acquire_shared_lock() {
+  if [[ "${BACKUP_PRE_SOURCE_LOCK_HELD:-false}" == "true" ]]; then return 0; fi
+  exec 9>"${BACKUP_LOCK_FILE}" || return 1
+  flock -n 9
+}
+
+backup_probe_deploy_lock() {
+  exec 8>"${DEPLOY_LOCK_FILE}" || return 1
+  if ! flock -n 8; then
+    exec 8>&-
+    return 1
+  fi
+  flock -u 8
+  exec 8>&-
+}
+
+backup_status_snapshot_id() {
+  local document="${1:-${STATUS_JSON:-}}"
+  [[ -n "${document}" ]] || return 1
+  local snapshot_id
+  snapshot_id="$(jq -er '.backup.lastSuccess.snapshotId' <<<"${document}")" || return 1
+  backup_validate_snapshot_id "${snapshot_id}" || return 1
+  printf '%s\n' "${snapshot_id}"
+}
+
+backup_publish_restore_attempt() {
+  local result_code="$1" snapshot_id="$2" duration_ms="$3" table_count="$4" constraint_count="$5" advance_success="$6"
+  backup_result_code_is_allowed "${result_code}" || return 1
+  [[ "${duration_ms}" =~ ^[0-9]+$ && "${table_count}" =~ ^[0-9]+$ && "${constraint_count}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${advance_success}" == "true" || "${advance_success}" == "false" ]] || return 1
+  if [[ -n "${snapshot_id}" ]]; then backup_validate_snapshot_id "${snapshot_id}" || return 1; fi
+  if [[ "${advance_success}" == "true" ]]; then
+    [[ "${result_code}" == "SUCCESS" && -n "${snapshot_id}" ]] || return 1
+  fi
+
+  local previous now duration_seconds source_revision success_json document
+  previous="$(backup_load_status)" || return 1
+  now="$(backup_now)"
+  duration_seconds=$(( (duration_ms + 999) / 1000 ))
+  success_json="null"
+  if [[ "${advance_success}" == "true" ]]; then
+    source_revision="$(jq -er '.backup.lastSuccess.sourceRevision' <<<"${previous}")" || return 1
+    backup_validate_revision "${source_revision}" || return 1
+    success_json="$(jq -cn --arg snapshot "${snapshot_id}" --arg revision "${source_revision}" --arg now "${now}" \
+      --argjson duration "${duration_seconds}" --argjson tables "${table_count}" --argjson constraints "${constraint_count}" \
+      '{snapshotId:$snapshot,sourceRevision:$revision,verifiedAt:$now,durationSeconds:$duration,
+        verificationCount:($tables+$constraints),tableCount:$tables,constraintCount:$constraints}')"
+  fi
+  document="$(backup_merge_attempt "${previous}" restore "${now}" "${result_code}" "${duration_seconds}" 0 null "${success_json}")" || return 1
+  if [[ -n "${snapshot_id}" ]]; then
+    document="$(jq -ce --arg snapshot "${snapshot_id}" '.restore.lastAttempt.snapshotId=$snapshot' <<<"${document}")" || return 1
+  fi
+  backup_publish_status "${document}"
+}

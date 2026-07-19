@@ -1,0 +1,33 @@
+[Unit]
+Description=Fukurou encrypted PostgreSQL logical backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou
+ExecStart=/usr/local/libexec/fukurou/backup-fukurou
+TimeoutStartSec=20min
+TimeoutStopSec=7min
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/fukurou/backups/postgres /srv/fukurou/monitoring /var/lock
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

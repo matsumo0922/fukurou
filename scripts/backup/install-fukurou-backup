@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly LIBEXEC_DIR=/usr/local/libexec/fukurou
+readonly SHARE_DIR=/usr/local/share/fukurou
+readonly UNIT_DIR=/etc/systemd/system
+readonly BACKUP_PARENT=/srv/fukurou/backups
+readonly BACKUP_ROOT=${BACKUP_PARENT}/postgres
+readonly BACKUP_LOCK_FILE="${FUKUROU_BACKUP_LOCK_FILE:-/var/lock/fukurou-backup.lock}"
+readonly BACKUP_HOST=fukurou-production
+readonly BACKUP_STDIN_PATH=/postgres.dump
+readonly RESTORE_LABEL_KEY=me.matsumo.fukurou.restore.attempt
+readonly DOCKER_LIST_TIMEOUT_SECONDS=30
+readonly JOURNAL_QUERY_TIMEOUT_SECONDS=30
+readonly ROLLOUT_MAX_EVIDENCE_AGE_SECONDS=86400
+readonly SERVICE_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+readonly STATUS_DIR=/srv/fukurou/monitoring
+readonly STATUS_FILE=${STATUS_DIR}/backup-status.json
+readonly SECRET_DIR=/srv/fukurou/secrets
+readonly PASSWORD_FILE=${SECRET_DIR}/restic-password
+readonly INSTALL_MARKER=${SHARE_DIR}/backup-installation-v1.json
+readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly UNIT_SOURCE_DIR=${SCRIPT_DIR}/systemd
+
+readonly -a LIBEXEC_ARTIFACTS=(
+    backup-common
+    backup-fukurou
+    restore-fukurou
+)
+readonly -a SHARE_ARTIFACTS=(
+    backup-status.schema.json
+    backup-result-codes-v1.txt
+    restore-inventory-v1.txt
+    restore-critical-tables-v1.txt
+    restore-readonly-invariants-v1.sql
+)
+readonly -a UNIT_ARTIFACTS=(
+    fukurou-postgres-backup.service
+    fukurou-postgres-backup.timer
+    fukurou-postgres-restore-drill.service
+    fukurou-postgres-restore-drill.timer
+)
+readonly -a ROLLOUT_UNITS=(
+    fukurou-postgres-backup.service
+    fukurou-postgres-backup.timer
+    fukurou-postgres-restore-drill.service
+    fukurou-postgres-restore-drill.timer
+)
+die() {
+    printf 'install-fukurou-backup: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+require_root() {
+    [[ ${EUID} -eq 0 ]] || die "root is required" 77
+}
+
+require_regular_source() {
+    local source=$1
+
+    [[ -f ${source} && ! -L ${source} ]] || die "reviewed artifact is not a regular file: ${source}" 66
+}
+
+verify_owner_mode() {
+    local path=$1
+    local expected_mode=$2
+    local actual
+
+    [[ -e ${path} && ! -L ${path} ]] || die "installed artifact is missing or symbolic: ${path}"
+    actual=$(stat -c '%U:%G:%a' "${path}")
+    [[ ${actual} == "root:root:${expected_mode}" ]] || die "unexpected owner or mode for ${path}: ${actual}"
+}
+
+timer_is_enabled() {
+    systemctl is-enabled --quiet "$1" 2>/dev/null
+}
+
+all_rollout_units_inactive() {
+    local unit
+
+    for unit in "${ROLLOUT_UNITS[@]}"; do
+        if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+            return 1
+        fi
+    done
+}
+
+acquire_install_lock() {
+    exec 9>"${BACKUP_LOCK_FILE}" || return 1
+    flock -n 9
+}
+
+require_quiescent_rollout() {
+    local timer
+
+    acquire_install_lock || die "backup or restore job owns the shared backup lock" 75
+    all_rollout_units_inactive || die "stop every backup and restore service/timer before continuing" 75
+    for timer in fukurou-postgres-backup.timer fukurou-postgres-restore-drill.timer; do
+        if timer_is_enabled "${timer}"; then
+            die "disable ${timer} before continuing" 75
+        fi
+    done
+}
+
+verify_repository_snapshot() {
+    local snapshot_id=$1
+    local snapshots
+
+    snapshots=$(RESTIC_PASSWORD_FILE="${PASSWORD_FILE}" restic --no-cache -r "${BACKUP_ROOT}" \
+        snapshots --json --host "${BACKUP_HOST}" --path "${BACKUP_STDIN_PATH}" \
+        --tag fukurou-postgres,integrity-checked "${snapshot_id}") || return 1
+    [[ $(jq -er 'length' <<<"${snapshots}") == 1 ]] || return 1
+    [[ $(jq -er '.[0].id' <<<"${snapshots}") == "${snapshot_id}" ]]
+}
+
+verify_rollout_status() {
+    local status_file=$1
+    local current_boot_id=$2
+
+    jq -e --arg current_boot_id "${current_boot_id}" '
+        .schemaVersion == 1 and
+        .backup.lastAttempt.resultCode == "SUCCESS" and
+        .backup.lastAttempt.retentionSucceeded == true and
+        (.backup.lastAttempt.serviceInvocationId | type == "string" and test("^[0-9a-f]{32}$")) and
+        .backup.lastAttempt.serviceBootId == $current_boot_id and
+        (.backup.lastAttempt.snapshotId | type == "string") and
+        .backup.lastAttempt.snapshotId == .backup.lastSuccess.snapshotId and
+        .restore.lastAttempt.resultCode == "SUCCESS" and
+        (.restore.lastAttempt.serviceInvocationId | type == "string" and test("^[0-9a-f]{32}$")) and
+        .restore.lastAttempt.serviceBootId == $current_boot_id and
+        .backup.lastAttempt.serviceInvocationId != .restore.lastAttempt.serviceInvocationId and
+        (.restore.lastAttempt.snapshotId | type == "string") and
+        .restore.lastAttempt.snapshotId == .restore.lastSuccess.snapshotId and
+        .backup.lastSuccess.snapshotId == .restore.lastSuccess.snapshotId
+    ' "${status_file}" >/dev/null
+}
+
+verify_no_restore_owned_resources() {
+    local identifiers
+
+    identifiers=$(timeout --signal=TERM --kill-after=5 "${DOCKER_LIST_TIMEOUT_SECONDS}" \
+        docker ps -aq --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null) || return 1
+    [[ -z ${identifiers} ]] || return 1
+
+    identifiers=$(timeout --signal=TERM --kill-after=5 "${DOCKER_LIST_TIMEOUT_SECONDS}" \
+        docker network ls -q --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null) || return 1
+    [[ -z ${identifiers} ]] || return 1
+
+    identifiers=$(timeout --signal=TERM --kill-after=5 "${DOCKER_LIST_TIMEOUT_SECONDS}" \
+        docker volume ls -q --filter "label=${RESTORE_LABEL_KEY}" 2>/dev/null) || return 1
+    [[ -z ${identifiers} ]]
+}
+
+verify_rollout_service_journal_evidence() {
+    local status_file=$1 job unit invocation_id evidence
+
+    for job in backup restore; do
+        case ${job} in
+            backup) unit=fukurou-postgres-backup.service ;;
+            restore) unit=fukurou-postgres-restore-drill.service ;;
+        esac
+        invocation_id=$(jq -er ".${job}.lastAttempt.serviceInvocationId" "${status_file}") || return 1
+        evidence=$(timeout --signal=TERM --kill-after=5 "${JOURNAL_QUERY_TIMEOUT_SECONDS}" \
+            journalctl --unit="${unit}" --boot=0 --output=json --no-pager \
+            --grep='^fukurou-backup: result=' --lines=1 2>/dev/null) || return 1
+        jq -se --arg invocation_id "${invocation_id}" '
+            length == 1 and
+            ((.[0]._SYSTEMD_INVOCATION_ID // "") | ascii_downcase) == $invocation_id and
+            .[0].MESSAGE == "fukurou-backup: result=SUCCESS"
+        ' <<<"${evidence}" >/dev/null || return 1
+    done
+}
+
+installed_artifact_paths() {
+    local artifact
+
+    for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
+        printf '%s\n' "${LIBEXEC_DIR}/${artifact}"
+    done
+    for artifact in "${SHARE_ARTIFACTS[@]}"; do
+        printf '%s\n' "${SHARE_DIR}/${artifact}"
+    done
+    for artifact in "${UNIT_ARTIFACTS[@]}"; do
+        printf '%s\n' "${UNIT_DIR}/${artifact}"
+    done
+}
+
+calculate_installed_artifact_hash() {
+    local path digest manifest=""
+
+    while IFS= read -r path; do
+        [[ -f ${path} && ! -L ${path} ]] || return 1
+        digest=$(sha256sum "${path}" | awk '{print $1}') || return 1
+        [[ ${digest} =~ ^[0-9a-f]{64}$ ]] || return 1
+        manifest+="${path} ${digest}"$'\n'
+    done < <(installed_artifact_paths)
+    printf '%s' "${manifest}" | sha256sum | awk '{print $1}'
+}
+
+verify_install_marker() {
+    local marker_file=$1 expected_hash=$2
+
+    jq -e --arg expected_hash "${expected_hash}" '
+        type == "object" and
+        (keys | sort) == (["artifactAggregateSha256", "installedAt", "schemaVersion"] | sort) and
+        .schemaVersion == 1 and
+        (.installedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+        .artifactAggregateSha256 == $expected_hash
+    ' "${marker_file}" >/dev/null
+}
+
+write_install_marker() {
+    local aggregate_hash installed_at temporary
+
+    aggregate_hash=$(calculate_installed_artifact_hash) || return 1
+    installed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    temporary=$(mktemp "${SHARE_DIR}/.backup-installation-v1.json.tmp.XXXXXX") || return 1
+    if ! jq -cn --arg installed_at "${installed_at}" --arg aggregate_hash "${aggregate_hash}" \
+        '{schemaVersion:1,installedAt:$installed_at,artifactAggregateSha256:$aggregate_hash}' >"${temporary}" ||
+        ! chown root:root "${temporary}" || ! chmod 0400 "${temporary}" || ! sync -f "${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    mv -f -- "${temporary}" "${INSTALL_MARKER}" || { rm -f -- "${temporary}"; return 1; }
+    sync -f "${SHARE_DIR}"
+}
+
+evidence_is_fresh_after_install() {
+    local evidence_epoch=$1 marker_epoch=$2 now_epoch=$3
+
+    [[ ${evidence_epoch} =~ ^[0-9]+$ && ${marker_epoch} =~ ^[0-9]+$ && ${now_epoch} =~ ^[0-9]+$ ]] || return 1
+    (( evidence_epoch > marker_epoch && evidence_epoch <= now_epoch )) || return 1
+    (( now_epoch - evidence_epoch <= ROLLOUT_MAX_EVIDENCE_AGE_SECONDS ))
+}
+
+verify_rollout_freshness_epochs() {
+    local marker_epoch=$1 backup_attempt_epoch=$2 restore_attempt_epoch=$3
+    local status_updated_epoch=$4 status_file_epoch=$5 now_epoch=$6
+    local evidence_epoch
+
+    for evidence_epoch in \
+        "${backup_attempt_epoch}" "${restore_attempt_epoch}" \
+        "${status_updated_epoch}" "${status_file_epoch}"; do
+        evidence_is_fresh_after_install "${evidence_epoch}" "${marker_epoch}" "${now_epoch}" || return 1
+    done
+    (( status_updated_epoch >= backup_attempt_epoch && status_updated_epoch >= restore_attempt_epoch ))
+}
+
+timestamp_epoch() {
+    [[ -n $1 ]] || return 1
+    date -u -d "$1" '+%s'
+}
+
+current_boot_id() {
+    local boot_id
+
+    [[ -f ${SERVICE_BOOT_ID_FILE} && ! -L ${SERVICE_BOOT_ID_FILE} ]] || return 1
+    boot_id=$(<"${SERVICE_BOOT_ID_FILE}") || return 1
+    boot_id=$(printf '%s' "${boot_id}" | tr '[:upper:]' '[:lower:]') || return 1
+    [[ ${boot_id} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+    printf '%s\n' "${boot_id}"
+}
+
+install_artifacts() {
+    local artifact
+
+    command -v install >/dev/null || die "install command is unavailable" 69
+    command -v systemctl >/dev/null || die "systemctl is unavailable" 69
+    command -v flock >/dev/null || die "flock is unavailable" 69
+    command -v sha256sum >/dev/null || die "sha256sum is unavailable" 69
+    command -v jq >/dev/null || die "jq is unavailable" 69
+    command -v sync >/dev/null || die "sync is unavailable" 69
+
+    require_quiescent_rollout
+
+    install -d -o root -g root -m 0555 "${LIBEXEC_DIR}"
+    install -d -o root -g root -m 0755 "${SHARE_DIR}"
+    install -d -o root -g root -m 0700 "${BACKUP_PARENT}" "${BACKUP_ROOT}" "${STATUS_DIR}" "${SECRET_DIR}"
+
+    for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
+        require_regular_source "${SCRIPT_DIR}/${artifact}"
+        install -o root -g root -m 0555 "${SCRIPT_DIR}/${artifact}" "${LIBEXEC_DIR}/${artifact}"
+    done
+    for artifact in "${SHARE_ARTIFACTS[@]}"; do
+        require_regular_source "${SCRIPT_DIR}/${artifact}"
+        install -o root -g root -m 0444 "${SCRIPT_DIR}/${artifact}" "${SHARE_DIR}/${artifact}"
+    done
+    for artifact in "${UNIT_ARTIFACTS[@]}"; do
+        require_regular_source "${UNIT_SOURCE_DIR}/${artifact}"
+        install -o root -g root -m 0444 "${UNIT_SOURCE_DIR}/${artifact}" "${UNIT_DIR}/${artifact}"
+    done
+
+    systemctl daemon-reload
+    write_install_marker || die "installation marker publication failed" 74
+    verify_installation
+    printf '%s\n' 'backup artifacts installed; timers remain disabled until the manual rollout gate passes'
+}
+
+verify_installation() {
+    local artifact aggregate_hash
+
+    command -v systemd-analyze >/dev/null || die "systemd-analyze is unavailable" 69
+    command -v sha256sum >/dev/null || die "sha256sum is unavailable" 69
+    command -v jq >/dev/null || die "jq is unavailable" 69
+    verify_owner_mode "${LIBEXEC_DIR}" 555
+    verify_owner_mode "${SHARE_DIR}" 755
+    verify_owner_mode "${BACKUP_PARENT}" 700
+    verify_owner_mode "${BACKUP_ROOT}" 700
+    verify_owner_mode "${STATUS_DIR}" 700
+    verify_owner_mode "${SECRET_DIR}" 700
+
+    for artifact in "${LIBEXEC_ARTIFACTS[@]}"; do
+        verify_owner_mode "${LIBEXEC_DIR}/${artifact}" 555
+    done
+    for artifact in "${SHARE_ARTIFACTS[@]}"; do
+        verify_owner_mode "${SHARE_DIR}/${artifact}" 444
+    done
+    for artifact in "${UNIT_ARTIFACTS[@]}"; do
+        verify_owner_mode "${UNIT_DIR}/${artifact}" 444
+        systemd-analyze verify "${UNIT_DIR}/${artifact}" >/dev/null
+        if grep -Eiq '(password|secret|token)=' "${UNIT_DIR}/${artifact}"; then
+            die "unit embeds secret-like assignment: ${artifact}"
+        fi
+    done
+    [[ -f ${INSTALL_MARKER} && ! -L ${INSTALL_MARKER} ]] || die "installation marker is missing or symbolic" 66
+    verify_owner_mode "${INSTALL_MARKER}" 400
+    aggregate_hash=$(calculate_installed_artifact_hash) || die "installed artifact aggregate hash is unavailable" 74
+    verify_install_marker "${INSTALL_MARKER}" "${aggregate_hash}" ||
+        die "installation marker does not match installed artifacts" 65
+
+    printf '%s\n' 'backup installation verified'
+}
+
+verify_rollout() {
+    local repository_config snapshot_id installed_at marker_epoch now_epoch boot_id
+    local backup_attempt_epoch restore_attempt_epoch status_updated_epoch status_file_epoch
+
+    command -v systemctl >/dev/null || die "systemctl is unavailable" 69
+    command -v flock >/dev/null || die "flock is unavailable" 69
+    require_quiescent_rollout
+    verify_installation
+    command -v restic >/dev/null || die "restic is unavailable" 69
+    command -v jq >/dev/null || die "jq is unavailable" 69
+    command -v docker >/dev/null || die "docker is unavailable" 69
+    command -v journalctl >/dev/null || die "journalctl is unavailable" 69
+    command -v timeout >/dev/null || die "timeout is unavailable" 69
+
+    [[ -f ${PASSWORD_FILE} ]] || die "restic password file is not a regular file" 66
+    [[ -f ${STATUS_FILE} ]] || die "status document is not a regular file" 66
+    verify_owner_mode "${PASSWORD_FILE}" 400
+    verify_owner_mode "${STATUS_FILE}" 600
+    FUKUROU_BACKUP_SHARE_DIRECTORY="${SHARE_DIR}" \
+        FUKUROU_BACKUP_STATUS_FILE="${STATUS_FILE}" \
+        bash -c 'source "$1"; document=$(<"$2"); backup_validate_status_json "${document}"' \
+        backup-status-validation "${LIBEXEC_DIR}/backup-common" "${STATUS_FILE}" ||
+        die "status document does not satisfy the installed contract" 65
+    boot_id=$(current_boot_id) || die "current boot identity is unavailable" 65
+    verify_rollout_status "${STATUS_FILE}" "${boot_id}" ||
+        die "latest backup retention and restore attempts are not successful exact-snapshot evidence" 65
+    verify_rollout_service_journal_evidence "${STATUS_FILE}" ||
+        die "latest current-boot systemd journal result does not match successful status evidence" 65
+    snapshot_id=$(jq -er '.backup.lastSuccess.snapshotId' "${STATUS_FILE}") ||
+        die "backup snapshot identity is unavailable" 65
+
+    repository_config=$(RESTIC_PASSWORD_FILE="${PASSWORD_FILE}" restic --no-cache -r "${BACKUP_ROOT}" cat config) ||
+        die "restic repository cannot be opened" 74
+    jq -e '.version == 2' <<<"${repository_config}" >/dev/null ||
+        die "restic repository is not format version 2" 65
+    verify_repository_snapshot "${snapshot_id}" ||
+        die "exact integrity-checked snapshot is absent from the current repository" 65
+    verify_no_restore_owned_resources ||
+        die "restore-owned Docker resources remain or cannot be enumerated" 65
+    installed_at=$(jq -er '.installedAt' "${INSTALL_MARKER}") ||
+        die "installation marker timestamp is unavailable" 65
+    marker_epoch=$(timestamp_epoch "${installed_at}") || die "installation marker timestamp is invalid" 65
+    backup_attempt_epoch=$(timestamp_epoch "$(jq -er '.backup.lastAttempt.attemptedAt' "${STATUS_FILE}")") ||
+        die "backup attempt timestamp is invalid" 65
+    restore_attempt_epoch=$(timestamp_epoch "$(jq -er '.restore.lastAttempt.attemptedAt' "${STATUS_FILE}")") ||
+        die "restore attempt timestamp is invalid" 65
+    status_updated_epoch=$(timestamp_epoch "$(jq -er '.updatedAt' "${STATUS_FILE}")") ||
+        die "status update timestamp is invalid" 65
+    status_file_epoch=$(stat -c '%Y' "${STATUS_FILE}") || die "status file timestamp is unavailable" 65
+    now_epoch=$(date -u '+%s') || die "current wall clock is unavailable" 65
+    verify_rollout_freshness_epochs \
+        "${marker_epoch}" "${backup_attempt_epoch}" "${restore_attempt_epoch}" "${status_updated_epoch}" \
+        "${status_file_epoch}" "${now_epoch}" ||
+        die "backup, restore, or status evidence is stale or predates the installed artifacts" 65
+
+    printf '%s\n' 'installed artifacts and fresh backup, restore, repository, cleanup, and service evidence verified'
+}
+
+usage() {
+    printf '%s\n' 'Usage: install-fukurou-backup {install|verify-installation|verify-rollout}' >&2
+    exit 64
+}
+
+main() {
+    require_root
+
+    case ${1:-} in
+        install)
+            [[ $# -eq 1 ]] || usage
+            install_artifacts
+            ;;
+        verify-installation)
+            [[ $# -eq 1 ]] || usage
+            verify_installation
+            ;;
+        verify-rollout)
+            [[ $# -eq 1 ]] || usage
+            verify_rollout
+            ;;
+        *) usage ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
