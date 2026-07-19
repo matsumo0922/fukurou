@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SELFTEST_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SELFTEST_ROOT="$(mktemp -d)"
+readonly PUBLIC_DIRECTORY=${SELFTEST_ROOT}/public
+readonly STATUS_FILE=${SELFTEST_ROOT}/backup-status.json
+readonly BOOT_ID_FILE=${SELFTEST_ROOT}/boot-id
+readonly LOCK_FILE=${SELFTEST_ROOT}/projection.lock
+readonly PUBLISHER=${SELFTEST_DIRECTORY}/publish-backup-monitoring
+readonly SELFTEST_BIN=${SELFTEST_ROOT}/bin
+readonly BOOT_ID=01234567-89ab-cdef-0123-456789abcdef
+readonly BACKUP_INVOCATION=0123456789abcdef0123456789abcdef
+readonly NEXT_INVOCATION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+readonly KILLED_INVOCATION=cccccccccccccccccccccccccccccccc
+readonly FAILED_PUBLICATION_INVOCATION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+trap 'rm -rf -- "${SELFTEST_ROOT}"' EXIT INT TERM
+
+fail() {
+    printf 'monitoring-projection-selftest: %s\n' "$1" >&2
+    exit 1
+}
+
+publisher() {
+    local invocation_id=$1
+    shift
+
+    env \
+        FUKUROU_MONITORING_PUBLISHER_SELFTEST=true \
+        FUKUROU_MONITORING_PUBLIC_DIRECTORY="${PUBLIC_DIRECTORY}" \
+        FUKUROU_BACKUP_STATUS_FILE="${STATUS_FILE}" \
+        FUKUROU_BACKUP_COMMON_FILE="${SELFTEST_DIRECTORY}/backup-common" \
+        FUKUROU_BACKUP_SHARE_DIRECTORY="${SELFTEST_DIRECTORY}" \
+        FUKUROU_SERVICE_BOOT_ID_FILE="${BOOT_ID_FILE}" \
+        FUKUROU_MONITORING_LOCK_FILE="${LOCK_FILE}" \
+        PATH="${SELFTEST_BIN}:${PATH}" \
+        INVOCATION_ID="${invocation_id}" \
+        "${PUBLISHER}" "$@"
+}
+
+write_status() {
+    local invocation_id=$1
+
+    jq -cn --arg invocation_id "${invocation_id}" --arg boot_id "${BOOT_ID}" '
+      {
+        schemaVersion: 1,
+        updatedAt: "2026-07-19T00:02:00Z",
+        backup: {
+          lastAttempt: {
+            attemptedAt: "2026-07-19T00:00:00Z",
+            resultCode: "SUCCESS",
+            durationSeconds: 1,
+            serviceInvocationId: $invocation_id,
+            serviceBootId: $boot_id,
+            snapshotId: "0123456789abcdef",
+            interruptedCandidateCount: 0,
+            retentionSucceeded: true
+          },
+          lastSuccess: {
+            snapshotId: "0123456789abcdef",
+            sourceRevision: "0123456789abcdef0123456789abcdef01234567",
+            verifiedAt: "2026-07-19T00:00:00Z",
+            durationSeconds: 1
+          }
+        },
+        restore: {lastAttempt: null, lastSuccess: null}
+      }
+    ' >"${STATUS_FILE}"
+}
+
+file_inode() {
+    stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"
+}
+
+file_hash() {
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+mkdir -p "${PUBLIC_DIRECTORY}"
+mkdir -p "${SELFTEST_BIN}"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"${SELFTEST_BIN}/flock"
+chmod +x "${SELFTEST_BIN}/flock"
+printf '%s\n' "${BOOT_ID}" >"${BOOT_ID_FILE}"
+write_status "${BACKUP_INVOCATION}"
+
+publisher "${BACKUP_INVOCATION}" start backup
+projection=${PUBLIC_DIRECTORY}/backup-restore.json
+[[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'start was not published first'
+[[ $(jq -r '.backup.lastAttempt' "${projection}") == null ]] || fail 'start adopted authoritative success early'
+start_inode=$(file_inode "${projection}")
+
+publisher "${BACKUP_INVOCATION}" terminal backup success exited 0
+[[ $(jq -r '.backup.service.terminalSemantic' "${projection}") == SUCCESS ]] || fail 'normal success was rejected'
+[[ $(jq -r '.backup.lastAttempt.resultCode' "${projection}") == SUCCESS ]] || fail 'allowlisted attempt was absent'
+[[ $(jq -r '.backup.lastSuccessAt' "${projection}") == 2026-07-19T00:00:00Z ]] || fail 'allowlisted success time was absent'
+[[ $(file_inode "${projection}") != "${start_inode}" ]] || fail 'atomic replacement did not change inode'
+if find "${PUBLIC_DIRECTORY}" -name '.backup-restore.json.tmp.*' -print -quit | grep -q .; then
+    fail 'temporary projection remained visible'
+fi
+
+publisher "${NEXT_INVOCATION}" start backup
+[[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'next invocation did not become running'
+[[ $(jq -r '.backup.lastAttempt.invocationId' "${projection}") == "${BACKUP_INVOCATION}" ]] ||
+    fail 'historical attempt was erased at start'
+publisher "${NEXT_INVOCATION}" terminal backup success exited 0
+[[ $(jq -r '.backup.service.terminalSemantic' "${projection}") == UNKNOWN ]] ||
+    fail 'stale authoritative invocation was accepted as current success'
+
+publisher "${KILLED_INVOCATION}" start restore
+[[ $(jq -r '.restore.service.state' "${projection}") == RUNNING ]] ||
+    fail 'pre-terminal process kill did not preserve running evidence'
+
+publisher "${FAILED_PUBLICATION_INVOCATION}" start backup
+before_failed_hash=$(file_hash "${projection}")
+write_status "${FAILED_PUBLICATION_INVOCATION}"
+if env \
+    FUKUROU_MONITORING_PUBLISHER_SELFTEST=true \
+    FUKUROU_MONITORING_PUBLIC_DIRECTORY="${PUBLIC_DIRECTORY}" \
+    FUKUROU_BACKUP_STATUS_FILE="${STATUS_FILE}" \
+    FUKUROU_BACKUP_COMMON_FILE="${SELFTEST_DIRECTORY}/backup-common" \
+    FUKUROU_BACKUP_SHARE_DIRECTORY="${SELFTEST_DIRECTORY}" \
+    FUKUROU_SERVICE_BOOT_ID_FILE="${BOOT_ID_FILE}" \
+    FUKUROU_MONITORING_LOCK_FILE="${LOCK_FILE}" \
+    FUKUROU_MONITORING_FAIL_BEFORE_RENAME=true \
+    PATH="${SELFTEST_BIN}:${PATH}" \
+    INVOCATION_ID="${FAILED_PUBLICATION_INVOCATION}" \
+    "${PUBLISHER}" terminal backup success exited 0; then
+    fail 'injected terminal publication failure was accepted'
+fi
+after_failed_hash=$(file_hash "${projection}")
+[[ ${before_failed_hash} == "${after_failed_hash}" ]] || fail 'failed terminal publication replaced running evidence'
+[[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'failed terminal lost stale-running evidence'
+
+jq '.repository="/srv/fukurou/backups/postgres"' "${STATUS_FILE}" >"${SELFTEST_ROOT}/malformed.json"
+mv "${SELFTEST_ROOT}/malformed.json" "${STATUS_FILE}"
+if publisher "${FAILED_PUBLICATION_INVOCATION}" terminal backup success exited 0; then
+    fail 'secret-bearing authoritative status was accepted'
+fi
+[[ $(jq -r '.backup.service.state' "${projection}") == RUNNING ]] || fail 'malformed input replaced running evidence'
+
+printf '%s\n' 'MONITORING_PROJECTION_SELFTEST_OK lifecycle=start-terminal pre-terminal-kill=running-preserved stale-invocation=unknown malformed=fail-closed atomic=rename failed-terminal=running-preserved'

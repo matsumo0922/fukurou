@@ -33,6 +33,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
+import me.matsumo.fukurou.trading.daemon.MutableLlmDaemonTickStatus
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
@@ -67,6 +68,7 @@ import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import java.io.File
+import java.nio.file.Path
 import java.time.Clock
 import java.util.logging.Level
 import java.util.logging.Logger
@@ -99,6 +101,9 @@ fun interface ReadinessProbe {
  * @param opsCommandEventFeedReader ops API 用 command_event_log feed reader。null なら DB 設定から構築する
  * @param opsDecisionRunProjectionRepository ops decision run projection。null なら DB 設定から構築する
  * @param opsRuntimeConfigAdminService ops API 用 runtime config admin service。null なら DB 設定から構築する
+ * @param opsMonitoringService monitoring API 用 snapshot service。null なら process source から構築する
+ * @param backupMonitoringProjectionPath application-readable backup projection の fixed file
+ * @param daemonTickStatus daemon worker と monitoring API が共有する live tick 状態
  * @param tradingConfig trading runtime config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param databaseConfig DB 接続設定。null なら DB 未構成として扱う
@@ -126,6 +131,9 @@ fun Application.module(
     opsCommandEventFeedReader: CommandEventFeedReader? = null,
     opsDecisionRunProjectionRepository: DecisionRunProjectionRepository? = null,
     opsRuntimeConfigAdminService: RuntimeConfigAdminService? = null,
+    opsMonitoringService: MonitoringSnapshotService? = null,
+    backupMonitoringProjectionPath: Path = DEFAULT_BACKUP_MONITORING_PROJECTION_PATH,
+    daemonTickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
     tradingConfig: TradingBotConfig = TradingBotConfig(),
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     databaseConfig: DatabaseConfig? = DatabaseConfig.fromEnv(),
@@ -145,6 +153,7 @@ fun Application.module(
             tradingConfig = tradingConfig,
             runtimeConfigEnvironment = runtimeConfigEnvironment,
             latestMarketQuoteStore = latestMarketQuoteStore,
+            daemonTickStatus = daemonTickStatus,
             onStaleLlmRunsRecovered = { count ->
                 log.warn("Recovered {} stale llm_runs rows during persistence bootstrap.", count)
             },
@@ -173,6 +182,15 @@ fun Application.module(
         ),
         runtime = runtime,
     )
+    val monitoringService = opsMonitoringService ?: DefaultMonitoringSnapshotService(
+        revision = revision,
+        daemonConfig = runtime.tradingConfig.daemon,
+        tickStatusProvider = runtime.daemonTickStatus,
+        reconcilerStatusProvider = runtime.reconcilerStatus,
+        repository = databaseResources.database?.let(::ExposedMonitoringRepository),
+        backupProjectionReader = BackupMonitoringProjectionReader(backupMonitoringProjectionPath),
+        clock = runtime.clock,
+    )
 
     installApplicationPlugins(webRoot)
 
@@ -181,6 +199,7 @@ fun Application.module(
         revisionRoute(revision)
         evaluationRoutes(routeResources.evaluation)
         opsRoutes(routeResources.ops.dependencies)
+        monitoringRoute(monitoringService)
         apiDocumentationRoutes()
     }
 
@@ -229,6 +248,7 @@ private fun createApplicationRuntimeResources(
         runtimeConfigState = runtimeConfigState,
         onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
         latestMarketQuoteStore = inputs.latestMarketQuoteStore,
+        daemonTickStatus = inputs.daemonTickStatus,
     )
 }
 
@@ -887,6 +907,7 @@ private fun startApplicationBackgroundWorkers(
             clock = runtime.clock,
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
             latestMarketQuoteStore = runtime.latestMarketQuoteStore,
+            tickStatus = runtime.daemonTickStatus,
         ),
         llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker(database, runtime.clock),
         obsidianWriterWorker = startObsidianWriterWorker(
@@ -1047,6 +1068,7 @@ internal fun sharedTradingPersistenceBootstrap(
  * @param tradingConfig 取引 bot 全体の typed config
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
+ * @param daemonTickStatus daemon worker と monitoring API が共有する live tick 状態
  */
 private data class ApplicationRuntimeInputs(
     val readinessProbe: ReadinessProbe?,
@@ -1056,6 +1078,7 @@ private data class ApplicationRuntimeInputs(
     val runtimeConfigEnvironment: Map<String, String>,
     val onStaleLlmRunsRecovered: (Int) -> Unit,
     val latestMarketQuoteStore: LatestMarketQuoteStore,
+    val daemonTickStatus: MutableLlmDaemonTickStatus,
 )
 
 /**
@@ -1087,6 +1110,7 @@ private data class ApplicationRuntimeConfigSnapshot(
  * @param runtimeConfigState active runtime config の現在状態 holder
  * @param onStaleLlmRunsRecovered stale llm_runs 回収件数の通知
  * @param latestMarketQuoteStore reconciler と Activity API が共有する最新気配値 store
+ * @param daemonTickStatus daemon worker と monitoring API が共有する live tick 状態
  */
 private data class ApplicationRuntimeResources(
     val readinessProbe: ReadinessProbe?,
@@ -1098,6 +1122,7 @@ private data class ApplicationRuntimeResources(
     val runtimeConfigState: ApplicationRuntimeConfigState,
     val onStaleLlmRunsRecovered: (Int) -> Unit,
     val latestMarketQuoteStore: LatestMarketQuoteStore,
+    val daemonTickStatus: MutableLlmDaemonTickStatus,
 )
 
 /**

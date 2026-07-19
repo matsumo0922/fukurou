@@ -65,6 +65,26 @@ class LlmDaemonSchedulerTest {
     }
 
     @Test
+    fun completedTick_advancesLiveStatusWithoutChangingInvocationTerminal() = runBlocking {
+        val fixture = schedulerFixture()
+
+        fixture.scheduler.tick()
+        val firstTerminalCount = fixture.eventLog.events()
+            .count { event -> event.eventType == CommandEventType.DAEMON_INVOCATION_COMPLETED }
+        fixture.clock.advance(Duration.ofSeconds(1))
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Skipped>(result)
+        assertEquals(LlmDaemonTickOutcome.SKIPPED, fixture.tickStatus.snapshot()?.outcome)
+        assertEquals(fixture.clock.instant(), fixture.tickStatus.snapshot()?.completedAt)
+        assertEquals(
+            firstTerminalCount,
+            fixture.eventLog.events().count { event -> event.eventType == CommandEventType.DAEMON_INVOCATION_COMPLETED },
+        )
+    }
+
+    @Test
     fun scheduledMaintenance_suppressesAfterEpisodeAndRestingMaintenanceWithoutReservationOrNoTrade() = runBlocking {
         val observedAt = Instant.parse("2026-07-11T00:00:00Z")
         val availability = RecordingLaunchAvailability(
@@ -1863,6 +1883,7 @@ private fun schedulerFixture(
     launchAvailability: LlmDaemonLaunchAvailability = AlwaysAvailableLlmDaemonLaunchAvailability,
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
+    val tickStatus = MutableLlmDaemonTickStatus()
     val scheduler = LlmDaemonScheduler(
         tradingConfig = tradingConfig,
         runtimeConfigSnapshot = runtimeConfigSnapshot,
@@ -1937,6 +1958,7 @@ private fun schedulerFixture(
             preFilter = preFilter,
             clock = clock,
             idGenerator = idGenerator,
+            tickStatus = tickStatus,
         ),
     )
 
@@ -1952,6 +1974,7 @@ private fun schedulerFixture(
         positionsReader = positionsReader,
         entryFillReader = entryFillReader,
         preFilter = preFilter,
+        tickStatus = tickStatus,
     )
 }
 
@@ -2044,6 +2067,7 @@ private data class SchedulerFixture(
     val positionsReader: FakePositionsReader,
     val entryFillReader: FakeEntryFillReader,
     val preFilter: FakePreFilter,
+    val tickStatus: MutableLlmDaemonTickStatus,
 )
 
 /**

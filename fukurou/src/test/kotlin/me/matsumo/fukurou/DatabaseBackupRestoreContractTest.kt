@@ -21,6 +21,7 @@ class DatabaseBackupRestoreContractTest {
             "backup-fukurou",
             "restore-fukurou",
             "install-fukurou-backup",
+            "publish-backup-monitoring",
         )
 
         scripts.forEach { name ->
@@ -42,6 +43,7 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(installer.contains("readonly LIBEXEC_DIR=/usr/local/libexec/fukurou"))
         assertTrue(installer.contains("readonly SHARE_DIR=/usr/local/share/fukurou"))
         assertTrue(installer.contains("readonly UNIT_DIR=/etc/systemd/system"))
+        assertTrue(installer.contains("readonly PUBLIC_STATUS_DIR=/srv/fukurou/monitoring-public"))
         assertTrue(installer.contains("[[ \${EUID} -eq 0 ]]"))
         assertTrue(installer.contains("-m 0555 \"\${SCRIPT_DIR}/\${artifact}\""))
         assertTrue(installer.contains("-m 0444 \"\${UNIT_SOURCE_DIR}/\${artifact}\""))
@@ -51,6 +53,9 @@ class DatabaseBackupRestoreContractTest {
             ),
         )
         assertTrue(installer.contains("verify_owner_mode \"\${BACKUP_PARENT}\" 700"))
+        assertTrue(installer.contains("verify_owner_mode \"\${PUBLIC_STATUS_DIR}\" 755"))
+        assertTrue(installer.contains("verify_owner_mode \"\${PUBLIC_STATUS_FILE}\" 444"))
+        assertTrue(installer.contains("public monitoring directory contains an unexpected artifact"))
         assertTrue(installer.contains("acquire_install_lock"))
         assertTrue(installer.contains("all_rollout_units_inactive"))
         assertTrue(installer.contains("require_quiescent_rollout"))
@@ -111,12 +116,20 @@ class DatabaseBackupRestoreContractTest {
             assertTrue(service.contains("User=root\nGroup=root\nUMask=0077"), name)
             assertTrue(service.contains("Environment=FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou"), name)
             assertTrue(service.contains("ExecStart=$entrypoint"), name)
+            assertTrue(service.contains("ExecStartPre=/usr/local/libexec/fukurou/publish-backup-monitoring start"), name)
+            assertTrue(service.contains("ExecStopPost=/usr/local/libexec/fukurou/publish-backup-monitoring terminal"), name)
             assertTrue(service.contains("TimeoutStartSec="), name)
             assertTrue(service.contains("TimeoutStopSec=7min"), name)
             assertTrue(service.contains("KillMode=control-group"), name)
             assertTrue(service.contains("NoNewPrivileges=yes"), name)
             assertTrue(service.contains("ProtectSystem=strict"), name)
-            assertTrue(service.contains("ReadWritePaths=/srv/fukurou/backups/postgres /srv/fukurou/monitoring /var/lock"), name)
+            assertTrue(
+                service.contains(
+                    "ReadWritePaths=/srv/fukurou/backups/postgres /srv/fukurou/monitoring " +
+                        "/srv/fukurou/monitoring-public /var/lock",
+                ),
+                name,
+            )
             assertFalse(service.lowercase().contains("password="), name)
             assertFalse(service.lowercase().contains("secret="), name)
         }
@@ -161,6 +174,11 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(backupSources.contains("fukurou-postgres"))
         assertFalse(compose.contains("backup-status.json"))
         assertFalse(application.contains("backup-status.json"))
+        assertTrue(compose.contains("source: /srv/fukurou/monitoring-public"))
+        assertTrue(compose.contains("target: /var/lib/fukurou/monitoring-public"))
+        assertTrue(compose.contains("create_host_path: true"))
+        assertFalse(compose.contains("FUKUROU_MONITORING_PUBLIC"))
+        assertFalse(compose.contains("source: /srv/fukurou/monitoring\n"))
         assertFalse(backupSources.contains("docker-compose.prod.yml"))
         assertFalse(backupSources.contains("sudoers-fukurou"))
     }
@@ -174,6 +192,7 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(workflow.contains("scripts/backup/restore-selftest"))
         assertTrue(workflow.contains("scripts/backup/backup-postgres-selftest"))
         assertTrue(workflow.contains("scripts/backup/install-selftest"))
+        assertTrue(workflow.contains("scripts/backup/monitoring-projection-selftest"))
         assertTrue(workflow.contains("postgresql-client restic"))
         assertTrue(workflow.contains("TradingTables.kt"))
         assertTrue(workflow.contains("TradingPersistenceBootstrap.kt"))

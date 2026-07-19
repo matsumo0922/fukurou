@@ -60,6 +60,12 @@ services:
       - type: bind
         source: ${FUKUROU_LAUNCH_FENCE_ROOT_HOST:-/srv/fukurou/runtime/launch-fence}
         target: /var/lib/fukurou/launch-fence
+      - type: bind
+        source: /srv/fukurou/monitoring-public
+        target: /var/lib/fukurou/monitoring-public
+        read_only: true
+        bind:
+          create_host_path: true
     networks:
       - edge
       - data

@@ -64,10 +64,13 @@ jobs:
             scripts/backup/backup-postgres-selftest \
             scripts/backup/install-fukurou-backup \
             scripts/backup/install-selftest \
+            scripts/backup/monitoring-projection-selftest \
+            scripts/backup/publish-backup-monitoring \
             scripts/backup/restore-fukurou \
             scripts/backup/restore-selftest
           scripts/backup/backup-selftest
           scripts/backup/install-selftest
+          scripts/backup/monitoring-projection-selftest
           scripts/backup/restore-selftest
           sudo env FUKUROU_BACKUP_POSTGRES_SELFTEST_REQUIRE=true scripts/backup/backup-postgres-selftest
 
