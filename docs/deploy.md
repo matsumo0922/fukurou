@@ -738,6 +738,8 @@ raw payload と secret は evidence artifact へ保存しない。
 
 各 arm の mutation 直前に、操作、最大停止 / 復旧窓、preflight 対象、予想される `orders` mutation、不可逆な `evaluation_exclusions`、評価母集団への影響を提示し、owner の明示 go を得る。設計承認、PR merge、falsification 通過は production mutation の承認にならない。
 
+WebSocket arm の request は、owner に提示した `targetOrderId`、永続化済みの `expectedOrderExpiresAt`、計算済み recovery bound と同じ `minimumRemainingTtlSeconds` を含める。controller は requested audit より前に同じ target が `OPEN`、BUY、position 未紐付けであること、expiry の完全一致、remaining TTL 境界、`PENDING_CANCEL` resting BUY 0、open position 0を再確認する。target の消失・入替、状態/expiry/TTL の変更は mutation なしの typed `409` とし、別 order を代用しない。operator は request 直前に全 `RUNNING` `llm_runs` / `llm_launch_reservations` と backup/restore timer、deploy、runtime config mutation を別途確認する。
+
 ### 他 deploy の禁止と72時間上限
 
 検証 deploy から cleanup deploy までの間は他の deploy を行わない。72時間以内に両 arm の precondition と verdict が揃わない場合は cleanup を先行し、残りは後日の別 change として再計画する。requested audit が durable に確定した後は、失敗の内容にかかわらず再注入しない。

@@ -13,9 +13,12 @@ import me.matsumo.fukurou.trading.audit.CommandEventByIdReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectOutcome
 import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnector
 import java.time.Clock
+import java.time.Instant
 import java.util.UUID
 
 /**
@@ -45,6 +48,9 @@ internal val ISSUE_192_WS_DISCONNECT_EXECUTED_EVENT_ID: UUID =
  */
 private const val MAX_REASON_LENGTH = 512
 
+/** operator-supplied TTL 境界の最大値。一時 seam の payload と時刻計算を bounded に保つ。 */
+private const val MAX_MINIMUM_REMAINING_TTL_SECONDS = 86_400L
+
 /**
  * 固定 audit payload を読むための JSON parser。
  */
@@ -55,11 +61,17 @@ private val Issue192AuditPayloadJson = Json { ignoreUnknownKeys = true }
  *
  * @param injectionId operator が 1 回ごとに新規発行する注入 ID
  * @param expectedSessionId 最終 preflight で固定した active market-data session ID
+ * @param targetOrderId owner が承認した resting BUY entry order ID
+ * @param expectedOrderExpiresAt owner 承認時に固定した order expiry
+ * @param minimumRemainingTtlSeconds 実行時に必要な最小 remaining TTL 秒数
  * @param reason owner 承認を結びつけた実行理由
  */
 internal data class Issue192WsDisconnectCommand(
     val injectionId: UUID,
     val expectedSessionId: UUID,
+    val targetOrderId: String,
+    val expectedOrderExpiresAt: Instant,
+    val minimumRemainingTtlSeconds: Long,
     val reason: String,
 )
 
@@ -90,8 +102,11 @@ internal sealed interface Issue192WsDisconnectResult {
  * @param activeSessionId `CONNECTED` な market-data session ID。未接続なら null
  * @param unresolvedMarketDataGapCount 未解決 market-data gap 件数
  * @param restingBuyEntryOrderCount `OPEN` な resting BUY entry 件数
+ * @param pendingCancelRestingBuyEntryOrderCount `PENDING_CANCEL` な resting BUY entry 件数
+ * @param orderSnapshots target order identity を最終照合する order snapshot
+ * @param observedAt order snapshot を読み終えた時刻
  * @param openPositionCount open position 件数
- * @param activeLlmWorkPresent active LLM run または launch reservation が存在するか
+ * @param activeLlmWorkPresent fresh な trading launch reservation が存在するか
  */
 internal data class Issue192WsFaultPreflightState(
     val paperMode: Boolean,
@@ -101,6 +116,9 @@ internal data class Issue192WsFaultPreflightState(
     val activeSessionId: UUID?,
     val unresolvedMarketDataGapCount: Int,
     val restingBuyEntryOrderCount: Int,
+    val pendingCancelRestingBuyEntryOrderCount: Int,
+    val orderSnapshots: List<Issue192OrderPreflightState>,
+    val observedAt: Instant,
     val openPositionCount: Int,
     val activeLlmWorkPresent: Boolean,
 )
@@ -111,6 +129,23 @@ internal data class Issue192WsFaultPreflightState(
 internal fun interface Issue192WsFaultPreflight {
     suspend fun read(): Result<Issue192WsFaultPreflightState>
 }
+
+/**
+ * controller が owner-approved order identity を照合するための bounded snapshot。
+ *
+ * @param orderId order identity
+ * @param side order side
+ * @param status order lifecycle status
+ * @param positionId 関連 position ID。resting entry なら null
+ * @param expiresAt order に永続化された expiry。解析不能または未設定なら null
+ */
+internal data class Issue192OrderPreflightState(
+    val orderId: String,
+    val side: OrderSide,
+    val status: OrderStatus,
+    val positionId: String?,
+    val expiresAt: Instant?,
+)
 
 /**
  * Issue #192 の一時的な WebSocket 切断注入を直列化する controller。
@@ -205,7 +240,9 @@ internal class Issue192WsFaultController(
             state.runtimeConfigVersionId != null &&
             state.accountBaselineMatchesRuntimeConfig
         val marketStateAdmitted = state.unresolvedMarketDataGapCount == 0 && state.activeSessionId != null
-        val inventoryAdmitted = state.restingBuyEntryOrderCount >= 1 && state.openPositionCount == 0
+        val inventoryAdmitted = state.restingBuyEntryOrderCount >= 1 &&
+            state.pendingCancelRestingBuyEntryOrderCount == 0 &&
+            state.openPositionCount == 0
 
         if (!armAdmitted) return Issue192WsDisconnectResult.Conflict("PREFLIGHT_EPOCH_OR_BASELINE_REJECTED")
         if (!marketStateAdmitted) return Issue192WsDisconnectResult.Conflict("PREFLIGHT_MARKET_DATA_REJECTED")
@@ -213,6 +250,29 @@ internal class Issue192WsFaultController(
         if (state.activeLlmWorkPresent) return Issue192WsDisconnectResult.Conflict("PREFLIGHT_ACTIVE_WORK_REJECTED")
         if (state.activeSessionId != command.expectedSessionId) {
             return Issue192WsDisconnectResult.Conflict("SESSION_MISMATCH")
+        }
+
+        return targetOrderRejection(state, command)
+    }
+
+    private fun targetOrderRejection(
+        state: Issue192WsFaultPreflightState,
+        command: Issue192WsDisconnectCommand,
+    ): Issue192WsDisconnectResult? {
+        val targetOrder = state.orderSnapshots.singleOrNull { order -> order.orderId == command.targetOrderId }
+            ?: return Issue192WsDisconnectResult.Conflict("TARGET_ORDER_NOT_FOUND")
+        val targetOrderAdmitted = targetOrder.side == OrderSide.BUY &&
+            targetOrder.status == OrderStatus.OPEN &&
+            targetOrder.positionId == null
+
+        if (!targetOrderAdmitted) return Issue192WsDisconnectResult.Conflict("TARGET_ORDER_STATE_REJECTED")
+        if (targetOrder.expiresAt != command.expectedOrderExpiresAt) {
+            return Issue192WsDisconnectResult.Conflict("TARGET_ORDER_EXPIRY_MISMATCH")
+        }
+
+        val minimumExpiry = state.observedAt.plusSeconds(command.minimumRemainingTtlSeconds)
+        if (targetOrder.expiresAt.isBefore(minimumExpiry)) {
+            return Issue192WsDisconnectResult.Conflict("TARGET_ORDER_TTL_INSUFFICIENT")
         }
 
         return null
@@ -234,6 +294,9 @@ internal class Issue192WsFaultController(
                 put("purpose", ISSUE_192_WS_DISCONNECT_PURPOSE)
                 put("injectionId", command.injectionId.toString())
                 put("expectedSessionId", command.expectedSessionId.toString())
+                put("targetOrderId", command.targetOrderId)
+                put("expectedOrderExpiresAt", command.expectedOrderExpiresAt.toString())
+                put("minimumRemainingTtlSeconds", command.minimumRemainingTtlSeconds)
                 put("reason", command.reason)
             }.toString(),
             occurredAt = clock.instant(),
@@ -244,24 +307,27 @@ internal class Issue192WsFaultController(
 /**
  * request 本体を検証済み command へ変換する。不正な形なら null を返す。
  */
-internal fun issue192WsDisconnectCommand(
-    injectionId: String,
-    expectedSessionId: String,
-    purpose: String,
-    reason: String,
-): Issue192WsDisconnectCommand? {
-    if (purpose != ISSUE_192_WS_DISCONNECT_PURPOSE) return null
+internal fun issue192WsDisconnectCommand(request: Issue192WsDisconnectRequest): Issue192WsDisconnectCommand? {
+    if (request.purpose != ISSUE_192_WS_DISCONNECT_PURPOSE) return null
 
-    val trimmedReason = reason.trim()
+    val trimmedReason = request.reason.trim()
 
     if (trimmedReason.isEmpty() || trimmedReason.length > MAX_REASON_LENGTH) return null
 
-    val parsedInjectionId = runCatching { UUID.fromString(injectionId) }.getOrNull() ?: return null
-    val parsedSessionId = runCatching { UUID.fromString(expectedSessionId) }.getOrNull() ?: return null
+    val parsedInjectionId = runCatching { UUID.fromString(request.injectionId) }.getOrNull() ?: return null
+    val parsedSessionId = runCatching { UUID.fromString(request.expectedSessionId) }.getOrNull() ?: return null
+    val parsedTargetOrderId = runCatching { UUID.fromString(request.targetOrderId) }.getOrNull() ?: return null
+    val parsedOrderExpiresAt = runCatching {
+        Instant.parse(request.expectedOrderExpiresAt.trim())
+    }.getOrNull() ?: return null
+    if (request.minimumRemainingTtlSeconds !in 1..MAX_MINIMUM_REMAINING_TTL_SECONDS) return null
 
     return Issue192WsDisconnectCommand(
         injectionId = parsedInjectionId,
         expectedSessionId = parsedSessionId,
+        targetOrderId = parsedTargetOrderId.toString(),
+        expectedOrderExpiresAt = parsedOrderExpiresAt,
+        minimumRemainingTtlSeconds = request.minimumRemainingTtlSeconds,
         reason = trimmedReason,
     )
 }

@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -60,6 +61,9 @@ internal class Issue192WsFaultHolder {
  *
  * @param injectionId 1 回の注入ごとに operator が新規発行する ID
  * @param expectedSessionId 最終 preflight で固定した active market-data session ID
+ * @param targetOrderId owner が承認した resting BUY entry order ID
+ * @param expectedOrderExpiresAt owner 承認時に固定した order expiry
+ * @param minimumRemainingTtlSeconds 実行時に必要な最小 remaining TTL 秒数
  * @param purpose 固定値 `ISSUE_192_WS_DISCONNECT`
  * @param reason owner 承認を結びつけた実行理由
  */
@@ -67,6 +71,9 @@ internal class Issue192WsFaultHolder {
 internal data class Issue192WsDisconnectRequest(
     val injectionId: String,
     val expectedSessionId: String,
+    val targetOrderId: String,
+    val expectedOrderExpiresAt: String,
+    val minimumRemainingTtlSeconds: Long,
     val purpose: String,
     val reason: String,
 )
@@ -99,12 +106,7 @@ internal fun Route.issue192WsFaultRoute(controller: Issue192WsFaultController) {
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("request body is invalid"))
             return@post
         }
-        val command = issue192WsDisconnectCommand(
-            injectionId = request.injectionId,
-            expectedSessionId = request.expectedSessionId,
-            purpose = request.purpose,
-            reason = request.reason,
-        )
+        val command = issue192WsDisconnectCommand(request)
 
         if (command == null) {
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("request is invalid"))
@@ -162,15 +164,30 @@ internal class DefaultIssue192WsFaultPreflight(
             val account = repositories.ledger.getAccountSnapshot().getOrThrow()
             val integrity = repositories.marketDataIntegrity.snapshot().getOrThrow()
             val gaps = repositories.monitoring.unresolvedGaps().getOrThrow()
-            val openOrders = repositories.ledger.getOpenOrders().getOrThrow()
             val openPositions = repositories.ledger.getOpenPositions().getOrThrow()
             val reservationActiveSince = clock.instant().minus(tradingConfig.daemon.launchReservationStaleAfter)
             val hasActiveReservation = repositories.launchReservation
                 .hasFreshRunningReservation(reservationActiveSince)
                 .getOrThrow()
+            val openOrders = repositories.ledger.getOpenOrders().getOrThrow()
+            val ordersObservedAt = clock.instant()
             val connected = integrity.state == MarketDataConnectionState.CONNECTED
             val restingBuyEntries = openOrders.count { order ->
                 order.side == OrderSide.BUY && order.status == OrderStatus.OPEN && order.positionId == null
+            }
+            val pendingCancelRestingBuyEntries = openOrders.count { order ->
+                order.side == OrderSide.BUY && order.status == OrderStatus.PENDING_CANCEL && order.positionId == null
+            }
+            val orderSnapshots = openOrders.map { order ->
+                Issue192OrderPreflightState(
+                    orderId = order.orderId,
+                    side = order.side,
+                    status = order.status,
+                    positionId = order.positionId,
+                    expiresAt = order.expiresAt?.let { expiresAt ->
+                        runCatching { Instant.parse(expiresAt) }.getOrNull()
+                    },
+                )
             }
 
             Issue192WsFaultPreflightState(
@@ -183,6 +200,9 @@ internal class DefaultIssue192WsFaultPreflight(
                 activeSessionId = integrity.sessionId?.takeIf { connected },
                 unresolvedMarketDataGapCount = gaps.marketDataCount,
                 restingBuyEntryOrderCount = restingBuyEntries,
+                pendingCancelRestingBuyEntryOrderCount = pendingCancelRestingBuyEntries,
+                orderSnapshots = orderSnapshots,
+                observedAt = ordersObservedAt,
                 openPositionCount = openPositions.size,
                 activeLlmWorkPresent = hasActiveReservation,
             )

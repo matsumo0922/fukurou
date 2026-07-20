@@ -19,6 +19,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectOutcome
 import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnector
 import java.time.Clock
@@ -39,6 +41,8 @@ class Issue192WsFaultSeamTest {
     private val clock = Clock.fixed(Instant.parse("2026-07-20T00:00:00Z"), ZoneOffset.UTC)
     private val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000192")
     private val injectionId = UUID.fromString("00000000-0000-0000-0000-000000000001")
+    private val targetOrderId = UUID.fromString("00000000-0000-0000-0000-000000000002")
+    private val targetOrderExpiresAt = Instant.parse("2026-07-20T00:10:00Z")
 
     @Test
     fun `flag_が既定の false なら production entrypoint は route を構築しない`() = testApplication {
@@ -87,6 +91,10 @@ class Issue192WsFaultSeamTest {
         assertNull(command(reason = "r".repeat(513)))
         assertNull(command(injectionId = "not-a-uuid"))
         assertNull(command(expectedSessionId = "not-a-uuid"))
+        assertNull(command(targetOrderId = "not-a-uuid"))
+        assertNull(command(expectedOrderExpiresAt = "not-an-instant"))
+        assertNull(command(minimumRemainingTtlSeconds = 0))
+        assertNull(command(minimumRemainingTtlSeconds = 86_401))
         assertEquals(injectionId, command()?.injectionId)
     }
 
@@ -200,6 +208,63 @@ class Issue192WsFaultSeamTest {
     }
 
     @Test
+    fun `PENDING_CANCEL の resting BUY entry が混入したら audit と切断の前に拒否する`() = runBlocking {
+        val eventLog = RecordingCommandEventLog()
+        val disconnector = RecordingDisconnector(InjectedWebSocketDisconnectOutcome.DISCONNECTED)
+        val preflightState = admittedPreflight().copy(pendingCancelRestingBuyEntryOrderCount = 1)
+
+        val result = controller(eventLog, disconnector, preflight = { Result.success(preflightState) })
+            .disconnect(requireNotNull(command()))
+
+        assertEquals(Issue192WsDisconnectResult.Conflict("PREFLIGHT_INVENTORY_REJECTED"), result)
+        assertEquals(0, disconnector.calls.get())
+        assertTrue(eventLog.appended.isEmpty())
+    }
+
+    @Test
+    fun `owner 承認後に target order が別 order へ入れ替わったら audit と切断の前に拒否する`() = runBlocking {
+        val eventLog = RecordingCommandEventLog()
+        val disconnector = RecordingDisconnector(InjectedWebSocketDisconnectOutcome.DISCONNECTED)
+        val replacementOrder = admittedOrder().copy(orderId = UUID.randomUUID().toString())
+        val preflightState = admittedPreflight().copy(orderSnapshots = listOf(replacementOrder))
+
+        val result = controller(eventLog, disconnector, preflight = { Result.success(preflightState) })
+            .disconnect(requireNotNull(command()))
+
+        assertEquals(Issue192WsDisconnectResult.Conflict("TARGET_ORDER_NOT_FOUND"), result)
+        assertEquals(0, disconnector.calls.get())
+        assertTrue(eventLog.appended.isEmpty())
+    }
+
+    @Test
+    fun `target order の状態 expiry remaining TTL 変化は mutation 前に typed rejection する`() = runBlocking {
+        val rejectedStates = mapOf(
+            "TARGET_ORDER_STATE_REJECTED" to admittedPreflight().copy(
+                orderSnapshots = listOf(admittedOrder().copy(status = OrderStatus.PENDING_CANCEL)),
+            ),
+            "TARGET_ORDER_EXPIRY_MISMATCH" to admittedPreflight().copy(
+                orderSnapshots = listOf(admittedOrder().copy(expiresAt = targetOrderExpiresAt.plusSeconds(1))),
+            ),
+            "TARGET_ORDER_TTL_INSUFFICIENT" to admittedPreflight().copy(
+                orderSnapshots = listOf(admittedOrder().copy(expiresAt = targetOrderExpiresAt)),
+                observedAt = targetOrderExpiresAt.minusSeconds(299),
+            ),
+        )
+
+        rejectedStates.forEach { (expectedCode, state) ->
+            val eventLog = RecordingCommandEventLog()
+            val disconnector = RecordingDisconnector(InjectedWebSocketDisconnectOutcome.DISCONNECTED)
+
+            val result = controller(eventLog, disconnector, preflight = { Result.success(state) })
+                .disconnect(requireNotNull(command()))
+
+            assertEquals(Issue192WsDisconnectResult.Conflict(expectedCode), result)
+            assertEquals(0, disconnector.calls.get())
+            assertTrue(eventLog.appended.isEmpty())
+        }
+    }
+
+    @Test
     fun `preflight 読み取り失敗は abort せず fail closed にする`() = runBlocking {
         val eventLog = RecordingCommandEventLog()
         val disconnector = RecordingDisconnector(InjectedWebSocketDisconnectOutcome.DISCONNECTED)
@@ -286,6 +351,9 @@ class Issue192WsFaultSeamTest {
         return buildJsonObject {
             put("injectionId", injectionId.toString())
             put("expectedSessionId", sessionId.toString())
+            put("targetOrderId", targetOrderId.toString())
+            put("expectedOrderExpiresAt", targetOrderExpiresAt.toString())
+            put("minimumRemainingTtlSeconds", 300)
             put("purpose", ISSUE_192_WS_DISCONNECT_PURPOSE)
             put("reason", "owner approved")
         }.toString()
@@ -294,10 +362,23 @@ class Issue192WsFaultSeamTest {
     private fun command(
         injectionId: String = this.injectionId.toString(),
         expectedSessionId: String = sessionId.toString(),
+        targetOrderId: String = this.targetOrderId.toString(),
+        expectedOrderExpiresAt: String = targetOrderExpiresAt.toString(),
+        minimumRemainingTtlSeconds: Long = 300,
         purpose: String = ISSUE_192_WS_DISCONNECT_PURPOSE,
         reason: String = "owner approved arm 1",
     ): Issue192WsDisconnectCommand? {
-        return issue192WsDisconnectCommand(injectionId, expectedSessionId, purpose, reason)
+        return issue192WsDisconnectCommand(
+            Issue192WsDisconnectRequest(
+                injectionId = injectionId,
+                expectedSessionId = expectedSessionId,
+                targetOrderId = targetOrderId,
+                expectedOrderExpiresAt = expectedOrderExpiresAt,
+                minimumRemainingTtlSeconds = minimumRemainingTtlSeconds,
+                purpose = purpose,
+                reason = reason,
+            ),
+        )
     }
 
     private fun controller(
@@ -323,8 +404,21 @@ class Issue192WsFaultSeamTest {
             activeSessionId = sessionId,
             unresolvedMarketDataGapCount = 0,
             restingBuyEntryOrderCount = 1,
+            pendingCancelRestingBuyEntryOrderCount = 0,
+            orderSnapshots = listOf(admittedOrder()),
+            observedAt = clock.instant(),
             openPositionCount = 0,
             activeLlmWorkPresent = false,
+        )
+    }
+
+    private fun admittedOrder(): Issue192OrderPreflightState {
+        return Issue192OrderPreflightState(
+            orderId = targetOrderId.toString(),
+            side = OrderSide.BUY,
+            status = OrderStatus.OPEN,
+            positionId = null,
+            expiresAt = targetOrderExpiresAt,
         )
     }
 
