@@ -30,7 +30,7 @@ class MaxDrawdownPolicyWiringTest {
         assertTrue(tradingRuntime.contains("maxDrawdownPolicy = context.maxDrawdownPolicy"))
         assertTrue(reconcilerWorker.contains("maxDrawdownPolicy = maxDrawdownPolicy"))
 
-        assertEquals(6, productionSources.sumOf { source -> source.count("ExposedPaperLedgerRepository(") })
+        assertEquals(5, productionSources.sumOf { source -> source.count("ExposedPaperLedgerRepository(") })
         assertTrue(application.contains("ExposedPaperLedgerRepository(connectedDatabase)"))
         assertTrue(obsidian.contains("ExposedPaperLedgerRepository(database)"))
         assertFalse(

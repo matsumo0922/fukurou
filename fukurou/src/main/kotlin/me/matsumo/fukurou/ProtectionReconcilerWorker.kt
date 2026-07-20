@@ -21,7 +21,6 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicWebSocketMarketEventStream
 import me.matsumo.fukurou.trading.logging.RateLimitedWarnLogger
-import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnector
 import me.matsumo.fukurou.trading.market.PaperMarketEventReceiptRepository
 import me.matsumo.fukurou.trading.market.UnavailablePaperMarketEventReceiptRepository
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
@@ -135,7 +134,6 @@ internal fun startProtectionReconcilerWorker(
     clock: Clock = Clock.systemUTC(),
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
     latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
-    onMarketEventStreamCreated: (InjectedWebSocketDisconnector) -> Unit = {},
 ): ProtectionReconcilerWorker {
     val maxDrawdownPolicy = MaxDrawdownPolicy(tradingConfig.safetyFloor.maxDrawdownRatio)
     val inputs = ProtectionReconcilerWorkerInputs(
@@ -149,8 +147,6 @@ internal fun startProtectionReconcilerWorker(
     )
     val runtimeComponents = inputs.createRuntimeComponents()
     val reconciler = runtimeComponents.createReconciler()
-
-    onMarketEventStreamCreated(runtimeComponents.marketEventStream)
 
     return ProtectionReconcilerWorker(
         reconciler = reconciler,

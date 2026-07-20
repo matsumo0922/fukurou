@@ -18,6 +18,17 @@ import kotlin.test.assertTrue
 class WebStaticDeliveryTest {
 
     @Test
+    fun retiredIssue192WebSocketDisconnectRouteReturnsNotFound() = testApplication {
+        application {
+            module(readinessProbe = { true })
+        }
+
+        val response = client.post("/ops/issue-192/ws-disconnect")
+
+        assertEquals(HttpStatusCode.NotFound, response.status)
+    }
+
+    @Test
     fun webStaticDelivery_returnsAssetAndFallbackIndex() = testApplication {
         val webRoot = createWebRoot()
 

@@ -45,7 +45,6 @@ import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
-import me.matsumo.fukurou.trading.persistence.ExposedMarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmDecisionReconstructionRepository
@@ -109,7 +108,6 @@ fun interface ReadinessProbe {
  * @param runtimeConfigEnvironment runtime config catalog API で参照する環境変数 map
  * @param databaseConfig DB 接続設定。null なら DB 未構成として扱う
  * @param webRoot WebUI の build output を配信する filesystem root。null なら Web 配信を無効にする
- * @param issue192WsFaultEnabled Issue #192 の一時的な WebSocket 切断 seam を構築するか。既定は false
  * @param shutdownResultObserver Application shutdown の全 resource cleanup 結果を受け取る observer
  */
 fun Application.module(
@@ -140,7 +138,6 @@ fun Application.module(
     runtimeConfigEnvironment: Map<String, String> = System.getenv(),
     databaseConfig: DatabaseConfig? = DatabaseConfig.fromEnv(),
     webRoot: File? = webRootFromEnv(),
-    issue192WsFaultEnabled: Boolean = issue192WsFaultEnabledFromEnv(),
     shutdownResultObserver: (Result<Unit>) -> Unit = {},
 ) {
     val databaseResources = createApplicationDatabaseResources(
@@ -194,9 +191,9 @@ fun Application.module(
 
     installApplicationPlugins(webRoot)
 
-    configureApplicationRoutes(routeResources, reconcilerStatus, revision, monitoringService, issue192WsFaultEnabled)
+    configureApplicationRoutes(routeResources, reconcilerStatus, revision, monitoringService)
 
-    val backgroundWorkers = startBackgroundWorkers(databaseResources, runtime, routeResources.issue192WsFault)
+    val backgroundWorkers = startApplicationBackgroundWorkers(databaseResources, runtime)
     subscribeApplicationShutdown(
         databaseResources = databaseResources,
         opsResources = routeResources.ops,
@@ -210,72 +207,15 @@ private fun Application.configureApplicationRoutes(
     reconcilerStatus: MutableReconcilerStatus,
     revision: String,
     monitoringService: MonitoringSnapshotService,
-    issue192WsFaultEnabled: Boolean,
 ) {
     routing {
         healthRoutes(routeResources.readinessProbe, reconcilerStatus)
         revisionRoute(revision)
         evaluationRoutes(routeResources.evaluation)
         opsRoutes(routeResources.ops.dependencies)
-        if (issue192WsFaultEnabled) issue192WsFaultRoute(routeResources.issue192WsFault.createController())
         monitoringRoute(monitoringService)
         apiDocumentationRoutes()
     }
-}
-
-/**
- * Issue #192 の一時的な切断 seam の application-scoped 配線。
- *
- * @param holder routing と background worker を橋渡しする disconnector holder
- * @param createController deployment flag が有効なときだけ呼ぶ切断 controller の factory
- */
-private class Issue192WsFaultWiring(
-    val holder: Issue192WsFaultHolder,
-    val createController: () -> Issue192WsFaultController,
-)
-
-/**
- * Issue #192 の一時的な切断 seam の配線を作る。controller は route を生やすときだけ構築する。
- */
-private fun createIssue192WsFaultWiring(
-    databaseResources: ApplicationDatabaseResources,
-    runtime: ApplicationRuntimeResources,
-): Issue192WsFaultWiring {
-    val holder = Issue192WsFaultHolder()
-
-    return Issue192WsFaultWiring(holder) { createIssue192WsFaultController(holder, databaseResources, runtime) }
-}
-
-/**
- * Issue #192 の一時的な切断 controller を production repository から構築する。
- */
-private fun createIssue192WsFaultController(
-    holder: Issue192WsFaultHolder,
-    databaseResources: ApplicationDatabaseResources,
-    runtime: ApplicationRuntimeResources,
-): Issue192WsFaultController {
-    val database = databaseResources.database
-    val commandEventLog = database?.let(::ExposedCommandEventLog)
-
-    return Issue192WsFaultController(
-        disconnectorProvider = holder::current,
-        commandEventLog = commandEventLog,
-        commandEventByIdReader = commandEventLog,
-        preflight = database?.let { connectedDatabase ->
-            DefaultIssue192WsFaultPreflight(
-                tradingConfig = runtime.tradingConfig,
-                runtimeConfigSnapshot = runtime.runtimeConfigSnapshot,
-                repositories = Issue192WsFaultPreflightRepositories(
-                    ledger = ExposedPaperLedgerRepository(connectedDatabase),
-                    marketDataIntegrity = ExposedMarketDataIntegrityRepository(connectedDatabase),
-                    monitoring = ExposedMonitoringRepository(connectedDatabase),
-                    launchReservation = ExposedLlmLaunchReservationRepository(connectedDatabase),
-                ),
-                clock = runtime.clock,
-            )
-        },
-        clock = runtime.clock,
-    )
 }
 
 private fun createMonitoringService(
@@ -533,7 +473,6 @@ private fun createApplicationRouteResources(
             riskStateRepository = riskStateRepository,
             runtime = runtime,
         ),
-        issue192WsFault = createIssue192WsFaultWiring(databaseResources, runtime),
     )
 }
 
@@ -941,10 +880,9 @@ private fun Application.installApplicationPlugins(webRoot: File?) {
     }
 }
 
-private fun startBackgroundWorkers(
+private fun startApplicationBackgroundWorkers(
     databaseResources: ApplicationDatabaseResources,
     runtime: ApplicationRuntimeResources,
-    issue192WsFault: Issue192WsFaultWiring,
 ): ApplicationBackgroundWorkers {
     val dataSource = databaseResources.dataSource
     val database = databaseResources.database
@@ -983,7 +921,6 @@ private fun startBackgroundWorkers(
             clock = runtime.clock,
             onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
             latestMarketQuoteStore = runtime.latestMarketQuoteStore,
-            onMarketEventStreamCreated = issue192WsFault.holder::publish,
         ),
         llmDaemonWorker = startApplicationLlmDaemonWorker(dataSource, database, runtime),
         llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker(database, runtime.clock),
@@ -1278,13 +1215,11 @@ private data class ApplicationOpsOverrides(
  * @param readinessProbe health route に渡す readiness probe
  * @param evaluation 評価系 route の依存関係
  * @param ops ops route の依存関係
- * @param issue192WsFault Issue #192 の一時的な切断 seam の配線
  */
 private data class ApplicationRouteResources(
     val readinessProbe: ReadinessProbe,
     val evaluation: EvaluationRouteDependencies,
     val ops: ApplicationOpsRouteResources,
-    val issue192WsFault: Issue192WsFaultWiring,
 )
 
 /**

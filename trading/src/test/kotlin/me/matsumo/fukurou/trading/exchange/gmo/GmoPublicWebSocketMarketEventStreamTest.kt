@@ -4,9 +4,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
-import me.matsumo.fukurou.trading.market.INJECTED_WEBSOCKET_DISCONNECT_MESSAGE
-import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectException
-import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectOutcome
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
@@ -360,139 +357,6 @@ class GmoPublicWebSocketMarketEventStreamTest {
         assertTrue(session.receive().exceptionOrNull()?.message.orEmpty().contains("closed"))
     }
 
-    @Test
-    fun `exact session への注入は socket を abort し terminal failure を1件届ける`() = runBlocking {
-        val socket = RecordingWebSocket()
-        val stream = GmoPublicWebSocketMarketEventStream(httpClient = FakeWebSocketHttpClient(socket))
-        val session = stream.connect().getOrThrow()
-
-        val outcome = stream.disconnectActiveSession(session.sessionId)
-
-        assertEquals(InjectedWebSocketDisconnectOutcome.DISCONNECTED, outcome)
-        assertTrue(socket.aborted)
-        assertTrue(session.receive().exceptionOrNull() is InjectedWebSocketDisconnectException)
-    }
-
-    @Test
-    fun `注入 exception の固定 message は sequence gap を含まない`() {
-        val message = InjectedWebSocketDisconnectException().message
-
-        assertEquals(INJECTED_WEBSOCKET_DISCONNECT_MESSAGE, message)
-        assertEquals("issue-192 injected websocket disconnect", message)
-        assertTrue(!message.orEmpty().contains("sequence gap", ignoreCase = true))
-    }
-
-    @Test
-    fun `stale session ID と active session 不在は mutation なしで拒否する`() = runBlocking {
-        val socket = RecordingWebSocket()
-        val stream = GmoPublicWebSocketMarketEventStream(httpClient = FakeWebSocketHttpClient(socket))
-
-        assertEquals(
-            InjectedWebSocketDisconnectOutcome.NO_ACTIVE_SESSION,
-            stream.disconnectActiveSession(UUID.randomUUID()),
-        )
-
-        stream.connect().getOrThrow()
-
-        assertEquals(
-            InjectedWebSocketDisconnectOutcome.SESSION_MISMATCH,
-            stream.disconnectActiveSession(UUID.randomUUID()),
-        )
-        assertTrue(!socket.aborted)
-    }
-
-    @Test
-    fun `自然な close 後の注入は active session 不在として拒否する`() = runBlocking {
-        val socket = RecordingWebSocket()
-        val httpClient = FakeWebSocketHttpClient(socket)
-        val stream = GmoPublicWebSocketMarketEventStream(httpClient = httpClient)
-        val session = stream.connect().getOrThrow()
-
-        requireNotNull(httpClient.capturedListener).onClose(socket, WebSocket.NORMAL_CLOSURE, "closed")
-
-        assertEquals(
-            InjectedWebSocketDisconnectOutcome.NO_ACTIVE_SESSION,
-            stream.disconnectActiveSession(session.sessionId),
-        )
-        assertTrue(!socket.aborted)
-        assertTrue(session.receive().exceptionOrNull()?.message.orEmpty().contains("closed"))
-    }
-
-    @Test
-    fun `abort 失敗時は terminal failure を届けない`() = runBlocking {
-        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
-        val listener = injectionListener(messages)
-        val session = GmoMarketEventSession(
-            sessionId = sessionId,
-            connectedAt = Instant.EPOCH,
-            socket = FailingAbortWebSocket(),
-            messages = messages,
-            listener = listener,
-        )
-
-        assertEquals(
-            InjectedWebSocketDisconnectOutcome.ABORT_FAILED,
-            session.abortAndDeliverInjectedTerminalFailure(),
-        )
-        assertTrue(messages.tryReceive().isFailure)
-    }
-
-    @Test
-    fun `注入は session-local one-shot であり自然 terminal の claim を奪わない`() = runBlocking {
-        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
-        val listener = injectionListener(messages)
-        val session = GmoMarketEventSession(
-            sessionId = sessionId,
-            connectedAt = Instant.EPOCH,
-            socket = RecordingWebSocket(),
-            messages = messages,
-            listener = listener,
-        )
-        val naturalError = IllegalStateException("network error")
-
-        listener.onError(NoOpWebSocket, naturalError)
-
-        assertEquals(
-            InjectedWebSocketDisconnectOutcome.DISCONNECTED,
-            session.abortAndDeliverInjectedTerminalFailure(),
-        )
-        assertEquals(
-            InjectedWebSocketDisconnectOutcome.ALREADY_INJECTED,
-            session.abortAndDeliverInjectedTerminalFailure(),
-        )
-        assertEquals(naturalError, session.receive().exceptionOrNull())
-        assertTrue(session.receive().exceptionOrNull() != null)
-    }
-
-    @Test
-    fun `terminal より前に受理済みの trade は注入 failure より先に届く`() = runBlocking {
-        val messages = Channel<Result<MarketEventSessionSignal>>(Channel.UNLIMITED)
-        val listener = injectionListener(messages)
-        val session = GmoMarketEventSession(
-            sessionId = sessionId,
-            connectedAt = Instant.EPOCH,
-            socket = RecordingWebSocket(),
-            messages = messages,
-            listener = listener,
-        )
-
-        listener.onText(NoOpWebSocket, tradePayload(), true)
-        session.abortAndDeliverInjectedTerminalFailure()
-
-        assertTrue(session.receive().getOrThrow() is MarketEventSessionSignal.Trade)
-        assertTrue(session.receive().exceptionOrNull() is InjectedWebSocketDisconnectException)
-    }
-
-    private fun injectionListener(messages: Channel<Result<MarketEventSessionSignal>>): GmoWebSocketListener {
-        return GmoWebSocketListener(
-            messages = messages,
-            decoder = GmoTradeMessageDecoder(TradingSymbol.BTC, sessionId),
-            clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
-            receiptRepository = SuccessfulReceiptRepository,
-            receiptExecutor = directExecutor,
-        )
-    }
-
     private fun tradePayload(): String {
         return """
             {
@@ -599,21 +463,6 @@ private class FailingSubscribeWebSocket : WebSocket by NoOpWebSocket {
     }
 }
 
-private class RecordingWebSocket : WebSocket by NoOpWebSocket {
-    var aborted = false
-        private set
-
-    override fun abort() {
-        aborted = true
-    }
-}
-
-private class FailingAbortWebSocket : WebSocket by NoOpWebSocket {
-    override fun abort() {
-        error("abort failed")
-    }
-}
-
 private class DeferredPongWebSocket : WebSocket by NoOpWebSocket {
     private val pongFuture = CompletableFuture<WebSocket>()
 
@@ -627,9 +476,6 @@ private class DeferredPongWebSocket : WebSocket by NoOpWebSocket {
 private class FakeWebSocketHttpClient(
     private val socket: WebSocket,
 ) : HttpClient() {
-    var capturedListener: WebSocket.Listener? = null
-        private set
-
     override fun newWebSocketBuilder(): WebSocket.Builder {
         return object : WebSocket.Builder {
             override fun header(name: String, value: String): WebSocket.Builder = this
@@ -639,7 +485,6 @@ private class FakeWebSocketHttpClient(
             override fun subprotocols(mostPreferred: String, vararg lesserPreferred: String): WebSocket.Builder = this
 
             override fun buildAsync(uri: URI, listener: WebSocket.Listener): CompletableFuture<WebSocket> {
-                capturedListener = listener
                 listener.onOpen(socket)
 
                 return CompletableFuture.completedFuture(socket)
