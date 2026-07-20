@@ -30,6 +30,8 @@ import me.matsumo.fukurou.trading.evaluation.LlmModelTokenStats
 import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
 import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
 import me.matsumo.fukurou.trading.evaluation.OWNER_SCORE_EXPECTED_DAYS
+import me.matsumo.fukurou.trading.evaluation.OWNER_SCORE_SEMANTICS_VERSION
+import me.matsumo.fukurou.trading.evaluation.OWNER_SCORE_SYNTHETIC_TAKER_FEE_RATE
 import me.matsumo.fukurou.trading.evaluation.OwnerScoreCalculationRequest
 import me.matsumo.fukurou.trading.evaluation.OwnerScoreCutoffMode
 import me.matsumo.fukurou.trading.evaluation.OwnerScoreMath
@@ -71,6 +73,10 @@ private const val DAILY_CANDLE_LOOKBACK_PADDING = 40
  * GMO 日足取得の最大本数。
  */
 private const val MAX_DAILY_CANDLE_LIMIT = 500
+
+/** Owner score V1 の fee 比較に残る既知のbias。 */
+private const val OWNER_SCORE_FEE_BIAS_DISCLOSURE_JA =
+    "window開始時にBTCを保有するbotはfresh buy & holdのentry feeを負わないため、約0.1% bot有利になりえます。"
 
 /**
  * API の日付解釈 timezone。
@@ -397,11 +403,21 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
             call.respond(EvaluationBenchmarkResponse.unsupported(scope, cutoff, cutoffMode, window))
             return@get
         }
+        val dailyCandleLimit = ownerScoreDailyCandleLimit(requestInstant, window)
+        if (dailyCandleLimit > MAX_DAILY_CANDLE_LIMIT) {
+            call.respond(
+                HttpStatusCode.BadRequest,
+                ErrorResponse(
+                    "cutoff window requires $dailyCandleLimit daily candles; maximum is $MAX_DAILY_CANDLE_LIMIT",
+                ),
+            )
+            return@get
+        }
         val evaluationMarketDataSource = call.requireMarketDataSource(dependencies.marketDataSource) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(
             symbol = dependencies.tradingConfig.symbol,
             interval = CandleInterval.ONE_DAY,
-            limit = OWNER_SCORE_EXPECTED_DAYS,
+            limit = dailyCandleLimit.toInt(),
         ).getOrThrow()
         val evidencePeriod = EvaluationPeriod(
             from = window.fromInclusive,
@@ -445,7 +461,7 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
                 schema = jsonSchema<EvaluationBenchmarkResponse>()
             }
             HttpStatusCode.BadRequest {
-                description = "cutoffが不正、future、またはfrom/toが指定されています。"
+                description = "cutoffが不正、future、取得上限超過、またはfrom/toが指定されています。"
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.InternalServerError {
@@ -454,6 +470,13 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
             }
         }
     }
+}
+
+private fun ownerScoreDailyCandleLimit(requestInstant: java.time.Instant, window: OwnerScoreWindow): Long {
+    val currentWindow = OwnerScoreWindow.fromCutoff(requestInstant, EvaluationZone)
+    val pastBusinessDays = Duration.between(window.lastCloseAt, currentWindow.lastCloseAt).toDays()
+
+    return OWNER_SCORE_EXPECTED_DAYS + 1L + pastBusinessDays
 }
 
 @OptIn(ExperimentalKtorApi::class)
@@ -1167,7 +1190,7 @@ data class EvaluationBenchmarkResponse(
                 window = EvaluationBenchmarkWindowResponse.fromWindow(result.window),
                 scope = scope.toResponse(),
                 syntheticTakerFeeRate = result.syntheticTakerFeeRate.toDecimalString(),
-                feeBiasDisclosureJa = "window開始時にBTCを保有するbotはfresh buy & holdのentry feeを負わないため、約0.1% bot有利になりえます。",
+                feeBiasDisclosureJa = OWNER_SCORE_FEE_BIAS_DISCLOSURE_JA,
                 assumptionsJa = "保存済みsnapshotとgapだけを使い、slippage・税・maker rebateは含めません。",
                 commonStartingCapitalJpy = result.commonStartingCapitalJpy?.toDecimalString(),
                 points = result.points.map(EvaluationBenchmarkPointResponse::fromPoint),
@@ -1186,13 +1209,13 @@ data class EvaluationBenchmarkResponse(
             window: OwnerScoreWindow,
         ): EvaluationBenchmarkResponse {
             return EvaluationBenchmarkResponse(
-                semanticsVersion = "OWNER_SCORE_V1",
+                semanticsVersion = OWNER_SCORE_SEMANTICS_VERSION,
                 cutoffMode = cutoffMode.name,
                 cutoff = cutoff.toString(),
                 window = EvaluationBenchmarkWindowResponse.fromWindow(window),
                 scope = scope.toResponse(),
-                syntheticTakerFeeRate = "0.0005",
-                feeBiasDisclosureJa = "window開始時のentry fee差を含むV1比較です。",
+                syntheticTakerFeeRate = OWNER_SCORE_SYNTHETIC_TAKER_FEE_RATE.toDecimalString(),
+                feeBiasDisclosureJa = OWNER_SCORE_FEE_BIAS_DISCLOSURE_JA,
                 assumptionsJa = "active CURRENT scopeだけを評価します。",
                 commonStartingCapitalJpy = null,
                 points = emptyList(),
