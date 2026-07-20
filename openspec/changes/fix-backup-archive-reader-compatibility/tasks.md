@@ -5,13 +5,13 @@
 
 ## 2. Production archive compatibility
 
-- [ ] 2.1 Validate the captured production container's `pg_dump` and `pg_restore` major-16 toolchain before repository mutation.
-- [ ] 2.2 Route full-stream archive-list validation through `docker exec -i` on the captured production container ID and remove host `pg_restore` as a runtime prerequisite.
+- [ ] 2.1 Route production identity reads, database control/watchdog queries, `pg_dump`, and full-stream `pg_restore --list` through the captured production container ID.
+- [ ] 2.2 Use the production container name only for initial ID capture and post-dump mapping verification, and remove host `pg_restore` as a runtime prerequisite.
 - [ ] 2.3 Preserve stable redacted failures, candidate isolation, tag identity, retention ordering, and producer/consumer stream status semantics.
 
 ## 3. Regression proof
 
-- [ ] 3.1 Extend shell selftests for captured-ID routing, early parser completion with EOF drain, reader failure, producer failure, and major mismatch before retention or success evidence.
+- [ ] 3.1 Extend shell selftests for captured-ID routing, A→B→A name replacement, early parser completion with EOF drain, reader failure, and producer failure before retention or success evidence.
 - [ ] 3.2 Extend the Docker-backed production entrypoint integration so a deliberately failing host `pg_restore` cannot affect real PostgreSQL 16 backup, retention, and restore coverage.
 - [ ] 3.3 Run the backup, restore, installer, publisher, systemd, monitoring, and OpenSpec focused validation inventory and record the tested HEAD.
 

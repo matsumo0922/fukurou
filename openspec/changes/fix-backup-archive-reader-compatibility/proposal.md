@@ -4,9 +4,8 @@ Production の初回 backup gate で、PostgreSQL 16 container が生成した c
 
 ## What Changes
 
-- （ユーザー確認済み）日次 custom archive の `pg_restore --list` を NAS host client ではなく、dump producer と同じ固定 production PostgreSQL container の client で実行する。
-- （agent 仮決め）container-side `pg_dump` / `pg_restore` が PostgreSQL 16 major であることを repository mutation 前に検証し、不一致・欠損は stable failure として fail closed にする。
-- host `pg_restore` が存在しない、または archive と非互換でも production entrypoint が成功する production-call-path test を追加する。container reader failure と major mismatch が retention・success evidence を進めないことも固定する。
+- （ユーザー確認済み）日次 custom archive の dump、database control、`pg_restore --list` を同じ captured production PostgreSQL container ID で実行する。
+- host `pg_restore` が存在しない、または archive と非互換でも production entrypoint が成功する production-call-path test を追加する。captured reader failure が retention・success evidence を進めないことも固定する。
 - restore drill、retention predicate、status schema、monitoring wire contract、timer cadence、production database replacement boundaryは変更しない。
 - NAS prerequisite と初回 rollout 手順を、実際の container-owned archive reader contract に同期する。
 
@@ -22,7 +21,7 @@ Production の初回 backup gate で、PostgreSQL 16 container が生成した c
 
 ## Impact
 
-- `scripts/backup/backup-fukurou` の production archive verification と client preflight。
-- `scripts/backup/backup-selftest` / `scripts/backup/backup-postgres-selftest` の version・routing・failure coverage。
+- `scripts/backup/backup-fukurou` の production identity routing と archive verification。
+- `scripts/backup/backup-selftest` / `scripts/backup/backup-postgres-selftest` の captured-ID routing・failure coverage。
 - `docs/deploy.md` と `database-backup-restore` spec の NAS prerequisite / archive reader contract。
 - DB schema、Ktor API、compose、sudoers、secret format、repository formatへの変更はない。

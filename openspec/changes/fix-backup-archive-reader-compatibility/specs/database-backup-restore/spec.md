@@ -1,17 +1,13 @@
 ## MODIFIED Requirements
 
 ### Requirement: Production PostgreSQL receives scheduled encrypted logical backup attempts
-A root-owned timer MUST attempt a PostgreSQL 16 custom-format logical backup once per calendar day and store successful snapshots only in an encrypted same-NAS restic repository. It MUST reach the host-unpublished database through the fixed production container without placing the production database password in inspect output, dump arguments/environment, or host artifacts. The dump producer and archive-list reader MUST execute in the same captured production PostgreSQL container and MUST identify as PostgreSQL 16 before repository mutation; a host-installed PostgreSQL client MUST NOT determine archive compatibility. It MUST bound the database-locking dump phase to 60 seconds with an independent exact-backend termination watchdog, and MUST NOT persist a plaintext dump, database password, or repository password in a filesystem artifact, process argument, log, or status document. The cadence is an attempt schedule and MUST NOT be represented as guaranteed daily success.
+A root-owned timer MUST attempt a PostgreSQL 16 custom-format logical backup once per calendar day and store successful snapshots only in an encrypted same-NAS restic repository. It MUST reach the host-unpublished database through the fixed production container without placing the production database password in inspect output, dump arguments/environment, or host artifacts. After capturing the production PostgreSQL container ID, identity reads, database control, the dump producer, and the archive-list reader MUST execute in that captured container; a host-installed PostgreSQL client MUST NOT determine archive compatibility. It MUST bound the database-locking dump phase to 60 seconds with an independent exact-backend termination watchdog, and MUST NOT persist a plaintext dump, database password, or repository password in a filesystem artifact, process argument, log, or status document. The cadence is an attempt schedule and MUST NOT be represented as guaranteed daily success.
 
 The Docker-backed integration contract MUST execute the production backup entrypoint itself against real PostgreSQL 16 and restic, MUST prove that host `pg_restore` absence or incompatibility cannot affect the entrypoint, and MUST cover its retention prune and redacted output rather than reproducing the orchestration as test-only commands.
 
 #### Scenario: Daily backup succeeds
 - **WHEN** production PostgreSQL 16 is reachable and the encrypted repository is healthy
 - **THEN** the job streams a custom-format dump into a restic snapshot, validates the archive with the captured production container's PostgreSQL 16 reader, and records its exact non-secret identity, source revision, integrity time, and successful attempt time
-
-#### Scenario: Container archive toolchain is missing or incompatible
-- **WHEN** the captured production container lacks `pg_dump` or `pg_restore`, or either client does not identify as PostgreSQL major 16
-- **THEN** the job exits nonzero with a stable redacted result before backup, tag, retention, or success-evidence mutation
 
 #### Scenario: Host PostgreSQL client is absent or incompatible
 - **WHEN** the NAS host has no `pg_restore` or has a client that cannot parse the PostgreSQL 16 custom archive
@@ -24,6 +20,10 @@ The Docker-backed integration contract MUST execute the production backup entryp
 #### Scenario: Production identity changes after the deploy-lock probe
 - **WHEN** the PostgreSQL container, application container, database identity, or application revision differs between the pre-dump and post-dump observations
 - **THEN** the attempt does not advance integrity-checked success evidence or attribute the snapshot to the earlier application revision
+
+#### Scenario: Production container name is replaced and restored during an attempt
+- **WHEN** the production container name points to another container and later returns to the originally captured container
+- **THEN** identity reads, database control, dump production, and archive-list validation continue to use only the captured container ID and do not mix data paths
 
 #### Scenario: Dump producer fails after restic accepted partial input
 - **WHEN** `pg_dump` fails or times out after restic created a snapshot from partial stdin

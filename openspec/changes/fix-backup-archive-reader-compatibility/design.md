@@ -8,8 +8,7 @@ This is a rollout-blocking correctness defect in the already-merged database bac
 
 **Goals:**
 
-- Bind daily archive production and list validation to one captured PostgreSQL 16 container identity.
-- Reject missing or wrong-major container clients before repository mutation.
+- Bind daily archive production, database control, and list validation to one captured PostgreSQL 16 container identity.
 - Preserve full-stream drain, independent producer/consumer status, no-retention-on-failure, and redacted failure behavior.
 - Make the production entrypoint test fail if it consults host `pg_restore`.
 - Re-audit the adjacent backup, restore, installer, publisher, systemd, monitoring, and rollout paths before using the one allowed hotfix PR.
@@ -23,17 +22,15 @@ This is a rollout-blocking correctness defect in the already-merged database bac
 
 ## Decisions
 
-### 1. The captured production container owns both archive ends
+### 1. The captured production container owns the complete backup data path
 
-（ユーザー確認済み）`pg_dump` already executes through the fixed production container. `verify_archive_stream` will execute `pg_restore --list` through `docker exec -i` against the previously captured `PRODUCTION_CONTAINER_ID`, not a name lookup and not the host `PATH`. Capturing the ID prevents a concurrent name replacement from silently selecting a different archive reader. If the captured container no longer exists or the reader fails, the current candidate remains unverified and retention does not run.
+（ユーザー確認済み）After the initial name-to-ID lookup, production identity reads, database control/watchdog queries, `pg_dump`, and `pg_restore --list` execute through `docker exec` against the captured `PRODUCTION_CONTAINER_ID`, not another name lookup and not the host `PATH`. The production name is used again only for the post-dump mapping check. Capturing the complete data path prevents an A→B→A name replacement from mixing a dump producer and archive reader. If the captured container no longer exists or any captured-ID operation fails, the current candidate remains unverified and retention does not run.
 
 Installing PostgreSQL 16 from PGDG on the host was rejected because it adds an operational package-repository dependency solely to compensate for an implementation boundary error. A `/usr/local/bin/pg_restore` wrapper was rejected because it creates an unreviewed persistent root artifact outside the installer manifest.
 
-### 2. PostgreSQL 16 client compatibility is checked before repository mutation
+### 2. PostgreSQL 16 remains a static deployment contract
 
-（agent 仮決め）After capturing the production container ID, the backup preflight reads the container-local `pg_dump --version` and `pg_restore --version` output and accepts only major 16 for both tools. Missing, extra, malformed, or wrong-major output returns the existing redacted `INVALID_CONFIGURATION` path before `restic backup`, tag, or retention. Minor versions remain flexible within major 16.
-
-The preflight does not inspect host package versions and does not add a new result code or monitoring contract. The fixed production image remains the toolchain authority already used by dump and restore operations.
+（ユーザー確認済み）The production compose image, isolated restore image, and contract tests continue to pin PostgreSQL 16. This hotfix does not add runtime parsing of `pg_dump --version` or `pg_restore --version`: the actual defect is cross-container/host routing, and a new output-format parser would add an unrelated availability gate.
 
 ### 3. Stream semantics remain two-sided
 
@@ -41,7 +38,7 @@ The preflight does not inspect host package versions and does not add a new resu
 
 ### 4. Tests make the production mismatch reproducible
 
-（agent 仮決め）The shell selftest records the exact captured-ID `docker exec -i ... pg_restore --list` call and covers successful early parser completion, parser failure, producer failure, toolchain major mismatch, and no retention/success evidence after failure. The Docker-backed production-entrypoint integration prepends a deliberately failing host `pg_restore`; the test can pass only if the real production script uses the PostgreSQL 16 container reader. Existing real restic retention and isolated restore coverage remain active.
+（agent 仮決め）The shell selftest gives the production name and captured ID different fixture behavior and records identity, control/watchdog, `pg_dump`, and `pg_restore --list` routing. It covers successful early parser completion, parser failure, producer failure, an A→B→A name-replacement attempt, and no retention/success evidence after failure. The Docker-backed production-entrypoint integration prepends a deliberately failing host `pg_restore`; the test can pass only if the real production script uses the PostgreSQL 16 container reader. Existing real restic retention and isolated restore coverage remain active.
 
 ### 5. Audit scope is finite
 
@@ -50,7 +47,6 @@ The preflight does not inspect host package versions and does not add a new resu
 ## Risks / Trade-offs
 
 - [The production container stops after creating a snapshot] → captured-ID archive validation fails closed; the candidate is untagged, excluded from retention, and counted on a later successful attempt.
-- [Container version output changes format] → exact preflight reports `INVALID_CONFIGURATION` before repository mutation; tests bind the supported PostgreSQL 16 image output.
 - [Using the production container for parsing affects production] → `pg_restore --list` reads stdin and does not connect to or mutate the database; `docker exec` uses no database arguments or credentials.
 - [A host client could have served as a fallback] → no fallback is used because cross-major acceptance would recreate the unbound compatibility defect.
 
