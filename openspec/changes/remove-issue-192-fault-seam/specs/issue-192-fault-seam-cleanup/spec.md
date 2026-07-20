@@ -22,10 +22,13 @@ The cleanup MUST preserve normal WebSocket connection, natural terminal failure 
 - **WHEN** the cleanup revision is deployed
 - **THEN** no schema migration, production row deletion, ledger rewrite, receipt backfill, gap rewrite, or evaluation-exclusion rewrite is performed
 
-### Requirement: Injection-only vocabulary is removed when no production audit exists
-The cleanup MUST remove Issue #192 requested/executed command-event types and activity labels because the injection was never enabled or executed in production. Removal MUST be code-only and MUST NOT attempt a data migration.
+### Requirement: Historical audit decoding remains safe
+The cleanup MUST retain the Issue #192 requested/executed command-event types and activity labels as decoding-only vocabulary so that any unknown existing row cannot break the activity feed. It MUST remove the writer and fixed-primary-key reader used by the retired runtime surface, and MUST NOT query-delete rows or add a data migration.
 
 #### Scenario: Repository is searched after cleanup
-- **WHEN** tracked runtime code, tests, compose, current documentation, catalog fixtures, and localization are searched for Issue #192 injection symbols
-- **THEN** no runtime activation key, route, controller, disconnector, requested/executed event type, or activity label remains outside the archived OpenSpec experiment record and this cleanup change
+- **WHEN** tracked runtime code, tests, compose, and current documentation are searched for Issue #192 injection symbols
+- **THEN** no runtime activation key, route, controller, disconnector, writer, or fixed-primary-key reader remains outside the archived OpenSpec experiment record and this cleanup change
 
+#### Scenario: A historical Issue #192 audit row is decoded
+- **WHEN** the activity feed encounters a requested or executed Issue #192 command-event value after cleanup
+- **THEN** the retained enum and activity catalog mapping decode it without exposing a callable injection surface
