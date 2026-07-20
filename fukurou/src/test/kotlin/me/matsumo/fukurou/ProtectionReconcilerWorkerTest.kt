@@ -37,12 +37,15 @@ import me.matsumo.fukurou.trading.reconciler.TickStream
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import java.math.BigDecimal
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.io.path.exists
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -63,6 +66,22 @@ class ProtectionReconcilerWorkerTest {
         val stream = createGmoMarketEventStream(config, Clock.fixed(Instant.EPOCH, ZoneOffset.UTC))
 
         assertEquals(Duration.ofSeconds(150), stream.transportLivenessTimeout)
+    }
+
+    @Test
+    fun production_worker_publishes_the_same_stream_instance_the_reconciler_receives() {
+        val worker = workerProductionSource()
+
+        assertEquals(1, worker.occurrences("GmoPublicWebSocketMarketEventStream("))
+        assertEquals(1, worker.occurrences("marketEventStream = createGmoMarketEventStream("))
+        assertEquals(1, worker.occurrences("onMarketEventStreamCreated(runtimeComponents.marketEventStream)"))
+        assertEquals(1, worker.occurrences("val reconciler = runtimeComponents.createReconciler()"))
+
+        val reconcilerComposition = worker
+            .substringAfter("ProtectionReconcilerRuntimeComponents.createReconciler(): ProtectionReconciler {")
+            .substringBefore("\n}")
+
+        assertEquals(1, reconcilerComposition.occurrences("marketEventStream = marketEventStream"))
     }
 
     @Test
@@ -391,6 +410,20 @@ class ProtectionReconcilerWorkerTest {
             integrityRepository.snapshot().getOrThrow().gapReason,
         )
     }
+}
+
+private fun workerProductionSource(): String {
+    var root = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize()
+
+    while (!root.resolve("settings.gradle.kts").exists()) {
+        root = root.parent ?: error("repository root was not found")
+    }
+
+    return Files.readString(root.resolve("fukurou/src/main/kotlin/me/matsumo/fukurou/ProtectionReconcilerWorker.kt"))
+}
+
+private fun String.occurrences(needle: String): Int {
+    return windowed(needle.length).count { candidate -> candidate == needle }
 }
 
 private suspend fun InMemoryCommandEventLog.failureEpisodeEventTypes(): List<CommandEventType> {

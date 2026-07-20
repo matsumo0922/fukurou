@@ -47,6 +47,8 @@ services:
       FUKUROU_CLAUDE_COMMON_ARGS: ${FUKUROU_CLAUDE_COMMON_ARGS:-}
       FUKUROU_CODEX_COMMON_ARGS: ${FUKUROU_CODEX_COMMON_ARGS:-}
       FUKUROU_CODEX_FALSIFIER_ARGS: ${FUKUROU_CODEX_FALSIFIER_ARGS:-}
+      # Issue #192 検証専用の一時 flag。既定 false。検証完了後に seam ごと削除する。
+      FUKUROU_ISSUE_192_WS_FAULT_ENABLED: ${FUKUROU_ISSUE_192_WS_FAULT_ENABLED:-false}
       HOME: /tmp/fukurou-cli-home
     volumes:
       - llm-auth:/tmp/fukurou-cli-home

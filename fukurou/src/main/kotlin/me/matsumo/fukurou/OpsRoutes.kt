@@ -2245,6 +2245,8 @@ private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalo
         CommandEventType.PAPER_ACCOUNT_EPOCH_IMPORTED -> "paperAccountEpochImported"
         CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCHED -> "paperAccountEpochSwitched"
         CommandEventType.PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED -> "paperAccountEpochSwitchRejected"
+        CommandEventType.ISSUE_192_WS_DISCONNECT_REQUESTED -> "issue192WsDisconnectRequested"
+        CommandEventType.ISSUE_192_WS_DISCONNECT_EXECUTED -> "issue192WsDisconnectExecuted"
     }
 
     return activityCatalogItem(name, "activity.catalog.audit.$keySuffix")
