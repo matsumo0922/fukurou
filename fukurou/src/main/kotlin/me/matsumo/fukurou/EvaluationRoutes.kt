@@ -15,13 +15,9 @@ import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.domain.Candle
 import me.matsumo.fukurou.trading.domain.CandleInterval
 import me.matsumo.fukurou.trading.domain.EvaluationCohort
-import me.matsumo.fukurou.trading.evaluation.BenchmarkCalculationRequest
-import me.matsumo.fukurou.trading.evaluation.BenchmarkPoint
-import me.matsumo.fukurou.trading.evaluation.BenchmarkResult
 import me.matsumo.fukurou.trading.evaluation.CalibrationBinStats
 import me.matsumo.fukurou.trading.evaluation.CalibrationGroupStats
 import me.matsumo.fukurou.trading.evaluation.DecisionRunRateStats
-import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationExclusionSummary
 import me.matsumo.fukurou.trading.evaluation.EvaluationMath
@@ -33,6 +29,15 @@ import me.matsumo.fukurou.trading.evaluation.LlmApiListPriceCatalog
 import me.matsumo.fukurou.trading.evaluation.LlmModelTokenStats
 import me.matsumo.fukurou.trading.evaluation.LlmProviderCostStats
 import me.matsumo.fukurou.trading.evaluation.MarketRegimePerformance
+import me.matsumo.fukurou.trading.evaluation.OWNER_SCORE_EXPECTED_DAYS
+import me.matsumo.fukurou.trading.evaluation.OWNER_SCORE_SEMANTICS_VERSION
+import me.matsumo.fukurou.trading.evaluation.OWNER_SCORE_SYNTHETIC_TAKER_FEE_RATE
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreCalculationRequest
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreCutoffMode
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreMath
+import me.matsumo.fukurou.trading.evaluation.OwnerScorePoint
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreResult
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreWindow
 import me.matsumo.fukurou.trading.evaluation.SetupPerformance
 import me.matsumo.fukurou.trading.evaluation.TradePerformanceStats
 import me.matsumo.fukurou.trading.evaluation.intersectLifecycle
@@ -68,6 +73,10 @@ private const val DAILY_CANDLE_LOOKBACK_PADDING = 40
  * GMO 日足取得の最大本数。
  */
 private const val MAX_DAILY_CANDLE_LIMIT = 500
+
+/** Owner score V1 の fee 比較に残る既知のbias。 */
+private const val OWNER_SCORE_FEE_BIAS_DISCLOSURE_JA =
+    "window開始時にBTCを保有するbotはfresh buy & holdのentry feeを負わないため、約0.1% bot有利になりえます。"
 
 /**
  * API の日付解釈 timezone。
@@ -359,91 +368,78 @@ private fun Route.registerEvaluationCalibrationRoute(dependencies: EvaluationRou
 @Suppress("LongMethod")
 private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRouteDependencies) {
     get("/evaluation/benchmark") {
-        val dateRange = call.parseEvaluationDateRange(dependencies.clock) ?: return@get
         val evaluationRepository = call.requireEvaluationRepository(dependencies.repository) ?: return@get
-        val scope = call.resolveEvaluationScope(evaluationRepository) ?: return@get
-        val period = dateRange.toPeriod()
-        val effectivePeriod = period.intersectLifecycle(scope)
-        val periodResponse = dateRange.toResponsePeriod(scope)
-        if (effectivePeriod.from == effectivePeriod.toExclusive) {
+        if (call.request.queryParameters.contains("from") || call.request.queryParameters.contains("to")) {
+            call.respond(HttpStatusCode.BadRequest, ErrorResponse("from / to are not supported; use cutoff"))
+            return@get
+        }
+        val requestInstant = dependencies.clock.instant()
+        val cutoffRaw = call.request.queryParameters["cutoff"]?.trim()
+        val cutoff = if (cutoffRaw == null) {
+            requestInstant
+        } else {
+            runCatching { java.time.Instant.parse(cutoffRaw) }
+                .getOrElse {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("cutoff must be an ISO-8601 instant"))
+                    return@get
+                }
+        }
+        if (cutoff > requestInstant) {
+            call.respond(HttpStatusCode.BadRequest, ErrorResponse("cutoff must not be in the future"))
+            return@get
+        }
+        val cutoffMode = if (cutoffRaw == null) {
+            OwnerScoreCutoffMode.ROLLING
+        } else {
+            OwnerScoreCutoffMode.FIXED_CUTOFF
+        }
+        val scope = evaluationRepository.resolveScope(epochId = null, cohort = null).getOrThrow()
+        val window = OwnerScoreWindow.fromCutoff(cutoff, EvaluationZone)
+        val requestedEpochId = call.request.queryParameters["epochId"]
+        val requestedCohort = call.request.queryParameters["cohort"]
+        val supportedScope = (requestedEpochId == null || requestedEpochId == scope.accountEpochId.toString()) &&
+            (requestedCohort == null || requestedCohort == EvaluationCohort.CURRENT.name)
+        if (!supportedScope) {
+            call.respond(EvaluationBenchmarkResponse.unsupported(scope, cutoff, cutoffMode, window))
+            return@get
+        }
+        val dailyCandleLimit = ownerScoreDailyCandleLimit(requestInstant, window)
+        if (dailyCandleLimit > MAX_DAILY_CANDLE_LIMIT) {
             call.respond(
-                EvaluationBenchmarkResponse(
-                    period = periodResponse,
-                    scope = scope.toResponse(),
-                    attributionCoverage = EvaluationAttributionCoverageResponse(0, 0, 0),
-                    truncated = false,
-                    assumptionsJa = "epoch lifecycle と requested period の積集合が空のため benchmark は計算しません。",
-                    baselineEquityJpy = null,
-                    points = emptyList(),
-                    returns = null,
-                    state = "EMPTY_LIFECYCLE",
+                HttpStatusCode.BadRequest,
+                ErrorResponse(
+                    "cutoff window requires $dailyCandleLimit daily candles; maximum is $MAX_DAILY_CANDLE_LIMIT",
                 ),
             )
             return@get
         }
         val evaluationMarketDataSource = call.requireMarketDataSource(dependencies.marketDataSource) ?: return@get
-        val effectiveFromDate = effectivePeriod.from.atZone(EvaluationZone).toLocalDate()
-        val effectiveToDate = effectivePeriod.toExclusive.minusMillis(1).atZone(EvaluationZone).toLocalDate()
-        val effectiveDateRange = EvaluationDateRange(effectiveFromDate, effectiveToDate, dateRange.referenceDate)
-        val initialCashJpy = scope.initialCashJpy
-        val priorPnlJpy = evaluationRepository.sumTradePnlBefore(effectivePeriod.from, scope).getOrThrow()
-        val baselineEquityJpy = initialCashJpy.add(priorPnlJpy)
-        val tradeResult = evaluationRepository.fetchClosedTrades(effectivePeriod, scope = scope).getOrThrow()
-        if (tradeResult.truncated) {
-            call.respond(
-                EvaluationBenchmarkResponse(
-                    period = periodResponse,
-                    scope = scope.toResponse(),
-                    attributionCoverage = tradeResult.attributionCoverage.toResponse(),
-                    truncated = true,
-                    assumptionsJa = "取引母集団が取得上限を超えたため benchmark は計算しません。",
-                    baselineEquityJpy = null,
-                    points = emptyList(),
-                    returns = null,
-                    state = "TRUNCATED_POPULATION",
-                ),
-            )
-            return@get
-        }
-        val dailyPnl = tradeResult.strategyEligibleTrades.map { trade ->
-            DailyTradePnlFact(trade.closedAt, trade.tradePnlJpy)
-        }
-        val dailyCandleLimit = call.requireDailyCandleLimit(effectiveDateRange) ?: return@get
         val candles = evaluationMarketDataSource.getCandles(
             symbol = dependencies.tradingConfig.symbol,
             interval = CandleInterval.ONE_DAY,
-            limit = dailyCandleLimit,
+            limit = dailyCandleLimit.toInt(),
         ).getOrThrow()
-        val benchmark = EvaluationMath.benchmark(
-            BenchmarkCalculationRequest(
+        val evidencePeriod = EvaluationPeriod(
+            from = window.fromInclusive,
+            toExclusive = window.lastCloseAt.plusMillis(1),
+        )
+        val evidence = evaluationRepository.fetchOwnerScoreEvidence(scope.accountEpochId, evidencePeriod).getOrThrow()
+        val benchmark = OwnerScoreMath.benchmark(
+            OwnerScoreCalculationRequest(
+                cutoff = cutoff,
+                cutoffMode = cutoffMode,
+                accountEpochId = scope.accountEpochId,
+                accountEpochStartedAt = scope.lifecycleFromInclusive,
                 candles = candles,
-                dailyPnlFacts = dailyPnl,
-                baselineEquityJpy = baselineEquityJpy,
-                fromDate = effectiveFromDate,
-                toDateInclusive = effectiveToDate,
+                snapshots = evidence.snapshots,
+                marketDataGaps = evidence.marketDataGaps,
                 zoneId = EvaluationZone,
             ),
         )
-        val baselineComparable = scope.cohort !=
-            EvaluationCohort.LEGACY_PRE_WS
-
-        call.respond(
-            EvaluationBenchmarkResponse(
-                period = periodResponse,
-                scope = scope.toResponse(),
-                attributionCoverage = tradeResult.attributionCoverage.toResponse(),
-                truncated = false,
-                assumptionsJa = "buy & hold は開始日 close で全額 BTC を買い、手数料・スリッページを無視します。bot equity は realized PnL のみを close 日に計上し、未実現損益は含めません。",
-                baselineEquityJpy = baselineEquityJpy.takeIf { baselineComparable }?.toDecimalString(),
-                points = benchmark.points.takeIf { baselineComparable }.orEmpty()
-                    .map { point -> EvaluationBenchmarkPointResponse.fromPoint(point) },
-                returns = EvaluationBenchmarkReturnResponse.fromResult(benchmark).takeIf { baselineComparable },
-                state = if (baselineComparable) "AVAILABLE" else "BASELINE_NOT_COMPARABLE",
-            ),
-        )
+        call.respond(EvaluationBenchmarkResponse.fromResult(scope, benchmark))
     }.describe {
-        summary = "benchmark 系列を取得する"
-        description = "buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。取引母集団が取得上限を超えた場合は TRUNCATED_POPULATION と coverage を返します。"
+        summary = "Owner score benchmark を取得する"
+        description = "active CURRENT account epoch の直近90 completed GMO business daysを06:00 JST境界で評価し、fee込みbot清算equity、buy & hold、cash、coverage、owner scoreを返します。from/toは受け付けません。"
         tag(EVALUATION_TAG)
         parameters {
             query("epochId") {
@@ -451,7 +447,11 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
                 schema = jsonSchema<String>()
             }
             query("cohort") {
-                description = "CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。"
+                description = "active CURRENT のみ指定できます。"
+                schema = jsonSchema<String>()
+            }
+            query("cutoff") {
+                description = "固定レビューcutoffのISO-8601 instant。省略時はrollingです。"
                 schema = jsonSchema<String>()
             }
         }
@@ -461,7 +461,7 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
                 schema = jsonSchema<EvaluationBenchmarkResponse>()
             }
             HttpStatusCode.BadRequest {
-                description = "from / to の指定が不正です。"
+                description = "cutoffが不正、future、取得上限超過、またはfrom/toが指定されています。"
                 schema = jsonSchema<ErrorResponse>()
             }
             HttpStatusCode.InternalServerError {
@@ -470,6 +470,13 @@ private fun Route.registerEvaluationBenchmarkRoute(dependencies: EvaluationRoute
             }
         }
     }
+}
+
+private fun ownerScoreDailyCandleLimit(requestInstant: java.time.Instant, window: OwnerScoreWindow): Long {
+    val currentWindow = OwnerScoreWindow.fromCutoff(requestInstant, EvaluationZone)
+    val pastBusinessDays = Duration.between(window.lastCloseAt, currentWindow.lastCloseAt).toDays()
+
+    return OWNER_SCORE_EXPECTED_DAYS + 1L + pastBusinessDays
 }
 
 @OptIn(ExperimentalKtorApi::class)
@@ -1155,27 +1162,116 @@ data class EvaluationCalibrationBinResponse(
     }
 }
 
-/**
- * benchmark レスポンス。
- *
- * @param period 評価対象期間
- * @param assumptionsJa benchmark の簡略化前提
- * @param baselineEquityJpy 期間開始時点の基準資金
- * @param points 日次系列
- * @param returns 期間 return
- */
+/** Owner score benchmark response。 */
 @Serializable
 data class EvaluationBenchmarkResponse(
-    val period: EvaluationPeriodResponse,
+    val semanticsVersion: String,
+    val cutoffMode: String,
+    val cutoff: String,
+    val window: EvaluationBenchmarkWindowResponse,
     val scope: EvaluationScopeResponse,
-    val attributionCoverage: EvaluationAttributionCoverageResponse,
-    val truncated: Boolean,
+    val syntheticTakerFeeRate: String,
+    val feeBiasDisclosureJa: String,
     val assumptionsJa: String,
-    val baselineEquityJpy: String?,
+    val commonStartingCapitalJpy: String?,
     val points: List<EvaluationBenchmarkPointResponse>,
+    val coverage: EvaluationBenchmarkCoverageResponse,
     val returns: EvaluationBenchmarkReturnResponse?,
+    val ownerScore: String?,
+    val winner: String?,
     val state: String,
-)
+) {
+    companion object {
+        fun fromResult(scope: EvaluationScope, result: OwnerScoreResult): EvaluationBenchmarkResponse {
+            return EvaluationBenchmarkResponse(
+                semanticsVersion = result.semanticsVersion,
+                cutoffMode = result.cutoffMode.name,
+                cutoff = result.cutoff.toString(),
+                window = EvaluationBenchmarkWindowResponse.fromWindow(result.window),
+                scope = scope.toResponse(),
+                syntheticTakerFeeRate = result.syntheticTakerFeeRate.toDecimalString(),
+                feeBiasDisclosureJa = OWNER_SCORE_FEE_BIAS_DISCLOSURE_JA,
+                assumptionsJa = "保存済みsnapshotとgapだけを使い、slippage・税・maker rebateは含めません。",
+                commonStartingCapitalJpy = result.commonStartingCapitalJpy?.toDecimalString(),
+                points = result.points.map(EvaluationBenchmarkPointResponse::fromPoint),
+                coverage = EvaluationBenchmarkCoverageResponse.fromResult(result),
+                returns = result.returns?.let(EvaluationBenchmarkReturnResponse::fromReturns),
+                ownerScore = result.ownerScore?.toDecimalString(),
+                winner = result.winner?.name,
+                state = if (result.conclusive) "AVAILABLE" else "INCONCLUSIVE",
+            )
+        }
+
+        fun unsupported(
+            scope: EvaluationScope,
+            cutoff: java.time.Instant,
+            cutoffMode: OwnerScoreCutoffMode,
+            window: OwnerScoreWindow,
+        ): EvaluationBenchmarkResponse {
+            return EvaluationBenchmarkResponse(
+                semanticsVersion = OWNER_SCORE_SEMANTICS_VERSION,
+                cutoffMode = cutoffMode.name,
+                cutoff = cutoff.toString(),
+                window = EvaluationBenchmarkWindowResponse.fromWindow(window),
+                scope = scope.toResponse(),
+                syntheticTakerFeeRate = OWNER_SCORE_SYNTHETIC_TAKER_FEE_RATE.toDecimalString(),
+                feeBiasDisclosureJa = OWNER_SCORE_FEE_BIAS_DISCLOSURE_JA,
+                assumptionsJa = "active CURRENT scopeだけを評価します。",
+                commonStartingCapitalJpy = null,
+                points = emptyList(),
+                coverage = EvaluationBenchmarkCoverageResponse.empty(),
+                returns = null,
+                ownerScore = null,
+                winner = null,
+                state = "UNSUPPORTED_SCOPE",
+            )
+        }
+    }
+}
+
+/** Owner score 90日window response。 */
+@Serializable
+data class EvaluationBenchmarkWindowResponse(
+    val fromInclusive: String,
+    val firstCloseAt: String,
+    val lastCloseAt: String,
+    val timezone: String = "Asia/Tokyo",
+    val expectedDays: Int = OWNER_SCORE_EXPECTED_DAYS,
+) {
+    companion object {
+        fun fromWindow(window: OwnerScoreWindow) = EvaluationBenchmarkWindowResponse(
+            fromInclusive = window.fromInclusive.toString(),
+            firstCloseAt = window.firstCloseAt.toString(),
+            lastCloseAt = window.lastCloseAt.toString(),
+        )
+    }
+}
+
+/** Owner score coverage response。 */
+@Serializable
+data class EvaluationBenchmarkCoverageResponse(
+    val expectedDays: Int,
+    val validDays: Int,
+    val gapDays: Int,
+    val unknownDays: Int,
+    val gapCount: Int,
+    val gapSeconds: Long,
+    val reasonCounts: Map<String, Int>,
+) {
+    companion object {
+        fun fromResult(result: OwnerScoreResult) = EvaluationBenchmarkCoverageResponse(
+            expectedDays = result.coverage.expectedDays,
+            validDays = result.coverage.validDays,
+            gapDays = result.coverage.gapDays,
+            unknownDays = result.coverage.unknownDays,
+            gapCount = result.coverage.gapCount,
+            gapSeconds = result.coverage.gapSeconds,
+            reasonCounts = result.coverage.reasonCounts.mapKeys { entry -> entry.key.name },
+        )
+
+        fun empty() = EvaluationBenchmarkCoverageResponse(OWNER_SCORE_EXPECTED_DAYS, 0, 0, 90, 0, 0, emptyMap())
+    }
+}
 
 /**
  * benchmark 日次 point。
@@ -1188,17 +1284,29 @@ data class EvaluationBenchmarkResponse(
 @Serializable
 data class EvaluationBenchmarkPointResponse(
     val date: String,
-    val buyAndHoldEquityJpy: String,
-    val noTradeEquityJpy: String,
-    val botEquityJpy: String,
+    val closeAt: String,
+    val state: String,
+    val reasons: List<String>,
+    val closeJpy: String?,
+    val buyAndHoldEquityJpy: String?,
+    val cashEquityJpy: String?,
+    val botLiquidationEquityJpy: String?,
+    val gapCount: Int,
+    val gapSeconds: Long,
 ) {
     companion object {
-        fun fromPoint(point: BenchmarkPoint): EvaluationBenchmarkPointResponse {
+        fun fromPoint(point: OwnerScorePoint): EvaluationBenchmarkPointResponse {
             return EvaluationBenchmarkPointResponse(
                 date = point.date.toString(),
-                buyAndHoldEquityJpy = point.buyAndHoldEquityJpy.toDecimalString(),
-                noTradeEquityJpy = point.noTradeEquityJpy.toDecimalString(),
-                botEquityJpy = point.botEquityJpy.toDecimalString(),
+                closeAt = point.closeAt.toString(),
+                state = point.state.name,
+                reasons = point.reasons.map { reason -> reason.name }.sorted(),
+                closeJpy = point.closeJpy?.toDecimalString(),
+                buyAndHoldEquityJpy = point.buyAndHoldLiquidationEquityJpy?.toDecimalString(),
+                cashEquityJpy = point.cashEquityJpy?.toDecimalString(),
+                botLiquidationEquityJpy = point.botLiquidationEquityJpy?.toDecimalString(),
+                gapCount = point.gapCount,
+                gapSeconds = point.gapSeconds,
             )
         }
     }
@@ -1214,15 +1322,17 @@ data class EvaluationBenchmarkPointResponse(
 @Serializable
 data class EvaluationBenchmarkReturnResponse(
     val buyAndHoldReturn: String?,
-    val noTradeReturn: String?,
+    val cashReturn: String?,
     val botReturn: String?,
 ) {
     companion object {
-        fun fromResult(result: BenchmarkResult): EvaluationBenchmarkReturnResponse {
+        fun fromReturns(
+            result: me.matsumo.fukurou.trading.evaluation.OwnerScoreReturns,
+        ): EvaluationBenchmarkReturnResponse {
             return EvaluationBenchmarkReturnResponse(
-                buyAndHoldReturn = result.buyAndHoldReturn?.toDecimalString(),
-                noTradeReturn = result.noTradeReturn?.toDecimalString(),
-                botReturn = result.botReturn?.toDecimalString(),
+                buyAndHoldReturn = result.buyAndHoldReturn.toDecimalString(),
+                cashReturn = result.cashReturn.toDecimalString(),
+                botReturn = result.botReturn.toDecimalString(),
             )
         }
     }

@@ -6,12 +6,17 @@ import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION
 import java.math.BigDecimal
 import java.time.Instant
+import java.util.UUID
 
 /**
  * 評価系が参照する DB 読み取り repository。
  */
 @Suppress("TooManyFunctions")
 interface EvaluationRepository {
+    /** active epoch の owner score に必要なsnapshot/gapを期間限定で返す。 */
+    suspend fun fetchOwnerScoreEvidence(accountEpochId: UUID, period: EvaluationPeriod): Result<OwnerScoreEvidence> =
+        Result.success(OwnerScoreEvidence())
+
     /** 明示選択可能な immutable epoch を新しい順で返す。 */
     suspend fun listEpochs(): Result<List<EvaluationEpochOption>> = Result.success(emptyList())
 

@@ -428,16 +428,18 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * benchmark 系列を取得する
-         * @description buy & hold、no-trade、bot realized equity の日次系列と期間 return を返します。取引母集団が取得上限を超えた場合は TRUNCATED_POPULATION と coverage を返します。
+         * Owner score benchmark を取得する
+         * @description active CURRENT account epoch の直近90 completed GMO business daysを06:00 JST境界で評価し、fee込みbot清算equity、buy & hold、cash、coverage、owner scoreを返します。from/toは受け付けません。
          */
         get: {
             parameters: {
                 query?: {
                     /** @description 評価対象 account epoch ID。省略時は active epoch です。 */
                     epochId?: string;
-                    /** @description CURRENT または LEGACY_PRE_WS。省略時は CURRENT です。 */
+                    /** @description active CURRENT のみ指定できます。 */
                     cohort?: string;
+                    /** @description 固定レビューcutoffのISO-8601 instant。省略時はrollingです。 */
+                    cutoff?: string;
                 };
                 header?: never;
                 path?: never;
@@ -454,7 +456,7 @@ export interface paths {
                         "application/json": components["schemas"]["EvaluationBenchmarkResponse"];
                     };
                 };
-                /** @description from / to の指定が不正です。 */
+                /** @description cutoffが不正、future、またはfrom/toが指定されています。 */
                 400: {
                     headers: {
                         [name: string]: unknown;
@@ -2559,29 +2561,61 @@ export interface components {
             bySetup: components["schemas"]["EvaluationCalibrationGroupResponse"][];
             byProvider: components["schemas"]["EvaluationCalibrationGroupResponse"][];
         };
+        /** EvaluationBenchmarkWindowResponse */
+        EvaluationBenchmarkWindowResponse: {
+            fromInclusive: string;
+            firstCloseAt: string;
+            lastCloseAt: string;
+            timezone?: string;
+            expectedDays?: number;
+        };
         /** EvaluationBenchmarkPointResponse */
         EvaluationBenchmarkPointResponse: {
             date: string;
-            buyAndHoldEquityJpy: string;
-            noTradeEquityJpy: string;
-            botEquityJpy: string;
+            closeAt: string;
+            state: string;
+            reasons: string[];
+            closeJpy?: string | null;
+            buyAndHoldEquityJpy?: string | null;
+            cashEquityJpy?: string | null;
+            botLiquidationEquityJpy?: string | null;
+            gapCount: number;
+            gapSeconds: number;
+        };
+        /** EvaluationBenchmarkCoverageResponse */
+        EvaluationBenchmarkCoverageResponse: {
+            expectedDays: number;
+            validDays: number;
+            gapDays: number;
+            unknownDays: number;
+            gapCount: number;
+            gapSeconds: number;
+            reasonCounts: {
+                [key: string]: number;
+            };
         };
         /** EvaluationBenchmarkReturnResponse */
         EvaluationBenchmarkReturnResponse: {
             buyAndHoldReturn?: string | null;
-            noTradeReturn?: string | null;
+            cashReturn?: string | null;
             botReturn?: string | null;
         };
         /** EvaluationBenchmarkResponse */
         EvaluationBenchmarkResponse: {
-            period: components["schemas"]["EvaluationPeriodResponse"];
+            semanticsVersion: string;
+            cutoffMode: string;
+            cutoff: string;
+            window: components["schemas"]["EvaluationBenchmarkWindowResponse"];
             scope: components["schemas"]["EvaluationScopeResponse"];
-            attributionCoverage: components["schemas"]["EvaluationAttributionCoverageResponse"];
-            truncated: boolean;
+            syntheticTakerFeeRate: string;
+            feeBiasDisclosureJa: string;
             assumptionsJa: string;
-            baselineEquityJpy?: string | null;
+            commonStartingCapitalJpy?: string | null;
             points: components["schemas"]["EvaluationBenchmarkPointResponse"][];
+            coverage: components["schemas"]["EvaluationBenchmarkCoverageResponse"];
             returns?: components["schemas"]["EvaluationBenchmarkReturnResponse"] | null;
+            ownerScore?: string | null;
+            winner?: string | null;
             state: string;
         };
         /** EvaluationPricingCatalogResponse */
