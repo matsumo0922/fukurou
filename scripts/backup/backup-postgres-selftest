@@ -64,11 +64,18 @@ cleanup() {
 trap cleanup EXIT INT TERM
 trap report_failure ERR
 
-mkdir -p "${fixture_root}/profiles" "${fixture_root}/repository" "${fixture_root}/run"
+mkdir -p "${fixture_root}/host-bin" "${fixture_root}/profiles" "${fixture_root}/repository" "${fixture_root}/run"
 chmod 0700 "${fixture_root}" "${fixture_root}/repository" "${fixture_root}/run"
 printf 'integration-password\n' >"${fixture_root}/source-password"
 printf 'integration-restic-password\n' >"${fixture_root}/restic-password"
 chmod 0400 "${fixture_root}/source-password" "${fixture_root}/restic-password"
+
+cat >"${fixture_root}/host-bin/pg_restore" <<'POISON'
+#!/usr/bin/env bash
+: >"${POISON_PG_RESTORE_MARKER:?}"
+exit 97
+POISON
+chmod +x "${fixture_root}/host-bin/pg_restore"
 
 cat >"${fixture_root}/setsid" <<'SETSID'
 #!/usr/bin/env python3
@@ -183,6 +190,8 @@ done
 
 phase=production-backup-entrypoint
 env \
+  PATH="${fixture_root}/host-bin:${PATH}" \
+  POISON_PG_RESTORE_MARKER="${fixture_root}/host-pg-restore-called" \
   INVOCATION_ID=0123456789abcdef0123456789abcdef \
   FUKUROU_POSTGRES_CONTAINER="${source_container}" \
   FUKUROU_APPLICATION_CONTAINER="${application_container}" \
@@ -199,6 +208,7 @@ env \
 phase=production-backup-verification
 [[ ! -s "${fixture_root}/backup-stdout" ]]
 [[ "$(<"${fixture_root}/backup-stderr")" == 'fukurou-backup: result=SUCCESS' ]]
+[[ ! -e "${fixture_root}/host-pg-restore-called" ]]
 if grep -F -e 'integration-password' -e 'integration-restic-password' \
   -e "${fixture_root}" -e 'fixture_database' \
   "${fixture_root}/backup-stdout" "${fixture_root}/backup-stderr" >/dev/null; then

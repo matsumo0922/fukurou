@@ -527,7 +527,7 @@ production backup は、同一 NAS の `/srv/fukurou/backups/postgres` に置く
 NASでroot operatorが次を確認する。
 
 - `bash`、`docker`、`restic`、`jq`、`openssl`、`systemctl`、`journalctl`、`systemd-analyze`がpersistent pathから利用できる。
-- PostgreSQL client packageの`pg_restore`、GNU coreutilsの`timeout` / `stat` / `df` / `sync` / `sha256sum` / `date` / `install` / `chown` / `chmod` / `mktemp` / `mv` / `rm` / `wc` / `tr` / `sleep`、util-linuxの`flock` / `setsid`、および`awk` / `sed` / `grep`が利用できる。
+- GNU coreutilsの`timeout` / `stat` / `df` / `sync` / `sha256sum` / `date` / `install` / `chown` / `chmod` / `mktemp` / `mv` / `rm` / `wc` / `tr` / `sleep`、util-linuxの`flock` / `setsid`、および`awk` / `sed` / `grep`が利用できる。custom archiveのdumpとlist validationは、hostのPostgreSQL clientではなくcaptured production PostgreSQL 16 containerの`pg_dump` / `pg_restore`を使う。
 - `/srv/fukurou/backups/postgres`を置くfilesystemに、production databaseの実測sizeに運用reserveを加えたfree spaceがある。
 - restic passwordはroot-owned regular file `/srv/fukurou/secrets/restic-password`、mode 0400であり、symlinkではない。
 - passwordのrecovery copyはNASと同時に失われない別管理のsecret managerまたは媒体へ保管する。repositoryだけを残してpasswordを失うとrestoreできない。
@@ -657,6 +657,34 @@ statusがmalformedまたはunsupportedな場合はtimerを無効にし、root-on
 
 interrupted attempt-tagged candidateは自動削除しない。対象snapshotをexact IDでfull-stream検証し、必要性を確認してからmanual `restic forget`を`--prune`なしで行う。その後に`restic check`を完了し、orphan packがないことを確認した場合だけchecked pruneを別操作で行う。repository integrityが不確実な間は`forget --prune`や`prune`を行わない。
 statusの`interruptedCandidateCount`が`null`の場合はrepository照合自体が失敗した未知状態であり、0件として扱わない。
+既存のuntagged candidateはretention対象外なので、rolloutのために削除する必要はない。manual forgetを検討する場合だけ、次のread-only手順でexact snapshotのfull streamとarchive listの両方を確認する。`SNAPSHOT_ID`は対象のexact IDに置き換える。
+
+```sh
+sudo env SNAPSHOT_ID=aaaaaaaa bash <<'ROOT'
+set -euo pipefail
+
+readonly repository=/srv/fukurou/backups/postgres
+readonly password_file=/srv/fukurou/secrets/restic-password
+production_container_id="$(docker inspect --format '{{.Id}}' fukurou-postgres)"
+
+set +e
+RESTIC_PASSWORD_FILE="${password_file}" restic --no-cache -r "${repository}" \
+  dump "${SNAPSHOT_ID}" /postgres.dump 2>/dev/null | {
+    set +e
+    docker exec -i "${production_container_id}" pg_restore --list >/dev/null 2>&1
+    reader_status="$?"
+    cat >/dev/null
+    drain_status="$?"
+    test "${reader_status}" = 0 && test "${drain_status}" = 0
+  }
+statuses=("${PIPESTATUS[@]}")
+set -e
+test "${statuses[0]}" = 0 && test "${statuses[1]}" = 0
+printf 'FULL_STREAM_ARCHIVE_OK snapshot=%s\n' "${SNAPSHOT_ID}"
+ROOT
+```
+
+この手順は`forget`や`prune`を実行しない。
 
 ```sh
 sudo env RESTIC_PASSWORD_FILE=/srv/fukurou/secrets/restic-password \

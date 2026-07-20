@@ -83,20 +83,67 @@ restic_command() {
     *) return 1 ;;
   esac
 }
-cat >"${SELFTEST_ROOT}/bin/pg_restore" <<'FAKE'
-#!/usr/bin/env bash
-head -c 1 >/dev/null
-exit "${FAKE_PG_RESTORE_STATUS:-0}"
-FAKE
-chmod +x "${SELFTEST_ROOT}/bin/pg_restore"
+PRODUCTION_CONTAINER_ID="$(printf 'a%.0s' {1..64})"
+ARCHIVE_READER_CALLS="${SELFTEST_ROOT}/archive-reader-calls"
+docker() {
+  printf 'docker %s\n' "$*" >>"${ARCHIVE_READER_CALLS}"
+  [[ "$1" == exec && "$2" == -i && "$3" == "${PRODUCTION_CONTAINER_ID}" && "$4" == pg_restore && "$5" == --list ]] || return 97
+  head -c 1 >/dev/null
+  return "${FAKE_PG_RESTORE_STATUS:-0}"
+}
 PATH="${SELFTEST_ROOT}/bin:${PATH}"
 verify_archive_stream aaaaaaaa || fail_selftest "early list completion did not drain producer"
+grep -Fx "docker exec -i ${PRODUCTION_CONTAINER_ID} pg_restore --list" "${ARCHIVE_READER_CALLS}" >/dev/null ||
+  fail_selftest "archive reader did not use captured production ID"
 FAKE_PG_RESTORE_STATUS=7
 export FAKE_PG_RESTORE_STATUS
 expect_failure consumer-status verify_archive_stream aaaaaaaa
 unset FAKE_PG_RESTORE_STATUS
 restic_command() { [[ "$1" != dump ]] || return 9; }
 expect_failure producer-status verify_archive_stream aaaaaaaa
+
+CAPTURED_ROUTING_CALLS="${SELFTEST_ROOT}/captured-routing-calls"
+fixture_production_id="$(printf 'c%.0s' {1..64})"
+fixture_application_id="$(printf 'd%.0s' {1..64})"
+routing_phase=capture
+docker() {
+  printf 'docker %s\n' "$*" >>"${CAPTURED_ROUTING_CALLS}"
+  if [[ "$1" == inspect ]]; then
+    case "${@: -1}" in
+      "${PRODUCTION_CONTAINER}")
+        [[ "${routing_phase}" != replacement ]] || { printf 'e%.0s' {1..64}; printf '\n'; return; }
+        printf '%s\n' "${fixture_production_id}"
+        ;;
+      "${APPLICATION_CONTAINER}") printf '%s\n' "${fixture_application_id}" ;;
+      *) return 1 ;;
+    esac
+    return
+  fi
+  if [[ "$1" == exec && "$2" == "${fixture_production_id}" ]]; then
+    printf 'fukurou\nfukurou\n'
+    return
+  fi
+  if [[ "$1" == exec && "$2" == "${fixture_application_id}" ]]; then
+    printf '0123456789abcdef0123456789abcdef01234567\n'
+    return
+  fi
+  return 1
+}
+timeout() {
+  printf 'timeout %s\n' "$*" >>"${CAPTURED_ROUTING_CALLS}"
+  printf '0\n'
+}
+read_production_identity || fail_selftest "captured production identity read failed"
+routing_phase=replacement
+[[ "$(postgres_scalar_bounded 5 'SELECT 0;')" == 0 ]] || fail_selftest "captured database control failed during name replacement"
+routing_phase=restored
+production_identity_is_unchanged || fail_selftest "restored production mapping was rejected"
+! grep -E "^docker exec (-i )?${PRODUCTION_CONTAINER}( |$)" "${CAPTURED_ROUTING_CALLS}" >/dev/null ||
+  fail_selftest "production data path re-resolved the container name"
+! grep -E "^docker exec (-i )?${APPLICATION_CONTAINER}( |$)" "${CAPTURED_ROUTING_CALLS}" >/dev/null ||
+  fail_selftest "application identity read re-resolved the container name"
+grep -F -- "docker exec -i ${fixture_production_id} psql " "${CAPTURED_ROUTING_CALLS}" >/dev/null ||
+  fail_selftest "database control did not use captured production ID"
 
 RESTIC_CALLS="${SELFTEST_ROOT}/restic-calls"
 restic_command() {
@@ -221,8 +268,10 @@ expect_failure pid-reuse terminate_or_observe_dump_backend 9876 "${SELFTEST_ROOT
 [[ "$(<"${SELFTEST_ROOT}/watchdog-reused")" == "WATCHDOG_TERMINATION_FAILED" ]] || fail_selftest "PID reuse was not failed closed"
 
 run_entrypoint_scenario() (
-  local scenario="$1" expected_result="$2" calls output status
+  local scenario="$1" expected_result="$2" calls output status fixture_production_id fixture_application_id
   calls="${SELFTEST_ROOT}/entrypoint-${scenario}.calls"
+  fixture_production_id="$(printf 'a%.0s' {1..64})"
+  fixture_application_id="$(printf 'b%.0s' {1..64})"
   : >"${calls}"
   backup_publish_status "${initial}" || exit 90
   ATTEMPT_STARTED_AT=""
@@ -250,8 +299,8 @@ run_entrypoint_scenario() (
     DATABASE_USER=fukurou
     DATABASE_NAME=fukurou
     SOURCE_REVISION=0123456789abcdef0123456789abcdef01234567
-    PRODUCTION_CONTAINER_ID="$(printf 'a%.0s' {1..64})"
-    APPLICATION_CONTAINER_ID="$(printf 'b%.0s' {1..64})"
+    PRODUCTION_CONTAINER_ID="${fixture_production_id}"
+    APPLICATION_CONTAINER_ID="${fixture_application_id}"
   }
   docker() {
     printf 'docker %s\n' "$*" >>"${calls}"
@@ -261,18 +310,18 @@ run_entrypoint_scenario() (
       if [[ "${scenario}" == identity_change && "${container}" == "${APPLICATION_CONTAINER}" && prior_inspections -gt 0 ]]; then
         printf 'c%.0s' {1..64}
       elif [[ "${container}" == "${PRODUCTION_CONTAINER}" ]]; then
-        printf 'a%.0s' {1..64}
+        printf '%s' "${fixture_production_id}"
       else
-        printf 'b%.0s' {1..64}
+        printf '%s' "${fixture_application_id}"
       fi
       printf '\n'
       return 0
     fi
-    if [[ "$1" == exec && "$2" == "${PRODUCTION_CONTAINER}" ]]; then
+    if [[ "$1" == exec && "$2" == "${fixture_production_id}" ]]; then
       printf 'fukurou\nfukurou\n'
       return 0
     fi
-    if [[ "$1" == exec && "$2" == "${APPLICATION_CONTAINER}" ]]; then
+    if [[ "$1" == exec && "$2" == "${fixture_application_id}" ]]; then
       printf '0123456789abcdef0123456789abcdef01234567\n'
       return 0
     fi
@@ -336,8 +385,16 @@ run_entrypoint_scenario() (
   status="$?"
   set -e
   if [[ "${scenario}" == success ]]; then
-    (( status == 0 )) || exit 91
-    [[ "${output}" == *"result=SUCCESS"* ]] || exit 92
+    if (( status != 0 )) || [[ "${output}" != *"result=SUCCESS"* ]]; then
+      printf 'scenario=%s expected=SUCCESS status=%s output=%s\n' "${scenario}" "${status}" "${output}" >&2
+      sed 's/^/call: /' "${calls}" >&2
+      exit 91
+    fi
+    if ! grep -F -- "-i ${fixture_production_id} pg_dump " "${calls}" >/dev/null; then
+      printf 'scenario=%s captured dump call missing\n' "${scenario}" >&2
+      sed 's/^/call: /' "${calls}" >&2
+      exit 103
+    fi
     grep -Fx 'restic tag --add integrity-checked aaaaaaaa' "${calls}" >/dev/null || exit 93
     grep -F -- '--tag fukurou-postgres,integrity-checked --keep-daily 14 --prune' "${calls}" >/dev/null || exit 94
     status="$(backup_load_status)" || exit 95
@@ -345,6 +402,8 @@ run_entrypoint_scenario() (
     [[ "$(jq -r '.backup.lastAttempt.snapshotId' <<<"${status}")" == bbbbbbbb ]] || exit 97
     [[ "$(jq -r '.backup.lastAttempt.resultCode' <<<"${status}")" == SUCCESS ]] || exit 98
     [[ "$(jq -r '.backup.lastAttempt.retentionSucceeded' <<<"${status}")" == true ]] || exit 99
+    ! grep -E "^docker exec (-i )?${PRODUCTION_CONTAINER}( |$)" "${calls}" >/dev/null || exit 101
+    ! grep -E "^docker exec (-i )?${APPLICATION_CONTAINER}( |$)" "${calls}" >/dev/null || exit 102
     return 0
   fi
 
@@ -403,4 +462,4 @@ schema_codes="$(jq -r '.["$defs"].resultCode.enum[]' "${SELFTEST_DIRECTORY}/back
 file_codes="$(sort "${SELFTEST_DIRECTORY}/backup-result-codes-v1.txt")"
 [[ "${schema_codes}" == "${file_codes}" ]] || fail_selftest "status schema and result-code allowlist drifted"
 
-printf '%s\n' 'BACKUP_SELFTEST_OK status=atomic-last-good-redacted pipeline=producer-consumer-drained watchdog=exact-cancel-reap retention=and-tags-no-uncertain-prune capacity=fail-closed locks=nonblocking'
+printf '%s\n' 'BACKUP_SELFTEST_OK status=atomic-last-good-redacted routing=captured-id-aba pipeline=producer-consumer-drained watchdog=exact-cancel-reap retention=and-tags-no-uncertain-prune capacity=fail-closed locks=nonblocking'

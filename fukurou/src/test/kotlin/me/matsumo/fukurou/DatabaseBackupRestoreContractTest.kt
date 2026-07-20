@@ -99,6 +99,8 @@ class DatabaseBackupRestoreContractTest {
         assertFalse(backup.contains("readonly BACKUP_STDIN_PATH="))
         assertTrue(backup.contains("df -B1 --output=avail"))
         assertFalse(backup.contains("df -PB1 --output=avail"))
+        assertTrue(backup.contains("docker exec -i \"\${PRODUCTION_CONTAINER_ID}\" pg_restore --list"))
+        assertFalse(backup.contains("command_name in docker restic pg_restore"))
         assertTrue(restore.contains("dump \"\${snapshot_id}\" \"\${BACKUP_STDIN_PATH}\""))
         assertTrue(installer.contains("FUKUROU_BACKUP_SHARE_DIRECTORY=\"\${SHARE_DIR}\""))
         val validationWorkflow = root.resolve(".github/workflows/deploy-validation.yml").readText()
@@ -200,7 +202,8 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(workflow.contains("scripts/backup/backup-postgres-selftest"))
         assertTrue(workflow.contains("scripts/backup/install-selftest"))
         assertTrue(workflow.contains("scripts/backup/monitoring-projection-selftest"))
-        assertTrue(workflow.contains("postgresql-client restic"))
+        assertTrue(workflow.contains("apt-get install --yes restic"))
+        assertFalse(workflow.contains("postgresql-client"))
         assertTrue(workflow.contains("TradingTables.kt"))
         assertTrue(workflow.contains("TradingPersistenceBootstrap.kt"))
         assertTrue(workflow.contains("deploy-foundation-v1.sql"))
@@ -340,6 +343,10 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(restoreNetworkInventory < restoreVolumeInventory)
         assertTrue(deploy.contains("data-at-rest incident"))
         assertTrue(deploy.contains("global pruneは使わない"))
+        assertFalse(deploy.contains("PostgreSQL client packageの`pg_restore`"))
+        assertTrue(deploy.contains("docker exec -i \"\${production_container_id}\" pg_restore --list"))
+        assertTrue(deploy.contains("既存のuntagged candidateはretention対象外"))
+        assertTrue(deploy.contains("この手順は`forget`や`prune`を実行しない"))
     }
 }
 

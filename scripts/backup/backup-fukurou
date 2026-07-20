@@ -139,14 +139,14 @@ read_production_identity() {
   PRODUCTION_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "${PRODUCTION_CONTAINER}" 2>/dev/null)" || return 1
   APPLICATION_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "${APPLICATION_CONTAINER}" 2>/dev/null)" || return 1
   [[ "${PRODUCTION_CONTAINER_ID}" =~ ^[0-9a-f]{64}$ && "${APPLICATION_CONTAINER_ID}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  identity="$(docker exec "${PRODUCTION_CONTAINER}" sh -ceu \
+  identity="$(docker exec "${PRODUCTION_CONTAINER_ID}" sh -ceu \
     'printf "%s\n%s\n" "${POSTGRES_USER:?}" "${POSTGRES_DB:?}"' 2>/dev/null)" || return 1
   [[ "$(wc -l <<<"${identity}" | tr -d ' ')" == "2" ]] || return 1
   DATABASE_USER="$(sed -n '1p' <<<"${identity}")"
   DATABASE_NAME="$(sed -n '2p' <<<"${identity}")"
   backup_validate_identifier "${DATABASE_USER}" && backup_validate_identifier "${DATABASE_NAME}" || return 1
 
-  application_revision="$(docker exec "${APPLICATION_CONTAINER}" printenv FUKUROU_REVISION 2>/dev/null)" || return 1
+  application_revision="$(docker exec "${APPLICATION_CONTAINER_ID}" printenv FUKUROU_REVISION 2>/dev/null)" || return 1
   backup_validate_revision "${application_revision}" || return 1
   SOURCE_REVISION="${FUKUROU_BACKUP_SOURCE_REVISION:-${application_revision}}"
   backup_validate_revision "${SOURCE_REVISION}" && [[ "${SOURCE_REVISION}" == "${application_revision}" ]]
@@ -156,9 +156,9 @@ production_identity_is_unchanged() {
   local production_id application_id identity revision
   production_id="$(docker inspect --format '{{.Id}}' "${PRODUCTION_CONTAINER}" 2>/dev/null)" || return 1
   application_id="$(docker inspect --format '{{.Id}}' "${APPLICATION_CONTAINER}" 2>/dev/null)" || return 1
-  identity="$(docker exec "${PRODUCTION_CONTAINER}" sh -ceu \
+  identity="$(docker exec "${PRODUCTION_CONTAINER_ID}" sh -ceu \
     'printf "%s\n%s\n" "${POSTGRES_USER:?}" "${POSTGRES_DB:?}"' 2>/dev/null)" || return 1
-  revision="$(docker exec "${APPLICATION_CONTAINER}" printenv FUKUROU_REVISION 2>/dev/null)" || return 1
+  revision="$(docker exec "${APPLICATION_CONTAINER_ID}" printenv FUKUROU_REVISION 2>/dev/null)" || return 1
 
   [[ "${production_id}" == "${PRODUCTION_CONTAINER_ID}" ]] &&
     [[ "${application_id}" == "${APPLICATION_CONTAINER_ID}" ]] &&
@@ -169,7 +169,7 @@ production_identity_is_unchanged() {
 postgres_scalar_bounded() {
   local timeout_seconds="$1" sql="$2"
   printf '%s\n' "${sql}" | timeout --signal=KILL --kill-after=1 "${timeout_seconds}" \
-    docker exec -i "${PRODUCTION_CONTAINER}" \
+    docker exec -i "${PRODUCTION_CONTAINER_ID}" \
     psql -X -v ON_ERROR_STOP=1 -U "${DATABASE_USER}" -d "${DATABASE_NAME}" -Atq 2>/dev/null
 }
 
@@ -334,7 +334,7 @@ verify_archive_stream() {
   set +e
   restic_command dump "$1" "${BACKUP_STDIN_PATH}" 2>/dev/null | {
     set +e
-    pg_restore --list >/dev/null 2>&1
+    docker exec -i "${PRODUCTION_CONTAINER_ID}" pg_restore --list >/dev/null 2>&1
     list_status="$?"
     cat >/dev/null
     drain_status="$?"
@@ -368,7 +368,7 @@ run_backup() {
     { fail_attempt INVALID_CONFIGURATION; return 1; }
 
   if [[ "${FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST:-0}" != "1" ]] && ! backup_require_root; then fail_attempt INVALID_CONFIGURATION; return 1; fi
-  for command_name in docker restic pg_restore jq flock timeout stat df sync; do
+  for command_name in docker restic jq flock timeout stat df sync; do
     backup_require_command "${command_name}" || { fail_attempt INVALID_CONFIGURATION; return 1; }
   done
   backup_acquire_shared_lock || { backup_emit_result BACKUP_BUSY; return 1; }
@@ -388,7 +388,7 @@ run_backup() {
   set +e
   timeout --signal=TERM --kill-after="${WATCHDOG_TERMINATION_GRACE_SECONDS}" \
     "$((DUMP_DEADLINE_SECONDS - WATCHDOG_TERMINATION_GRACE_SECONDS))" \
-    docker exec -e "PGAPPNAME=${APPLICATION_NAME}" -i "${PRODUCTION_CONTAINER}" \
+    docker exec -e "PGAPPNAME=${APPLICATION_NAME}" -i "${PRODUCTION_CONTAINER_ID}" \
       pg_dump --format=custom --compress=0 -U "${DATABASE_USER}" -d "${DATABASE_NAME}" 2>/dev/null |
     restic_command backup --json --stdin --stdin-filename "${BACKUP_STDIN_PATH#/}" \
       --host "${BACKUP_HOST}" --tag fukurou-postgres --tag "${ATTEMPT_TAG}" \
