@@ -45,7 +45,7 @@ Claude Opus 4.8 was unavailable due rate limit. The user selected fresh `gpt-5.5
 | serialized `./gradlew test --max-workers=1` | fukurou PASS; trading 999 tests with 2 unrelated Hikari connection failures |
 | admission health isolation regression tasks | PASS |
 | `make detekt` all modules | PASS |
-| CI full validation | UNOBSERVED |
+| CI full validation | PASS (`Deploy contract and PostgreSQL 16`, GitGuardian) |
 | final clean-context falsification | PASS / blocking 0 |
 
 Final fresh `gpt-5.5` / `xhigh` falsification after the PR-2/PR-3 split returned `PASS` with `blocking_count: 0`. Its only non-blocking finding requested exact active-work observation in the PR-3 HANDOFF; the bounded read-only SQL was added there.
