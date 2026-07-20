@@ -20,6 +20,7 @@ import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
+import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectOutcome
 import me.matsumo.fukurou.trading.market.MarketDataConnectionState
 import me.matsumo.fukurou.trading.market.MarketDataGapReason
 import me.matsumo.fukurou.trading.market.MarketDataIntegrityRepository
@@ -63,6 +64,23 @@ class ProtectionReconcilerWorkerTest {
         val stream = createGmoMarketEventStream(config, Clock.fixed(Instant.EPOCH, ZoneOffset.UTC))
 
         assertEquals(Duration.ofSeconds(150), stream.transportLivenessTimeout)
+    }
+
+    @Test
+    fun production_worker_stream_publishes_injected_disconnect_interface() {
+        val stream = createGmoMarketEventStream(
+            TradingBotConfig.fromEnvironment(emptyMap()),
+            Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
+        )
+        val holder = Issue192WsFaultHolder()
+
+        holder.publish(stream)
+
+        assertEquals(stream, holder.current())
+        assertEquals(
+            InjectedWebSocketDisconnectOutcome.NO_ACTIVE_SESSION,
+            requireNotNull(holder.current()).disconnectActiveSession(UUID.randomUUID()),
+        )
     }
 
     @Test

@@ -706,6 +706,46 @@ tagのAND predicateはcomma-separatedの単一`--tag`を使う。複数の`--tag
 
 replacementを承認した場合もowner/ACLをarchiveから再生しない。application起動前にcode-owned `scripts/deploy/sql/deploy-foundation-v1.sql`、index foundation、`scripts/deploy/sql/mcp-role.sql`を適用し、application role、PUBLIC revoke、MCP role/effective privilegeをbootstrap手順どおり検証する。role/ACL bootstrapが確認できないdatabaseをproductionとして起動しない。
 
+## Issue #192 WebSocket fault-injection seam（一時的）
+
+Issue #192 の paper WebSocket fidelity 検証だけに使う一時的な seam である。検証が終わった revision で code、route、compose flag をまとめて削除する。
+
+### 有効化
+
+seam は `FUKUROU_ISSUE_192_WS_FAULT_ENABLED` が明示的に `true` の場合だけ controller と `POST /ops/issue-192/ws-disconnect` を構築する。既定は `false` であり、既定 revision には route が存在しない。route は生成 OpenAPI から `.hide()` で除外し、外部入口は既存の Cloudflare Access `/ops/*` policy で保護する。専用 token、capability file、Dockerfile 変更、WebUI 操作は追加しない。
+
+`docker-compose.prod.yml` は `${FUKUROU_ISSUE_192_WS_FAULT_ENABLED:-false}` を container へ渡す。有効化するには resting BUY 0 かつ open position 0 の flat state を確認したうえで、NAS `/srv/fukurou/.env` に次の1行を追加し、通常の signed quality / deploy gate で検証 revision を deploy する。
+
+```dotenv
+FUKUROU_ISSUE_192_WS_FAULT_ENABLED=true
+```
+
+flat state を満たせない場合は、その deploy 固有の exact inventory と不可逆な `evaluation_exclusions` への影響を提示し、owner の明示承認を得てから deploy する。
+
+### read-only rehearsal
+
+deploy 後、production を変更せずに次を確認する。socket の切断、process の再起動、runtime config の変更、ledger 行の書き込みは行わない。
+
+- 稼働 revision、image digest、container ID / 開始時刻
+- route が有効であること（不正 purpose での `400`、preflight 不成立での `409` など mutation なしの typed 応答）
+- `command_event_log` の固定 primary key 2件（`588ce39f-90ec-4479-9430-f22a6d0356a9` / `0367f844-595a-4ed7-8480-43a1d3e5df6c`）が不存在であることと、その lookup latency
+- lookup が失敗する状況では abort を呼ばず fail closed になること
+- active runtime config 値、account epoch と paper account baseline の一致、次回 backup / restore timer の時刻窓
+
+raw payload と secret は evidence artifact へ保存しない。
+
+### owner go/no-go
+
+各 arm の mutation 直前に、操作、最大停止 / 復旧窓、preflight 対象、予想される `orders` mutation、不可逆な `evaluation_exclusions`、評価母集団への影響を提示し、owner の明示 go を得る。設計承認、PR merge、falsification 通過は production mutation の承認にならない。
+
+### 他 deploy の禁止と72時間上限
+
+検証 deploy から cleanup deploy までの間は他の deploy を行わない。72時間以内に両 arm の precondition と verdict が揃わない場合は cleanup を先行し、残りは後日の別 change として再計画する。requested audit が durable に確定した後は、失敗の内容にかかわらず再注入しない。
+
+### cleanup
+
+evidence が揃ったら、controller、route、application-scoped holder、compose flag、注入専用 test と本節を削除した revision を deploy する。既存行の `CommandEventType.valueOf` と activity catalog read を壊さないため、実際に保存した `ISSUE_192_WS_DISCONNECT_REQUESTED` / `ISSUE_192_WS_DISCONNECT_EXECUTED` の enum 値と両 locale の label / description は残す。deploy 後に route が `404` であること、通常の WebSocket 再接続、readiness、public connectivity を確認してから NAS `.env` の1行を削除する。ledger、receipt、gap、exclusion、execution、audit 行は削除・backfill しない。
+
 ## Rollback
 
 application rollback は過去のcommit SHAを`workflow_dispatch`の`image_sha`に指定し、空でない`rollback_reason`を記入して再実行する。対象がcurrent revisionのstrict ancestorである場合だけworkflow/root executorが`AUTHORIZED_ROLLBACK`として受け入れる。同一SHA、新しいSHA、divergent/main外SHAは拒否する。historical targetも現在のCI環境で`make test`、`make detekt`、clean-tree検査を通す必要があり、quality bypassはない。

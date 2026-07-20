@@ -161,6 +161,16 @@
       "value": "PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED",
       "labelKey": "activity.catalog.audit.paperAccountEpochSwitchRejected.label",
       "descriptionKey": "activity.catalog.audit.paperAccountEpochSwitchRejected.description"
+    },
+    {
+      "value": "ISSUE_192_WS_DISCONNECT_REQUESTED",
+      "labelKey": "activity.catalog.audit.issue192WsDisconnectRequested.label",
+      "descriptionKey": "activity.catalog.audit.issue192WsDisconnectRequested.description"
+    },
+    {
+      "value": "ISSUE_192_WS_DISCONNECT_EXECUTED",
+      "labelKey": "activity.catalog.audit.issue192WsDisconnectExecuted.label",
+      "descriptionKey": "activity.catalog.audit.issue192WsDisconnectExecuted.description"
     }
   ],
   "decisionActions": [

@@ -147,6 +147,12 @@ enum class CommandEventType {
 
     /** open risk により epoch switch を拒否した。 */
     PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED,
+
+    /** Issue #192 の WebSocket 切断注入を要求として durable に確定した。 */
+    ISSUE_192_WS_DISCONNECT_REQUESTED,
+
+    /** Issue #192 の WebSocket 切断注入が成功したことを durable に確定した。 */
+    ISSUE_192_WS_DISCONNECT_EXECUTED,
 }
 
 /**
@@ -194,6 +200,18 @@ interface CommandEventLog {
      * 指定 decision run ID に紐づく tool call 監査イベント数を返す。
      */
     suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int>
+}
+
+/**
+ * command_event_log を primary key で1件だけ読むための狭い read repository。
+ *
+ * 固定 event ID による one-shot gate に使い、event_type の table scan を避ける。
+ */
+fun interface CommandEventByIdReader {
+    /**
+     * primary key 1件分の lookup を行う。存在しない場合は null を成功として返す。
+     */
+    suspend fun findEventById(id: UUID): Result<CommandEvent?>
 }
 
 /**
