@@ -15,7 +15,7 @@
 ## 3. PR-2 delivery
 
 - [x] 3.1 Run the initial full validation under the shared lease at the complete implementation HEAD and record command/result/SHA.
-- [ ] 3.2 Create a draft PR with `Refs #192`, Scenario evidence, falsification disposition, and `ドキュメント影響` line.
+- [x] 3.2 Create a draft PR with `Refs #192`, Scenario evidence, falsification disposition, and `ドキュメント影響` line.
 - [ ] 3.3 Run the approved fresh reviewer, adjudicate anchored findings, and use fresh `gpt-5.6-sol` medium only for accepted fix clusters.
 - [ ] 3.4 Run final full validation once at converged HEAD, synchronize PR/CI evidence, and post `APPROVED` or `HANDOFF` without merging.
 

@@ -53,3 +53,5 @@ Final fresh `gpt-5.5` / `xhigh` falsification after the PR-2/PR-3 split returned
 ## Production-dependent HANDOFF
 
 The detailed secret-free pre-deploy audit, canonical `1000000 JPY` activation gate, owner-performed NAS flag step, `ROLL_FORWARD_ONLY` decision, two arm templates, and finite cleanup inventory are preserved in `pr3-production-handoff.md`. They are not PR-2 success claims.
+
+Draft delivery: [PR #272](https://github.com/matsumo0922/fukurou/pull/272). The PR remains unmerged and production remains unchanged.
