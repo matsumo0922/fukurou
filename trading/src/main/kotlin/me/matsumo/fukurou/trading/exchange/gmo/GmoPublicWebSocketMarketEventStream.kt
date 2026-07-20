@@ -9,9 +9,6 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.TradingSymbol
-import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectException
-import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnectOutcome
-import me.matsumo.fukurou.trading.market.InjectedWebSocketDisconnector
 import me.matsumo.fukurou.trading.market.InvalidMarketDataMessageException
 import me.matsumo.fukurou.trading.market.MarketDataBackpressureException
 import me.matsumo.fukurou.trading.market.MarketDataSubscriptionException
@@ -37,7 +34,6 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionStage
 import java.util.concurrent.Executor
 import java.util.concurrent.ForkJoinPool
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.logging.Logger
@@ -65,9 +61,7 @@ class GmoPublicWebSocketMarketEventStream(
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(config.connectTimeout)
         .build(),
-) : MarketEventStream, InjectedWebSocketDisconnector {
-
-    private val activeSession = AtomicReference<GmoMarketEventSession?>()
+) : MarketEventStream {
 
     override val reconnectBackoff: java.time.Duration
         get() = config.reconnectBackoff
@@ -90,7 +84,6 @@ class GmoPublicWebSocketMarketEventStream(
                 clock = clock,
                 receiptRepository = receiptRepository,
                 receiptExecutor = receiptExecutor,
-                afterTerminalClaim = { clearActiveSession(sessionId) },
             )
             val connectedSocket = httpClient.newWebSocketBuilder()
                 .connectTimeout(config.connectTimeout)
@@ -105,26 +98,11 @@ class GmoPublicWebSocketMarketEventStream(
                 connectedAt = connectedAt,
                 socket = connectedSocket,
                 messages = sessionMessages,
-                listener = listener,
-                onClosed = { closedSessionId -> clearActiveSession(closedSessionId) },
-            ).also { session -> activeSession.set(session) }
+            )
         }.onFailure { throwable ->
             socket?.abort()
             messages?.close(throwable)
         }
-    }
-
-    override fun disconnectActiveSession(expectedSessionId: UUID): InjectedWebSocketDisconnectOutcome {
-        val session = activeSession.get() ?: return InjectedWebSocketDisconnectOutcome.NO_ACTIVE_SESSION
-
-        if (session.sessionId != expectedSessionId) return InjectedWebSocketDisconnectOutcome.SESSION_MISMATCH
-
-        return session.abortAndDeliverInjectedTerminalFailure()
-    }
-
-    /** session identity が一致する場合だけ active session 登録を解除する。 */
-    private fun clearActiveSession(sessionId: UUID) {
-        activeSession.updateAndGet { current -> current?.takeIf { session -> session.sessionId != sessionId } }
     }
 }
 
@@ -158,22 +136,13 @@ data class GmoPublicWebSocketConfig(
     }
 }
 
-/**
- * GMO WebSocket 1接続分のevent受信session。
- *
- * @param listener この session の socket callback を受ける listener
- * @param onClosed 通常 close 時に active session 登録を解除する callback
- */
+/** GMO WebSocket 1接続分のevent受信session。 */
 internal class GmoMarketEventSession(
     override val sessionId: UUID,
     override val connectedAt: Instant,
     private val socket: WebSocket,
     private val messages: Channel<Result<MarketEventSessionSignal>>,
-    private val listener: GmoWebSocketListener? = null,
-    private val onClosed: (UUID) -> Unit = {},
 ) : MarketEventSession {
-    private val injectionClaimed = AtomicBoolean(false)
-
     override suspend fun receive(): Result<MarketEventSessionSignal> {
         return try {
             messages.receive()
@@ -185,27 +154,8 @@ internal class GmoMarketEventSession(
     }
 
     override fun close() {
-        onClosed(sessionId)
         socket.sendClose(WebSocket.NORMAL_CLOSURE, "session closed")
         messages.close()
-    }
-
-    /**
-     * session-local one-shot CAS の後に実 socket を abort し、abort が正常 return した場合だけ
-     * listener の terminal-claim boundary へ typed failure を1回渡す。
-     */
-    fun abortAndDeliverInjectedTerminalFailure(): InjectedWebSocketDisconnectOutcome {
-        if (!injectionClaimed.compareAndSet(false, true)) {
-            return InjectedWebSocketDisconnectOutcome.ALREADY_INJECTED
-        }
-
-        val abortFailure = runCatching { socket.abort() }.exceptionOrNull()
-
-        if (abortFailure != null) return InjectedWebSocketDisconnectOutcome.ABORT_FAILED
-
-        listener?.deliverTerminalFailure(InjectedWebSocketDisconnectException())
-
-        return InjectedWebSocketDisconnectOutcome.DISCONNECTED
     }
 }
 
@@ -402,15 +352,6 @@ internal class GmoWebSocketListener(
 
             sendTerminalFailureLocked(MarketDataBackpressureException("GMO WebSocket market event buffer overflowed."))
         }
-    }
-
-    /**
-     * `onError` / `onClose` と同じ private terminal-claim boundary へ failure を1回渡す。
-     *
-     * one-shot claim は共有するため、自然な terminal callback が先行した場合は何も起きない。
-     */
-    fun deliverTerminalFailure(throwable: Throwable) {
-        sendTerminalFailure(throwable)
     }
 
     private fun sendTerminalFailure(throwable: Throwable) {

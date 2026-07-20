@@ -3,7 +3,6 @@ package me.matsumo.fukurou.trading.persistence
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEvent
-import me.matsumo.fukurou.trading.audit.CommandEventByIdReader
 import me.matsumo.fukurou.trading.audit.CommandEventFeedReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -99,13 +98,6 @@ private const val SELECT_COMMAND_EVENTS_STABLE_FEED_SQL_SUFFIX = """
 """
 
 /**
- * command_event_log を primary key 1件だけ読む SELECT の WHERE 条件。
- */
-private const val SELECT_COMMAND_EVENT_BY_ID_SQL_SUFFIX = """
-    WHERE id = ?
-"""
-
-/**
  * cursor 未指定時に全件を対象にするための DB 保存可能な終端時刻。
  */
 private val COMMAND_EVENT_FEED_END_CURSOR: Instant = Instant.ofEpochMilli(Long.MAX_VALUE)
@@ -117,17 +109,7 @@ private val COMMAND_EVENT_FEED_END_CURSOR: Instant = Instant.ofEpochMilli(Long.M
  */
 class ExposedCommandEventLog(
     private val database: ExposedDatabase,
-) : CommandEventLog, CommandEventFeedReader, CommandEventByIdReader {
-
-    override suspend fun findEventById(id: UUID): Result<CommandEvent?> {
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                exposedTransaction(database) {
-                    selectEventById(id)
-                }
-            }
-        }
-    }
+) : CommandEventLog, CommandEventFeedReader {
 
     override suspend fun append(event: CommandEvent): Result<Unit> {
         runCatching {
@@ -328,18 +310,6 @@ private fun countToolCallEventsSql(eventTypeCount: Int, toolNameCount: Int): Str
 
 private fun placeholders(count: Int): String {
     return List(count) { "?" }.joinToString(", ")
-}
-
-private fun JdbcTransaction.selectEventById(id: UUID): CommandEvent? {
-    val sql = SELECT_COMMAND_EVENTS_SQL_PREFIX + SELECT_COMMAND_EVENT_BY_ID_SQL_SUFFIX
-
-    return jdbcConnection().prepareStatement(sql).use { statement ->
-        statement.setObject(1, id)
-
-        statement.executeQuery().use { resultSet ->
-            if (resultSet.next()) resultSet.toCommandEvent() else null
-        }
-    }
 }
 
 private fun JdbcTransaction.selectEventsBefore(
