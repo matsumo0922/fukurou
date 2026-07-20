@@ -26,4 +26,6 @@
 - [x] 4.1 Rewrite the two retained event-type KDocs as decoding-only vocabulary, check docs/README/KDoc for stale current-state references, run `git diff --check`, commit, push, and create a draft PR with docs impact and explicit not-planned Issue disposition.
   - Worker scope completed the implementation, documentation/KDoc grep, diff check, and local commit preparation. Push and draft PR creation remain with the parent run because this worker is explicitly prohibited from external GitHub mutation.
 - [ ] 4.2 Run clean-context Claude Opus review, adjudicate anchored findings, and converge accepted must-fix/should findings.
+  - S-1 accepted: the retained decoding-only labels and descriptions could be read as evidence that injection rows existed or executed, although production injection was not performed.
+  - Remediation: describe both values as compatibility vocabulary that decodes a matching row only if present, and state that the writer and route are removed. Re-review remains pending.
 - [ ] 4.3 Run final full validation once at converged HEAD, synchronize PR/CI evidence, and post `APPROVED` or `HANDOFF` without merging.

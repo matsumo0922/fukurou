@@ -148,10 +148,10 @@ enum class CommandEventType {
     /** open risk により epoch switch を拒否した。 */
     PAPER_ACCOUNT_EPOCH_SWITCH_REJECTED,
 
-    /** 撤去済み Issue #192 WebSocket 切断要求 row の historical decoding vocabulary。 */
+    /** writer/route 撤去後も、未確認を含む既存の該当 row があれば切断要求値を decode する互換 vocabulary。 */
     ISSUE_192_WS_DISCONNECT_REQUESTED,
 
-    /** 撤去済み Issue #192 WebSocket 切断実行 row の historical decoding vocabulary。 */
+    /** writer/route 撤去後も、未確認を含む既存の該当 row があれば切断実行値を decode する互換 vocabulary。 */
     ISSUE_192_WS_DISCONNECT_EXECUTED,
 }
 
