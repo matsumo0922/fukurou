@@ -1325,7 +1325,7 @@ persistence bootstrap は、`status = RUNNING` かつ `finished_at IS NULL` の 
 
 kill 基準は `ProtectionReconciler` の pass 内で評価し、到達時は `KILL_CRITERION_BREACHED` audit、`RiskStateCommandService.setHardHalt(reason)`、`Broker.sweepHardHalt(reasonJa, tickSnapshot)` の順で既存 HARD_HALT 経路へ接続する。既定値は `minClosedTrades = 100`、`minProfitFactor = 0.8`。enforcement と `/evaluation/summary.killCriterion` はどちらも active epoch + `CURRENT` の全期間 DB aggregate を使う。epoch/cohort 切替で eligible closed trade が 0 になっても新しい population の評価が未着手という意味であり、既存 `HARD_HALT` は解除しない。runtime key `killCriterion.minClosedTrades` は下げる方向のみ、`killCriterion.minProfitFactor` は上げる方向のみ override できる。無効化スイッチは持たない。
 
-公開 API は次の5本とする。`from` / `to` は ISO-8601 日付を JST として解釈し、省略時は直近30日を返す。
+公開 API は次の5本とする。benchmark以外の`from` / `to`はISO-8601日付をJSTとして解釈し、省略時は直近30日を返す。benchmarkは`from` / `to`を400で拒否し、任意のISO-8601 instant `cutoff`だけを受け付ける。
 
 - `GET /evaluation/summary`: 期間成績、行動率、相場局面別成績に加え、kill 基準への近接度（closedTrades、currentPF、閾値、残り trade 数、breached、HARD_HALT 状態）を返す。
 - `GET /evaluation/setups`
@@ -1341,13 +1341,17 @@ Historical Outcome Ridge は observed paper trade の realized R だけを `[-2R
 
 Evidence Relationship Graph は report segment → typed claim → deterministic fact → source の参照関係を client-side の fixed DAG として投影する。これは因果・相関・確率・confidence を表さず、node size と edge width にそれらの意味を持たせない。graph が利用できない場合も native table と Claim Inspector から同じ evidence に到達できる。
 
-benchmark は GMO 日足を都度取得して算出し、永続化しない。基準資金は選択した immutable account epoch の初期資金と同じ epoch/cohort の期間開始前 realized PnL だけから算出する。trade の epoch 帰属は約定時刻順で最初の BUY execution から決定し、その後の SELL execution が別 epoch でも開始前 realized PnL を正しい entry epoch に含める。開始前 baseline を再構成できない `LEGACY_PRE_WS` は series、return、benchmark fact を生成せず `BASELINE_NOT_COMPARABLE` とする。buy & hold は開始日 close で全額 BTC を買ったと仮定し、手数料とスリッページを無視する。no-trade は基準資金の水平線、bot equity は close 日に realized trade PnL だけを計上し、未実現損益を含めない。
+`GET /evaluation/benchmark` はactive `CURRENT` account epochだけを`OWNER_SCORE_V1`で評価する。cutoff省略時はrequest clockを一度読んだ`ROLLING`、指定時はfutureでない`FIXED_CUTOFF`とする。cutoff以下の最新06:00 JST close境界から連続90 expected slotを生成し、GMO日足をleft joinする。欠損slotを91日前のcandleで置換しない。snapshotとgapの選択も同じ06:00境界を使い、epoch開始前の日は`OUTSIDE_ACCOUNT_EPOCH`のまま90日分母へ残す。epoch未帰属の旧snapshotは混ぜず、backfillや削除を行わない。
 
-benchmark の取引母集団が取得上限を超えた場合は `TRUNCATED_POPULATION` と attribution coverage を返し、baseline、series、return を生成しない。
+各valid日のbot清算equityは、close以前の最新active-epoch snapshotから`cash + btcQuantity × close × (1 - f)`で再計算する。保存済みmark priceとtotal equityは使わず、snapshotが更新されない日はcash/BTC数量をcarry forwardして当日closeでmark-to-marketする。`f = 0.0005`（0.05%）はV1固定のsynthetic taker feeで、snapshot cashへ反映済みの実fill feeを再加算しない。window開始日のbot清算equityを共通元本`S`とし、`buyHoldBtc = S / (startClose × (1 + f))`、`buyHold = buyHoldBtc × close × (1 - f)`、`cash = S`とする。returnは系列自身のfirst point比ではなく、`botEnd / S - 1`、`buyHoldEnd / S - 1`、`cashReturn = 0`に固定する。`ownerScore = botReturn - buyHoldReturn`で、正なら`BOT`、0以下なら`BUY_AND_HOLD`とする。
+
+保存済み`market_data_gaps`は各06:00 JST business dayとの交差秒を合算し、日計1時間以上だけをunknownにする。1時間未満もgap件数・秒数へ残す。日足またはusable snapshotの欠損、同一最新時刻の口座状態矛盾もunknownとし、補間しない。validが81/90日未満、開始日または終了日がunknown、価格または`S`が非正なら、coverageとnullable seriesを返して`INCONCLUSIVE`とし、return、owner score、winnerを返さない。未回復gapはcutoffを終端とする。coverageは保存済み証拠だけに基づき、未記録のintentional stop、slippage、税、maker rebateは既知の限界として画面に表示する。
+
+window開始時にBTCを保有するbotはentry feeを再度負わず、fresh buy & holdだけがentry feeを負うため、V1はbotへ約0.1%有利になりうる。このbiasは受容済みの比較起点としてresponseとWebUIへ表示する。immutable Evaluation Reportのschema、legacy `EvaluationMath.benchmark`、canonical fact、hashは変更せず、report内のrealized benchmarkは`legacy`と明示してowner scoreとして扱わない。
 
 LLM usage、run rate、decision/action、exclusion などの non-trade population は account epoch の作成時刻を lifecycle 開始境界とし、trade history の legacy fallback 境界とは分離する。CURRENT 以外へ non-trade fact を推測帰属せず、API/report は `NOT_ATTRIBUTABLE` として扱う。Reflection と Knowledge も active epoch + CURRENT を明示解決し、decision、run、usage、trade の全取得を同じ lifecycle scope に限定する。
 
-評価 API/report は requested period と、requested period と epoch lifecycle の積集合である effective period をそれぞれ返す。requested period が epoch 開始前を含む場合は `PARTIAL_LIFECYCLE` と effective days を返し、積集合が空の場合は `EMPTY_LIFECYCLE` と null の effective date を返す。benchmark の trade population、prior PnL aggregate、market candle window は effective period で計算し、requested 90D を 90D の実績として表示しない。`EMPTY_LIFECYCLE` の report は baseline、return、chart point、canonical benchmark fact を生成しない。
+benchmark以外の評価APIとimmutable reportはrequested periodと、requested periodとepoch lifecycleの積集合であるeffective periodをそれぞれ返す。requested periodがepoch開始前を含む場合は`PARTIAL_LIFECYCLE`とeffective daysを返し、積集合が空の場合は`EMPTY_LIFECYCLE`とnullのeffective dateを返す。immutable reportの`EMPTY_LIFECYCLE`はlegacy benchmarkのbaseline、return、chart point、canonical benchmark factを生成しない。
 
 LLM cost / usage は `RUNNER_PHASE_COMPLETED` audit のうち LLM 呼び出し phase（`pre_filter` / `proposer` / `falsifier` / `reflection`）だけを集計する。Claude 2.1.199 / Codex 0.142.5 の versioned adapter が structured output から usage と provider-observed model を抽出する。model 未指定は名前を推測せず `CLI_DEFAULT` とし、session file は探索しない。保存済み `details.usage` がない過去の Claude 行は redacted `details.stdout` から best-effort で fallback parse する。cleanup 失敗時も process status、exit code、usage を保持し、呼び出しを fail closed にする。
 

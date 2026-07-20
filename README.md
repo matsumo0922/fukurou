@@ -54,6 +54,10 @@ Gradle module は `:fukurou`、package root は `me.matsumo.fukurou` です。
 - `GET /health/live`
 - `GET /health/ready`
 - `/evaluation/*`: 既存集計 API と、共通 LLM reservation / audited manual generation / immutable revision / deterministic evidence を扱う Evaluation Report Console API
+
+`GET /evaluation/benchmark` は `OWNER_SCORE_V1` として active `CURRENT` account epoch の直近90 completed GMO business daysを比較します。営業日境界は06:00 JSTで、cutoff省略時はrolling、ISO-8601 instant指定時はfixed cutoffです。window開始時のbot清算equityを共通元本`S`とし、`bot = cash + BTC数量 × close × (1 - 0.0005)`、`buy & hold BTC = S / (開始close × (1 + 0.0005))`、`cash = S`で計算します。全returnは`S`を分母に固定し、owner scoreは`botReturn - buyAndHoldReturn`です。fresh buy & holdだけがwindow開始時のentry feeを負うため、開始時にBTCを保有するbotへ約0.1%有利になりうるbiasを画面に表示します。
+
+90日のうちvalidが81日未満、または開始・終了境界がvalidでない場合は`INCONCLUSIVE`です。日足・active epoch snapshotの欠損、epoch開始前、同一最新時刻のsnapshot矛盾、1 GMO business dayで累積1時間以上の保存済み`market_data_gaps`をunknownにし、欠損日を古いcandleで繰り上げません。1時間未満のgapも件数と秒数には残します。epoch未帰属の旧snapshot、未記録の停止期間、slippage、税、maker rebateはV1へ補完しません。immutable report内のrealized benchmarkはlegacy factとして維持され、owner scoreとは表示を分けます。
 - `/ops/*`
 - `GET /ops/runtime-config`
 - `GET /ops/monitoring`

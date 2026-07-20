@@ -258,6 +258,7 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Auditable LLM evaluation" })).toBeInTheDocument();
     expect(screen.getByText("CURRENT CONTEXT · NOT REPORT EVIDENCE")).toBeInTheDocument();
     expect(screen.getByText(/live trading is not enabled/i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "90-day liquidation benchmark" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "No immutable report revision" })).toBeInTheDocument();
   });
 
@@ -321,7 +322,7 @@ describe("App", () => {
     expect(screen.getByText("within bounds")).toBeInTheDocument();
   });
 
-  it("loads only the immutable report contract on Evaluation", async () => {
+  it("loads the live owner score and immutable report contracts on Evaluation", async () => {
     const fetchMock = stubSystemFetch();
     window.history.pushState({}, "", "/app/evaluation");
 
@@ -330,6 +331,7 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Auditable LLM evaluation" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Evaluation/ })).toHaveAttribute("href", "/app/evaluation");
     expect(await screen.findByRole("heading", { name: "No immutable report revision" })).toBeInTheDocument();
+    expect(hasGetCall(fetchMock, "/evaluation/benchmark", () => true)).toBe(true);
     expect(hasGetCall(fetchMock, "/evaluation/reports/default", (params) => params.get("scopeKey") === "PRESET:30D")).toBe(true);
     expect(fetchMock).not.toHaveBeenCalledWith("/evaluation/summary", expect.anything());
   });
@@ -1618,62 +1620,52 @@ function stubSystemFetch(fixture: SystemFetchFixture = {}) {
         });
       case "/evaluation/benchmark":
         return jsonResponse({
-          period: {
-            from: "2026-06-05",
-            to: "2026-07-05",
+          semanticsVersion: "OWNER_SCORE_V1",
+          cutoffMode: "ROLLING",
+          cutoff: "2026-07-05T21:00:00Z",
+          window: {
+            fromInclusive: "2026-04-06T21:00:00Z",
+            firstCloseAt: "2026-04-07T21:00:00Z",
+            lastCloseAt: "2026-07-05T21:00:00Z",
             timezone: "Asia/Tokyo",
+            expectedDays: 90,
           },
-          assumptionsJa: "buy & hold は初期残高で BTC を購入し、no-trade は現金維持として比較します。",
-          baselineEquityJpy: "100000",
+          scope: {
+            accountEpochId: "11111111-1111-1111-1111-111111111111",
+            accountEpochStartedAt: "2026-04-06T21:00:00Z",
+            cohort: "CURRENT",
+          },
+          syntheticTakerFeeRate: "0.0005",
+          feeBiasDisclosureJa: "比較には合成 taker fee 0.05% を含みます。",
+          assumptionsJa: "active CURRENT epoch の 06:00 JST 境界スナップショットを清算価値で比較します。",
+          commonStartingCapitalJpy: null,
           points: [
             {
-              date: "2026-06-29",
-              buyAndHoldEquityJpy: "98000",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "98000",
-            },
-            {
-              date: "2026-06-30",
-              buyAndHoldEquityJpy: "99000",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "99000",
-            },
-            {
-              date: "2026-07-01",
-              buyAndHoldEquityJpy: "99500",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "100000",
-            },
-            {
-              date: "2026-07-02",
-              buyAndHoldEquityJpy: "100500",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "102000",
-            },
-            {
-              date: "2026-07-03",
-              buyAndHoldEquityJpy: "100000",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "100000",
-            },
-            {
-              date: "2026-07-04",
-              buyAndHoldEquityJpy: "103000",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "104000",
-            },
-            {
               date: "2026-07-05",
-              buyAndHoldEquityJpy: "102000",
-              noTradeEquityJpy: "100000",
-              botEquityJpy: "101000",
+              closeAt: "2026-07-05T21:00:00Z",
+              state: "OUTSIDE_ACCOUNT_EPOCH",
+              reasons: ["OUTSIDE_ACCOUNT_EPOCH"],
+              closeJpy: null,
+              botLiquidationEquityJpy: null,
+              buyAndHoldLiquidationEquityJpy: null,
+              cashEquityJpy: null,
+              gapCount: 0,
+              gapSeconds: 0,
             },
           ],
-          returns: {
-            buyAndHoldReturn: "0.02",
-            noTradeReturn: "0",
-            botReturn: "0.01",
+          coverage: {
+            expectedDays: 90,
+            validDays: 0,
+            gapDays: 0,
+            unknownDays: 90,
+            gapCount: 0,
+            gapSeconds: 0,
+            reasonCounts: { OUTSIDE_ACCOUNT_EPOCH: 90 },
           },
+          returns: null,
+          ownerScore: null,
+          winner: null,
+          state: "INCONCLUSIVE",
         });
       case "/evaluation/costs":
         return jsonResponse({

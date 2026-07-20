@@ -6,6 +6,7 @@ import { LazyHistoricalOutcomeRidge } from "./evaluation-report/HistoricalOutcom
 import { LazyEvidenceRelationshipGraph } from "./evaluation-report/EvidenceRelationshipGraph.lazy";
 import { initialContextState } from "./evaluation-report/currentContextStateMachine";
 import { startCurrentContextClient } from "./evaluation-report/currentContextClient";
+import { evaluationBenchmarkQuery, type EvaluationBenchmarkResponse } from "../api/ops";
 
 export function EvaluationPage() {
   const [days, setDays] = useState(30);
@@ -60,6 +61,7 @@ export function EvaluationPage() {
     {cohort === "LEGACY_PRE_WS" && <div className="console-alert" role="status">Legacy pre-WebSocket trades are reference-only. Baseline benchmark series and returns are not comparable.</div>}
     {cohort === "UNSUPPORTED_EXECUTION_SEMANTICS" && <div className="console-alert" role="alert">Unsupported execution semantics are not evaluable. Coverage and missing attribution remain visible, but results must not be treated as CURRENT performance.</div>}
     <CurrentContextStrip />
+    <OwnerScoreCard />
     {generationJob && generation.isPending && <div className="console-alert" role="status">Job {generationJob.jobId.slice(0, 12)} · revision #{generationJob.revisionNumber} · {generationJob.stage}. Existing pinned revision remains authoritative.</div>}
     {generation.isError && <div className="console-alert" role="alert">Generation failed: {generation.error.message}. Existing revision remains authoritative.</div>}
     {query.isPending ? <div className="console-empty">Loading immutable report revision…</div> : query.isError ? <div className="console-alert" role="alert">Report request failed: {query.error.message}</div> : displayedReport == null ? <EmptyReport onGenerate={() => generation.mutate()} /> : <ReportConsole report={displayedReport} pinned={displayedIsPinned} />}
@@ -92,6 +94,40 @@ function CurrentContextStrip() {
     <div><span>Latest LLM run</span><strong>{latestRun?.value?.status ?? "UNAVAILABLE"}</strong><small>{latestRun?.value?.invocationId ?? "no persisted run"}</small></div>
     <div><span>Freshness</span><strong>{quote?.freshness ?? "UNAVAILABLE"}</strong><small>Historical revision remains unchanged</small></div>
   </section>;
+}
+
+function OwnerScoreCard() {
+  const query = useQuery(evaluationBenchmarkQuery);
+  if (query.isPending) return <section className="report-panel"><p>Loading OWNER_SCORE_V1…</p></section>;
+  if (query.isError) return <section className="console-alert" role="alert">Owner score request failed: {query.error.message}</section>;
+  const benchmark = query.data;
+
+  return <section className="report-panel" aria-labelledby="owner-score-title">
+    <header className="report-panel__header"><div><span className="console-kicker">CURRENT OWNER SCORE · {benchmark.cutoffMode}</span><h2 id="owner-score-title">90-day liquidation benchmark</h2><p>{benchmark.semanticsVersion} · cutoff {new Date(benchmark.cutoff).toLocaleString()} · 06:00 JST boundary</p></div><span className="report-status">{benchmark.state}</span></header>
+    <div className="evidence-summary"><div><span>Winner</span><strong>{benchmark.winner ?? "INCONCLUSIVE"}</strong></div><div><span>Owner score</span><strong>{benchmark.ownerScore ?? "—"}</strong></div><div><span>Coverage</span><strong>{benchmark.coverage.validDays}/{benchmark.coverage.expectedDays}</strong><small>{benchmark.coverage.unknownDays} unknown</small></div><div><span>Persisted gaps</span><strong>{benchmark.coverage.gapDays} days</strong><small>{benchmark.coverage.gapSeconds}s · {benchmark.coverage.gapCount} observations</small></div><div><span>Synthetic fee</span><strong>{Number(benchmark.syntheticTakerFeeRate) * 100}%</strong><small>entry/exit comparison</small></div></div>
+    <p>{benchmark.feeBiasDisclosureJa}</p>
+    <OwnerScoreChart benchmark={benchmark} />
+    {benchmark.state === "INCONCLUSIVE" && <p>Coverage reasons: {Object.entries(benchmark.coverage.reasonCounts).map(([reason, count]) => `${reason} ${count}`).join(" · ") || "no valid boundary evidence"}</p>}
+    <details><summary>Daily evidence ({benchmark.points.length} expected slots)</summary><div className="console-table-wrap"><table><caption>Unknown days remain chart gaps</caption><thead><tr><th>Close</th><th>State</th><th>Bot liquidation JPY</th><th>Buy &amp; hold JPY</th><th>Cash JPY</th></tr></thead><tbody>{benchmark.points.map((point) => <tr key={point.closeAt}><td>{point.date}</td><td>{point.state}</td><td>{point.botLiquidationEquityJpy ?? "gap"}</td><td>{point.buyAndHoldEquityJpy ?? "gap"}</td><td>{point.cashEquityJpy ?? "gap"}</td></tr>)}</tbody></table></div></details>
+  </section>;
+}
+
+function OwnerScoreChart({ benchmark }: { benchmark: EvaluationBenchmarkResponse }) {
+  const fields = ["botLiquidationEquityJpy", "buyAndHoldEquityJpy", "cashEquityJpy"] as const;
+  const values = benchmark.points.flatMap((point) => fields.flatMap((field) => point[field] == null ? [] : [Number(point[field])])).filter(Number.isFinite);
+  if (values.length < 2) return <p>Insufficient coverage: liquidation series is unavailable.</p>;
+  const min = Math.min(...values); const max = Math.max(...values); const span = Math.max(max - min, 1);
+  const segments = (field: typeof fields[number]) => {
+    const result: string[][] = []; let current: string[] = [];
+    benchmark.points.forEach((point, index) => {
+      const raw = point[field];
+      if (raw == null) { if (current.length > 1) result.push(current); current = []; return; }
+      current.push(`${(index / Math.max(benchmark.points.length - 1, 1)) * 100},${60 - ((Number(raw) - min) / span) * 50}`);
+    });
+    if (current.length > 1) result.push(current);
+    return result;
+  };
+  return <><svg viewBox="0 0 100 65" role="img" aria-labelledby="owner-score-chart-title owner-score-chart-desc"><title id="owner-score-chart-title">Owner score liquidation series</title><desc id="owner-score-chart-desc">Unknown business days are rendered as gaps. Blue is bot liquidation, amber is buy and hold, gray is cash.</desc>{segments("botLiquidationEquityJpy").map((segment, index) => <polyline key={`bot-${index}`} points={segment.join(" ")} fill="none" stroke="currentColor" strokeWidth="1.5" />)}{segments("buyAndHoldEquityJpy").map((segment, index) => <polyline key={`hold-${index}`} points={segment.join(" ")} fill="none" stroke="#c78b2c" strokeWidth="1.2" />)}{segments("cashEquityJpy").map((segment, index) => <polyline key={`cash-${index}`} points={segment.join(" ")} fill="none" stroke="#777" strokeWidth="1" />)}</svg><p>Legend: bot liquidation (blue/current color), fee-inclusive buy &amp; hold (amber), cash (gray). Unknown days are gaps.</p></>;
 }
 
 function EmptyReport({ onGenerate }: { onGenerate: () => void }) {
@@ -154,7 +190,7 @@ function DeterministicEvidenceBoard({ report }: { report: EvaluationReport }) {
   return <section className="report-panel" aria-labelledby="deterministic-evidence-title">
     <header className="report-panel__header"><div><span className="console-kicker">DETERMINISTIC SNAPSHOT VISUALIZATIONS</span><h2 id="deterministic-evidence-title">Performance, calibration and integrity</h2><p>Authority: immutable closed paper trades, daily candles and persisted runner usage. These panels are descriptive, not forecasts.</p></div></header>
     <div className="report-stage__grid">
-      <article><h3>Bot realized vs benchmark equity</h3><p>JPY · {report.benchmark.points.length} daily observations · {report.benchmark.state}</p><EquityChart report={report} /><table><caption>Equity series accessible fallback</caption><thead><tr><th>Date</th><th>Bot JPY</th><th>Buy &amp; hold JPY</th><th>No trade JPY</th></tr></thead><tbody>{report.benchmark.points.map((point) => <tr key={point.date}><td>{point.date}</td><td>{point.botEquityJpy}</td><td>{point.buyAndHoldEquityJpy}</td><td>{point.noTradeEquityJpy}</td></tr>)}</tbody></table></article>
+      <article><h3>Legacy realized benchmark equity</h3><p>Immutable report fact (not OWNER_SCORE_V1) · JPY · {report.benchmark.points.length} daily observations · {report.benchmark.state}</p><EquityChart report={report} /><table><caption>Legacy realized equity series accessible fallback</caption><thead><tr><th>Date</th><th>Bot realized JPY</th><th>Buy &amp; hold JPY</th><th>No trade JPY</th></tr></thead><tbody>{report.benchmark.points.map((point) => <tr key={point.date}><td>{point.date}</td><td>{point.botEquityJpy}</td><td>{point.buyAndHoldEquityJpy}</td><td>{point.noTradeEquityJpy}</td></tr>)}</tbody></table></article>
       <article><h3>Forecast calibration probability lattice</h3><p>{report.calibration.unit} · {report.calibration.authority} · {report.calibration.state}</p>{setupCalibration.length === 0 ? <p>Insufficient sample: no closed trade has a usable forecast probability.</p> : <table><caption>Forecast probability against realized win rate</caption><thead><tr><th>Setup / bin</th><th>Forecast p</th><th>Realized win rate</th><th>n / state</th></tr></thead><tbody>{setupCalibration.map((cell) => <tr key={`${cell.groupKey}-${cell.lowerBoundInclusive}`}><td>{cell.groupKey} [{cell.lowerBoundInclusive}, {cell.upperBound}]</td><td>{cell.averageForecastProbability ?? "missing"}</td><td>{cell.realizedWinRate ?? "insufficient"}</td><td>{cell.sampleCount} / {cell.state}</td></tr>)}</tbody></table>}</article>
       <article><h3>Setup × market regime performance lattice</h3><p>{report.performanceLattice.unit} · {report.performanceLattice.authority} · {report.performanceLattice.state}</p>{report.performanceLattice.cells.length === 0 ? <p>Insufficient sample: there are no eligible closed trades.</p> : <table><caption>Expected realized R by setup and market regime</caption><thead><tr><th>Setup</th><th>Regime</th><th>Expected R</th><th>PnL JPY</th><th>n / state</th></tr></thead><tbody>{report.performanceLattice.cells.map((cell) => <tr key={`${cell.setup}-${cell.marketRegime}`}><td>{cell.setup}</td><td>{cell.marketRegime}</td><td>{cell.expectedR ?? "missing R"}</td><td>{cell.totalPnlJpy}</td><td>{cell.tradeCount} / {cell.state}</td></tr>)}</tbody></table>}</article>
       <article><h3>Evidence integrity / coverage and cost</h3><p>Snapshot authority · missing and exclusions remain explicit</p><dl><dt>Eligible trades</dt><dd>{report.integrity.eligibleTradeCount}</dd><dt>Missing realized R</dt><dd>{report.integrity.missingRCount}</dd><dt>Excluded order / position / run</dt><dd>{report.integrity.excludedOrderCount} / {report.integrity.excludedPositionCount} / {report.integrity.excludedDecisionRunCount}</dd><dt>LLM usage phases</dt><dd>{report.integrity.llmPhaseCount} ({report.integrity.missingUsagePhaseCount} missing usage, {report.integrity.unpricedPhaseCount} unpriced)</dd><dt>Known cost USD</dt><dd>{report.integrity.knownCostUsd ?? "unavailable"}{report.integrity.usageTruncated ? " · partial" : ""}</dd></dl>{Object.keys(report.integrity.exclusionReasons).length === 0 ? <p>No persisted exclusion reason in this period.</p> : <ul>{Object.entries(report.integrity.exclusionReasons).map(([reason, count]) => <li key={reason}>{reason}: {count}</li>)}</ul>}</article>
