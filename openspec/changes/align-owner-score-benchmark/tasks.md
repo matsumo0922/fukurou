@@ -6,7 +6,7 @@
 
 ## 2. Existing-evidence snapshot
 
-- [ ] 2.1 Add one bounded read-only repeatable-read owner-score query for the active CURRENT epoch, 90 daily candles/account states, existing gaps, execution semantics, and evaluation exclusions
+- [ ] 2.1 Add one bounded read-only repeatable-read owner-score query for the active CURRENT epoch, 90 daily account states, existing gaps, execution semantics, and evaluation exclusions; fetch daily candles once through the existing market-data source
 - [ ] 2.2 Project `PROCESS_RESTART` from last transport activity and cap open market/infrastructure gaps at the frozen query/cutoff boundary
 - [ ] 2.3 Add focused PostgreSQL tests for epoch isolation, ambiguous snapshots, young epochs, multi-day/open gaps, and existing legacy/exclusion reasons
 

@@ -40,7 +40,7 @@ fee を変える場合は `OWNER_SCORE_V2` を追加する。DB policy や runti
 
 ### 4. 既存 evaluation repository で evidence を1 snapshotに固定する
 
-既存の Exposed evaluation repository patternを使い、read-only repeatable-read transaction で active CURRENT epoch、90日分のdaily candle、epoch-scoped account snapshot、gap、既存 population / exclusion evidence を読む。読み取りは90日windowと既存query limitでboundedにする。新しいschemaや汎用query frameworkは作らない。
+既存の Exposed evaluation repository patternを使い、read-only repeatable-read transaction で active CURRENT epoch、epoch-scoped account snapshot、gap、既存 population / exclusion evidence を読む。DB読み取りは90日windowと既存query limitでboundedにする。daily candleは既存 `MarketDataSource` からrequest中に1回だけ取得し、immutable listとして同じ計算へ渡す。新しいschema、candle永続化、汎用query frameworkは作らない。
 
 各日末以前の最新 `EPOCH_START` / `BOOTSTRAP` / `FILL` / `DAILY` snapshotからcash/BTC quantityを取得し、その日のcloseで再評価する。stored mark price / total equityは使わない。同一最大 `captured_at` に異なるcash/BTCがある日は `ACCOUNT_STATE_AMBIGUOUS` とする。
 
@@ -69,6 +69,7 @@ Evaluation pageはowner-score endpointを独立queryし、bot / B&H / cash、sco
 - [intentional HALTの完全な期間履歴がない] → durable evidenceのないintervalを推測せず、既知のgapだけを使う。
 - [既存population evidenceでは完全なlineage証明ができない] → conclusiveへ推定せず、既知のlegacy/exclusion/missingをfail-closedにする。
 - [current epochが若い] → `OUTSIDE_ACCOUNT_EPOCH` を返し、90日denominatorを短縮しない。
+- [外部sourceのhistorical candleが後日訂正される] → request内では1回取得して固定し、fixed cutoffはwindow境界の再現性を表す。candle revisionの永続化は本changeのscope外とする。
 
 ## Migration Plan
 

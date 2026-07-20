@@ -35,7 +35,7 @@ The system SHALL use the bot liquidation equity at the window start as the commo
 - **THEN** the system preserves that cash unchanged and labels `0.0005` only as the `OWNER_SCORE_V1` synthetic entry/exit assumption
 
 ### Requirement: Causal daily account state
-The system SHALL derive each daily bot point from the latest epoch-scoped `EPOCH_START`, `BOOTSTRAP`, `FILL`, or `DAILY` account snapshot captured no later than that day's end. It SHALL use cash and BTC quantity from that snapshot and the day's close; it SHALL NOT use the snapshot's stored mark price or total equity as the daily market value. Account, candle, gap, and existing population-integrity reads SHALL be frozen in one read-only repeatable-read transaction bounded to the 90-day window and existing query limits.
+The system SHALL derive each daily bot point from the latest epoch-scoped `EPOCH_START`, `BOOTSTRAP`, `FILL`, or `DAILY` account snapshot captured no later than that day's end. It SHALL use cash and BTC quantity from that snapshot and the day's close; it SHALL NOT use the snapshot's stored mark price or total equity as the daily market value. Account, gap, and existing population-integrity database reads SHALL be frozen in one read-only repeatable-read transaction bounded to the 90-day window and existing query limits. Daily candles SHALL be fetched once from the existing market-data source per request and fixed as one immutable calculation input without adding candle persistence.
 
 #### Scenario: No fill occurs on a day
 - **WHEN** an earlier valid epoch snapshot exists and no later fill changes the account before day end
