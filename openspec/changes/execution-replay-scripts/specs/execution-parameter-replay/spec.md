@@ -1,157 +1,171 @@
 ## ADDED Requirements
 
-### Requirement: Read-only replay boundary
+### Requirement: Read-only and external-call-free boundary
 
-replay の実行経路は記録済みデータの読み取りだけを行う。system SHALL NOT ledger、`positions`、`orders`、`executions`、`paper_account`、`runtime_config_*` を含むいかなる table へ書き込む。system SHALL NOT production API の状態変更 endpoint を呼ぶ。system SHALL NOT runtime config を変更する。replay の出力は標準出力および明示的に指定された出力 file に限る。
+replay の実行経路は記録済みデータの読み取りだけを行う。system SHALL NOT ledger、`positions`、`orders`、`executions`、`paper_account`、`command_event_log`、`runtime_config_*` を含むいかなる table へ書き込む。system SHALL NOT production API の状態変更 endpoint を呼ぶ。system SHALL NOT runtime config を変更する。
+
+system SHALL NOT 外部取引所 API を呼ぶ。取引所 API client は request audit を通じて `command_event_log` へ書きうるため、replay はこれを依存に含めない。
 
 #### Scenario: Replay attempts no write
 
-- **WHEN** どちらかの replay スクリプトが完走する
-- **THEN** DB への write 文が 1 件も発行されず、ledger の状態は実行前後で同一である
+- **WHEN** replay スクリプトが完走する
+- **THEN** DB への write 文が 1 件も発行されず、対象テーブルの内容は実行前後で同一である
 
 #### Scenario: Read-only role is sufficient
 
 - **WHEN** read-only 権限の DB role で replay を実行する
 - **THEN** 権限エラーなく完走する
 
-### Requirement: Fidelity is declared by the output itself
+#### Scenario: No exchange API is contacted
 
-replay 出力は行ごとに fidelity を自己申告する。system SHALL 各出力行に `fidelity` を含め、値は `EXACT` または `APPROXIMATE` とする。`EXACT` は、production が実際に消費した因果的入力だけから再計算したことを意味する。`APPROXIMATE` は、production が消費した入力の一部が保存されておらず再構成を含むことを意味する。
+- **WHEN** replay スクリプトが完走する
+- **THEN** 外部取引所への HTTP request が 1 件も発行されない
 
-`APPROXIMATE` の行は `basis` (再構成の根拠) と `usage` (許される用途) を併記する。system SHALL NOT `APPROXIMATE` の行を「実際にこう約定した」と読める語で表現する。
+### Requirement: Fidelity is declared and narrowly scoped
 
-#### Scenario: TTL variation at the recorded limit price declares EXACT
+replay 出力は行ごとに fidelity を自己申告する。system SHALL 各出力行に `fidelity` を含める。
 
-- **WHEN** 指値を記録済みの値に固定し、記録済みの `queue_ahead_btc` を用いて TTL だけを変えた行を出力する
-- **THEN** その行の `fidelity` は `EXACT` である
+`EXACT` は次の 2 点が記録済み事実と一致することだけを意味する。system SHALL NOT これ以外の意味で `EXACT` を主張する。
 
-#### Scenario: Offset variation declares its unresolved queue
+1. 論理期限が記録済みの値と一致する
+2. 約定を発火させた receipt が記録済み execution の source 情報と一致する
 
-- **WHEN** 記録済みと異なる指値の行を出力する
-- **THEN** その行は `fidelity` が `EXACT` ではなく、queue が未確定である旨と、約定に必要な queue の上限を含む
-
-#### Scenario: Trailing replay declares APPROXIMATE
-
-- **WHEN** trailing exit replay が再取得した 5 分足から ATR を再構成して exit を再計算する
-- **THEN** 各行の `fidelity` は `APPROXIMATE`、`basis` は再取得 candle である旨、`usage` は候補間の相対順位づけに限る旨を含む
-
-#### Scenario: Fidelity levels are not aggregated together
-
-- **WHEN** 出力が集計値を含む
-- **THEN** `EXACT` の行と `APPROXIMATE` の行は別々に集計され、単一の集計値へ混ぜられない
-
-### Requirement: Cohort separation
-
-replay 出力は execution semantics cohort を分離する。system SHALL 各対象へ `CURRENT` / `LEGACY_PRE_WS` / `UNSUPPORTED_EXECUTION_SEMANTICS` のいずれかを付与し、cohort ごとに分離して集計する。system SHALL NOT `LEGACY_PRE_WS` または `UNSUPPORTED_EXECUTION_SEMANTICS` の対象を `CURRENT` の集計へ含める。
-
-`paper_market_event_receipts` は WebSocket execution semantics 導入以降にのみ存在するため、それ以前の対象は replay の因果的入力を持たない。system SHALL そのような対象を `NO_REPLAY_INPUT` として報告し、fill / 失効 / exit を推定しない。
-
-#### Scenario: Legacy trade has no receipt journal
-
-- **WHEN** 対象 order の生存区間に対応する receipt が 1 件も存在しない
-- **THEN** その対象は `LEGACY_PRE_WS` cohort かつ `NO_REPLAY_INPUT` として出力され、fill 有無を推定されない
-
-#### Scenario: Current cohort is reported separately
-
-- **WHEN** 出力が cohort 横断の対象を含む
-- **THEN** `CURRENT` の集計は `LEGACY_PRE_WS` の対象を母数にも分子にも含めない
-
-### Requirement: Unknown periods remain unknown
-
-market data gap と交差する対象を確定した結果へ変換しない。system SHALL 対象の因果的生存区間が `market_data_gaps` の未回復または回復済み区間と交差する場合、その対象の replay 結果を `UNKNOWN` とする。system SHALL `UNKNOWN` の対象を母集団に残し、件数を明示する。system SHALL NOT `UNKNOWN` の対象を fill、失効、exit のいずれかへ確定させる。
-
-gap 判定は既存の `InfrastructureGapProjection` と同じ半開区間の交差規則に従う。
-
-#### Scenario: Order lifetime intersects a market data gap
-
-- **WHEN** resting order の生存区間が `market_data_gaps` の 1 件と交差する
-- **THEN** その order の replay 結果は `UNKNOWN` となり、fill とも失効とも判定されない
-
-#### Scenario: Unknown count is disclosed
-
-- **WHEN** replay が完走する
-- **THEN** 出力は eligible 件数、`UNKNOWN` 件数、`NO_REPLAY_INPUT` 件数をそれぞれ明示する
-
-#### Scenario: Receipt journal has a sequence discontinuity
-
-- **WHEN** 対象区間の receipt に `admission_ordinal` の欠落がある
-- **THEN** その区間を跨ぐ対象は `UNKNOWN` として扱われ、欠落を無視した再計算をしない
-
-### Requirement: TTL and offset counterfactual over the receipt journal
-
-TTL×offset replay は、記録済みの resting LIMIT entry order に対し、指定された TTL と指値 offset の組ごとに約定条件を再計算する。system SHALL 判定入力を `paper_market_event_receipts` の trade event に限り、`admission_ordinal` の昇順で適用する。
-
-system SHALL production と同じ queue consumption 規則を用いる。すなわち約定は、`side` が SELL かつ価格が指値以下である receipt の数量累積和が `queue_ahead_btc` と注文数量の和に達した時点で成立する。
-
-system SHALL order の実効期限を、system TTL による期限と記録済みの LLM time stop のうち早い方とする。system SHALL 記録済みの `expiry_source` が `LLM_TIME_STOP` である order について、system TTL を変えても実効期限が変わらないことを保持する。
-
-system SHALL 記録済みの eligibility 境界より前の receipt で約定を成立させない。
+厳密性を保証できない対象について、system SHALL `EXACT` を主張せず `UNKNOWN` として出力する。
 
 #### Scenario: Recorded parameters reproduce the recorded outcome
 
-- **WHEN** 実約定した既知 order 1 件に対し、記録済みの指値と TTL を与えて replay する
-- **THEN** 約定を成立させた receipt が記録済み execution の `source_sequence` および `source_price_jpy` と一致し、約定価格と手数料が記録済み execution と一致する
+- **WHEN** 実約定した既知 order 1 件に対し、記録済みの TTL を与えて replay する
+- **THEN** 約定を発火させた receipt が記録済み execution の source session、source sequence、source price と一致し、約定価格と手数料が記録済み execution と一致する
 
-#### Scenario: TTL is varied at the recorded limit price
+#### Scenario: Recorded expiry is reproduced
 
-- **WHEN** 指値を記録済みの値に固定して TTL だけを変える
-- **THEN** 記録済みの `queue_ahead_btc` を用いて約定 / 失効が確定し、その行は `fidelity` が `EXACT` である
+- **WHEN** 失効した既知 order 1 件に対し、記録済みの TTL を与えて replay する
+- **THEN** 算出された論理期限が記録済みの論理期限と一致する
 
-#### Scenario: Recorded expiry came from the LLM time stop
+### Requirement: Targets whose exactness cannot be guaranteed become unknown
 
-- **WHEN** `expiry_source` が `LLM_TIME_STOP` の order に、より長い system TTL を与える
-- **THEN** 実効期限は LLM time stop のまま変わらない
+厳密性が崩れる対象を確定した結果へ変換しない。system SHALL 次の対象を `UNKNOWN` とし、理由を区別して出力する。system SHALL NOT これらの対象を約定とも失効とも判定する。
 
-### Requirement: Offset counterfactual reports observable volume, not a binary fill
+- **処理時刻の曖昧性**: 失効判定に使われる処理時刻は保存されない。候補期限の直前 1 poll 間隔以内に約定条件を満たす receipt が存在する対象は、production が失効と約定のどちらを先に観測したか決定できない。
+- **同価格 order の queue 結合**: 発注時点の queue は同一指値の自 open order 数量を含む。対象の生存区間と重なる同一指値の別 order が存在する場合、候補 TTL の適用でその重なりが変化しうるため、記録済み queue を流用できない。
+- **LLM time stop の未解決**: 実効期限は候補 TTL による期限と LLM time stop の早い方である。time stop を解決できない対象は期限を確定できない。
 
-指値を記録済みの値から変えた場合、その価格レベルの queue は保存されていないため確定できない。system SHALL この場合に fill / no-fill の二値判定を出力してはならない。
+#### Scenario: A fill lands inside the expiry ambiguity window
 
-system SHALL 代わりに、TTL 窓内に観測された `side` が SELL かつ価格が当該指値以下である receipt の数量累積和を出力する。system SHALL その累積和から注文数量を引いた値を、約定に必要な queue の上限として出力する。
+- **WHEN** 候補期限の直前 1 poll 間隔以内に約定条件を満たす receipt が存在する
+- **THEN** その対象は処理時刻の曖昧性を理由に `UNKNOWN` となり、約定とも失効とも判定されない
 
-この上限が負である場合、queue が非負であることから約定は成立しえない。system SHALL この場合に限り約定しないことを確定してよい。上限が 0 以上である場合、system SHALL 約定したとも約定しなかったとも表現せず、上限値を条件として提示する。
+#### Scenario: A same-price sibling order overlaps the target
 
-#### Scenario: Volume cannot cover the order size
+- **WHEN** 対象の生存区間と重なる同一指値の別 order が存在する
+- **THEN** その対象は queue 結合を理由に `UNKNOWN` となる
 
-- **WHEN** ある offset の TTL 窓内で観測された該当数量の累積和が注文数量に満たない
-- **THEN** その組は約定しないと確定され、queue の値に依存しない旨が示される
+#### Scenario: Expiry is outside the ambiguity window
 
-#### Scenario: Volume could cover the order under some queue
+- **WHEN** 候補期限の前後 1 poll 間隔以内に約定条件を満たす receipt が存在せず、同価格の重なりも無い
+- **THEN** その対象は `EXACT` として約定または失効が確定する
 
-- **WHEN** 累積和が注文数量を上回る
-- **THEN** 出力は約定に必要な queue の上限を示し、約定したとは表現しない
+### Requirement: Effective expiry combines the candidate TTL and the recorded time stop
 
-#### Scenario: Counterfactual offsets are not marked EXACT
+system SHALL 実効期限を、候補 TTL による期限と記録済みの LLM time stop のうち早い方とする。system SHALL time stop を保存済みの実値から解決する。記録済みの期限区分値のみに依拠して time stop の存在を判断してはならない。
 
-- **WHEN** 記録済みと異なる指値の行が出力される
-- **THEN** その行の `fidelity` は `EXACT` ではない
+#### Scenario: Candidate TTL exceeds the recorded time stop
 
-#### Scenario: Multiple pairs are evaluated over one journal read
+- **WHEN** 候補 TTL による期限が記録済みの LLM time stop より遅い
+- **THEN** 実効期限は LLM time stop となり、候補 TTL まで延長されない
 
-- **WHEN** 複数の TTL×offset の組が指定される
-- **THEN** 各組の結果が組ごとに分離して出力される
+#### Scenario: Time stop cannot be resolved
 
-### Requirement: Trailing exit counterfactual with declared reconstruction
+- **WHEN** 対象の time stop を解決できない
+- **THEN** その対象は `UNKNOWN` となり、候補 TTL をそのまま実効期限としない
 
-trailing exit replay は、記録済みの closed trade に対し、trailing の起動条件と ATR 係数の組ごとに exit を再計算する。起動条件は即時、0.5R 到達後、1R 到達後を扱う。system SHALL trailing stop を production と同じ `highestPriceSinceEntry − ATR × 係数` の式および同じ単調 tighten 規則で算出する。
+### Requirement: Fill follows the production queue consumption rule
 
-ATR14 系列および REST tick の価格経路は保存されていないため、system SHALL 価格経路を receipt journal から導出し、ATR を再取得した 5 分足から再構成する。system SHALL この再構成を `APPROXIMATE` として申告し、production が観測した ATR と一致する保証がない旨を出力に含める。
+system SHALL production と同じ queue consumption 規則を用いる。約定は、`side` が SELL かつ価格が指値以下である receipt の数量累積和が、記録済みの発注時 queue と注文数量の和に達した時点で成立する。
 
-#### Scenario: Candidates are ranked, not asserted
+system SHALL 記録済みの eligibility 境界より前の receipt で約定を成立させない。
 
-- **WHEN** 複数の起動条件と係数の組が指定される
-- **THEN** 出力は組ごとの相対順位と壊滅的 tail の有無を示し、各行は `APPROXIMATE` を申告する
+system SHALL 指値を記録済みの値に固定する。指値を変えた反実仮想を出力してはならない。
 
-#### Scenario: Current parameters preserve ordering against the recorded trade
+#### Scenario: Cumulative volume reaches the queue threshold
 
-- **WHEN** 既知の closed trade 1 件に対し現行の起動条件と係数を与えて replay する
-- **THEN** 再計算された exit は記録済み exit と同じ方向であり、他候補との相対順位が保たれる
+- **WHEN** 該当 receipt の数量累積和が発注時 queue と注文数量の和に達する
+- **THEN** その時点の receipt で約定が成立する
 
-#### Scenario: Catastrophic tail is surfaced
+#### Scenario: Receipts before the eligibility boundary are ignored
 
-- **WHEN** ある候補で最大逆行幅が閾値を超える trade が存在する
-- **THEN** その候補の出力にその件数が明示される
+- **WHEN** eligibility 境界より前の receipt が約定条件を満たす
+- **THEN** その receipt では約定が成立しない
 
-#### Scenario: Candle refetch fails
+### Requirement: Cohort is derived from lineage, independent of replay input availability
 
-- **WHEN** ATR 再構成に必要な 5 分足を取得できない
-- **THEN** 対象は `UNKNOWN` となり、欠損を無視した ATR 代替値で exit を確定させない
+system SHALL cohort を `orders` / `executions` / `positions` の lineage から既存の導出規則で決める。system SHALL NOT receipt の有無を cohort の判定に使う。
+
+system SHALL 生存区間に receipt を持たない対象へ、cohort とは独立に入力欠如の状態を付与し、約定有無を推定しない。
+
+system SHALL cohort ごとに分離して集計する。system SHALL NOT 現行以外の cohort の対象を現行 cohort の集計へ含める。
+
+#### Scenario: A current-cohort order has no receipts
+
+- **WHEN** 現行 lineage を持つ order の生存区間に receipt が 1 件も存在しない
+- **THEN** cohort は現行のまま、入力欠如として出力され、約定有無を推定されない
+
+#### Scenario: Legacy cohort is reported separately
+
+- **WHEN** 出力が cohort 横断の対象を含む
+- **THEN** 現行 cohort の集計は他 cohort の対象を母数にも分子にも含めない
+
+### Requirement: Gap and receipt discontinuity remain unknown
+
+system SHALL 対象の生存区間が market data gap または infrastructure gap と交差する場合、その対象を `UNKNOWN` とする。system SHALL 両 gap を別系統として投影する。
+
+receipt の欠落判定に、system SHALL 接続 session 内の source sequence の連続性を用いる。system SHALL NOT 全順序 ordinal の欠番を欠落と解釈する。ordinal は永続 sequence 由来であり、正当な欠番を含むためである。
+
+#### Scenario: Target intersects a market data gap
+
+- **WHEN** 対象の生存区間が market data gap と交差する
+- **THEN** その対象は `UNKNOWN` となり、約定とも失効とも判定されない
+
+#### Scenario: Ordinal has a legitimate hole
+
+- **WHEN** 全順序 ordinal に欠番があるが、session 内の source sequence は連続している
+- **THEN** その区間は欠落と判定されず、対象は `UNKNOWN` にならない
+
+#### Scenario: Source sequence is discontinuous
+
+- **WHEN** session 内の source sequence に欠落がある
+- **THEN** その区間を跨ぐ対象は `UNKNOWN` となる
+
+### Requirement: Bounded scope and no silent truncation
+
+system SHALL 対象期間の指定を必須とする。system SHALL 対象件数の上限を設ける。上限を超えた場合、system SHALL 結果を打ち切らず run 全体を失敗させる。
+
+gap の投影が件数上限により失敗した場合、system SHALL 部分結果を出力せず run 全体の失敗として扱う。system SHALL run 全体の失敗と対象ごとの `UNKNOWN` を出力上で区別する。
+
+#### Scenario: Target count exceeds the limit
+
+- **WHEN** 指定期間の対象件数が上限を超える
+- **THEN** run は失敗し、一部の対象だけを出力しない
+
+#### Scenario: Gap projection fails
+
+- **WHEN** gap の件数が投影の上限を超えて query が失敗する
+- **THEN** run 全体が失敗し、対象ごとの結果を出力しない
+
+### Requirement: Population counts are disclosed
+
+system SHALL eligible 件数と、`UNKNOWN` の件数を理由ごとに分けて開示する。system SHALL 入力欠如の件数を開示する。
+
+#### Scenario: Replay completes
+
+- **WHEN** replay が完走する
+- **THEN** 出力は eligible 件数、理由別の `UNKNOWN` 件数、入力欠如の件数を明示する
+
+### Requirement: Per-order independence is disclosed
+
+本 replay は各 order を独立に変更した場合の反実仮想であり、候補 TTL を全 order へ一律適用した場合の結果ではない。system SHALL この限定を出力に明記する。
+
+#### Scenario: Output states its interpretation
+
+- **WHEN** replay が完走する
+- **THEN** 出力は各 order を独立に変更した反実仮想である旨を含む

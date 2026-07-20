@@ -1,54 +1,73 @@
 ## Why
 
-C1 (trailing) と C3 (TTL/offset) のパラメータ候補を、本番適用前に記録済みデータで絞り込む手段が無い。候補を実運用で 1 つずつ試すと 1 候補あたり数週間かかり、Epic #180 の期間ベース証拠バーに乗らない。
+Epic #180 の C3 (TTL/offset) の候補を、適用前に記録済みデータで絞り込む手段が無い。候補を実運用で 1 つずつ試すと 1 候補あたり数週間かかる。
 
-decision を固定した執行層だけの replay は LLM 学習データのリークと無縁であり、候補の方向を絞る根拠として使える。paper execution の因果的正本である `paper_market_event_receipts` が既に durable journal として無期限保存されているため、記録済み指値のもとでの TTL 反実仮想は実履歴と厳密一致する形で計算できる。
+decision を固定した執行層だけの replay は LLM 学習データのリークと無縁である。paper execution の因果的正本である `paper_market_event_receipts` が durable journal として保存されているため、**記録済み指値のもとで TTL だけを変えた反実仮想** は、限定条件下で実履歴と厳密一致する形で計算できる。
+
+本 change はこの範囲に限定する。offset 反実仮想と trailing exit replay は、独立反証で「記録済みデータからは目的を達成できない」ことが判明したため、本 change に含めない (「本 change で実施しないこと」参照)。
 
 ## What Changes
 
-- read-only の replay スクリプトを 2 本追加する。どちらも ledger・production API・runtime config へ一切書き込まない。
-  1. **TTL×offset replay**: 記録済みの resting LIMIT entry order に対し、TTL と指値 offset を変えた場合の約定条件を `paper_market_event_receipts` 上で再計算する。
-  2. **trailing exit replay**: 記録済みの closed trade に対し、trailing の起動条件 (即時 / 0.5R / 1R 到達後) と ATR 係数を変えた場合の exit を再計算する。
-- 両スクリプトの出力に **fidelity ラベル** を必須項目として持たせる。記録済み指値での TTL 反実仮想のみ `EXACT`、それ以外は `EXACT` を主張しない。
-- 両スクリプトの出力で cohort (`CURRENT` / `LEGACY_PRE_WS` / `UNSUPPORTED_EXECUTION_SEMANTICS`) を分離し、gap と交差する対象を `UNKNOWN` として母集団に残す。
+- read-only の TTL 反実仮想 replay スクリプトを 1 本追加する。ledger・production API・runtime config へ一切書き込まない。外部 API を一切呼ばない。
+- 記録済みの resting LIMIT entry order に対し、**指値を記録済みの値に固定したまま** TTL 候補ごとの約定 / 失効を `paper_market_event_receipts` 上で再計算する。
+- 出力は cohort (`CURRENT` / `LEGACY_PRE_WS` / `UNSUPPORTED_EXECUTION_SEMANTICS`) を分離し、gap・sequence 欠落・入力欠如・**厳密性を保証できない対象** をすべて `UNKNOWN` として母集団に残す。
+- `EXACT` の主張範囲を「論理期限の一致」と「約定を発火させた receipt の一致」に限定し、厳密性が崩れる対象は `EXACT` を主張せず `UNKNOWN` に落とす。
 
-### 保存されていない入力に起因する 2 つの明示的な制約
+### `EXACT` の定義と、そこから除外する対象
 
-**1. offset の反実仮想では約定の二値判定を出さない (agent 仮決め)**
+独立反証により、素朴な「TTL 反実仮想は厳密」という主張は次の 3 つの入力で破れることが判明した。本 change はこれらを `UNKNOWN` として除外することで、残る対象についてのみ `EXACT` を主張する。
 
-本番の約定規則は価格クロスではなく queue consumption であり (`ExposedPaperLedgerWriter.kt:1155`)、発注時点の板から算出した `queue_ahead_btc` に依存する。板そのものは保存されないため、記録済みと異なる指値における queue は原理的に不明である。
+1. **処理時刻の非保存** — production の TTL 失効判定は writer の処理時刻 (`clock.instant()`) で行われるが、この時刻は保存されない (`ExposedPaperLedgerWriter.kt:806`)。receipt の `socket_observed_at` が候補期限の直近にある対象は、production が失効を先に見たか約定を先に見たかを決定できない。
+2. **同価格 order 間の queue 相互作用** — TTL を変えると、同一指値の別 order の生存期間が変わり、後続 order の `queue_ahead_btc` が変わる (`PaperBroker.kt:490`)。記録済み queue を流用できない。
+3. **LLM time stop の非考慮** — 実効期限は system TTL と LLM の time stop の早い方である (`PaperBroker.kt:795`)。`orders` には確定後の値しか残らないため、`trade_plans.time_stop_at` を join しなければ TTL を延ばす候補で誤って延長する。
 
-そこで offset の反実仮想では、receipt から厳密に計算できる量 (TTL 窓内に観測された該当 SELL 数量の累積和) と、約定に必要な queue の上限だけを出力し、fill / no-fill の二値判定を出さない。上限が負の場合に限り、queue の値に依存せず約定しないことを確定する。
-
-**2. trailing replay は近似であることを明示する (ユーザー確認済み)**
-
-trailing stop の入力である ATR14 系列は mark 時点に取引所 API から取得され永続化されない (`PaperBroker.kt:1334`)。REST tick の発火時刻を保存する table も存在しない。したがって trailing exit の実履歴との厳密一致は不可能である。
-
-本 change では trailing replay を `APPROXIMATE` と明示したうえで実施し、その出力は **候補間の相対順位づけと壊滅的 tail の有無の確認にのみ** 使う。「実際にこう約定した」という主張には使わない。この制約は出力自身が `fidelity` / `basis` / `usage` フィールドで自己申告する。
+3 は join で解決する。1 と 2 は解決できないため、該当する対象を `UNKNOWN` として除外する。
 
 ## Capabilities
 
 ### New Capabilities
-- `execution-parameter-replay`: 記録済み execution データに対して TTL / offset / trailing のパラメータを変えた反実仮想を再計算し、fidelity・cohort・unknown を明示して出力する read-only 分析の契約
+- `execution-parameter-replay`: 記録済み execution データに対して TTL を変えた反実仮想を再計算し、fidelity・cohort・unknown を明示して出力する read-only 分析の契約
 
 ### Modified Capabilities
 
-なし。既存 spec の要件は変更しない。read-only の分析経路のみを追加する。
+なし。既存 spec の要件は変更しない。
 
 ## Impact
 
-- **新規コード**: `:trading` module に replay の算出ロジックと 2 本のエントリポイントを追加する。`scripts/` に実行 wrapper を置く。
-- **読み取り対象テーブル**: `paper_market_event_receipts`、`market_data_gaps`、`infrastructure_gap_events`、`market_data_sessions`、`orders`、`executions`、`positions`、`paper_account_epochs`。
-- **再利用する既存実装**: `EVALUATION_GAP_INTERVAL_CTE_V1` (gap 区間投影)、`EvaluationCohort` と既存 cohort 導出規則、`DefaultPaperExecutionSimulator.simulatePendingLimit` (約定価格と手数料)、`SafetyFloorDefaults.trailingAtrMultiplier` (現行係数の基準値)。
-- **外部依存**: trailing replay のみ ATR 再構成のため GMO の 5 分足を再取得する。TTL×offset replay は外部 API に依存しない。
+- **新規コード**: `:trading` module に replay の算出ロジックと 1 本のエントリポイントを追加する。`scripts/` に実行 wrapper を置く。
+- **読み取り対象テーブル**: `paper_market_event_receipts`、`market_data_gaps`、`infrastructure_gap_events`、`market_data_sessions`、`orders`、`trade_plans`、`executions`、`positions`。
+- **再利用する既存実装**: `EvaluationCohort` と既存 cohort 導出規則、`DefaultPaperExecutionSimulator.simulatePendingLimit` (約定価格と手数料)。
+- **外部依存**: なし。本 change は外部 API を呼ばない。
 - **書き込み**: なし。DB 接続は read-only role を前提とする。
-- **ドキュメント影響**: あり (`docs/design.md` の実験手順節に replay スクリプトの位置づけと fidelity の読み方を追記)。
+- **ドキュメント影響**: あり (`docs/design.md` の実験手順節に replay スクリプトの位置づけ、`EXACT` の定義、除外条件を追記)。
 
-## やらないこと
+## 本 change で実施しないこと
 
-- 汎用 replay framework、versioned assumption manifest 体系、L2 replay (prompt / provider 再実行)
+### offset 反実仮想 (人間判断待ち)
+
+本番の約定規則は queue consumption であり (`ExposedPaperLedgerWriter.kt:1155`)、発注時点の板から算出した `queue_ahead_btc` に依存する。板は保存されない。
+
+当初案は「約定に必要な queue の上限 (`queueHeadroom`) を出力して候補を順位づける」ものだったが、独立反証により **queue は価格レベルごとに独立であるため headroom の大小が約定可能性の順位を与えない** ことが判明した。`queueHeadroom` が大きい候補が実際には no-fill で、小さい候補が fill になりうる。すべての候補で headroom が非負なら確定除外は 0 件となり、絞り込みが成立しない。
+
+加えて、offset を広げて BUY limit が ask 以上へ移動する候補は、production では resting queue に入らず発注時点で即時 taker 約定する (`PaperBroker.kt:389`)。これは receipt 上の queue 条件とは別の経路であり、同じ枠組みで扱えない。
+
+したがって offset 反実仮想は記録済みデータからは達成できない。板 depth の永続化を伴う別 change とするか、C3 の絞り込み手段自体を変えるかは、オーナーの判断を要する。
+
+### trailing exit replay (人間判断待ち)
+
+trailing の近似実施はオーナー承認済みだったが、その承認は「replay の ratchet が production より密であるため、偏りは tighten 側へ一様にかかる」という前提の上にあった。独立反証により **この前提が誤り** であることが判明した。
+
+production は REST ticker からも `highestPriceSinceEntry` を更新する (`ExposedPaperLedgerWriter.kt:414`)。REST ticker が WS receipt に存在しない高値を観測した場合、receipt のみから復元した価格経路は高値を取りこぼし、trailing stop は production より**緩く**なる。偏りの向きが一定でないため、候補間の相対順位の保存が保証できない。
+
+さらに、既存の `MarketDataSource.getCandles` は「現在から直近 N 本」を返し、過去時点を指定できない (`GmoPublicMarketDataSource.kt:552`)。過去の trade に対する ATR 再構成には historical reader の新規実装が要る。取得が成功してしまうため `UNKNOWN` にも落ちず、無関係な ATR で exit を確定する危険がある。
+
+偏りの向きが保証できない以上、当初の承認条件は満たされない。実施可否はオーナーの再判断を要する。
+
+### その他
+
+- 汎用 replay framework、versioned assumption manifest 体系、L2 replay
+- 板 depth / ATR14 / tick snapshot の永続化
 - replay 結果だけを根拠にした本番適用 (方向の絞り込みまで。採否は 2〜4 週の実適用観察で判断)
-- 板 depth の永続化 (offset 反実仮想を `EXACT` にするには必要だが、production 書き込みの追加になるため scope 外)
-- ATR14 / tick snapshot の永続化 (trailing を `EXACT` にするには必要だが、同じ理由で scope 外)
-- MARKET / STOP entry の replay (板依存のため厳密再現できない)
-- LLM decision の再実行や、過去 klines を用いた戦略バックテスト
+- MARKET / crossing LIMIT entry の replay (発注時点の板に依存するため厳密再現できない)
+- STOP entry の replay (receipt の価格比較で判定でき技術的には可能だが、C3 の絞り込みに不要)
+- LLM decision の再実行、過去 klines を用いた戦略バックテスト
