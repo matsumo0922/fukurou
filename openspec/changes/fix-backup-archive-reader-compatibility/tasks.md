@@ -13,10 +13,10 @@
 
 - [x] 3.1 Extend shell selftests for captured-ID routing, A→B→A name replacement, early parser completion with EOF drain, reader failure, and producer failure before retention or success evidence.
 - [x] 3.2 Extend the Docker-backed production entrypoint integration so a deliberately failing host `pg_restore` cannot affect real PostgreSQL 16 backup, retention, and restore coverage.
-- [ ] 3.3 Run the backup, restore, installer, publisher, systemd, monitoring, and OpenSpec focused validation inventory and record the tested HEAD.
+- [x] 3.3 Run the backup, restore, installer, publisher, systemd, monitoring, and OpenSpec focused validation inventory and record the tested HEAD.
 
 ## 4. Documentation and final validation
 
 - [x] 4.1 Update `docs/deploy.md` and affected current-state documentation to describe the container-owned PostgreSQL 16 archive reader and actual NAS prerequisites.
 - [x] 4.2 Grep README/docs/KDoc for stale `pg_restore`, backup, restore, and rollout statements and synchronize the delta spec.
-- [ ] 4.3 Run final OpenSpec validation, full repository test/detekt/build, diff/secret checks, and clean-context review on one final HEAD.
+- [x] 4.3 Run final OpenSpec validation, full repository test/detekt/build, diff/secret checks, and clean-context review on one final HEAD.
