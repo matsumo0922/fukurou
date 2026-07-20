@@ -1380,12 +1380,12 @@ internal const val SAFETY_SCALE = 8
 /**
  * ピラミッディングの最大追加回数。
  */
-private const val MAX_PYRAMID_ADD_COUNT = 2
+internal const val MAX_PYRAMID_ADD_COUNT = 2
 
 /**
  * 追加 risk の初回 risk budget に対する上限比率。
  */
-private val PYRAMID_ADD_RISK_RATIO = BigDecimal("0.50")
+internal val PYRAMID_ADD_RISK_RATIO = BigDecimal("0.50")
 
 /**
  * bps 分母。

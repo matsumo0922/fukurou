@@ -8,6 +8,15 @@ import java.math.BigDecimal
 object SafetyFloorDefaults {
 
     /**
+     * 安全床の閾値世代。
+     *
+     * margin 観測レコードに記録し、閾値変更の前後で母集団を切り分けるために使う。
+     * 本 object の閾値定数を変更したときは、同じ変更で必ずこの値を更新する。
+     * 定数の追加やリネームだけでは更新しない（閾値が変わっていないのに母集団が切れるため）。
+     */
+    const val policyVersion: String = "sfp_v1"
+
+    /**
      * HARD_HALT を立てる drawdown。
      */
     val maxDrawdownRatio: BigDecimal = BigDecimal("-0.15")
