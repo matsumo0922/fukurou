@@ -6,12 +6,12 @@ Issue #197 の現行 benchmark は bot を realized PnL のみ、buy & hold を 
 
 ## What Changes
 
-- （ユーザー確認済み）current account epoch の直近 90 JST 日について、window 開始時の bot 清算 equity を共通元本として bot、fee 込み buy & hold、cash を比較する。
+- （ユーザー確認済み）current account epoch の直近 90 completed GMO business days（06:00 JST 境界）について、window 開始時の bot 清算 equity を共通元本として bot、fee 込み buy & hold、cash を比較する。
 - （ユーザー確認済み）valid day が 81/90 日未満、または開始日・終了日が valid でなければ、勝敗を `INCONCLUSIVE` にする。
 - 既存 `GET /evaluation/benchmark` と既存 Evaluation 画面を owner-score semantics に更新する。新しい endpoint や dashboard は作らない。
 - bot は epoch-scoped `equity_snapshots` の cash / BTC 数量を日足 close で mark-to-market する。buy & hold は window 開始時に全額購入したと仮定する。（ユーザー確認済み）この起点差によるbot有利のfee biasは既知前提として表示する。
 - `OWNER_SCORE_V1` の synthetic taker fee をコード定数 `0.0005` とし、entry / hypothetical exit に適用して response に表示する。fee を変える場合は semantics version を上げる。
-- 既存の日足、account snapshot、`market_data_gaps` を使って valid / gap / unknown 日数を表示する。（ユーザー確認済み）1 JST 日の累積 gap が1時間以上ならunknownとし、短いgapは件数・秒数だけを表示する。欠損を補間したり、過去の paper state を作り直したりしない。
+- 既存の日足、account snapshot、`market_data_gaps` を使って valid / gap / unknown 日数を表示する。（ユーザー確認済み）1 GMO business day の累積 gap が1時間以上ならunknownとし、短いgapは件数・秒数だけを表示する。欠損を補間したり、過去の paper state を作り直したりしない。
 - cutoff 省略時は rolling、指定時は同じ 90 日計算を固定 cutoff として返す。
 
 ## Capabilities

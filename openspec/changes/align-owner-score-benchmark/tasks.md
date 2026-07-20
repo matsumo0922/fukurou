@@ -3,13 +3,13 @@
 - [ ] 1.1 In a sibling worktree, read current production epoch age, first epoch-attributed snapshot date, and 90-day gap durations without mutation; record whether V1 initially returns `INCONCLUSIVE`
 - [ ] 1.2 Update benchmark models for nullable daily liquidation points, coverage, cutoff mode, semantics version, owner score, and winner
 - [ ] 1.3 Add owner-score math with active-epoch snapshot mark-to-market, fixed `0.0005` synthetic fee, window-start B&H, and cash comparison without changing legacy `EvaluationMath.benchmark`
-- [ ] 1.4 Add focused tests for open-position loss, B&H entry/exit fee, carry-forward/JST date mapping, and the 81/90 plus valid-boundary gate
+- [ ] 1.4 Add focused tests for open-position loss, constant-price B&H entry/exit fee with common-`S` returns, missing expected candle slots, carry-forward/06:00 JST boundary, 00:30 JST cutoff, and the 81/90 plus valid-boundary gate
 
 ## 2. Existing evidence reads
 
 - [ ] 2.1 Add `accountEpochId` and `EPOCH_START` support to the snapshot reader model
 - [ ] 2.2 Add bounded reads for the active epoch's snapshots and persisted market-data gaps over the 90-day window; do not reuse unbounded `findAll()`
-- [ ] 2.3 Sum persisted gaps by JST day, mark days with at least one hour unknown, and test both short and material gaps
+- [ ] 2.3 Sum persisted gaps by 06:00 JST GMO business day, mark days with at least one hour unknown, and test both short and material gaps
 
 ## 3. Existing API and UI
 
