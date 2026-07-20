@@ -1,0 +1,39 @@
+## 1. Design and falsification gate
+
+- [x] 1.1 Validate the OpenSpec proposal, delta spec, design, and finite two-arm scope.
+- [x] 1.2 Run clean-context five-vector falsification over production facts, invariants, downstream failure state, safety direction, load/upgrade path, scope, and high-risk assumptions.
+- [x] 1.3 Reconcile every blocking finding into the artifacts and obtain an independent Claude falsifier's confirmation that unresolved blocking findings are zero before any production mutation.
+
+## 2. Read-only production rehearsal
+
+### 2A. Temporary minimal seam
+
+- [ ] 2.1 Add an application-owned active-session registry and session-local compare-and-disconnect operation that aborts the exact live socket, then delivers one typed failure through the existing listener terminal-claim boundary; never expose REST clients and explicitly exclude peer/kernel callback dispatch from the guarantee.
+- [ ] 2.2 Create an application-scoped holder in `Application.module`, pass it to the earlier routing composition and later worker startup, publish the worker-composed stream disconnect interface through it without a process-global mutable singleton; add the temporary `/ops/issue-192/ws-disconnect` route behind a default-false deployment flag, hide it from generated OpenAPI, bind Issue #192 purpose/session/injection/owner reason, rely on existing Cloudflare Access at the external boundary, and avoid a dedicated token, capability file, Dockerfile change, OpenAPI operation, or WebUI action.
+- [ ] 2.3 Use only a controller-local mutex, not the global trading lock; implement the two fixed audit UUIDs as bounded primary-key lookups, fail closed on lookup timeout/unavailability/type/payload conflict, decide all no-mutation rejections before inserting requested, and preserve the global one-shot gate across response loss, duplicate/new IDs, CAS/abort failures, and the arm-2 restart while retaining historical audit decoding.
+- [ ] 2.4 Add exact-session, stale-session, abort-plus-immediate-terminal, abort failure, fixed-message `DISCONNECTED` classification, buffered-trade-before-terminal, duplicate/concurrent/new-ID-after-restart request, requested-without-executed permanent burn, fixed-PK lookup latency/failure/no-table-scan, fixed audit identities passing `ManifestPersistencePolicy.validateCommandEvent`, audit crash windows, response-loss retry, no-global-lock, REST non-interference, reconnect/single-gap, route-hidden, and route-disabled proving tests.
+- [ ] 2.5 Add the single temporary default-false compose flag, simple deploy add/remove procedure, and current-state docs; verify false leaves the route absent and the signed bundle contains the reviewed compose change without changing the deploy capability catalog.
+
+### 2B. Read-only production rehearsal
+
+- [ ] 2.6 Create `implementation-evidence.md` with fields and bounded read-only queries for revision/image/container, route enabled state, injection/session identity, active epoch/config/account baseline, timer window, session/receipt ordinal, target entities, active work, gap, exclusion, execution lineage, and explicit `CURRENT` evaluation scope.
+- [ ] 2.7 At flat state or after separate deploy-specific owner approval, set the NAS `.env` flag, deploy the reviewed verification revision through the signed quality/deploy gate, avoid other deploys for at most 72 hours, then rehearse both preflight inventories, route state, two fixed audit-PK absence/latency and fail-closed behavior, typed no-mutation conflicts, bounded cleanup, and reviewed recovery commands without disconnecting a session, restarting a process, changing runtime config, or writing ledger rows.
+- [ ] 2.8 Confirm the deployed revision contains the current WebSocket receipt, gap recovery, epoch/cohort, atomic risk-exit, and temporary seam contracts; record targeted proving tests and stop if production topology or schema differs from the design.
+
+## 3. Resting-entry WebSocket disconnect arm
+
+- [ ] 3.1 Wait for ordinary soak to provide at least one open resting BUY entry and zero open positions, capture the final immutable preflight, verify baseline/timer/active-work gates, present the exact inventory and irreversible exclusion impact, and obtain the owner's explicit go decision for this arm.
+- [ ] 3.2 Create one injection ID, send one owner-approved request naming the exact active session through the temporary route, require the durable executed audit or typed no-mutation result, and bounded-poll the original session's gap and applied impact within the active-runtime-derived bound without retrying the mutation.
+- [ ] 3.3 Capture the executed audit joined by expected session to exactly one `DISCONNECTED` target gap without requiring the gap detail exception class, the authoritative impact-time affected inventory and preflight delta, the new connected session, post-recovery durable receipt, gap recovery time, zero unresolved gaps, readiness/public connectivity, target `MARKET_DATA_GAP` cancellation, zero target executions, exact exclusion reasons, and arm verdict; any other reason or gap is `INVALID`/`UNKNOWN` and not reinjected.
+
+## 4. Open-position process-restart arm
+
+- [ ] 4.1 After the first arm passes, wait for ordinary soak to provide at least one open position and zero open/pending resting BUY entries, capture the final immutable preflight, verify baseline/timer/active-work gates, present the exact inventory and irreversible exclusion impact, and obtain the owner's explicit go decision for this arm.
+- [ ] 4.2 Restart the same Ktor container/image exactly once without deploy, config activation, or PostgreSQL restart, then capture exactly one target gap in the arm window, container generation, prior-session `PROCESS_RESTART` gap/impact, the authoritative impact-time affected inventory and preflight delta, exact exclusion reasons, new session, first durable receipt, recovery time, zero unresolved gaps, readiness, and public connectivity.
+- [ ] 4.3 If the target position changes state, prove every post-restart execution against the new session's exact durable receipt; otherwise record that the close/fill path was not observed without treating absence as positive evidence.
+
+## 5. Evidence verdict and closeout
+
+- [ ] 5.1 For both evidence windows, close the finite lineage join, affected-entity exclusion inventory, explicit active-epoch `CURRENT` KPI anti-join, hard-fail count, unknown count, and restoration checks.
+- [ ] 5.2 For every post-mutation verdict, require a connected session, post-recovery durable receipt, zero unresolved gaps, readiness, and public connectivity; use the existing reviewed recovery path if needed, stop without automatic reinjection on `HARD_FAIL`, `INVALID`, or `UNKNOWN`, and preserve all facts for human direction.
+- [ ] 5.3 When both arms pass, finalize `implementation-evidence.md` including injected-audit-to-gap joins, post-preflight receipts that were not dispatched, buffered pre-terminal events, and unverified peer/kernel callback scope; obtain deploy-specific owner approval after presenting the cleanup deploy's added exclusion inventory, unless flat state is proven, then remove the temporary controller/route/compose flag while retaining the exact audit enum values used by existing `CommandEventType.valueOf` reads and their activity-catalog label/description strings, run tests/OpenSpec/diff/docs checks, deploy and prove the route absent plus normal WebSocket operation, remove the NAS `.env` entry, post the secret-free DoD summary to Issue #192, and explicitly choose `Archive without syncing`.
