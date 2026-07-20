@@ -20,45 +20,22 @@ The system SHALL expose additive `GET /evaluation/owner-score` for the active CU
 - **THEN** the system preserves that endpoint's current wire contract and legacy realized-equity semantics
 
 ### Requirement: Fee-inclusive liquidation-equity comparison
-The system SHALL use the bot liquidation equity at the window start as the common starting capital. Bot daily equity SHALL equal epoch-scoped cash plus BTC quantity multiplied by the daily close, less the synthetic taker fee for liquidating the BTC. Buy and hold SHALL buy BTC with the common starting capital at the window-start close after entry fee and value it after exit fee on each valid day. Cash SHALL remain at the common starting capital. The synthetic fee assumption SHALL be stored in an immutable epoch benchmark policy and exposed as an assumption distinct from actual execution-fee provenance.
+The system SHALL use the bot liquidation equity at the window start as the common starting capital. Bot daily equity SHALL equal epoch-scoped cash plus BTC quantity multiplied by the daily close, less the `OWNER_SCORE_V1` synthetic taker fee for liquidating the BTC. Buy and hold SHALL buy BTC with the common starting capital at the window-start close after the same synthetic entry fee and value it after the same synthetic exit fee on each valid day. Cash SHALL remain at the common starting capital. `OWNER_SCORE_V1` SHALL fix the synthetic taker fee rate at `0.0005` and expose it as an assumption distinct from actual execution-fee provenance.
 
 #### Scenario: Open BTC position loses value
 - **WHEN** the bot holds BTC whose daily close falls below its acquisition value
 - **THEN** bot equity includes the unrealized loss and synthetic exit fee instead of retaining realized-PnL-only equity
 
 #### Scenario: Buy and hold pays both synthetic fees
-- **WHEN** the window boundaries and epoch benchmark policy are available
-- **THEN** buy-and-hold BTC quantity reflects the synthetic entry fee and its daily liquidation equity reflects the synthetic exit fee
+- **WHEN** the window boundaries are available
+- **THEN** buy-and-hold BTC quantity reflects the fixed synthetic entry fee and its daily liquidation equity reflects the fixed synthetic exit fee
 
 #### Scenario: Actual realized fees differ from the assumption
 - **WHEN** paper cash already contains actual fees sourced from exchange rules or a fallback rule
-- **THEN** the system preserves that cash unchanged and labels the benchmark rate only as the synthetic entry/exit fee assumption
-
-#### Scenario: Fee assumption cannot be proven
-- **WHEN** no immutable `OWNER_SCORE_V1` fee policy exists for the epoch
-- **THEN** the system returns `INCONCLUSIVE` with `FEE_POLICY_UNAVAILABLE` and does not substitute the current config or a network value
-
-### Requirement: Immutable epoch benchmark policy
-The system SHALL persist one append-only benchmark policy per account epoch and semantics version. Future epoch activation SHALL insert the policy in the same transaction as the epoch and `EPOCH_START` snapshot. Provisioning MAY insert a policy for the existing active epoch only when its retained runtime-config snapshot hash is exactly verified; it SHALL NOT rewrite epoch or account history when verification fails.
-
-#### Scenario: New account epoch is activated
-- **WHEN** runtime config activation creates an account epoch
-- **THEN** the same transaction inserts its `OWNER_SCORE_V1` synthetic taker fee assumption and source config hash before activation succeeds
-
-#### Scenario: Fee config changes without an epoch switch
-- **WHEN** runtime config activation changes the fallback taker fee but leaves `paper.initialCashJpy` and the active account epoch unchanged
-- **THEN** the existing epoch policy remains unchanged and the response may intentionally differ from the current config because the assumption is fixed per epoch
-
-#### Scenario: Runtime config versions are pruned
-- **WHEN** a runtime-config version used to create an epoch is later removed by retention
-- **THEN** the epoch benchmark policy remains available and the fixed-cutoff calculation does not change
-
-#### Scenario: Existing epoch cannot be bootstrapped safely
-- **WHEN** provisioning cannot match the active epoch hash to exactly one retained config snapshot
-- **THEN** it leaves the policy absent and the API reports `FEE_POLICY_UNAVAILABLE` until an operator activates a new auditable epoch
+- **THEN** the system preserves that cash unchanged and labels `0.0005` only as the `OWNER_SCORE_V1` synthetic entry/exit assumption
 
 ### Requirement: Causal daily account state
-The system SHALL derive each daily bot point from the latest epoch-scoped `EPOCH_START`, `BOOTSTRAP`, `FILL`, or `DAILY` account snapshot captured no later than that day's end. It SHALL use cash and BTC quantity from that snapshot and the day's close; it SHALL NOT use the snapshot's stored mark price or total equity as the daily market value. Snapshot, gap, fee-policy, population-integrity, and active-epoch reads SHALL be frozen in one repeatable-read transaction with fixed bounds.
+The system SHALL derive each daily bot point from the latest epoch-scoped `EPOCH_START`, `BOOTSTRAP`, `FILL`, or `DAILY` account snapshot captured no later than that day's end. It SHALL use cash and BTC quantity from that snapshot and the day's close; it SHALL NOT use the snapshot's stored mark price or total equity as the daily market value. Account, candle, gap, and existing population-integrity reads SHALL be frozen in one read-only repeatable-read transaction bounded to the 90-day window and existing query limits.
 
 #### Scenario: No fill occurs on a day
 - **WHEN** an earlier valid epoch snapshot exists and no later fill changes the account before day end
@@ -70,69 +47,57 @@ The system SHALL derive each daily bot point from the latest epoch-scoped `EPOCH
 
 #### Scenario: Same timestamp has conflicting states
 - **WHEN** multiple latest snapshots share `captured_at` but have different cash or BTC quantity
-- **THEN** the affected day is `UNKNOWN` with `ACCOUNT_STATE_AMBIGUOUS` rather than selecting a random UUID order
-
-#### Scenario: Epoch changes during request
-- **WHEN** account epoch activation races with an owner-score request
-- **THEN** the request returns a snapshot wholly before or wholly after activation, never mixed inputs from both epochs
+- **THEN** the affected day is `UNKNOWN` with `ACCOUNT_STATE_AMBIGUOUS`
 
 ### Requirement: Strategy-population integrity
-The system SHALL evaluate all positions and executions whose exposure or account mutation intersects the owner-score window. If any such lineage is legacy, unsupported, attribution-missing, cross-epoch, or covered by an evaluation exclusion, the system SHALL expose integrity counts and return `INCONCLUSIVE` rather than including the affected cash or BTC movement in a current strategy KPI.
+The system SHALL evaluate only the active CURRENT account epoch and SHALL reuse existing execution-semantics, cohort, attribution, and evaluation-exclusion evidence for the owner-score window. If that evidence reports legacy, unsupported, attribution-missing, cross-epoch, or excluded population, the system SHALL expose reason counts and return `INCONCLUSIVE` rather than publishing a current strategy winner. The system SHALL NOT infer conclusive lineage where existing durable evidence is insufficient.
 
-#### Scenario: Mixed execution semantics affect cash
-- **WHEN** a legacy or unsupported position changes account cash within the window
-- **THEN** the system returns `INCONCLUSIVE` with the relevant integrity reason instead of publishing a winner
+#### Scenario: Existing evidence reports mixed semantics
+- **WHEN** legacy or unsupported execution semantics are reported for the window
+- **THEN** the system returns `INCONCLUSIVE` with the relevant population reason
 
-#### Scenario: Position spans the window boundary
-- **WHEN** a position opened before the window remains exposed or closes inside the window
-- **THEN** its full entry/execution lineage is included in the integrity check
-
-#### Scenario: Excluded position affects the account
-- **WHEN** an order or position intersecting the window has a persisted evaluation exclusion
-- **THEN** the system retains the real account state as evidence but withholds owner score and winner
+#### Scenario: Excluded population affects the window
+- **WHEN** existing evaluation evidence reports an excluded order, position, or execution in the window
+- **THEN** the system withholds owner score and winner while retaining the account state as evidence
 
 ### Requirement: Truth coverage and crash-aware downtime
-The system SHALL classify each of the 90 expected days as valid or unknown. A day SHALL be unknown when it intersects a persisted market-data gap, a process-restart downtime, an infrastructure gap, lacks a complete daily candle, lacks scoped account state, or depends on an invalid or truncated source. Every open market-data or infrastructure gap with no recovered/close timestamp SHALL use the request's frozen query instant as its exclusive effective end. For a `PROCESS_RESTART` gap, evaluation SHALL conservatively extend its effective start to the stale session's last transport activity (or connection start if absent) and use recovery or the frozen query instant as its end. The system SHALL expose expected, epoch-effective, valid, gap, unknown, and reason counts.
+The system SHALL classify each of the 90 expected days as valid or unknown. A day SHALL be unknown when it intersects a persisted market-data gap, a process-restart downtime, an infrastructure gap, lacks a complete daily candle, lacks scoped account state, or depends on invalid existing population evidence. Every open gap SHALL end at the earlier of the request's frozen query instant and cutoff. For a `PROCESS_RESTART` gap, evaluation SHALL conservatively extend its effective start to the stale session's last transport activity, or connection start if absent. The system SHALL expose expected, valid, gap, unknown, and reason counts without interpolating missing evidence.
 
 #### Scenario: Process is down across several days
 - **WHEN** a stale connected session's last transport activity precedes restart recovery by several JST days
-- **THEN** every intersected day from the last observed activity through recovery is `UNKNOWN` even if the stored gap `started_at` equals restart time
+- **THEN** every intersected day from the last observed activity through recovery is `UNKNOWN`
 
 #### Scenario: Gap remains open at query time
-- **WHEN** a market-data gap has no `recovered_at` or an infrastructure gap has no matching CLOSE event
-- **THEN** the system treats it as a half-open interval ending at the request's frozen query instant and does not classify any intersected completed day as valid
+- **WHEN** a market-data or infrastructure gap has no recovery boundary
+- **THEN** the system ends the interval at the frozen query boundary and does not classify an intersected completed day as valid
 
-#### Scenario: Coverage meets the user-selected threshold
+#### Scenario: Coverage meets the threshold
 - **WHEN** at least 81 expected days are valid, both boundary days are valid, and population integrity is valid
-- **THEN** the system returns bot and buy-and-hold liquidation returns, their difference as owner score, and `BOT`, `BUY_AND_HOLD`, or `TIE`
+- **THEN** the system returns bot and buy-and-hold liquidation returns, owner score, and `BOT`, `BUY_AND_HOLD`, or `TIE`
 
 #### Scenario: Coverage is below threshold
 - **WHEN** fewer than 81 expected days are valid
 - **THEN** the system returns coverage evidence but no owner score, winner, or conclusive returns
 
 #### Scenario: Boundary day is unknown
-- **WHEN** the window-start or window-end day is unknown even though 81 other days are valid
-- **THEN** the system returns `INCONCLUSIVE` because a period return cannot be grounded at both boundaries
+- **WHEN** the window-start or window-end day is unknown even though at least 81 other days are valid
+- **THEN** the system returns `INCONCLUSIVE`
 
 #### Scenario: Account epoch is too young
-- **WHEN** days before epoch creation prevent the 81-day threshold or a valid window-start boundary
-- **THEN** the system returns `INCONCLUSIVE` with `OUTSIDE_ACCOUNT_EPOCH` counts distinct from operational gap counts
-
-#### Scenario: Gap crosses midnight
-- **WHEN** one persisted gap interval intersects multiple JST calendar days
-- **THEN** every intersected day is counted once as a gap day and retains all applicable stable reason codes
+- **WHEN** days before epoch creation prevent a valid window-start boundary or the 81-day threshold
+- **THEN** the system reports `OUTSIDE_ACCOUNT_EPOCH` separately from operational gap counts
 
 ### Requirement: Evaluation UI truthfulness
-The Evaluation screen SHALL obtain the current owner score from `/evaluation/owner-score`, display liquidation returns, winner, synthetic fee assumption, cutoff mode, and coverage, and render unknown points as gaps. Existing immutable report benchmark charts without `OWNER_SCORE_V1` SHALL be labeled as legacy realized-equity comparison and SHALL NOT be used as the owner score.
+The Evaluation screen SHALL obtain the current owner score from `/evaluation/owner-score`, display liquidation returns, winner, fixed synthetic fee assumption, cutoff mode, coverage, and reasons, and render unknown points as gaps. Existing immutable report benchmark charts without `OWNER_SCORE_V1` SHALL be labeled as legacy realized-equity comparison and SHALL NOT be used as the owner score.
 
 #### Scenario: Owner score is available
 - **WHEN** the API returns an available result
-- **THEN** the UI displays bot, buy-and-hold, and cash liquidation series plus owner score and winner with the semantics version
+- **THEN** the UI displays bot, buy-and-hold, and cash liquidation series plus owner score and winner
 
 #### Scenario: Owner score is inconclusive
 - **WHEN** the API returns `INCONCLUSIVE`
-- **THEN** the UI displays coverage and integrity reasons without a winner
+- **THEN** the UI displays coverage and reasons without a winner
 
 #### Scenario: Legacy immutable report is displayed
-- **WHEN** the Evaluation screen renders an existing report benchmark without current owner-score semantics
+- **WHEN** the Evaluation screen renders an existing report benchmark
 - **THEN** it labels the chart as legacy realized equity and does not visually merge it with the owner-score panel
