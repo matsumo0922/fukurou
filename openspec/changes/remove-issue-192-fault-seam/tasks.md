@@ -25,7 +25,13 @@
 
 - [x] 4.1 Rewrite the two retained event-type KDocs as decoding-only vocabulary, check docs/README/KDoc for stale current-state references, run `git diff --check`, commit, push, and create a draft PR with docs impact and explicit not-planned Issue disposition.
   - Worker scope completed the implementation, documentation/KDoc grep, diff check, and local commit preparation. Push and draft PR creation remain with the parent run because this worker is explicitly prohibited from external GitHub mutation.
-- [ ] 4.2 Run clean-context Claude Opus review, adjudicate anchored findings, and converge accepted must-fix/should findings.
+- [x] 4.2 Run clean-context Claude Opus review, adjudicate anchored findings, and converge accepted must-fix/should findings.
   - S-1 accepted: the retained decoding-only labels and descriptions could be read as evidence that injection rows existed or executed, although production injection was not performed.
-  - Remediation: describe both values as compatibility vocabulary that decodes a matching row only if present, and state that the writer and route are removed. Re-review remains pending.
-- [ ] 4.3 Run final full validation once at converged HEAD, synchronize PR/CI evidence, and post `APPROVED` or `HANDOFF` without merging.
+  - Remediation: describe both values as compatibility vocabulary that decodes a matching row only if present, and state that the writer and route are removed.
+  - Same-session Claude Opus re-review at `2835577d6fed0cb2f09f788cd169be09bfc16806`: S-1 `CLOSED`; must-fix 0, should 0, new 0; verdict `APPROVE`.
+- [x] 4.3 Run final full validation once at converged HEAD, synchronize PR/CI evidence, and post `APPROVED` or `HANDOFF` without merging.
+  - Validation HEAD: `2835577d6fed0cb2f09f788cd169be09bfc16806`; the shared lease was acquired immediately (0 seconds wait), with worktree-only `GRADLE_USER_HOME=/private/tmp/fukurou-192-cleanup-gradle`.
+  - Final full command: `./gradlew test :fukurou:admissionHealthIsolationRegressionTest :trading:admissionHealthIsolationRegressionTest build --continue`. Result: `992 tests completed, 1 failed, 2 skipped`; build and admission-isolation tasks completed, and the only failure was `PostgresPersistenceIntegrationTest.risk_state_command_service_rolls_back_when_audit_append_fails` with `HikariPool.PoolInitializationException` / `PSQLException`.
+  - Flake confirmation under the same lease, worktree, and Gradle home: `./gradlew :trading:test --tests me.matsumo.fukurou.trading.persistence.PostgresPersistenceIntegrationTest.risk_state_command_service_rolls_back_when_audit_append_fails`. Result: successful; no regression or shared-state recovery action was observed or required.
+  - `./gradlew detekt --auto-correct --continue` succeeded under the same lease and Gradle home. Strict OpenSpec validation succeeded with `@fission-ai/openspec` 1.6.0 because the standalone `openspec` binary was not on this shell's `PATH`.
+  - `git diff --check` succeeded. The bounded grep found no runtime activation key, controller, disconnector, writer, or fixed-PK reader; the retired route path remains only in the required `404` regression, and Issue #192 current docs/KDoc references are limited to the retained enum/catalog/golden/i18n compatibility vocabulary.
