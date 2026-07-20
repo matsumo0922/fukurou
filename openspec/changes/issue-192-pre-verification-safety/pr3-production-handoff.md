@@ -36,7 +36,7 @@ PR-1 archive の template を引き継ぐ。production で確認するまでは 
 | NAS flag operator | 権限を持つownerが手動設定する。secretや`.env`内容をartifactへ転記しない |
 | manual deploy compatibility mode | `ROLL_FORWARD_ONLY` |
 
-**Remaining block:** clean-context再反証のblocking 0、baseline activation後の整合確認、ownerによるNAS flag設定、deploy直前flat-state再確認が揃うまでproduction write/deployを実行しない。
+**Remaining block:** PR-2 final clean-context falsification は `PASS` / blocking 0 で完了している。PR-2のmergeとproduction `/revision`へのreviewed PR-2 revision反映、baseline activation後の整合確認、ownerによるNAS flag設定、deploy直前flat-state再確認が揃うまでproduction write/deployを実行しない。
 
 ### Independent re-falsification
 
@@ -56,6 +56,8 @@ Second clean-context re-falsification found one blocking identity-swap counterex
 Accepted fix implementation binds the route request and both fixed audit payloads to target order UUID, approved expiry, and a bounded minimum remaining TTL. Final preflight rejects target absence/replacement, non-`OPEN`/non-BUY/position-linked state, expiry mismatch, or insufficient TTL before audit/disconnect. `Issue192WsFaultSeamTest`, `:fukurou:detekt`, and `git diff --check` passed; production remains unmodified pending another fresh falsification.
 
 Third clean-context re-falsification found one blocking specification overclaim: application final preflight cannot authoritatively read NAS backup/restore timers, GitHub deploy state, runtime-config mutation, or every active `llm_run`. Disposition is `ACCEPTED` as a contract correction, not a cross-system coordinator: controller owns application-local final reads; the operator performs bounded request-time reads for NAS/GitHub/runtime maintenance and all active work. Drift after either final check is `INVALID` with no retry. Two safe-side non-blocking findings are documented as purpose-only fixed-row consumption and fail-closed `STREAM_UNAVAILABLE` before stream publication; no additional temporary framework is added.
+
+After the accepted contract corrections, PR-2 final clean-context re-falsification returned `PASS` with blocking 0. This closes the PR-2 design/implementation gate only; it is not production observation and does not satisfy any production gate below.
 
 ## Verification deploy
 
