@@ -120,7 +120,18 @@ SELECT COUNT(*) AS unresolved_market_data_gaps
 FROM market_data_gaps
 WHERE recovered_at IS NULL;
 
-SELECT order_id, status, side, position_id, created_at, expires_at, expiry_source
+SELECT
+  order_id,
+  status,
+  side,
+  position_id,
+  created_at,
+  expires_at,
+  CASE WHEN expires_at % 1000 = 0
+    THEN to_char(to_timestamp(expires_at/1000)   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+    ELSE to_char(to_timestamp(expires_at/1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  END AS expected_order_expires_at,
+  expiry_source
 FROM orders
 WHERE status IN ('OPEN', 'PENDING_CANCEL')
   AND side = 'BUY'
@@ -150,6 +161,24 @@ SELECT
   (SELECT COUNT(*) FROM llm_launch_reservations WHERE status = 'RUNNING') AS running_launch_reservations;
 ```
 
+### Request binding values
+
+`expectedOrderExpiresAt` の正本は、read-only MCP `getOpenOrders` が対象 order の `expiresAt` として返すミリ秒精度の ISO-8601 文字列である。末尾 `Z` を含む文字列を加工せず、そのまま request へコピーする。DB の `orders.expires_at` は epoch millis なので、生の数値を request に入れたり、operator が手作業で ISO-8601 へ変換したりしない。SQL で交差確認する場合は、preflight inventory の `expected_order_expires_at` 列を使い、MCP の文字列と完全一致することを確認する。
+
+`minimumRemainingTtlSeconds` は、owner に提示する recovery bound に、`liveness + 2 × backoff + 30 秒` の待機上限（5分 hard cap）を加え、controller の order snapshot 観測後から実際の disconnect までの遅延を吸収できる値にする。入力可能範囲は1秒以上86400秒以下である。算出に使った recovery bound、待機上限、加算結果をPreflight boundaryとInjectionの両方へ記録する。
+
+typed `409` はrequested固定auditより前のno-mutation rejectionであり、次のcodeではone-shotを消費しない。
+
+| code | one-shot | 意味 |
+|---|---|---|
+| `PREFLIGHT_INVENTORY_REJECTED` | 未消費 | `PENDING_CANCEL` resting BUY混入 / `OPEN` resting BUY 0 / open position有 |
+| `TARGET_ORDER_NOT_FOUND` | 未消費 | 承認したtarget orderが消滅または入替 |
+| `TARGET_ORDER_STATE_REJECTED` | 未消費 | targetが`OPEN` / BUY / position未紐付けでなくなった |
+| `TARGET_ORDER_EXPIRY_MISMATCH` | 未消費 | expiry不一致、またはDBの`expires_at`がparse不能 |
+| `TARGET_ORDER_TTL_INSUFFICIENT` | 未消費 | 残TTLが承認境界未満 |
+
+`TARGET_ORDER_EXPIRY_MISMATCH` は値の不一致とparse不能を区別しない。このcodeを受けた場合は、再送の前にMCP `getOpenOrders`を正本とする取得手順とSQLの`expected_order_expires_at`を確認する。requested固定auditがdurableに確定した後の失敗は、HTTP status/codeやexecuted auditの有無にかかわらずone-shot消費済みであり、再注入しない。
+
 ### Preflight boundary
 
 | 項目 | 値 |
@@ -171,6 +200,7 @@ SELECT
 | active `llm_runs` / launch reservation | UNOBSERVED |
 | runtime config mutation / deploy / backup / restore maintenance | UNOBSERVED |
 | 待機上限（liveness + 2 × backoff + 30 秒、5 分 hard cap） | UNOBSERVED |
+| 指定した `minimumRemainingTtlSeconds` / recovery bound・待機上限からの算出根拠 | UNOBSERVED |
 | owner go/no-go（提示した inventory と不可逆な exclusion 影響） | UNOBSERVED |
 
 ### Injection
@@ -179,6 +209,9 @@ SELECT
 |---|---|
 | injection ID | UNOBSERVED |
 | expected session ID | UNOBSERVED |
+| `targetOrderId`（送信値） | UNOBSERVED |
+| `expectedOrderExpiresAt`（送信値 / 取得元） | UNOBSERVED |
+| `minimumRemainingTtlSeconds`（送信値 / 算出根拠） | UNOBSERVED |
 | request 送信時刻 (UTC) | UNOBSERVED |
 | HTTP 応答 status / code | UNOBSERVED |
 | requested 固定 audit の durable 確定 | UNOBSERVED |
