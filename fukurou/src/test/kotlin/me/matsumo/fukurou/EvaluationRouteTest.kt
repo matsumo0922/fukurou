@@ -30,7 +30,6 @@ import me.matsumo.fukurou.trading.evaluation.DailyTradePnlFact
 import me.matsumo.fukurou.trading.evaluation.DecisionActionCount
 import me.matsumo.fukurou.trading.evaluation.DeduplicationMetrics
 import me.matsumo.fukurou.trading.evaluation.EvaluationLlmUsageQueryResult
-import me.matsumo.fukurou.trading.evaluation.EvaluationAttributionCoverage
 import me.matsumo.fukurou.trading.evaluation.EvaluationPeriod
 import me.matsumo.fukurou.trading.evaluation.EvaluationPopulationStatus
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
@@ -186,40 +185,28 @@ class EvaluationRouteTest {
     }
 
     @Test
-    fun benchmarkReturnsStructuredStateForTruncatedPopulation() = testApplication {
-        val truncatedRepository = object : EvaluationRepository by FakeEvaluationRepository {
-            override suspend fun fetchClosedTrades(
-                period: EvaluationPeriod,
-                limit: Int,
-                scope: EvaluationScope,
-            ): Result<EvaluationTradeQueryResult> = Result.success(
-                EvaluationTradeQueryResult(
-                    trades = FakeEvaluationRepository.fetchClosedTrades(period, limit).getOrThrow().trades,
-                    truncated = true,
-                    attributionCoverage = EvaluationAttributionCoverage(attributed = 20_000, missing = 0, total = 20_000),
-                ),
-            )
-        }
+    fun benchmarkUsesRollingOwnerScoreContract() = testApplication {
         application {
             module(
                 readinessProbe = { true },
                 clock = fixedClock(),
-                evaluationRepository = truncatedRepository,
+                evaluationRepository = FakeEvaluationRepository,
                 evaluationRiskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
                 evaluationMarketDataSource = FakeEvaluationMarketDataSource,
                 tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
             )
         }
 
-        val response = client.get("/evaluation/benchmark?from=2026-07-01&to=2026-07-03")
+        val response = client.get("/evaluation/benchmark")
         val body = response.bodyAsText()
 
         assertEquals(HttpStatusCode.OK, response.status)
-        assertTrue(body.contains("\"state\":\"TRUNCATED_POPULATION\""))
-        assertTrue(body.contains("\"truncated\":true"))
-        assertTrue(body.contains("\"points\":[]"))
+        assertTrue(body.contains("\"semanticsVersion\":\"OWNER_SCORE_V1\""))
+        assertTrue(body.contains("\"cutoffMode\":\"ROLLING\""))
+        assertTrue(body.contains("\"expectedDays\":90"))
+        assertTrue(body.contains("\"syntheticTakerFeeRate\":\"0.0005\""))
         assertTrue(body.contains("\"returns\":null"))
-        assertTrue(body.contains("\"total\":20000"))
+        assertTrue(body.contains("\"state\":\"INCONCLUSIVE\""))
     }
 
     @Test
@@ -247,13 +234,12 @@ class EvaluationRouteTest {
             )
         }
 
-        val empty = client.get("/evaluation/benchmark?from=2026-06-01&to=2026-06-02").bodyAsText()
+        val empty = client.get("/evaluation/summary?from=2026-06-01&to=2026-06-02").bodyAsText()
         val partial = client.get("/evaluation/summary?from=2026-07-01&to=2026-07-03").bodyAsText()
         val full = client.get("/evaluation/costs?from=2026-07-03&to=2026-07-04").bodyAsText()
 
         assertTrue(empty.contains("\"populationState\":\"EMPTY_LIFECYCLE\""))
         assertTrue(empty.contains("\"effectiveFrom\":null"))
-        assertTrue(empty.contains("\"state\":\"EMPTY_LIFECYCLE\""))
         assertTrue(partial.contains("\"populationState\":\"PARTIAL_LIFECYCLE\""))
         assertTrue(partial.contains("\"effectiveFrom\":\"2026-07-02\""))
         assertTrue(full.contains("\"populationState\":\"FULL_REQUESTED_PERIOD\""))
@@ -412,7 +398,11 @@ class EvaluationRouteTest {
             val body = response.bodyAsText()
 
             assertEquals(HttpStatusCode.OK, response.status, path)
-            assertTrue(body.contains("\"period\""), path)
+            if (path == "/evaluation/benchmark") {
+                assertTrue(body.contains("\"semanticsVersion\":\"OWNER_SCORE_V1\""), path)
+            } else {
+                assertTrue(body.contains("\"period\""), path)
+            }
         }
 
         val summaryBody = client.get("/evaluation/summary").bodyAsText()
@@ -468,7 +458,7 @@ class EvaluationRouteTest {
     }
 
     @Test
-    fun evaluationRoutes_requestHistoricalCandlesFromReferenceDate() = testApplication {
+    fun evaluationBenchmark_rejectsFromAndTo() = testApplication {
         val marketDataSource = RecordingEvaluationMarketDataSource()
 
         application {
@@ -484,15 +474,13 @@ class EvaluationRouteTest {
 
         val response = client.get("/evaluation/benchmark?from=2026-01-01&to=2026-01-02")
 
-        assertEquals(HttpStatusCode.OK, response.status)
-        assertEquals(
-            expected = listOf(224),
-            actual = marketDataSource.requestedLimits,
-        )
+        assertEquals(HttpStatusCode.BadRequest, response.status)
+        assertTrue(response.bodyAsText().contains("not supported"))
+        assertEquals(emptyList(), marketDataSource.requestedLimits)
     }
 
     @Test
-    fun evaluationBenchmark_legacyScopeDoesNotExposeSyntheticBaselineSeriesOrReturns() = testApplication {
+    fun evaluationBenchmark_nonActiveScopeReturnsUnsupportedWithoutOwnerScore() = testApplication {
         application {
             module(
                 readinessProbe = { true },
@@ -508,14 +496,14 @@ class EvaluationRouteTest {
         val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
 
         assertEquals(HttpStatusCode.OK, response.status)
-        assertEquals("BASELINE_NOT_COMPARABLE", body.getValue("state").jsonPrimitive.content)
-        assertTrue(body.getValue("baselineEquityJpy") is kotlinx.serialization.json.JsonNull)
+        assertEquals("UNSUPPORTED_SCOPE", body.getValue("state").jsonPrimitive.content)
+        assertTrue(body.getValue("ownerScore") is kotlinx.serialization.json.JsonNull)
         assertTrue(body.getValue("returns") is kotlinx.serialization.json.JsonNull)
         assertTrue(body.getValue("points").jsonArray.isEmpty())
     }
 
     @Test
-    fun evaluationRoutes_returnBadRequestWhenDailyCandleLimitExceedsMaximum() = testApplication {
+    fun evaluationBenchmark_fixedCutoffUsesNinetyCandles() = testApplication {
         val marketDataSource = RecordingEvaluationMarketDataSource()
 
         application {
@@ -529,12 +517,12 @@ class EvaluationRouteTest {
             )
         }
 
-        val response = client.get("/evaluation/benchmark?from=2024-01-01&to=2024-01-02")
+        val response = client.get("/evaluation/benchmark?cutoff=2026-07-02T00:00:00Z")
 
-        assertEquals(HttpStatusCode.BadRequest, response.status)
-        assertTrue(response.bodyAsText().contains("maximum is 500"))
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("\"cutoffMode\":\"FIXED_CUTOFF\""))
         assertEquals(
-            expected = emptyList(),
+            expected = listOf(90),
             actual = marketDataSource.requestedLimits,
         )
     }

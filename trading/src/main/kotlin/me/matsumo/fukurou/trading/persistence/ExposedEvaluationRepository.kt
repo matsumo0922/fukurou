@@ -33,7 +33,12 @@ import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
 import me.matsumo.fukurou.trading.evaluation.LlmPhaseUsageFact
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreEvidence
+import me.matsumo.fukurou.trading.evaluation.OwnerScoreMarketDataGap
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotReason
+import me.matsumo.fukurou.trading.evaluation.EquitySnapshotRecord
 import me.matsumo.fukurou.trading.domain.EvaluationCohort
+import me.matsumo.fukurou.trading.domain.TradingMode
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -514,6 +519,20 @@ private val SELECT_SCOPED_PNL_BEFORE_SQL = """
 class ExposedEvaluationRepository(
     private val database: ExposedDatabase,
 ) : EvaluationRepository {
+    override suspend fun fetchOwnerScoreEvidence(
+        accountEpochId: UUID,
+        period: EvaluationPeriod,
+    ): Result<OwnerScoreEvidence> = withContext(Dispatchers.IO) {
+        runCatching {
+            exposedTransaction(database) {
+                OwnerScoreEvidence(
+                    snapshots = selectOwnerScoreSnapshots(accountEpochId, period),
+                    marketDataGaps = selectOwnerScoreMarketDataGaps(period),
+                )
+            }
+        }
+    }
+
     override suspend fun fetchDeduplicationMetrics(period: EvaluationPeriod): Result<DeduplicationMetrics> {
         return withContext(Dispatchers.IO) {
             runCatching { exposedTransaction(database) { selectDeduplicationMetrics(period) } }
@@ -790,6 +809,91 @@ class ExposedEvaluationRepository(
                     val scope = selectCurrentEvaluationScope()
                     setEvaluationRequestBounds(EvaluationPeriod(scope.lifecycleFromInclusive, Instant.now()))
                     selectKillCriterionStats()
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectOwnerScoreSnapshots(
+    accountEpochId: UUID,
+    period: EvaluationPeriod,
+): List<EquitySnapshotRecord> {
+    return prepare(
+        """
+            WITH bounded AS (
+                (
+                    SELECT id, account_epoch_id, mode, reason, trading_date, captured_at,
+                        cash_jpy, btc_quantity, btc_mark_price_jpy, total_equity_jpy,
+                        equity_peak_jpy, drawdown_ratio
+                    FROM equity_snapshots
+                    WHERE account_epoch_id = ? AND captured_at < ?
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 1
+                )
+                UNION ALL
+                SELECT id, account_epoch_id, mode, reason, trading_date, captured_at,
+                    cash_jpy, btc_quantity, btc_mark_price_jpy, total_equity_jpy,
+                    equity_peak_jpy, drawdown_ratio
+                FROM equity_snapshots
+                WHERE account_epoch_id = ? AND captured_at >= ? AND captured_at < ?
+            )
+            SELECT * FROM bounded ORDER BY captured_at ASC, id ASC
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setObject(1, accountEpochId)
+        statement.setLong(2, period.from.toEpochMilli())
+        statement.setObject(3, accountEpochId)
+        statement.setLong(4, period.from.toEpochMilli())
+        statement.setLong(5, period.toExclusive.toEpochMilli())
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    add(
+                        EquitySnapshotRecord(
+                            id = resultSet.getObject("id", UUID::class.java),
+                            mode = TradingMode.valueOf(resultSet.getString("mode")),
+                            reason = EquitySnapshotReason.valueOf(resultSet.getString("reason")),
+                            tradingDate = java.time.LocalDate.parse(resultSet.getString("trading_date")),
+                            capturedAt = Instant.ofEpochMilli(resultSet.getLong("captured_at")),
+                            cashJpy = resultSet.getBigDecimal("cash_jpy"),
+                            btcQuantity = resultSet.getBigDecimal("btc_quantity"),
+                            btcMarkPriceJpy = resultSet.getBigDecimal("btc_mark_price_jpy"),
+                            totalEquityJpy = resultSet.getBigDecimal("total_equity_jpy"),
+                            equityPeakJpy = resultSet.getBigDecimal("equity_peak_jpy"),
+                            drawdownRatio = resultSet.getBigDecimal("drawdown_ratio"),
+                            accountEpochId = resultSet.getObject("account_epoch_id", UUID::class.java),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun JdbcTransaction.selectOwnerScoreMarketDataGaps(period: EvaluationPeriod): List<OwnerScoreMarketDataGap> {
+    return prepare(
+        """
+            SELECT id, started_at, recovered_at
+            FROM market_data_gaps
+            WHERE started_at < ? AND COALESCE(recovered_at, ?) > ?
+            ORDER BY started_at ASC, id ASC
+        """.trimIndent(),
+    ).use { statement ->
+        statement.setLong(1, period.toExclusive.toEpochMilli())
+        statement.setLong(2, period.toExclusive.toEpochMilli())
+        statement.setLong(3, period.from.toEpochMilli())
+        statement.executeQuery().use { resultSet ->
+            buildList {
+                while (resultSet.next()) {
+                    val recoveredAt = resultSet.getLong("recovered_at").takeUnless { resultSet.wasNull() }
+                    add(
+                        OwnerScoreMarketDataGap(
+                            id = resultSet.getObject("id", UUID::class.java),
+                            startedAt = Instant.ofEpochMilli(resultSet.getLong("started_at")),
+                            recoveredAt = recoveredAt?.let(Instant::ofEpochMilli),
+                        ),
+                    )
                 }
             }
         }

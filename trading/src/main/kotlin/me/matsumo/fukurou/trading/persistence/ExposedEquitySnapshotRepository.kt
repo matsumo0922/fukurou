@@ -64,6 +64,7 @@ private const val INSERT_DAILY_EQUITY_SNAPSHOT_SQL = """
 private const val SELECT_EQUITY_SNAPSHOTS_SQL = """
     SELECT
         id,
+        account_epoch_id,
         mode,
         reason,
         trading_date,
@@ -178,5 +179,6 @@ private fun ResultSet.toEquitySnapshotRecord(): EquitySnapshotRecord {
         totalEquityJpy = getBigDecimal("total_equity_jpy"),
         equityPeakJpy = getBigDecimal("equity_peak_jpy"),
         drawdownRatio = getBigDecimal("drawdown_ratio"),
+        accountEpochId = getObject("account_epoch_id", UUID::class.java),
     )
 }

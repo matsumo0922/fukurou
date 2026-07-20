@@ -17,6 +17,9 @@ val EQUITY_SNAPSHOT_TRADING_DATE_ZONE: ZoneId = ZoneId.of("Asia/Tokyo")
  * equity_snapshots を追加する理由。
  */
 enum class EquitySnapshotReason {
+    /** account epoch の開始状態を記録した。 */
+    EPOCH_START,
+
     /**
      * 約定により paper_account が変化した。
      */
@@ -60,6 +63,7 @@ data class EquitySnapshotRecord(
     val totalEquityJpy: BigDecimal,
     val equityPeakJpy: BigDecimal,
     val drawdownRatio: BigDecimal,
+    val accountEpochId: UUID? = null,
 )
 
 /**
