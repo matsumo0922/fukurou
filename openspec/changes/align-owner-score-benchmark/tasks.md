@@ -1,32 +1,24 @@
-## 1. Immutable benchmark policy
+## 1. Benchmark calculation
 
-- [ ] 1.1 Add append-only `paper_account_epoch_benchmark_policies`, immutability/schema checks, backup inventory/critical-table PK verification, and bounded snapshot lookup indexes
-- [ ] 1.2 Insert `OWNER_SCORE_V1` policy atomically during future epoch activation and prove an insert failure rolls back the config/epoch/account transaction
-- [ ] 1.3 Provision the active epoch policy only on exact retained-config hash verification and test retention independence / fail-closed absence
+- [ ] 1.1 In a sibling worktree, read current production epoch age, first epoch-attributed snapshot date, and 90-day gap durations without mutation; record whether V1 initially returns `INCONCLUSIVE`
+- [ ] 1.2 Update benchmark models for nullable daily liquidation points, coverage, cutoff mode, semantics version, owner score, and winner
+- [ ] 1.3 Add owner-score math with active-epoch snapshot mark-to-market, fixed `0.0005` synthetic fee, window-start B&H, and cash comparison without changing legacy `EvaluationMath.benchmark`
+- [ ] 1.4 Add focused tests for open-position loss, B&H entry/exit fee, carry-forward/JST date mapping, and the 81/90 plus valid-boundary gate
 
-## 2. Frozen benchmark evidence
+## 2. Existing evidence reads
 
-- [ ] 2.1 Define versioned owner-score input/result, point, coverage, fee-assumption, population-integrity, winner, and reason models; extend snapshot reader models for `accountEpochId` and `EPOCH_START`
-- [ ] 2.2 Implement one explicitly read-only repeatable-read bounded query for active epoch, policy, 90 daily account states, gaps, and population integrity, with an activation-race/isolation regression test
-- [ ] 2.3 Derive `PROCESS_RESTART` downtime from last transport activity, cap every open market/infrastructure gap at frozen `queryNow/cutoff`, and test multi-day crash, never-recovered gaps, missing session evidence, and normal disconnect intervals
-- [ ] 2.4 Reuse execution-lineage/exclusion rules for positions/executions intersecting the window, including positions spanning its start
+- [ ] 2.1 Add `accountEpochId` and `EPOCH_START` support to the snapshot reader model
+- [ ] 2.2 Add bounded reads for the active epoch's snapshots and persisted market-data gaps over the 90-day window; do not reuse unbounded `findAll()`
+- [ ] 2.3 Sum persisted gaps by JST day, mark days with at least one hour unknown, and test both short and material gaps
 
-## 3. Shared liquidation calculation
+## 3. Existing API and UI
 
-- [ ] 3.1 Implement synthetic-fee bot liquidation, window-start buy-and-hold, cash, returns, and owner-score math with explicit decimal scale
-- [ ] 3.2 Implement the 90-day/81-valid-day gate, mandatory boundaries, gap union, young-epoch reasons, and nullable unknown points
-- [ ] 3.3 Add regression tests for unrealized loss, actual-fee cash preservation, synthetic entry/exit fee, no-fill carry-forward, ambiguous snapshots, population failure, missing boundaries, and gap overlap
+- [ ] 3.1 Update `GET /evaluation/benchmark`, its Japanese `.describe {}`, and route tests for rolling/fixed cutoff, rejected `from` / `to`, active CURRENT scope, and owner-score response
+- [ ] 3.2 Regenerate OpenAPI TypeScript types and update the existing Evaluation benchmark card; render unknown days as gaps
+- [ ] 3.3 Keep legacy benchmark math and immutable report facts/hash unchanged, preserve the legacy-scope protection test, and label old report benchmark as legacy where displayed
 
-## 4. Additive API and Evaluation UI
+## 4. Documentation and validation
 
-- [ ] 4.1 Add `GET /evaluation/owner-score` with `ROLLING` / `FIXED_CUTOFF` semantics and route-local Japanese OpenAPI
-- [ ] 4.2 Add compatibility tests proving `/evaluation/benchmark` and immutable report JSON remain unchanged
-- [ ] 4.3 Regenerate OpenAPI TypeScript types and add the Evaluation owner-score panel with liquidation labels, cutoff, fee assumption, coverage, and integrity
-- [ ] 4.4 Render unknown points as chart gaps/reason rows and relabel the existing report chart as legacy realized equity
-
-## 5. Documentation and validation
-
-- [ ] 5.1 Update `README.md` and `docs/design.md` with the formula, 90% rule, crash projection, fee assumption (including fee-only config activation), cutoff semantics, backup-profile transition, and residual risks
-- [ ] 5.2 Grep README/docs for `benchmark`, `Bot realized`, `owner score`, and `buy & hold` and reconcile stale descriptions
-- [ ] 5.3 Run focused PostgreSQL/trading/route/Web tests, OpenSpec validation, `make test`, `make detekt`, `make build`, and Web test/build
-- [ ] 5.4 Read current epoch age and window lineage/gap reason counts without mutation, verify fixed-cutoff determinism after runtime-config pruning, and verify crash/open-gap/mixed-lineage fixtures remain `INCONCLUSIVE`
+- [ ] 4.1 Update `README.md` and `docs/design.md` with current V1 formula, 0.05% fee assumption and bias, 90% coverage rule, one-hour gap threshold, cutoff, and known limits
+- [ ] 4.2 Grep README/docs for stale realized-only benchmark descriptions
+- [ ] 4.3 Run focused tests, OpenSpec strict validation, `make test`, `make detekt`, `make build`, and Web tests/build
