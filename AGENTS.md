@@ -13,7 +13,8 @@
 
 - 本リポジトリは暗号資産 BTC 現物トレーディング bot の実験プロジェクトであり、投資の学習に用いる。
 - 実資金を動かす機能は、ユーザーが明示的に要求するまで実装・有効化しない。
-- 取引実行や scheduler を追加する場合は、`docs/design.md` の「安全床」を優先する。最大損失、損切り必須、ナンピン禁止、最大ドローダウン停止、エクスポージャー上限、呼び出し回数上限を迂回できる設計にしない。
+- 取引実行や scheduler を追加する場合は、`docs/design.md` の「安全床」を優先する。資金保護の 5 不変条件（最大損失、損切り必須、ナンピン禁止、最大ドローダウン停止、エクスポージャー上限）を迂回できる設計にしない。
+- LLM 呼び出し回数上限は資金保護ではなく運用 policy（サブスクコストと負荷の管理）であり、変更には config と根拠の記録を要するが、5 不変条件と同列の調整不能な安全床ではない。
 - 最初の実装は paper trading / dry-run を既定にし、本番取引への切り替えは config と運用手順の両方で明示的にする。
 
 ### Paper Simulation Fidelity
@@ -26,6 +27,21 @@
 - infrastructure failure、market-data gap、監視停止は strategy outcome と分離する。影響を受けた期間・注文・position は評価不能であることを明示し、勝率、EV、profit factor などの戦略評価へ黙って混ぜない。
 - paper と live は、LLM decision、SafetyFloor、order lifecycle の意味を揃える。live の約定事実は取引所の注文・約定結果を正本とし、paper の約定事実も事前に定義した因果的な入力と処理境界だけから作る。
 - paper execution fidelity を変更するときは、LLM 評価への影響、データ欠損時の扱い、live との意味の一致を先に設計し、回帰テストと運用上の監査証跡を同じ変更で更新する。
+
+## スコープ較正
+
+本リポジトリは single-owner の hobby プロジェクトであり、実験スループットを優先する。
+
+- 標準 DoD は「動く、関連回帰テスト 1 本、資金と paper truth を壊さない」とする
+- 1 PR は human-authored diff 1,000 行を目安とし、超える場合は分割を先に検討する
+- OpenSpec（propose→specs→tasks）は schema、ledger、order lifecycle、cross-module contract の変更に限定する。分析・実験はスクリプト + 小 PR で直行する
+- property test、chaos 注入、coverage 数値目標は、資金・ledger・order lifecycle に直接関係する変更だけに要求する
+- レビューで block する基準は「資金が漏れる、paper truth が歪む、production が落ちる」に限定し、その他は suggestion とする
+- agent は依頼されていない汎用 framework、dashboard、監視基盤、alert 機構を自発的に追加しない
+- issue を書くときは、背景・現状のコード位置・scope 外（やらないこと）を省略しない。軽くするのは受け入れ条件であって、実装 agent が迷わないための文脈ではない
+- 軽量化の対象外: secret 境界、paper 真実性ルール、資金保護の 5 不変条件、live 有効化のオーナー明示承認
+
+実験の合格ラインと運用ルール（Owner score、3 ヶ月レビュー、期間ベース証拠バー）は Epic #181 を正とする。
 
 ## Swagger / OpenAPI
 
