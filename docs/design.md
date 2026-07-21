@@ -3982,6 +3982,50 @@ maxDD = min((equity - equityPeak) / equityPeak)
 - 100トレード時点PFのkill基準を評価できる。
 - setupタグ別のPF/勝率/期待Rを集計できる。
 
+### 15.x 執行パラメータ replay（read-only 分析スクリプト）
+
+執行パラメータ候補を実運用で 1 つずつ試すと 1 候補あたり数週間かかる。decision を固定した執行層だけの replay は LLM 学習データのリークと無縁であり、記録済みデータから忠実に計算できる範囲だけを read-only で分析して候補の方向を絞り込む。実装は `me.matsumo.fukurou.trading.replay` に置き、ledger・production API・runtime config・外部取引所 API へ一切書き込まない・呼ばない。全入力を単一の `REPEATABLE READ` read-only transaction snapshot から読む。採否は replay 結果だけでは決めず、方向を絞った後に 2〜4 週の実適用観察で判断する。
+
+#### 共通の位置づけ
+
+- fill の権威は記録済み execution 行に置き、queue から fill を再導出しない。約定判定は execution 行の有無で行う。
+- cohort は lineage から既存規則で導出し、`CURRENT` 以外（`LEGACY_PRE_WS` / `UNSUPPORTED_EXECUTION_SEMANTICS`）を現行集計へ混ぜない。receipt の有無を cohort 判定に使わない。
+- gap は 2 系統を別々に投影する。`infrastructure_gap_events` は既存 `EVALUATION_GAP_INTERVAL_CTE_V1`、`market_data_gaps` は `started_at`/`recovered_at`（未回復は snapshot 時刻まで開区間）で投影し、交差する対象を `UNKNOWN` にする。infrastructure gap の件数上限超過は部分結果を出さず run 全体を失敗させる。
+- receipt の欠落は接続 session 内 source sequence の連続性で判定する。`admission_ordinal` の欠番は永続 sequence 由来の正当な穴を含むため欠落と解釈しない。receipt は対象 order が跨ぐ `(session_id, source_sequence)` 範囲で indexed に読み、全期間 time scan を発行しない。
+- 対象期間を必須引数とし、対象件数上限と statement timeout を設ける。超過は打ち切らず run 全体を失敗させる。run 全体の失敗と対象ごとの `UNKNOWN` を区別する。
+- 出力は JSON Lines（1 行 1 対象 + cohort ごとの集計行 + run summary）。summary で eligible / 理由別 `UNKNOWN` / 入力欠如 / `NON_TTL_TERMINAL` / `OPEN_AT_SNAPSHOT` を開示し、終端状態を黙って落とさない。
+- read-only credential 前提: replay の実行には receipt を含む read set への SELECT 権を持ち write 権を持たない専用 read-only credential を要する。既存 `fukurou_mcp` role は receipt SELECT を持たず要件を満たさないため、必要な read-only 権限の付与はオーナー承認の運用作業とする（role 定義の変更は replay コードに含めない）。
+
+#### `EXACT` の定義
+
+`EXACT` は次のいずれかだけを意味し、これ以外の意味で `EXACT` を主張しない。
+
+- market 応答レイテンシ `L`（発注から、約定を発火させた market event の socket 受信までの経過 = `executions.executed_at − orders.created_at`）が記録済み execution から一意に決まる。
+- 短縮 TTL が約定を確実に取りこぼす（候補の論理期限 `E' = created_at + T'` が socket 受信時刻 `executed_at` 以下）ことが一意に決まる（confirmed-DROPPED）。
+
+#### `UNKNOWN` 区分
+
+- `RETENTION_UNCONFIRMED`: `E' > executed_at` の候補。失効判定の処理 wall-clock は保存されず、WS event 経路と独立な REST 周期 tick 経路の両方で socket 受信から無上限に遅延しうるため、RETAINED / DROPPED を確定できない。RETAINED は主張しない。
+- `TIME_STOP_UNRESOLVED`: 候補 TTL と `trade_plans.time_stop_at` の早い方を決める time stop を lineage から解決できない。
+- `MARKET_DATA_GAP` / `INFRASTRUCTURE_GAP`: 対象の生存区間が gap と交差する。
+- `RECEIPT_SEQUENCE_GAP`: 生存区間の source sequence が連続せず receipt 欠落がある。
+- `NO_REPLAY_INPUT`: 生存区間に receipt が存在しない。cohort とは独立の入力欠如として開示し、約定有無を推定しない。
+
+#### 1. TTL 短縮感度スクリプト（`scripts/ttl-replay`）
+
+記録済みの resting LIMIT entry order に対し、指値を記録済みの値に固定したまま TTL を短縮した場合の約定 / 失効を再計算する。production の運用 config は resting entry TTL を短縮方向にしか変更できない（`TradingBotConfig.kt` の `restingEntryOrderTtl ≤ 1800s`）。短縮は記録済みの約定を取りこぼす方向にしか働かず、延命先の口座状態・安全ゲートを跨がないため、延長で生じる問題が構造的に発生しない。
+
+主出力は各 order の market 応答レイテンシ `L`（EXACT）と、各短縮 TTL 候補が確実に取りこぼす fill 件数（confirmed-DROPPED、EXACT）である。confirmed-DROPPED は真の取りこぼしの下界であるため、安全に短縮できる境界は confirmed-DROPPED の立ち上がりではなく `RETENTION_UNCONFIRMED` の立ち上がりを慎重側の境界として読む。各行は指値を固定したまま TTL だけを短縮した、order ごとに独立な反実仮想である。
+
+queue 到達後に安全ゲートで棄却され execution を持たない order には約定を主張せず `NON_TTL_TERMINAL` として母数から分離し、snapshot 時点で OPEN の order は `OPEN_AT_SNAPSHOT` として開示する。`DefaultPaperExecutionSimulator.simulatePendingLimit` は約定価格・手数料の fixture cross-check にのみ用い、fill 生成には使わない。
+
+実行は `scripts/ttl-replay --from-ms <ms> --to-exclusive-ms <ms>`（対象期間は必須）。Gradle からは `:trading:runTtlReplay` task を用いる。
+
+#### trailing / offset を除外した理由
+
+- **trailing 候補 exit ランキング（不可能）**: trailing stop を決める ATR14 値と、tighten を発火させる REST poll の時刻がどちらも未保存で、誤差が上下双方向であるため、候補間の相対順位づけを忠実にできない。ATR 値と poll cadence の永続化を要する別 change とする。
+- **指値 offset の反実仮想（不可能）**: 約定規則は queue consumption であり、発注時点の板から算出した `queue_ahead_btc` に依存する。板 depth は保存されず、指値を変えた価格レベルの queue が不明であるため、候補間の約定可能性を順位づけられない。板 depth の永続化を要する別 change とする。
+
 ---
 
 ## 16. 未解決点・仮定・リスク・今後の拡張（確定事項からの逸脱提案があればここに理由と代替を明記）

@@ -62,3 +62,12 @@ tasks.register<JavaExec>("runOneShotLlm") {
     environment("FUKUROU_LLM_WORKING_DIRECTORY", rootProject.projectDir.absolutePath)
     environment("FUKUROU_MCP_JAR_PATH", mcpJarPath)
 }
+
+tasks.register<JavaExec>("runTtlReplay") {
+    group = "application"
+    description = "Runs the read-only TTL shortening sensitivity replay over recorded execution data."
+    dependsOn(tasks.named("classes"))
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("me.matsumo.fukurou.trading.replay.TtlReplayMainKt")
+    workingDir = rootProject.projectDir
+}
