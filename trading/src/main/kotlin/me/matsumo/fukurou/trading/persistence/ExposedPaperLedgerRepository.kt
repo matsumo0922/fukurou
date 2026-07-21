@@ -43,6 +43,7 @@ import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.RestingEntryFillInvariantEvaluator
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import me.matsumo.fukurou.trading.shadow.GateShadowRepository
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.sql.ResultSet
@@ -919,6 +920,7 @@ class ExposedPaperLedgerRepository private constructor(
             maxDrawdownRatio = maxDrawdownPolicy.thresholdRatio,
         ),
         paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
+        gateShadowRepository: GateShadowRepository = ExposedGateShadowRepository(database),
     ) : this(
         writer = ExposedPaperLedgerWriter(
             database = database,
@@ -933,6 +935,7 @@ class ExposedPaperLedgerRepository private constructor(
             ),
             clock = clock,
             maxDrawdownPolicy = maxDrawdownPolicy,
+            gateShadowRepository = gateShadowRepository,
         ),
         accountRepository = ExposedPaperLedgerAccountReader(database),
         executionRepository = ExposedPaperLedgerExecutionReader(database),

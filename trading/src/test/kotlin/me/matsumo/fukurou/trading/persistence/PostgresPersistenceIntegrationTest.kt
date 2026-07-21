@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.persistence
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -190,6 +191,13 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorEvaluationPoints
 import me.matsumo.fukurou.trading.safety.SafetyFloorObservationReport
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
+import me.matsumo.fukurou.trading.shadow.GateShadowObservation
+import me.matsumo.fukurou.trading.shadow.GateShadowOutcome
+import me.matsumo.fukurou.trading.shadow.GateShadowRepository
+import me.matsumo.fukurou.trading.shadow.GateShadowResolution
+import me.matsumo.fukurou.trading.shadow.GateShadowScanProgress
+import me.matsumo.fukurou.trading.shadow.InMemoryGateShadowRepository
+import me.matsumo.fukurou.trading.shadow.ShadowDataQuality
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.DockerClientFactory
@@ -8245,6 +8253,336 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun gate_shadow_ttl_capture_preserves_ledger_and_captures_geometry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val shadowRepository = ExposedGateShadowRepository(database)
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowRepository = shadowRepository,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                protectiveStopPriceJpy = BigDecimal("9700000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val openOrder = ledgerRepository.getOpenOrders().getOrThrow().single()
+        val orderId = UUID.fromString(openOrder.orderId)
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000193")
+        val admissionFence = exposedTransaction(database) {
+            prepare("UPDATE orders SET market_data_session_id = ?, queue_ahead_btc = 0.25 WHERE id = ?").use { statement ->
+                statement.setObject(1, sessionId)
+                statement.setObject(2, orderId)
+                assertEquals(1, statement.executeUpdate())
+            }
+            prepare(
+                """
+                    UPDATE trade_intents SET geometry_hash = 'geo_v1_test_capture'
+                    WHERE id = (SELECT intent_id FROM orders WHERE id = ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, orderId)
+                assertEquals(1, statement.executeUpdate())
+            }
+            selectLongForTest("SELECT nextval('paper_market_admission_ordinal_seq')")
+        }
+        val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val closedTradesBefore = ExposedEvaluationRepository(database)
+            .fetchKillCriterionStats()
+            .getOrThrow()
+            .closedTrades
+
+        ledgerRepository.reconcile(
+            tickSnapshot = stopTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(60)),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        val observation = shadowRepository.findObservationByOrderId(orderId).getOrThrow()
+        val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
+        val closedTradesAfter = ExposedEvaluationRepository(database)
+            .fetchKillCriterionStats()
+            .getOrThrow()
+            .closedTrades
+
+        assertNotNull(observation)
+        assertEquals(orderId, observation.orderId)
+        assertEquals(sessionId, observation.marketDataSessionId)
+        assertEquals(admissionFence, observation.startAdmissionOrdinal)
+        assertEquals(fixedInstant().plusSeconds(60), observation.windowStartTime)
+        assertEquals(OrderSide.BUY, observation.side)
+        assertEquals(OrderType.LIMIT, observation.orderType)
+        assertEquals(0, observation.sizeBtc.compareTo(openOrder.sizeBtc.toBigDecimal()))
+        assertEquals(0, requireNotNull(observation.limitPriceJpy).compareTo(BigDecimal("9900000")))
+        assertEquals(0, requireNotNull(observation.stopPriceJpy).compareTo(BigDecimal("9700000")))
+        assertEquals(0, requireNotNull(observation.takeProfitPriceJpy).compareTo(BigDecimal("10500000")))
+        assertEquals(0, requireNotNull(observation.queueAheadBtc).compareTo(BigDecimal("0.25")))
+        assertNotNull(observation.geometryHash)
+        assertEquals(ShadowDataQuality.OK, observation.dataQuality)
+        assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
+        assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
+        assertEquals(accountBefore.totalEquityJpy, accountAfter.totalEquityJpy)
+        assertTrue(ledgerRepository.getOpenPositions().getOrThrow().isEmpty())
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+        assertEquals(closedTradesBefore, closedTradesAfter)
+    }
+
+    @Test
+    fun gate_shadow_capture_failure_does_not_rollback_ttl_cancel_and_reconciliation_detects_gap() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val captureFailure = IllegalStateException("synthetic gate-shadow capture failure")
+        val failingRepository = object : GateShadowRepository by InMemoryGateShadowRepository() {
+            override suspend fun appendObservation(observation: GateShadowObservation): Result<Unit> {
+                return Result.failure(captureFailure)
+            }
+        }
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowRepository = failingRepository,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val orderId = UUID.fromString(ledgerRepository.getOpenOrders().getOrThrow().single().orderId)
+        ledgerRepository.reconcile(
+            tickSnapshot = stopTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(60)),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        assertEquals(
+            OrderStatus.CANCELED.name,
+            selectTextForTest(database, "SELECT status FROM orders WHERE id = '$orderId'"),
+        )
+        assertEquals(
+            PaperOrderCancelReason.TTL_EXPIRY.wireCode,
+            selectTextForTest(database, "SELECT cancel_reason FROM orders WHERE id = '$orderId'"),
+        )
+        assertEquals(1L, ExposedGateShadowRepository(database).countMissingTtlExpiryObservations().getOrThrow())
+    }
+
+    @Test
+    fun gate_shadow_capture_rethrows_cancellation_after_ttl_cancel_commit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val cancelingRepository = object : GateShadowRepository by InMemoryGateShadowRepository() {
+            override suspend fun appendObservation(observation: GateShadowObservation): Result<Unit> {
+                throw CancellationException("synthetic gate-shadow cancellation")
+            }
+        }
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowRepository = cancelingRepository,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.STOP,
+                priceJpy = BigDecimal("10100000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val orderId = UUID.fromString(ledgerRepository.getOpenOrders().getOrThrow().single().orderId)
+
+        assertFailsWith<CancellationException> {
+            ledgerRepository.reconcile(
+                tickSnapshot = stopTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(60)),
+                simulator = FillSimulator(),
+            )
+        }
+
+        assertEquals(
+            OrderStatus.CANCELED.name,
+            selectTextForTest(database, "SELECT status FROM orders WHERE id = '$orderId'"),
+        )
+        assertEquals(
+            PaperOrderCancelReason.TTL_EXPIRY.wireCode,
+            selectTextForTest(database, "SELECT cancel_reason FROM orders WHERE id = '$orderId'"),
+        )
+    }
+
+    @Test
+    fun gate_shadow_ignores_market_non_buy_and_non_ttl_cancellation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val shadowRepository = ExposedGateShadowRepository(database)
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowRepository = shadowRepository,
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val limitCommand = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        broker.placeOrder(limitCommand).getOrThrow()
+        val limitOrderId = UUID.fromString(ledgerRepository.getOpenOrders().getOrThrow().single().orderId)
+        ledgerRepository.cancelOrder(
+            CancelOrderCommand(
+                commandId = UUID.randomUUID(),
+                orderId = limitOrderId,
+                reasonJa = "operator cancel before TTL",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val sellOrderId = UUID.randomUUID()
+        val marketOrderId = UUID.randomUUID()
+        exposedTransaction(database) {
+            prepare(
+                """
+                    INSERT INTO orders (
+                        id, mode, symbol, side, order_type, status, size_btc,
+                        trigger_price_jpy, expires_at, reason_ja, created_at, updated_at
+                    ) VALUES (?, 'PAPER', 'BTC', 'SELL', 'STOP', 'OPEN', 0.001,
+                              9900000, ?, 'non-buy fixture', ?, ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, sellOrderId)
+                statement.setLong(2, fixedInstant().plusSeconds(60).toEpochMilli())
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.setLong(4, fixedInstant().toEpochMilli())
+                assertEquals(1, statement.executeUpdate())
+            }
+            prepare(
+                """
+                    INSERT INTO orders (
+                        id, mode, symbol, side, order_type, status, size_btc,
+                        expires_at, reason_ja, created_at, updated_at
+                    ) VALUES (?, 'PAPER', 'BTC', 'BUY', 'MARKET', 'OPEN', 0.001,
+                              ?, 'market fixture', ?, ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, marketOrderId)
+                statement.setLong(2, fixedInstant().plusSeconds(60).toEpochMilli())
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.setLong(4, fixedInstant().toEpochMilli())
+                assertEquals(1, statement.executeUpdate())
+            }
+        }
+
+        ledgerRepository.reconcile(
+            tickSnapshot = stopTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(60)),
+            simulator = FillSimulator(),
+        ).getOrThrow()
+
+        exposedTransaction(database) {
+            assertEquals(0L, selectLongForTest("SELECT COUNT(*) FROM gate_shadow_observations"))
+        }
+        assertEquals(
+            OrderStatus.OPEN.name,
+            selectTextForTest(database, "SELECT status FROM orders WHERE id = '$sellOrderId'"),
+        )
+        assertEquals(
+            OrderStatus.OPEN.name,
+            selectTextForTest(database, "SELECT status FROM orders WHERE id = '$marketOrderId'"),
+        )
+    }
+
+    @Test
+    fun gate_shadow_repository_round_trips_and_crossed_wins() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedGateShadowRepository(database)
+        val observation = gateShadowObservationFixture()
+        val progress = GateShadowScanProgress(
+            observationId = observation.id,
+            lastScannedAdmissionOrdinal = 12L,
+            lastScannedAt = fixedInstant().plusSeconds(1),
+        )
+        val unknown = GateShadowResolution(
+            observationId = observation.id,
+            outcome = GateShadowOutcome.UNKNOWN,
+            crossingEventSequence = null,
+            crossingExchangeAt = null,
+            crossingPriceJpy = null,
+            distanceJpy = null,
+            dataQuality = ShadowDataQuality.OK,
+            resolvedAt = fixedInstant().plusSeconds(2),
+        )
+        val crossed = GateShadowResolution(
+            observationId = observation.id,
+            outcome = GateShadowOutcome.CROSSED,
+            crossingEventSequence = 42L,
+            crossingExchangeAt = fixedInstant().plusSeconds(3),
+            crossingPriceJpy = BigDecimal("9890000"),
+            distanceJpy = BigDecimal("10000"),
+            dataQuality = ShadowDataQuality.OK,
+            resolvedAt = fixedInstant().plusSeconds(4),
+        )
+
+        repository.appendObservation(observation).getOrThrow()
+        repository.upsertScanProgress(progress).getOrThrow()
+        repository.upsertResolution(unknown).getOrThrow()
+        repository.upsertResolution(crossed).getOrThrow()
+        repository.upsertResolution(unknown.copy(resolvedAt = fixedInstant().plusSeconds(5))).getOrThrow()
+
+        val restoredObservation = repository.findObservationByOrderId(observation.orderId).getOrThrow()
+        val restoredProgress = repository.findScanProgress(observation.id).getOrThrow()
+        val restoredResolution = repository.findResolution(observation.id).getOrThrow()
+
+        assertEquals(observation.id, restoredObservation?.id)
+        assertEquals(observation.orderId, restoredObservation?.orderId)
+        assertEquals(progress.lastScannedAdmissionOrdinal, restoredProgress?.lastScannedAdmissionOrdinal)
+        assertEquals(GateShadowOutcome.CROSSED, restoredResolution?.outcome)
+        assertEquals(crossed.crossingEventSequence, restoredResolution?.crossingEventSequence)
+        assertEquals(0, requireNotNull(restoredResolution?.crossingPriceJpy).compareTo(crossed.crossingPriceJpy))
+        assertTrue(repository.isReceiptScanIndexReady().getOrThrow())
+    }
+
+    @Test
     fun paper_execution_persists_virtual_take_profit_then_stop_cancel() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
 
@@ -8419,7 +8757,7 @@ class PostgresPersistenceIntegrationTest {
             assertEquals(123L, selectLongForTest("SELECT last_received_at FROM market_data_sessions LIMIT 1"))
             assertEquals(0L, selectLongForTest("SELECT COUNT(*) FROM paper_market_event_receipts"))
             assertEquals(
-                2L,
+                3L,
                 selectLongForTest(
                     "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() " +
                         "AND indexname LIKE 'idx_paper_market_receipts_%'",
@@ -13956,6 +14294,31 @@ private fun runtimeConfigDraftCreation(note: String): RuntimeConfigDraftCreation
         values = mapOf("runner.maxToolCallsPerRun" to "12"),
         note = note,
         createdBy = "test",
+    )
+}
+
+/** gate-shadow repository integration test 用 observation。 */
+private fun gateShadowObservationFixture(): GateShadowObservation {
+    return GateShadowObservation(
+        id = UUID.fromString("00000000-0000-0000-0000-000000000194"),
+        orderId = UUID.fromString("00000000-0000-0000-0000-000000000195"),
+        decisionId = UUID.fromString("00000000-0000-0000-0000-000000000196"),
+        opportunityEpisodeId = UUID.fromString("00000000-0000-0000-0000-000000000197"),
+        geometryHash = "geo_v1_gate_shadow_fixture",
+        symbol = "BTC",
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        sizeBtc = BigDecimal("0.001"),
+        limitPriceJpy = BigDecimal("9900000"),
+        triggerPriceJpy = null,
+        stopPriceJpy = BigDecimal("9700000"),
+        takeProfitPriceJpy = BigDecimal("10500000"),
+        queueAheadBtc = BigDecimal("0.25"),
+        marketDataSessionId = UUID.fromString("00000000-0000-0000-0000-000000000198"),
+        startAdmissionOrdinal = 10L,
+        windowStartTime = fixedInstant(),
+        dataQuality = ShadowDataQuality.OK,
+        observedAt = fixedInstant(),
     )
 }
 

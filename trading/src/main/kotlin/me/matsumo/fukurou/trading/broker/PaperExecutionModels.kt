@@ -11,6 +11,7 @@ import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.safety.SafetyViolation
+import me.matsumo.fukurou.trading.shadow.GateShadowObservation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import java.math.BigDecimal
 import java.time.Instant
@@ -259,6 +260,7 @@ data class PaperTradeResult(
  * @param closedPositionIds close された position IDs
  * @param executionIds 作成された execution IDs
  * @param divergenceMemos paper/live 乖離を command_event_log へ残すための structured memo
+ * @param gateShadowObservations ledger commit 後に保存する TTL 失効 capture payload
  */
 data class PaperReconcileResult(
     val advanced: Boolean,
@@ -268,4 +270,5 @@ data class PaperReconcileResult(
     val closedPositionIds: List<String>,
     val executionIds: List<String>,
     val divergenceMemos: List<PaperExecutionDivergenceMemo> = emptyList(),
+    val gateShadowObservations: List<GateShadowObservation> = emptyList(),
 )

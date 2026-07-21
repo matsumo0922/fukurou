@@ -2,35 +2,35 @@
 
 ## 1. PR-2 / 観測 model とテーブル
 
-- [ ] 1.1 `shadow/GateShadowObservation.kt` を新設し、`GateShadowOutcome`(CROSSED / UNKNOWN)、`ShadowDataQuality`（OK と欠落理由コード）、`GateShadowObservation`（`orderId` / `marketDataSessionId` / `startAdmissionOrdinal` / `windowStartTime` / geometry）、`GateShadowResolution` を定義する。`@Immutable` を付ける
-- [ ] 1.2 `persistence/TradingTables.kt` に 3 テーブルを追加する（design.md D6）。`gate_shadow_observations`(append-only、`order_id` NOT NULL + UNIQUE / `start_admission_ordinal` / `window_start_time` / `market_data_session_id` / `data_quality` NOT NULL)、`gate_shadow_scan_progress`(mutable、`observation_id` PK / `last_scanned_admission_ordinal`)、`gate_shadow_resolutions`(`observation_id` PK / `outcome` / `data_quality` NOT NULL)
-- [ ] 1.3 `paper_market_event_receipts` に `(session_id, admission_ordinal)` index を **`CREATE INDEX CONCURRENTLY`** で追加する。`ensureSchema()` の schema transaction の**外**の先行 provisioning stage とする（startup transaction 内の通常 `CREATE INDEX` は大規模テーブルの INSERT を止める、design.md D6）
-- [ ] 1.4 `persistence/TradingPersistenceBootstrap.kt` の `ensureSchema()` 列挙に 3 テーブルを追加する（index は 1.3 の別 stage）
-- [ ] 1.5 `scripts/backup/restore-inventory-v1.txt` に 3 テーブルを追加する（`DatabaseBackupRestoreContractTest` が落ちる）
+- [x] 1.1 `shadow/GateShadowObservation.kt` を新設し、`GateShadowOutcome`(CROSSED / UNKNOWN)、`ShadowDataQuality`（OK と欠落理由コード）、`GateShadowObservation`（`orderId` / `marketDataSessionId` / `startAdmissionOrdinal` / `windowStartTime` / geometry）、`GateShadowResolution` を定義する。`@Immutable` を付ける
+- [x] 1.2 `persistence/TradingTables.kt` に 3 テーブルを追加する（design.md D6）。`gate_shadow_observations`(append-only、`order_id` NOT NULL + UNIQUE / `start_admission_ordinal` / `window_start_time` / `market_data_session_id` / `data_quality` NOT NULL)、`gate_shadow_scan_progress`(mutable、`observation_id` PK / `last_scanned_admission_ordinal`)、`gate_shadow_resolutions`(`observation_id` PK / `outcome` / `data_quality` NOT NULL)
+- [x] 1.3 `paper_market_event_receipts` に `(session_id, admission_ordinal)` index を **`CREATE INDEX CONCURRENTLY`** で追加する。`ensureSchema()` の schema transaction の**外**の先行 provisioning stage とする（startup transaction 内の通常 `CREATE INDEX` は大規模テーブルの INSERT を止める、design.md D6）
+- [x] 1.4 `persistence/TradingPersistenceBootstrap.kt` の `ensureSchema()` 列挙に 3 テーブルを追加する（index は 1.3 の別 stage）
+- [x] 1.5 `scripts/backup/restore-inventory-v1.txt` に 3 テーブルを追加する（`DatabaseBackupRestoreContractTest` が落ちる）
 
 ## 2. PR-2 / repository と捕捉
 
-- [ ] 2.1 `shadow/GateShadowRepository.kt` を新設する。append-only observation + mutable scan-progress + 単調昇格 resolution。`Result<T>` + InMemory 実装併走。`CancellationException` は再 throw する
-- [ ] 2.2 `persistence/ExposedGateShadowRepository.kt` を実装する。transaction 非依存の境界。resolution は **CROSSED-wins upsert**（`CROSSED` は `ON CONFLICT (observation_id) DO UPDATE SET outcome='CROSSED'`、`UNKNOWN` は `ON CONFLICT DO NOTHING`、design.md D4）
-- [ ] 2.3 **production（Exposed）の失効 ledger transaction 内**で immutable capture payload を作る。失効 order 行から `order_id` / `market_data_session_id` / geometry / `expired_at` を、`start_admission_ordinal` は同 transaction 内で読む現在の admission high-watermark を取る（event admission と同じ session 直列化で線形化。**commit 後の post-hoc `MAX()` は使わない**）
-- [ ] 2.4 in-memory ledger 経路は shadow 対象外（admission_ordinal 権威を持たない test 経路。production only）。in-memory では capture を no-op にする
-- [ ] 2.5 capture payload を cancel 成功後に best-effort 保存する。**ledger transaction 外・cancel を巻き込まない**。LIMIT/STOP のみ対象
-- [ ] 2.6 取りこぼしを SQL reconciliation で算出する経路を用意する（design.md D7）。`cancel_reason=TTL_EXPIRY` かつ LIMIT/STOP の order 行に対し `order_id` join で observation 欠落を算出。in-memory counter は使わない
-- [ ] 2.7 DI / runtime 配線に repository を追加する
+- [x] 2.1 `shadow/GateShadowRepository.kt` を新設する。append-only observation + mutable scan-progress + 単調昇格 resolution。`Result<T>` + InMemory 実装併走。`CancellationException` は再 throw する
+- [x] 2.2 `persistence/ExposedGateShadowRepository.kt` を実装する。transaction 非依存の境界。resolution は **CROSSED-wins upsert**（`CROSSED` は `ON CONFLICT (observation_id) DO UPDATE SET outcome='CROSSED'`、`UNKNOWN` は `ON CONFLICT DO NOTHING`、design.md D4）
+- [x] 2.3 **production（Exposed）の失効 ledger transaction 内**で immutable capture payload を作る。失効 order 行から `order_id` / `market_data_session_id` / geometry / `expired_at` を、`start_admission_ordinal` は同 transaction 内で読む現在の admission high-watermark を取る（event admission と同じ session 直列化で線形化。**commit 後の post-hoc `MAX()` は使わない**）
+- [x] 2.4 in-memory ledger 経路は shadow 対象外（admission_ordinal 権威を持たない test 経路。production only）。in-memory では capture を no-op にする
+- [x] 2.5 capture payload を cancel 成功後に best-effort 保存する。**ledger transaction 外・cancel を巻き込まない**。LIMIT/STOP のみ対象
+- [x] 2.6 取りこぼしを SQL reconciliation で算出する経路を用意する（design.md D7）。`cancel_reason=TTL_EXPIRY` かつ LIMIT/STOP の order 行に対し `order_id` join で observation 欠落を算出。in-memory counter は使わない
+- [x] 2.7 DI / runtime 配線に repository を追加する
 
 ## 3. PR-2 / テスト
 
-- [ ] 3.1 **DoD**: shadow の観測書き込みが cash / position / strategy PnL を変更しないこと
-- [ ] 3.2 TTL 失効で observation が 1 件書かれ、`order_id` / `market_data_session_id` / `start_admission_ordinal` / geometry が正しいこと
-- [ ] 3.3 shadow の捕捉が失敗しても TTL cancel が完了し rollback されないこと。欠落が `order_id` join の reconciliation で検出できること
-- [ ] 3.4 `CancellationException` が握り潰されないこと
-- [ ] 3.5 対象外（MARKET / 非 BUY / TTL 以外の cancel）では observation が書かれないこと
-- [ ] 3.6 永続化の往復テスト（Exposed）。resolution の CROSSED-wins upsert（`UNKNOWN` 後に `CROSSED` で上書き、`CROSSED` 後に `UNKNOWN` は no-op）
+- [x] 3.1 **DoD**: shadow の観測書き込みが cash / position / strategy PnL を変更しないこと
+- [x] 3.2 TTL 失効で observation が 1 件書かれ、`order_id` / `market_data_session_id` / `start_admission_ordinal` / geometry が正しいこと
+- [x] 3.3 shadow の捕捉が失敗しても TTL cancel が完了し rollback されないこと。欠落が `order_id` join の reconciliation で検出できること
+- [x] 3.4 `CancellationException` が握り潰されないこと
+- [x] 3.5 対象外（MARKET / 非 BUY / TTL 以外の cancel）では observation が書かれないこと
+- [x] 3.6 永続化の往復テスト（Exposed）。resolution の CROSSED-wins upsert（`UNKNOWN` 後に `CROSSED` で上書き、`CROSSED` 後に `UNKNOWN` は no-op）
 
 ## 4. PR-2 / 仕上げ
 
-- [ ] 4.1 `docs/deploy.md` に `paper_market_event_receipts` への `(session_id, admission_ordinal)` index を `CREATE INDEX CONCURRENTLY` で追加する運用手順を書く（10.3 ユーザー確認済み）: 実行主体・deploy 順序・fresh DB 初期化順序・invalid index の drop/retry・既存行数/index size/WAL 増加の確認（新規ファイルは作らず deploy.md に追記）
-- [ ] 4.2 `make detekt` と関連テストを通す
+- [x] 4.1 `docs/deploy.md` に `paper_market_event_receipts` への `(session_id, admission_ordinal)` index を `CREATE INDEX CONCURRENTLY` で追加する運用手順を書く（10.3 ユーザー確認済み）: 実行主体・deploy 順序・fresh DB 初期化順序・invalid index の drop/retry・既存行数/index size/WAL 増加の確認（新規ファイルは作らず deploy.md に追記）
+- [x] 4.2 `make detekt` と関連テストを通す
 - [ ] 4.3 PR-2 を出す（change は open のまま）
 
 ## 5. PR-3 / decoder と scan

@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.market.PaperMarketTradeEvent
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
+import me.matsumo.fukurou.trading.shadow.GateShadowObservation
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Instant
@@ -499,6 +500,7 @@ data class ReconcileMarketContext(
  * @param closedPositionIds close した position ID
  * @param executionIds 作成した execution ID
  * @param divergenceMemos paper/live 乖離を audit に渡す structured memo
+ * @param gateShadowObservations commit 後に保存する TTL 失効 capture payload
  */
 data class ReconcileProgress(
     val filledOrderIds: MutableList<String>,
@@ -507,6 +509,7 @@ data class ReconcileProgress(
     val closedPositionIds: MutableList<String>,
     val executionIds: MutableList<String>,
     val divergenceMemos: MutableList<PaperExecutionDivergenceMemo> = mutableListOf(),
+    val gateShadowObservations: MutableList<GateShadowObservation> = mutableListOf(),
 )
 
 /**
@@ -573,6 +576,7 @@ internal fun ReconcileProgress.toPaperReconcileResult(): PaperReconcileResult {
         closedPositionIds = closedPositionIds,
         executionIds = executionIds,
         divergenceMemos = divergenceMemos.toList(),
+        gateShadowObservations = gateShadowObservations.toList(),
     )
 }
 
