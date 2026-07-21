@@ -120,7 +120,7 @@ PR を 2 本に分ける。**PR 1 = 共通基盤 + TTL 短縮感度** (tasks 群
 
 ## Risks / Trade-offs
 
-- **[短縮 TTL の境界帯が処理遅延で広がりうる]** → D2 の `UNKNOWN` 帯は poll grace を下限とし、上限を保証できないことを residual risk として出力に明記する。境界帯の外は EXACT。
+- **[confirmed-DROPPED は真の取りこぼしの下界]** → `E' > executed_at` の一部も production では drop しうるが確定できず `RETENTION_UNCONFIRMED` に入る。confirmed-DROPPED は総 drop 数の下界であるため、C3 で「安全に短縮できる境界」を読む際は confirmed-DROPPED の立ち上がりではなく `RETENTION_UNCONFIRMED` の立ち上がりを慎重側の境界として読む。出力は両件数を併記し、慎重側境界を明示する。
 - **[tail の最安値が exit slippage で過大評価]** → D4 で台帳値であることを明記し、市場最大逆行とは主張しない。tail 方向には保守的 (やや多めに検出) である。
 - **[`UNKNOWN` / `NO_REPLAY_INPUT` が多く母数が残らない]** → 実装後に実データで cohort 別・理由別の母数を実測し、絞り込みに足りるかを報告に含める。足りなければ「母数不足」を結論とする。
 - **[replay が production の約定規則から乖離]** → fill 発火条件は simulator の外にあり型で守れない。fixture 回帰テストで `executions.source_*` と突き合わせる。

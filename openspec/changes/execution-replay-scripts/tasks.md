@@ -19,7 +19,7 @@
 - [ ] 3.2 記録済み結果を分類する。entry execution 行あり → 約定 (L = `executed_at − created_at`、`executed_at` は約定発火 market event の socket 受信時刻)、`expired_at` あり → TTL 失効、`cancel_reason` あり (execution 無し・`expired_at` NULL) → `NON_TTL_TERMINAL` で TTL retention 母数から除外、いずれも無し → `OPEN_AT_SNAPSHOT`。execution 行を持たない order に fill を合成しない
 - [ ] 3.3 約定 order の market 応答レイテンシ L を EXACT として出力する。`DefaultPaperExecutionSimulator.simulatePendingLimit` は約定価格・手数料の照合 (fixture cross-check) にのみ用い、fill 生成に使わない
 - [ ] 3.4 短縮 TTL 候補ごとに confirmed-DROPPED を判定する。論理期限 `E' = created_at + T'` が `executed_at` 以下なら DROPPED (EXACT)、後なら `RETENTION_UNCONFIRMED` で `UNKNOWN` (RETAINED を主張しない)。実効期限は候補 TTL と `time_stop_at` の早い方とし、解決不能な time stop を `TIME_STOP_UNRESOLVED` で `UNKNOWN`
-- [ ] 3.5 各短縮 TTL 候補の confirmed-DROPPED 件数と、`RETENTION_UNCONFIRMED` 件数を集計出力する
+- [ ] 3.5 各短縮 TTL 候補の confirmed-DROPPED 件数と `RETENTION_UNCONFIRMED` 件数を集計出力し、confirmed-DROPPED が下界である旨と慎重側境界 (`RETENTION_UNCONFIRMED` の立ち上がり) を併記する
 - [ ] 3.6 eligibility 境界より前の receipt を約定 anchor に選ばないガードを実装する (cross-check 用)
 - [ ] 3.7 TTL 短縮の探索格子を既存 order 分布から決める。現行 30 分を上限に含める
 
