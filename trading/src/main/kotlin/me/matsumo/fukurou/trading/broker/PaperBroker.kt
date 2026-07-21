@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.broker
 
+import kotlin.coroutines.cancellation.CancellationException
 import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
 import me.matsumo.fukurou.trading.decision.AtomicIntentConsumptionRepository
 import me.matsumo.fukurou.trading.decision.DecisionRepository
@@ -165,6 +166,36 @@ class PaperBroker private constructor(
             reconcilerStatusProvider = reconcilerStatusProvider,
         ),
     )
+}
+
+/**
+ * [enforce] を実行し、その成否によらず [observe] を 1 回試みる。
+ *
+ * [enforce]（HARD_HALT の掃引を含む）が例外を投げた場合、その例外を正として伝播し、
+ * [observe] の失敗はそれに suppress して覆い隠さない。[enforce] がキャンセルされた場合は
+ * 追加処理を試みずに即座に伝播する。[enforce] が成功した場合のみ [observe] の例外
+ * （キャンセルを含む）をそのまま伝播する。
+ *
+ * `finally` で [observe] を呼ぶと、[observe] が投げた例外が [enforce] の例外を上書きして
+ * しまうため、この形で明示的に順序を制御する。
+ */
+internal suspend fun <T> enforceThenObserve(enforce: suspend () -> T, observe: suspend () -> Unit): T {
+    val result = try {
+        enforce()
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (enforceError: Throwable) {
+        try {
+            observe()
+        } catch (observeError: Throwable) {
+            enforceError.addSuppressed(observeError)
+        }
+        throw enforceError
+    }
+
+    observe()
+
+    return result
 }
 
 private val paperBrokerLogger: Logger = Logger.getLogger(PaperBroker::class.java.name)
@@ -1094,21 +1125,24 @@ private class PaperBrokerSafetyGate(
             preparedOrder.safetyContext,
         )
 
-        return try {
-            enforceSafetyFloor(
-                verdict = verdict,
-                command = preparedOrder.command,
-                ticker = preparedOrder.ticker,
-                symbolRules = preparedOrder.symbolRules,
-            )
-        } finally {
-            runtime.recordSafetyFloorMargin(
-                command = preparedOrder.command,
-                context = preparedOrder.safetyContext,
-                verdict = verdict,
-                callSite = SafetyFloorCallSite.PLACE,
-            )
-        }
+        return enforceThenObserve(
+            enforce = {
+                enforceSafetyFloor(
+                    verdict = verdict,
+                    command = preparedOrder.command,
+                    ticker = preparedOrder.ticker,
+                    symbolRules = preparedOrder.symbolRules,
+                )
+            },
+            observe = {
+                runtime.recordSafetyFloorMargin(
+                    command = preparedOrder.command,
+                    context = preparedOrder.safetyContext,
+                    verdict = verdict,
+                    callSite = SafetyFloorCallSite.PLACE,
+                )
+            },
+        )
     }
 
     suspend fun enforceSafetyFloor(
