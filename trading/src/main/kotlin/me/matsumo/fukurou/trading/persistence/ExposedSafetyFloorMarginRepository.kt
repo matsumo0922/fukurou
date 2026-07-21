@@ -39,12 +39,11 @@ class ExposedSafetyFloorMarginRepository(
             safetyFloorMarginResult(SafetyFloorMarginPersistenceStage.REPORT) {
                 transaction(database) {
                     // 監査書き込みが lock 待ちで注文処理を長時間ブロックしないよう、
-                    // 短い timeout を transaction 局所で設定する。
+                    // 短い timeout を transaction 局所で設定する。statement_timeout は文ごとに
+                    // 効くため、child は 1 文の multi-row INSERT にまとめて文数を 2 に抑える。
                     applyWriteTimeouts()
                     insertReport(report)
-                    report.observations.forEach { observation ->
-                        insertObservation(report.id, observation, report.observedAt)
-                    }
+                    insertObservations(report.id, report.observations, report.observedAt)
                 }
             }
         }
@@ -84,21 +83,35 @@ class ExposedSafetyFloorMarginRepository(
         }
     }
 
-    private fun JdbcTransaction.insertObservation(
+    /**
+     * evaluation point を 1 文の multi-row INSERT で書き込む。
+     *
+     * statement_timeout は文ごとに効くため、逐次 INSERT だと文数分の deadline が積み上がる。
+     * 1 文にまとめることで、注文経路をブロックしうる時間を transaction あたり実質 2 文分に抑える。
+     */
+    private fun JdbcTransaction.insertObservations(
         reportId: UUID,
-        observation: RuleObservation,
+        observations: List<RuleObservation>,
         observedAt: Instant,
     ) {
-        jdbcConnection().prepareStatement(INSERT_OBSERVATION_SQL).use { statement ->
-            statement.setObject(1, UUID.randomUUID())
-            statement.setObject(2, reportId)
-            statement.setString(3, observation.point.rule.name)
-            statement.setString(4, observation.point.pointId)
-            statement.setString(5, observation.status.name)
-            statement.setNullableString(6, observation.naReason?.name)
-            statement.setNullableBigDecimal(7, observation.marginValue)
-            statement.setNullableString(8, observation.point.marginUnit?.name)
-            statement.setLong(9, observedAt.toEpochMilli())
+        if (observations.isEmpty()) return
+
+        val rowPlaceholders = List(observations.size) { OBSERVATION_ROW_PLACEHOLDER }.joinToString(", ")
+        val sql = "$INSERT_OBSERVATIONS_PREFIX $rowPlaceholders"
+
+        jdbcConnection().prepareStatement(sql).use { statement ->
+            observations.forEachIndexed { index, observation ->
+                val base = index * OBSERVATION_COLUMN_COUNT
+                statement.setObject(base + 1, UUID.randomUUID())
+                statement.setObject(base + 2, reportId)
+                statement.setString(base + 3, observation.point.rule.name)
+                statement.setString(base + 4, observation.point.pointId)
+                statement.setString(base + 5, observation.status.name)
+                statement.setNullableString(base + 6, observation.naReason?.name)
+                statement.setNullableBigDecimal(base + 7, observation.marginValue)
+                statement.setNullableString(base + 8, observation.point.marginUnit?.name)
+                statement.setLong(base + 9, observedAt.toEpochMilli())
+            }
             statement.executeUpdate()
         }
     }
@@ -177,10 +190,14 @@ class ExposedSafetyFloorMarginRepository(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
-        const val INSERT_OBSERVATION_SQL = """
+        const val OBSERVATION_COLUMN_COUNT = 9
+
+        const val OBSERVATION_ROW_PLACEHOLDER = "(?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+        const val INSERT_OBSERVATIONS_PREFIX = """
             INSERT INTO safety_floor_rule_margins (
                 id, report_id, rule, point_id, status, na_reason, margin_value, margin_unit, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES
         """
 
         const val SELECT_REPORT_SQL =
