@@ -14,7 +14,7 @@ read-only の分析スクリプトを 2 本追加する。どちらも ledger・
 
 production の運用 config は resting entry TTL を **短縮方向にしか変更できない** (`TradingBotConfig.kt:439` で `restingEntryOrderTtl ≤ 1800s`)。したがって反実仮想も短縮のみを対象とする。短縮は記録済みの約定を「取りこぼす」方向にしか働かず、口座状態や安全ゲートを跨いだ延命を伴わないため、延長で生じる問題 (延命先の halt / 残高 / exposure 判定) が構造的に発生しない。
 
-主出力は各 order の**約定レイテンシ** (発注から約定条件成立までの経過。receipt から EXACT に決まる) と、記録済み結果を ground truth とした短縮 TTL ごとの retention (約定を保てるか / 取りこぼすか) である。
+約定の権威は記録済み execution 行に置き、queue から fill を再導出しない (queue 規則は fixture cross-check にのみ使う)。主出力は各 order の**約定レイテンシ** (`executions.executed_at − created_at`、EXACT) と、短縮 TTL ごとの retention である。retention は候補の論理期限を execution の処理時刻 `executed_at` と比較して判定するため、両方向とも EXACT になる。queue 到達後に安全ゲートで棄却され execution を持たない order には約定を主張せず、`NON_TTL_TERMINAL` として分離する。
 
 ### 2. tail 事実シート (`:trading` の position を対象)
 

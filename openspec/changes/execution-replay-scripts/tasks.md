@@ -15,19 +15,19 @@
 
 ## 3. TTL 短縮感度 (PR 1)
 
-- [ ] 3.1 対象 resting LIMIT entry order を選択する query を実装する。`created_at` / `expires_at` / `expiry_source` / `queue_ahead_btc` / limit 価格 / size / eligibility 境界 / `market_data_session_id` を取得し、`trade_plans` を join して `time_stop_at` を取得する
-- [ ] 3.2 production と同じ queue consumption 規則で約定を判定し、約定を発火させた receipt と約定レイテンシ L を求める。queue 累積はメモリ上でのみ進める。約定価格と手数料は `DefaultPaperExecutionSimulator.simulatePendingLimit` から得る
-- [ ] 3.3 記録済み結果 (約定 / 失効) を ground truth として出力する。約定 order では発火 receipt が `executions.source_*` と整合することを前提に L を EXACT とする
-- [ ] 3.4 短縮 TTL 候補ごとに retention を判定する。論理期限が約定の論理時刻より境界帯を超えて後なら RETAINED、前なら DROPPED。実効期限は候補 TTL と `time_stop_at` の早い方とし、解決不能な time stop を `TIME_STOP_UNRESOLVED` で `UNKNOWN`
-- [ ] 3.5 境界帯 (下限 = reconciler poll grace) 内の候補を `PROCESSING_CLOCK_AMBIGUOUS` で `UNKNOWN` とし、処理遅延の上限を排除できない旨を出力に明記する
-- [ ] 3.6 eligibility 境界より前の receipt で約定させないガードを実装する
+- [ ] 3.1 対象 resting LIMIT entry order を選択する query を実装する。`created_at` / `expires_at` / `expiry_source` / `expired_at` / `cancel_reason` / limit 価格 / size / eligibility 境界 / `market_data_session_id` を取得し、`trade_plans` を join して `time_stop_at`、`executions` を join して entry execution の `executed_at` を取得する
+- [ ] 3.2 記録済み結果を分類する。entry execution 行あり → 約定 (L = `executed_at − created_at`)、`expired_at` あり → TTL 失効、`cancel_reason` あり (execution 無し・`expired_at` NULL) → `NON_TTL_TERMINAL` で TTL retention 母数から除外。execution 行を持たない order に fill を合成しない
+- [ ] 3.3 約定 order の L を EXACT として出力する。`DefaultPaperExecutionSimulator.simulatePendingLimit` は約定価格・手数料の照合 (fixture cross-check) にのみ用い、fill 生成に使わない
+- [ ] 3.4 短縮 TTL 候補ごとに retention を判定する。論理期限 `E' = created_at + T'` を execution の処理時刻 `executed_at` と比較し、`E' ≤ executed_at` なら DROPPED、後なら RETAINED。実効期限は候補 TTL と `time_stop_at` の早い方とし、解決不能な time stop を `TIME_STOP_UNRESOLVED` で `UNKNOWN`
+- [ ] 3.5 `E'` が `executed_at` とミリ秒単位で一致する退化ケースを `PROCESSING_CLOCK_TIE` で `UNKNOWN` とする
+- [ ] 3.6 eligibility 境界より前の receipt を約定 anchor に選ばないガードを実装する (cross-check 用)
 - [ ] 3.7 TTL 短縮の探索格子を既存 order 分布から決める。現行 30 分を上限に含める
 
 ## 4. TTL 検証 (PR 1)
 
-- [ ] 4.1 fixture 回帰テスト。約定した既知 order 1 件で、発火 receipt が `executions.source_session_id`/`source_sequence`/`source_price_jpy` と一致し、約定価格と手数料が記録済み execution と一致する
-- [ ] 4.2 短縮 retention の回帰テスト。約定より境界帯を超えて前で失効する候補が DROPPED、後の候補が RETAINED になる
-- [ ] 4.3 境界帯の回帰テスト。約定の論理時刻の境界帯内の候補が `PROCESSING_CLOCK_AMBIGUOUS` で `UNKNOWN` になる
+- [ ] 4.1 fixture cross-check 回帰テスト。約定した既知 order 1 件で、記録済み execution の source receipt が queue 理解と整合し、約定価格と手数料が記録済み execution と一致する
+- [ ] 4.2 短縮 retention の回帰テスト。execution の `executed_at` より前で失効する候補が DROPPED、後の候補が RETAINED になる
+- [ ] 4.3 fill 非合成の回帰テスト。`cancel_reason` を持ち execution 行を持たない order が `NON_TTL_TERMINAL` に分類され、約定を主張されず retention 母数に入らない。`PROCESSING_CLOCK_TIE` の退化ケースが `UNKNOWN` になる
 - [ ] 4.4 read-only 回帰テスト。replay 完走前後で対象テーブル内容が同一である。取引所 API client が依存グラフに含まれない
 - [ ] 4.5 time stop 優先・ordinal 欠番・gap 交差・cohort 分離・境界超過の各 `UNKNOWN` / 失敗経路の回帰テスト
 
@@ -36,7 +36,7 @@
 - [ ] 5.1 対象 position を選択する query を実装する。`average_entry_price_jpy` / `lowest_price_since_entry_jpy` / size / partial close 有無を取得する
 - [ ] 5.2 初期リスク R を既存 evaluation と同じ fill-weighted stop から復元する。pyramiding でも同時点に存在した基準になることを確認する
 - [ ] 5.3 実際の逆行を平均約定価格と `lowest_price_since_entry_jpy` の差から求め、初期リスクの指定倍数を超えた件数を出力する。最安値が exit fill slippage を含む台帳値である旨を明記する
-- [ ] 5.4 最安値または entry stop が null の position を `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とし、部分決済 position に基準数量変化を注記する
+- [ ] 5.4 最安値・entry stop が null、または risk width が非正 (fill-weighted stop ≥ average entry) の position を `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とし、部分決済 position に基準数量変化を注記する
 - [ ] 5.5 壊滅的 tail の閾値 (初期 R の倍数) を実データ分布から決める
 - [ ] 5.6 tail の回帰テスト。逆行が閾値を超える既知 position が計上され、fill-weighted R を用い、null 基準が `UNKNOWN` になる
 

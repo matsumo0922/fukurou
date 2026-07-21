@@ -45,17 +45,28 @@ cohort は lineage から `CASE` で導出される派生値である (`ExposedE
 
 config が短縮しか許さない。短縮は記録済み約定を取りこぼす方向のみで、延命先の安全ゲート・口座状態を必要としないため B-06 が構造的に発生しない。TTL 延長は Non-Goal とする。
 
-### D2. 出力の主軸を EXACT な約定レイテンシとし、retention は境界帯を UNKNOWN にする — [B-05, B-07]
+### D2. fill の権威を記録済み execution に置き、retention を処理時刻 `executed_at` で判定する — [F1, F2, B-05, B-07]
 
-各 order について次を出す。
+fill を queue から再導出して判定に使わない。約定の権威は記録済み execution 行とする [F1]。各 order について次を出す。
 
-- **記録済み結果** (ground truth): 約定 (`executions` に残る) か失効 (`orders.expired_at`)。
-- **約定レイテンシ** `L`: 発注 (`created_at`) から約定条件を満たした receipt までの経過。約定した order で EXACT に決まる。
-- **短縮 TTL retention**: 候補 TTL `T'` について、`T'` の論理期限 (`created_at + T'`) と約定の論理時刻を比較する。`T'` が約定の論理時刻より**十分後**なら約定を保つ (RETAINED)、**十分前**なら取りこぼす (DROPPED)。
+- **記録済み結果** (ground truth): entry execution 行が存在すれば約定、`orders.expired_at` が立てば TTL 失効、`cancel_reason` が立てば非 TTL 終端 (D2b)。
+- **約定レイテンシ** `L`: `executions.executed_at − orders.created_at`。resting entry fill は全量一括で 1 execution なので (`ExposedPaperLedgerWriter.kt:1058`) `executed_at` は一意。EXACT。
+- **短縮 TTL retention**: 候補 TTL `T'` の論理期限 `E' = created_at + T'` を、約定の**処理時刻** `executed_at` と比較する。
 
-処理時刻の遅延に上限が無い [B-05] ため、論理期限が約定時刻の近傍にある候補は `PROCESSING_CLOCK_AMBIGUOUS` で `UNKNOWN` とする。近傍の幅は reconciler の grace (`PaperOrderLifecyclePolicy` の poll 間隔 + grace) を下限とし、それを超える処理遅延を排除できないことを residual risk として出力に明記する。
+`executed_at` は fill を書いた writer clock の処理時刻であり (`fill.executedAt`)、失効判定に使う `clock.instant()` (`ExposedPaperLedgerWriter.kt:806`) と同一の clock である。fill event の処理は expiry を fill より**前**に評価する (`:869` が `:873` より前)。したがって:
 
-fidelity 契約 [B-07]: 約定レイテンシと、境界帯の外の RETAINED / DROPPED は `EXACT`。境界帯は `UNKNOWN`。記録済み TTL の再現は当然に `EXACT`。本 replay は候補 TTL の延長を扱わないため、記録値と異なる論理期限を持つ候補でも「短縮による取りこぼし」しか主張せず、延長 fill を作らない。
+- `E' ≤ executed_at` なら、fill event の処理時点で expiry が先に発火し **DROPPED**。
+- `E' > executed_at` なら、fill 処理までに `E'` を跨ぐ処理が無く **RETAINED**。
+
+この判定は socket-to-処理の遅延に依存しない。遅延の無上限 [B-05] は receipt の socket 時刻を anchor にした場合の問題であり、本設計は処理時刻 `executed_at` を anchor にするため発生しない。両方向とも EXACT である [F2]。intra-transaction の μ秒差 (`:869` と `:873` の間) は TTL の秒粒度を大きく下回るため無視できるが、`E'` が `executed_at` とミリ秒単位で一致する退化ケースは `PROCESSING_CLOCK_TIE` で `UNKNOWN` とする。
+
+fidelity 契約 [B-07]: 約定レイテンシと、RETAINED / DROPPED は `EXACT` (退化ケースのみ `UNKNOWN`)。本 replay は延長を扱わないため延長 fill を作らない。
+
+### D2b. execution 行を持たない order に fill を合成しない — [F1]
+
+queue 到達後、production は hard-halt ゲート (`ExposedPaperLedgerWriter.kt:872`) と order ごとの resting-entry fill invariant (drawdown / exposure / balance / group risk / EV、`:1060, 1652-1687`, `SafetyFloor.kt:526-538`) を fill 時点の口座状態で評価し、棄却すると execution 行を作らず `status=CANCELED` (`expired_at` は NULL、`cancel_reason ∈ {HARD_HALT, MARKET_DATA_GAP, LEGACY_UNCLASSIFIED}`) で終端する。
+
+これらの order は約定でも TTL 失効でもない。system は execution 行を持たない order に fill を主張しない。対象選択で `cancel_reason` を持つ CANCELED を `NON_TTL_TERMINAL` として分類し、TTL retention 分析の母数から除外する (短縮しても TTL 由来で結果が変わらないため)。queue consumption 規則は fixture の cross-check にのみ使い、fill 生成には使わない。
 
 ### D3. 各 order を独自の記録済み queue で独立評価し、sibling ゲートを置かない — [N-01]
 
@@ -65,7 +76,7 @@ fidelity 契約 [B-07]: 約定レイテンシと、境界帯の外の RETAINED /
 
 初期 R を既存 evaluation と同じ fill-weighted stop から復元する [B-03] (pyramiding でも同時点に存在した基準になる)。実際の逆行を `average_entry_price_jpy − lowest_price_since_entry_jpy` から求める。この最安値は exit fill slippage を含む台帳値であるため [B-04]、出力に「台帳記録値、exit fill slippage を含みうる」と明記し、市場最安値とは主張しない。
 
-`lowest` または entry stop が null の position は `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とする [B-04]。tail は exit 理由に依らず逆行幅を出すが、partial close で基準 size が変わる position はその旨を注記する [B-10]。
+`lowest` または entry stop が null の position、および fill-weighted stop が average entry 以上で risk width が非正になる position (`EvaluationMath.kt:26` が `width > 0` のみ採用) は `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とする [B-04, F3]。tail は exit 理由に依らず逆行幅を出すが、partial close で基準 size が変わる position はその旨を注記する [B-10]。
 
 ### D5. 実効期限は `trade_plans.time_stop_at` を join して算出する — [前回 2-C]
 
@@ -93,9 +104,9 @@ receipt に時刻 index は無い [B-11]。対象 order は `market_data_session
 
 replay の実行には receipt を含む read set への SELECT 権を持ち write 権を持たない専用 read-only credential を前提とする。既存 `fukurou_mcp` role は要件を満たさない [B-09] ため、本 change は必要な read-only 権限の付与を運用前提として文書化する (role 定義の変更は本 change のコードには含めない。付与はオーナー承認の運用作業)。`ExposedPaperLedgerWriter` / `PaperBroker` を依存に含めない。回帰テストで完走前後のテーブル内容一致を検証する。
 
-### D11. 約定規則は production の式を写し、価格算出のみ simulator を使う — [前回 D7]
+### D11. queue 規則は fixture cross-check にのみ使う — [F1, 前回 D7]
 
-fill 発火条件は `consumeLimitQueue` の queue 式を同じ形で持ち、queue 累積をメモリ上でのみ進める。約定価格と手数料は `simulatePendingLimit` を再利用する。eligibility 境界以前の receipt で約定させない。乖離検知は fixture 突き合わせで行う。
+fill の権威は記録済み execution である (D2)。queue consumption 規則 (`consumeLimitQueue` の式) は本 replay の fill 判定には使わず、fixture 回帰テストで「記録済み execution の source receipt が我々の queue 理解と整合するか」を検証する cross-check にのみ使う。約定価格と手数料の照合には `simulatePendingLimit` を用いる。eligibility 境界以前の receipt を約定 anchor に選ばない。
 
 ### D12. 配置と PR 分割・全 task の帰属 — [B-12]
 
@@ -119,7 +130,7 @@ production への deploy を伴わない。read-only 接続から実行する。
 
 - TTL 短縮の探索格子は既存 order 分布から決める。現行 30 分 (`TradingBotConfig.kt:764`) を上限に含め、それ以下の短縮候補を並べる。
 - 壊滅的 tail の閾値 (初期 R の倍数) と対象件数上限は実データ分布から決める。
-- 境界帯の下限 (poll grace) の具体値は `PaperOrderLifecyclePolicy` の値に合わせる。
+- 長い replay window (数ヶ月) では infrastructure gap が 1,000 件を超えて gap CTE が run 全体を失敗させうる (D6)。長 window は windowing を前提とする。
 
 ## Next steps (本 change では実施しない)
 
@@ -131,6 +142,6 @@ production への deploy を伴わない。read-only 接続から実行する。
 | 決定 | タグ |
 | --- | --- |
 | scope を忠実なコアに確定 (trailing ランキング・offset の除外) | ユーザー確認済み |
-| D1〜D12 | agent 仮決め |
+| D1〜D12 (D2b 含む) | agent 仮決め |
 
 trailing ランキングと offset を「記録済みデータでは不可能」として除外することはオーナーが確定した。read-only credential の付与 (D10) はオーナー承認を要する運用前提として PR の「人間に確認してほしいこと」へ転記する。
