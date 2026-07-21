@@ -41,6 +41,8 @@ table public positions
 table public risk_state
 table public runtime_config_values
 table public runtime_config_versions
+table public safety_floor_margin_reports
+table public safety_floor_rule_margins
 table public safety_violations
 table public trade_intent_consumptions
 table public trade_intents

@@ -503,6 +503,18 @@ private const val ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL = """
     WHERE closed_at IS NULL
 """
 
+/** rule ごとの margin 分布を期間で引く index。親子をまたげないため child に observed_at を持つ。 */
+private const val ENSURE_SAFETY_FLOOR_RULE_MARGINS_RULE_TIME_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_safety_floor_rule_margins_rule_observed_at
+    ON safety_floor_rule_margins (rule, observed_at)
+"""
+
+/** report 単位で child を引く index。 */
+private const val ENSURE_SAFETY_FLOOR_RULE_MARGINS_REPORT_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS idx_safety_floor_rule_margins_report_id
+    ON safety_floor_rule_margins (report_id)
+"""
+
 /** historical trade timestamp を新しい正本列へ一度だけ移す SQL。 */
 private const val BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL = """
     UPDATE market_data_sessions
@@ -1372,6 +1384,8 @@ class TradingPersistenceBootstrap(
                     OpportunityEpisodesTable,
                     DedupeShadowObservationsTable,
                     DedupeShadowResolutionsTable,
+                    SafetyFloorMarginReportsTable,
+                    SafetyFloorRuleMarginsTable,
                     DecisionsTable,
                     DecisionSubmissionAuthoritiesTable,
                     TradePlansTable,
@@ -1699,6 +1713,8 @@ private fun JdbcTransaction.ensureRuntimeSchemaObjects(
     executeUpdate(ENSURE_PAPER_MARKET_RECEIPT_SOURCE_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_PAPER_MARKET_RECEIPT_ORDINAL_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_OPEN_OPPORTUNITY_EPISODE_UNIQUE_INDEX_SQL)
+    executeUpdate(ENSURE_SAFETY_FLOOR_RULE_MARGINS_RULE_TIME_INDEX_SQL)
+    executeUpdate(ENSURE_SAFETY_FLOOR_RULE_MARGINS_REPORT_INDEX_SQL)
     executeUpdate(BACKFILL_MARKET_DATA_TRADE_TIMESTAMP_SQL)
     executeUpdate(ENSURE_EVALUATION_EXCLUSIONS_UNIQUE_INDEX_SQL)
     executeUpdate(ENSURE_MARKET_DATA_GAPS_SESSION_STARTED_INDEX_SQL)

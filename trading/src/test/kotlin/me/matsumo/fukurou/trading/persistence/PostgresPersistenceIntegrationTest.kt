@@ -175,9 +175,19 @@ import me.matsumo.fukurou.trading.runtime.TradingDatabaseConfig
 import me.matsumo.fukurou.trading.runtime.TradingRuntime
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
+import me.matsumo.fukurou.trading.safety.EvaluationPointId
+import me.matsumo.fukurou.trading.safety.MarginUnit
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
+import me.matsumo.fukurou.trading.safety.ObservedVerdict
+import me.matsumo.fukurou.trading.safety.RuleObservation
+import me.matsumo.fukurou.trading.safety.RuleStatus
 import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.safety.SafetyFloorCallSite
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import me.matsumo.fukurou.trading.safety.SafetyFloorDefaults
+import me.matsumo.fukurou.trading.safety.SafetyFloorEvaluationPath
+import me.matsumo.fukurou.trading.safety.SafetyFloorEvaluationPoints
+import me.matsumo.fukurou.trading.safety.SafetyFloorObservationReport
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -947,6 +957,76 @@ class PostgresPersistenceIntegrationTest {
         exposedTransaction(database) {
             assertSqlCount("SELECT COUNT(*) FROM llm_tool_evidence_activation_boundaries", 0)
         }
+    }
+
+    @Test
+    fun safetyFloorMargin_roundTripsReportWithAllObservations() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedSafetyFloorMarginRepository(database)
+        val report = safetyFloorMarginReport()
+
+        repository.append(report).getOrThrow()
+
+        val loaded = repository.find(report.id).getOrThrow()
+        assertEquals(report.commandId, loaded?.commandId)
+        assertEquals(report.observations.size, loaded?.observations?.size)
+        assertEquals(report.verdict, loaded?.verdict)
+        assertEquals(report.policyVersion, loaded?.policyVersion)
+        exposedTransaction(database) {
+            assertSqlCount(
+                "SELECT COUNT(*) FROM safety_floor_rule_margins WHERE report_id = '${report.id}'",
+                report.observations.size,
+            )
+        }
+    }
+
+    @Test
+    fun safetyFloorMargin_leavesNoPartialRowsWhenAChildInsertFails() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedSafetyFloorMarginRepository(database)
+        // margin_value は NUMERIC(30,12)。整数部が 18 桁を超える値で child insert を失敗させる。
+        val overflowingObservation = RuleObservation(
+            point = EvaluationPointId(
+                rule = SafetyFloorRule.MAX_RISK_PER_TRADE,
+                marginUnit = MarginUnit.JPY,
+            ),
+            status = RuleStatus.PASS,
+            marginValue = java.math.BigDecimal("1E19"),
+        )
+        val report = safetyFloorMarginReport(extraObservations = listOf(overflowingObservation))
+
+        val result = repository.append(report)
+
+        assertTrue(result.isFailure)
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM safety_floor_margin_reports WHERE id = '${report.id}'", 0)
+            assertSqlCount("SELECT COUNT(*) FROM safety_floor_rule_margins WHERE report_id = '${report.id}'", 0)
+        }
+    }
+
+    private fun safetyFloorMarginReport(
+        extraObservations: List<RuleObservation> = emptyList(),
+    ): SafetyFloorObservationReport {
+        val observations = SafetyFloorEvaluationPoints.placeOrderPoints.map { point ->
+            RuleObservation(point = point, status = RuleStatus.PASS)
+        } + extraObservations
+
+        return SafetyFloorObservationReport(
+            id = UUID.randomUUID(),
+            path = SafetyFloorEvaluationPath.PLACE_ORDER,
+            callSite = SafetyFloorCallSite.PLACE,
+            decisionRunId = "margin-roundtrip",
+            commandId = UUID.randomUUID(),
+            verdict = ObservedVerdict.ACCEPTED,
+            rejectedRule = null,
+            policyVersion = SafetyFloorDefaults.policyVersion,
+            runtimeConfigVersion = null,
+            observationSchemaVersion = 1,
+            divergence = false,
+            collectionFailed = false,
+            observations = observations,
+            observedAt = fixedInstant(),
+        )
     }
 
     @Test

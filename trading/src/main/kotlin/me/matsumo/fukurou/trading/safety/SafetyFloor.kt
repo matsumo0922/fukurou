@@ -486,9 +486,9 @@ data class SafetyFloorPlaceOrderRiskDetails(
  */
 @Suppress("LargeClass") // placement と fill が同じ rule authority を共有するため、rule set を分散させない。
 class SafetyFloor(
-    private val config: SafetyFloorConfig = SafetyFloorConfig(),
-    private val clock: Clock = Clock.systemUTC(),
-    private val paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
+    internal val config: SafetyFloorConfig = SafetyFloorConfig(),
+    internal val clock: Clock = Clock.systemUTC(),
+    internal val paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
     internal val maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(config.maxDrawdownRatio),
 ) {
     private val riskCalculator = SafetyFloorRiskCalculator(config, clock, paperExecutionConfig)
@@ -1380,12 +1380,12 @@ internal const val SAFETY_SCALE = 8
 /**
  * ピラミッディングの最大追加回数。
  */
-private const val MAX_PYRAMID_ADD_COUNT = 2
+internal const val MAX_PYRAMID_ADD_COUNT = 2
 
 /**
  * 追加 risk の初回 risk budget に対する上限比率。
  */
-private val PYRAMID_ADD_RISK_RATIO = BigDecimal("0.50")
+internal val PYRAMID_ADD_RISK_RATIO = BigDecimal("0.50")
 
 /**
  * bps 分母。

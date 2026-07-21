@@ -44,6 +44,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
+import me.matsumo.fukurou.trading.persistence.ExposedSafetyFloorMarginRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedReconcilerStatusProvider
 import me.matsumo.fukurou.trading.persistence.ExposedRiskStateCommandService
@@ -576,6 +577,7 @@ private fun createPostgresBroker(
             maxDrawdownPolicy = context.maxDrawdownPolicy,
         ),
         maxDrawdownPolicy = context.maxDrawdownPolicy,
+        safetyFloorMarginRepository = ExposedSafetyFloorMarginRepository(connection.database),
         marketDataSource = context.marketDataSource,
         paperExecutionConfig = context.tradingConfig.paperExecution,
         fillSimulator = DefaultPaperExecutionSimulator(context.tradingConfig.paperExecution, context.clock),
