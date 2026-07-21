@@ -75,27 +75,27 @@
 
 ## 7. Stage 2 / margin 値
 
-- [ ] 7.1 NUMERIC 17 point の margin を design.md D4 の式で算出する。符号は「正 = 閾値までの余裕」に統一する
-- [ ] 7.2 `ECONOMIC_EVENT_BLACKOUT` を `min over events(max(startsAt - observedAt, observedAt - endsAt))` で実装する。**内側は max**
-- [ ] 7.3 `FOMC_CALENDAR_EXPIRED` の境界を `>= 0` とする
-- [ ] 7.4 `placeOrderRiskDetails` の既存 15 フィールドを流用し、コストゼロで取れる point で重複計算しない
-- [ ] 7.5 `PYRAMID_ADD_RISK_LIMIT` の `initialTradeGroupRiskBudget` を calculator から取得する
-- [ ] 7.6 BOOLEAN 10 point は margin を欠測のままとする
-- [ ] 7.7 `observation_schema_version = 2` を記録する。Stage 1 の行（version 1）へ backfill は行わない
+- [x] 7.1 NUMERIC 17 point の margin を design.md D4 の式で算出する。符号は「正 = 閾値までの余裕」に統一する
+- [x] 7.2 `ECONOMIC_EVENT_BLACKOUT` を `min over events(max(startsAt - observedAt, observedAt - endsAt))` で実装する。**内側は max**
+- [x] 7.3 `FOMC_CALENDAR_EXPIRED` の境界を `>= 0` とする
+- [x] 7.4 `placeOrderRiskDetails` の既存 15 フィールドを流用し、コストゼロで取れる point で重複計算しない
+- [x] 7.5 `PYRAMID_ADD_RISK_LIMIT` の `initialTradeGroupRiskBudget` を calculator から取得する
+- [x] 7.6 BOOLEAN 10 point は margin を欠測のままとする
+- [x] 7.7 `observation_schema_version = 2` を記録する。Stage 1 の行（version 1）へ backfill は行わない
 
 ## 8. Stage 2 / テスト
 
-- [ ] 8.1 margin の符号のテスト。余裕がある PASS で正、違反した FAIL で負
-- [ ] 8.2 `ECONOMIC_EVENT_BLACKOUT` が window 外で正、window 内で負になること。開始前・終了後の両方
-- [ ] 8.3 `FOMC_CALENDAR_EXPIRED` が `observedAt == validThrough` で PASS になること
-- [ ] 8.4 NUMERIC 17 point それぞれの式のテスト
-- [ ] 8.5 単位が evaluation point ごとに正しく記録されること（特に `NO_AVERAGING_DOWN` の JPY と JPY_PER_BTC）
-- [ ] 8.6 現状 PASS に潰れている 2 件（`EXPECTED_MOVE_TO_COST_RATIO` の TP null、`STOP_LOSS_LOOSENING` の全件 stop null）が `NA` になること
+- [x] 8.1 margin の符号のテスト。余裕がある PASS で正、違反した FAIL で負
+- [x] 8.2 `ECONOMIC_EVENT_BLACKOUT` が window 外で正、window 内で負になること。開始前・終了後の両方
+- [x] 8.3 `FOMC_CALENDAR_EXPIRED` が `observedAt == validThrough` で PASS になること
+- [x] 8.4 NUMERIC 17 point それぞれの式のテスト
+- [x] 8.5 単位が evaluation point ごとに正しく記録されること（特に `NO_AVERAGING_DOWN` の JPY と JPY_PER_BTC）
+- [x] 8.6 現状 PASS に潰れている 2 件（`EXPECTED_MOVE_TO_COST_RATIO` の TP null、`STOP_LOSS_LOOSENING` の全件 stop null）が `NA` になること
 
 ## 9. Stage 2 / 仕上げ
 
-- [ ] 9.1 `make detekt` と関連テストを通す
-- [ ] 9.2 margin ベクトルを SQL で照会する例を `docs/` の該当箇所に追記する。**margin の照会は `observation_schema_version >= 2` で絞ること**を明記する（新規ファイルは作らない）
-- [ ] 9.3 完了報告に、後続 change（`RESTING_ENTRY_FILL` は ledger transaction 内配線、`UPDATE_PROTECTION` は risk-reducing 遅延の考慮）を明記する
-- [ ] 9.4 完了報告に、residual risk を明記する。`Rejected` 方向の乖離検出が rule 単位に留まること、clock 由来の margin 差が検出されないこと、retention 未設定でレコードが無期限に増えること、Stage 1 の行に margin が無く backfill しないこと
-- [ ] 9.5 完了報告に、scope 外として残した既存例外リスク（`Ticker.ask/bid` の `toBigDecimal()` 不統一、`mergedPositionRisk` の非 guard 除算、Position の String フィールド群のパース）を列挙する
+- [x] 9.1 `make detekt` と関連テストを通す
+- [x] 9.2 margin ベクトルを SQL で照会する例を `docs/` の該当箇所に追記する。**margin の照会は `observation_schema_version >= 2` で絞ること**を明記する（新規ファイルは作らない）
+- [x] 9.3 完了報告に、後続 change（`RESTING_ENTRY_FILL` は ledger transaction 内配線、`UPDATE_PROTECTION` は risk-reducing 遅延の考慮）を明記する
+- [x] 9.4 完了報告に、residual risk を明記する。`Rejected` 方向の乖離検出が rule 単位に留まること、clock 由来の margin 差が検出されないこと、retention 未設定でレコードが無期限に増えること、Stage 1 の行に margin が無く backfill しないこと
+- [x] 9.5 完了報告に、scope 外として残した既存例外リスク（`Ticker.ask/bid` の `toBigDecimal()` 不統一、`mergedPositionRisk` の非 guard 除算、Position の String フィールド群のパース）を列挙する

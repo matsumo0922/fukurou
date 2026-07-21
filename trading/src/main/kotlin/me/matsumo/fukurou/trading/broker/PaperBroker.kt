@@ -1,6 +1,5 @@
 package me.matsumo.fukurou.trading.broker
 
-import kotlin.coroutines.cancellation.CancellationException
 import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
 import me.matsumo.fukurou.trading.decision.AtomicIntentConsumptionRepository
 import me.matsumo.fukurou.trading.decision.DecisionRepository
@@ -62,6 +61,7 @@ import java.time.format.DateTimeParseException
 import java.util.UUID
 import java.util.logging.Level
 import java.util.logging.Logger
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * paper ledger を読み取る Broker 実装。

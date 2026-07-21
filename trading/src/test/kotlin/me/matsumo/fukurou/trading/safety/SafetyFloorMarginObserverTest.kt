@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.safety
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PaperTradeAuditContext
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
@@ -9,7 +10,9 @@ import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
+import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -22,6 +25,7 @@ import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskState
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.UUID
@@ -156,6 +160,21 @@ class SafetyFloorMarginObserverTest {
     }
 
     @Test
+    fun `drawdown status agrees with the verdict immediately before the threshold`() {
+        val command = acceptedEntry()
+        val context = acceptedContext(command).copy(
+            account = acceptedContext(command).account.copy(drawdownRatio = "-0.1499999999"),
+        )
+        val verdict = safetyFloor().evaluatePlaceOrder(command, context)
+        assertIs<SafetyFloorVerdict.Accepted>(verdict)
+
+        val report = observer().observe(command, context, verdict, SafetyFloorCallSite.PLACE)
+
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.MAX_DRAWDOWN_HALT, POINT_THRESHOLD))
+        assertFalse(report.divergence)
+    }
+
+    @Test
     fun `marks expected value points as unevaluable when the stop is above entry`() {
         val command = entryCommand(protectiveStopPriceJpy = BigDecimal("10500000"))
         val report = observe(command, baseContext())
@@ -232,16 +251,368 @@ class SafetyFloorMarginObserverTest {
 
         assertEquals(SafetyFloorDefaults.policyVersion, report.policyVersion)
         assertNull(report.runtimeConfigVersion)
-        assertEquals(1, report.observationSchemaVersion)
+        assertEquals(2, report.observationSchemaVersion)
     }
 
     @Test
-    fun `stage one records status without margin values`() {
+    fun `records margins only for evaluable numeric points`() {
         val report = observe(entryCommand(), baseContext())
 
         report.observations.forEach { observation ->
-            assertNull(observation.marginValue, "Stage 1 records status only.")
+            if (observation.point.isNumeric && observation.status != RuleStatus.NA) {
+                assertNotNull(observation.marginValue, "${observation.point} must carry a numeric margin.")
+            } else {
+                assertNull(observation.marginValue, "BOOLEAN and NA points must not carry a margin.")
+            }
         }
+    }
+
+    @Test
+    fun `records positive room for passing margins and negative excess for failing margins`() {
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val passing = observer().observe(
+            command = command,
+            context = context,
+            verdict = safetyFloor().evaluatePlaceOrder(command, context),
+            callSite = SafetyFloorCallSite.PLACE,
+        )
+        val strictConfig = SafetyFloorConfig(maxRiskPerTradeRatio = BigDecimal("0.0000001"))
+        val failing = SafetyFloorMarginObserver(strictConfig, fixedClock()).observe(
+            command = command,
+            context = context,
+            verdict = SafetyFloor(config = strictConfig, clock = fixedClock()).evaluatePlaceOrder(command, context),
+            callSite = SafetyFloorCallSite.PLACE,
+        )
+
+        assertTrue(passing.marginOf(SafetyFloorRule.MAX_RISK_PER_TRADE) > BigDecimal.ZERO)
+        assertEquals(RuleStatus.PASS, passing.statusOf(SafetyFloorRule.MAX_RISK_PER_TRADE))
+        assertTrue(failing.marginOf(SafetyFloorRule.MAX_RISK_PER_TRADE) < BigDecimal.ZERO)
+        assertEquals(RuleStatus.FAIL, failing.statusOf(SafetyFloorRule.MAX_RISK_PER_TRADE))
+    }
+
+    @Test
+    fun `records every non-pyramid numeric margin using the design formulas`() {
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val config = observerConfig()
+        val report = SafetyFloorMarginObserver(config, fixedClock()).observe(
+            command = command,
+            context = context,
+            verdict = SafetyFloor(config = config, clock = fixedClock()).evaluatePlaceOrder(command, context),
+            callSite = SafetyFloorCallSite.PLACE,
+        )
+        val details = SafetyFloor(config = config, clock = fixedClock()).placeOrderRiskDetails(command, context)
+        val calendar = config.fomcBlackoutCalendar
+
+        assertMargin(report, SafetyFloorRule.MAX_DRAWDOWN_HALT, POINT_THRESHOLD, BigDecimal("0.15"))
+        assertMargin(
+            report,
+            SafetyFloorRule.FOMC_CALENDAR_EXPIRED,
+            expected = BigDecimal.valueOf(Duration.between(fixedInstant(), requireNotNull(calendar.validThrough)).seconds),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT,
+            expected = calendar.events.minOf { event ->
+                val window = requireNotNull(event.toSafeWindow())
+                maxOf(
+                    BigDecimal.valueOf(Duration.between(fixedInstant(), window.startsAt).seconds),
+                    BigDecimal.valueOf(Duration.between(window.endsAt, fixedInstant()).seconds),
+                )
+            },
+        )
+        assertMargin(report, SafetyFloorRule.STOP_LOSS_REQUIRED, POINT_POSITIVE, command.protectiveStopPriceJpy)
+        assertMargin(
+            report,
+            SafetyFloorRule.STOP_LOSS_REQUIRED,
+            POINT_BELOW_ENTRY,
+            details.estimatedEntryPriceJpy.toBigDecimal().subtract(command.protectiveStopPriceJpy),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT,
+            POINT_CASH,
+            details.availableCashJpy.toBigDecimal().subtract(details.requiredCashJpy.toBigDecimal()),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.MAX_RISK_PER_TRADE,
+            expected = details.maxRiskPerTradeJpy.toBigDecimal().subtract(details.groupRiskAfterOrderJpy.toBigDecimal()),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.MAX_TOTAL_EXPOSURE,
+            expected = details.maxTotalExposureJpy.toBigDecimal()
+                .subtract(details.totalExposureAfterOrderJpy.toBigDecimal()),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE,
+            expected = requireNotNull(details.expectedValueR).toBigDecimal(),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.EXPECTED_VALUE_GATE,
+            expected = details.expectedValueR.toBigDecimal().subtract(config.minExpectedValueR),
+        )
+        assertMargin(
+            report,
+            SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO,
+            expected = requireNotNull(details.expectedMoveToCostRatio).toBigDecimal()
+                .subtract(config.minExpectedMoveToCostRatio),
+        )
+    }
+
+    @Test
+    fun `records every position and pyramid margin using the design formulas`() {
+        val tradeGroupId = UUID.randomUUID()
+        val command = acceptedEntry().copy(tradeGroupId = tradeGroupId)
+        val position = openPosition(
+            tradeGroupId = tradeGroupId,
+            currentStopLossJpy = "9600000",
+            unrealizedPnlJpy = "5000",
+            currentPriceJpy = "10200000",
+            unrealizedR = "3.0",
+            pyramidAddCount = 1,
+        )
+        val initialOrder = filledInitialOrder(tradeGroupId)
+        val context = acceptedContext(command).copy(
+            positions = listOf(position),
+            tradeGroupOrders = listOf(initialOrder),
+        )
+        val config = observerConfig()
+        val report = SafetyFloorMarginObserver(config, fixedClock()).observe(
+            command = command,
+            context = context,
+            verdict = SafetyFloor(config = config, clock = fixedClock()).evaluatePlaceOrder(command, context),
+            callSite = SafetyFloorCallSite.PLACE,
+        )
+        val calculator = SafetyFloorRiskCalculator(
+            config = config,
+            clock = fixedClock(),
+            paperExecutionConfig = PaperExecutionConfig(),
+        )
+        val details = calculator.placeOrderRiskDetails(command, context)
+        val initialBudget = requireNotNull(calculator.initialTradeGroupRiskBudget(context, tradeGroupId.toString()))
+        val expectedAddRiskMargin = initialBudget.multiply(PYRAMID_ADD_RISK_RATIO)
+            .safetyScale()
+            .subtract(details.orderRiskJpy.toBigDecimal())
+
+        assertMargin(report, SafetyFloorRule.STOP_LOSS_LOOSENING, expected = BigDecimal("100000"))
+        assertMargin(report, SafetyFloorRule.NO_AVERAGING_DOWN, POINT_UNREALIZED_PNL, BigDecimal("5000"))
+        assertMargin(report, SafetyFloorRule.NO_AVERAGING_DOWN, POINT_PRICE_DIFF, BigDecimal("100000"))
+        assertMargin(report, SafetyFloorRule.PYRAMID_ADD_LIMIT, expected = BigDecimal("1"))
+        assertMargin(report, SafetyFloorRule.PYRAMID_PROFIT_GATE, expected = BigDecimal("1"))
+        assertMargin(report, SafetyFloorRule.PYRAMID_ADD_RISK_LIMIT, expected = expectedAddRiskMargin)
+        assertFalse(
+            report.marginOf(SafetyFloorRule.PYRAMID_ADD_RISK_LIMIT)
+                .compareTo(
+                    details.groupRiskBeforeOrderJpy.toBigDecimal()
+                        .multiply(PYRAMID_ADD_RISK_RATIO)
+                        .subtract(details.orderRiskJpy.toBigDecimal())
+                        .safetyScale(),
+                ) == 0,
+            "The initial trade-group risk budget must take precedence over current group risk.",
+        )
+    }
+
+    @Test
+    fun `pyramid profit status agrees with the verdict immediately below required R`() {
+        val tradeGroupId = UUID.randomUUID()
+        val command = acceptedEntry().copy(tradeGroupId = tradeGroupId)
+        val context = acceptedContext(command).copy(
+            positions = listOf(
+                openPosition(
+                    tradeGroupId = tradeGroupId,
+                    currentStopLossJpy = "9600000",
+                    unrealizedPnlJpy = "5000",
+                    currentPriceJpy = "10200000",
+                    unrealizedR = "1.9999999999",
+                    pyramidAddCount = 1,
+                ),
+            ),
+        )
+        val verdict = safetyFloor().evaluatePlaceOrder(command, context)
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+        assertEquals(SafetyFloorRule.PYRAMID_PROFIT_GATE, rejected.violation.rule)
+
+        val report = observer().observe(command, context, verdict, SafetyFloorCallSite.PLACE)
+
+        assertEquals(RuleStatus.FAIL, report.statusOf(SafetyFloorRule.PYRAMID_PROFIT_GATE))
+        assertFalse(report.divergence)
+    }
+
+    @Test
+    fun `expected value status agrees with a higher precision runtime threshold`() {
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val calculator = SafetyFloorRiskCalculator(
+            config = observerConfig(),
+            clock = fixedClock(),
+            paperExecutionConfig = PaperExecutionConfig(),
+        )
+        val expectedValueR = calculator.expectedValueDetails(
+            command,
+            context,
+            requireNotNull(command.takeProfitPriceJpy),
+        ).expectedValueR
+        val config = SafetyFloorConfig(
+            minExpectedValueR = expectedValueR.add(BigDecimal("0.0000000049")),
+        )
+        val safetyFloor = SafetyFloor(config = config, clock = fixedClock())
+        val verdict = safetyFloor.evaluatePlaceOrder(command, context)
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+        assertEquals(SafetyFloorRule.EXPECTED_VALUE_GATE, rejected.violation.rule)
+
+        val report = SafetyFloorMarginObserver(config = config, clock = fixedClock()).observe(
+            command,
+            context,
+            verdict,
+            SafetyFloorCallSite.PLACE,
+        )
+
+        assertEquals(RuleStatus.FAIL, report.statusOf(SafetyFloorRule.EXPECTED_VALUE_GATE))
+        assertFalse(report.divergence)
+    }
+
+    @Test
+    fun `economic blackout margin is positive before and after a window and negative inside`() {
+        val eventAt = fixedInstant().plusSeconds(100)
+        val events = listOf(
+            EconomicEventBlackout("cpi-test", "CPI", eventAt, Duration.ofSeconds(10), Duration.ofSeconds(10)),
+            EconomicEventBlackout("fomc-future", "FOMC", eventAt.plusSeconds(10_000), Duration.ZERO, Duration.ZERO),
+        )
+
+        listOf(
+            fixedInstant().plusSeconds(80) to BigDecimal("10"),
+            fixedInstant().plusMillis(89_500) to BigDecimal("0.5"),
+            fixedInstant().plusSeconds(100) to BigDecimal("-10"),
+            fixedInstant().plusSeconds(120) to BigDecimal("10"),
+        ).forEach { (observedAt, expected) ->
+            val report = observeAt(observedAt, events)
+
+            assertMargin(report, SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT, expected = expected)
+        }
+    }
+
+    @Test
+    fun `economic blackout status agrees with the verdict one nanosecond before the window`() {
+        val startsAt = fixedInstant().plusSeconds(100)
+        val observedAt = startsAt.minusNanos(1)
+        val events = listOf(
+            EconomicEventBlackout("cpi-boundary", "CPI", startsAt, Duration.ZERO, Duration.ZERO),
+            EconomicEventBlackout(
+                "fomc-future",
+                "FOMC",
+                startsAt.plusSeconds(10_000),
+                Duration.ZERO,
+                Duration.ZERO,
+            ),
+        )
+        val config = SafetyFloorConfig(economicEventBlackouts = events)
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
+        val verdict = SafetyFloor(config = config, clock = clock).evaluatePlaceOrder(command, context)
+        assertIs<SafetyFloorVerdict.Accepted>(verdict)
+
+        val report = SafetyFloorMarginObserver(config = config, clock = clock).observe(
+            command,
+            context,
+            verdict,
+            SafetyFloorCallSite.PLACE,
+        )
+
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT))
+        assertFalse(report.divergence)
+    }
+
+    @Test
+    fun `FOMC calendar expiry passes at the valid through boundary`() {
+        val events = listOf(
+            EconomicEventBlackout("fomc-boundary", "FOMC", fixedInstant(), Duration.ZERO, Duration.ZERO),
+        )
+        val report = observeAt(fixedInstant(), events)
+
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.FOMC_CALENDAR_EXPIRED))
+        assertMargin(report, SafetyFloorRule.FOMC_CALENDAR_EXPIRED, expected = BigDecimal.ZERO)
+    }
+
+    @Test
+    fun `FOMC expiry status agrees with the verdict one nanosecond after valid through`() {
+        val validThrough = fixedInstant()
+        val observedAt = validThrough.plusNanos(1)
+        val config = SafetyFloorConfig(
+            economicEventBlackouts = listOf(
+                EconomicEventBlackout("fomc-boundary", "FOMC", validThrough, Duration.ZERO, Duration.ZERO),
+            ),
+        )
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
+        val verdict = SafetyFloor(config = config, clock = clock).evaluatePlaceOrder(command, context)
+        val rejected = assertIs<SafetyFloorVerdict.Rejected>(verdict)
+        assertEquals(SafetyFloorRule.FOMC_CALENDAR_EXPIRED, rejected.violation.rule)
+
+        val report = SafetyFloorMarginObserver(config = config, clock = clock).observe(
+            command,
+            context,
+            verdict,
+            SafetyFloorCallSite.PLACE,
+        )
+
+        assertEquals(RuleStatus.FAIL, report.statusOf(SafetyFloorRule.FOMC_CALENDAR_EXPIRED))
+        assertFalse(report.divergence)
+    }
+
+    @Test
+    fun `records the design unit for every numeric point`() {
+        val expected = mapOf(
+            SafetyFloorRule.MAX_DRAWDOWN_HALT to mapOf(POINT_THRESHOLD to MarginUnit.RATIO),
+            SafetyFloorRule.FOMC_CALENDAR_EXPIRED to mapOf(DEFAULT_POINT to MarginUnit.SECONDS),
+            SafetyFloorRule.ECONOMIC_EVENT_BLACKOUT to mapOf(DEFAULT_POINT to MarginUnit.SECONDS),
+            SafetyFloorRule.STOP_LOSS_REQUIRED to mapOf(
+                POINT_POSITIVE to MarginUnit.JPY,
+                POINT_BELOW_ENTRY to MarginUnit.JPY,
+            ),
+            SafetyFloorRule.NO_AVERAGING_DOWN to mapOf(
+                POINT_UNREALIZED_PNL to MarginUnit.JPY,
+                POINT_PRICE_DIFF to MarginUnit.JPY_PER_BTC,
+            ),
+            SafetyFloorRule.STOP_LOSS_LOOSENING to mapOf(DEFAULT_POINT to MarginUnit.JPY),
+            SafetyFloorRule.PYRAMID_ADD_LIMIT to mapOf(DEFAULT_POINT to MarginUnit.COUNT),
+            SafetyFloorRule.PYRAMID_PROFIT_GATE to mapOf(DEFAULT_POINT to MarginUnit.R),
+            SafetyFloorRule.PYRAMID_ADD_RISK_LIMIT to mapOf(DEFAULT_POINT to MarginUnit.JPY),
+            SafetyFloorRule.BALANCE_RATE_AND_COST_LIMIT to mapOf(POINT_CASH to MarginUnit.JPY),
+            SafetyFloorRule.MAX_RISK_PER_TRADE to mapOf(DEFAULT_POINT to MarginUnit.JPY),
+            SafetyFloorRule.MAX_TOTAL_EXPOSURE to mapOf(DEFAULT_POINT to MarginUnit.JPY),
+            SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE to mapOf(DEFAULT_POINT to MarginUnit.R),
+            SafetyFloorRule.EXPECTED_VALUE_GATE to mapOf(DEFAULT_POINT to MarginUnit.R),
+            SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO to mapOf(DEFAULT_POINT to MarginUnit.RATIO),
+        )
+        val actual = SafetyFloorEvaluationPoints.placeOrderPoints
+            .filter { point -> point.isNumeric }
+            .groupBy { point -> point.rule }
+            .mapValues { (_, points) -> points.associate { point -> point.pointId to requireNotNull(point.marginUnit) } }
+
+        assertEquals(expected, actual)
+    }
+
+    @Test
+    fun `marks missing TP and all-null stops as NA without margins`() {
+        val missingTargetReport = observe(entryCommand(takeProfitPriceJpy = null), baseContext())
+        assertEquals(RuleStatus.NA, missingTargetReport.statusOf(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO))
+        assertNull(missingTargetReport.observationOf(SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO).marginValue)
+
+        val tradeGroupId = UUID.randomUUID()
+        val command = entryCommand(tradeGroupId = tradeGroupId)
+        val allNullStopsReport = observe(
+            command,
+            baseContext(positions = listOf(openPosition(tradeGroupId = tradeGroupId, currentStopLossJpy = null))),
+        )
+        assertEquals(RuleStatus.NA, allNullStopsReport.statusOf(SafetyFloorRule.STOP_LOSS_LOOSENING))
+        assertNull(allNullStopsReport.observationOf(SafetyFloorRule.STOP_LOSS_LOOSENING).marginValue)
     }
 
     @Test
@@ -271,6 +642,21 @@ class SafetyFloorMarginObserverTest {
     }
 
     private fun observerConfig(): SafetyFloorConfig = SafetyFloorConfig()
+
+    private fun observeAt(observedAt: Instant, events: List<EconomicEventBlackout>): SafetyFloorObservationReport {
+        val config = SafetyFloorConfig(economicEventBlackouts = events)
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val clock = Clock.fixed(observedAt, ZoneOffset.UTC)
+        val verdict = SafetyFloor(config = config, clock = clock).evaluatePlaceOrder(command, context)
+
+        return SafetyFloorMarginObserver(config = config, clock = clock).observe(
+            command = command,
+            context = context,
+            verdict = verdict,
+            callSite = SafetyFloorCallSite.PLACE,
+        )
+    }
 
     private fun scenarios(): List<Scenario> {
         val tradeGroupId = UUID.randomUUID()
@@ -337,8 +723,33 @@ class SafetyFloorMarginObserverTest {
         const val POINT_FEE = SafetyFloorEvaluationPoints.POINT_FEE
         const val POINT_CASH = SafetyFloorEvaluationPoints.POINT_CASH
         const val POINT_BELOW_ENTRY = SafetyFloorEvaluationPoints.POINT_BELOW_ENTRY
+        const val POINT_POSITIVE = SafetyFloorEvaluationPoints.POINT_POSITIVE
         const val POINT_UNREALIZED_PNL = SafetyFloorEvaluationPoints.POINT_UNREALIZED_PNL
+        const val POINT_PRICE_DIFF = SafetyFloorEvaluationPoints.POINT_PRICE_DIFF
+        const val DEFAULT_POINT = EvaluationPointId.DEFAULT_POINT_ID
     }
+}
+
+private fun assertMargin(
+    report: SafetyFloorObservationReport,
+    rule: SafetyFloorRule,
+    pointId: String? = null,
+    expected: BigDecimal,
+) {
+    assertEquals(expected.safetyScale(), report.marginOf(rule, pointId), "$rule.$pointId")
+}
+
+private fun SafetyFloorObservationReport.observationOf(
+    rule: SafetyFloorRule,
+    pointId: String? = null,
+): RuleObservation {
+    return observations.single { observation ->
+        observation.point.rule == rule && (pointId == null || observation.point.pointId == pointId)
+    }
+}
+
+private fun SafetyFloorObservationReport.marginOf(rule: SafetyFloorRule, pointId: String? = null): BigDecimal {
+    return requireNotNull(observationOf(rule, pointId).marginValue)
 }
 
 private fun SafetyFloorObservationReport.statusOf(rule: SafetyFloorRule, pointId: String? = null): RuleStatus {
@@ -490,6 +901,30 @@ private fun openPosition(
         pyramidAddCount = pyramidAddCount,
         highestPriceSinceEntryJpy = "10200000",
         lowestPriceSinceEntryJpy = "10000000",
+    )
+}
+
+private fun filledInitialOrder(tradeGroupId: UUID): Order {
+    return Order(
+        orderId = UUID.randomUUID().toString(),
+        intentId = UUID.randomUUID().toString(),
+        positionId = UUID.randomUUID().toString(),
+        tradeGroupId = tradeGroupId.toString(),
+        symbol = TradingSymbol.BTC.apiSymbol,
+        mode = TradingMode.PAPER,
+        side = OrderSide.BUY,
+        orderType = OrderType.LIMIT,
+        status = OrderStatus.FILLED,
+        sizeBtc = "0.0100",
+        limitPriceJpy = "10000000",
+        triggerPriceJpy = null,
+        protectiveStopPriceJpy = "9900000",
+        takeProfitPriceJpy = "10500000",
+        estimatedWinProbability = "0.60",
+        reasonJa = "initial trade group order",
+        clientRequestId = null,
+        createdAt = fixedInstant().minusSeconds(60).toString(),
+        updatedAt = fixedInstant().minusSeconds(60).toString(),
     )
 }
 
