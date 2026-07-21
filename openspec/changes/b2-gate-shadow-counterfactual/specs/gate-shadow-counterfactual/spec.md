@@ -23,7 +23,7 @@
 
 ### Requirement: 分類対象は因果境界より後かつ同一 session の event に限る
 
-システムは、観測の分類対象を、`session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at <= window_start_time + horizon` を満たす市場 event に限定しなければならない（MUST）。開始境界は `admission_ordinal`、終了境界に用いる時刻は event の `socket_observed_at`（callback で確定する値）に固定しなければならない（MUST）。因果境界以前の event、別 session の event、終了境界より後に観測された event を分類に用いてはならない（MUST NOT）。本 change 導入前の既存失効への backfill を行ってはならない（MUST NOT）。
+システムは、観測の分類対象を、`session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at >= window_start_time AND socket_observed_at <= window_start_time + horizon` を満たす市場 event に限定しなければならない（MUST）。`admission_ordinal` の下界（線形化・scan 起点）と `socket_observed_at >= window_start_time` の下界（因果の芯）を両方課さなければならない（MUST）。終了境界に用いる時刻は event の `socket_observed_at`（callback で確定する値）に固定しなければならない（MUST）。因果境界以前の event、別 session の event、終了境界より後に観測された event を分類に用いてはならない（MUST NOT）。receipt admission は allocation fence と同一 lock を取らないため、失効前に観測されたが fence 後に採番された event が `admission_ordinal > start_admission_ordinal` を満たしうる。この event を `socket_observed_at < window_start_time` の下界で分類から排除しなければならない（MUST NOT 分類に用いる）。本 change 導入前の既存失効への backfill を行ってはならない（MUST NOT）。
 
 #### Scenario: 因果境界以前の event を無視する
 
@@ -34,6 +34,11 @@
 
 - **WHEN** ある event の `session_id` が観測の `market_data_session_id` と異なる
 - **THEN** その event は分類に使われない
+
+#### Scenario: 失効前に観測された event を admission race でも無視する
+
+- **WHEN** ある event の `socket_observed_at` が観測の `window_start_time` より前だが、admission fence 後に採番され `admission_ordinal > start_admission_ordinal` を満たす
+- **THEN** その event は `socket_observed_at < window_start_time` の下界により分類に使われない
 
 ### Requirement: 約定境界の充足を陽性の観測事実として記録し、約定も非約定も断定しない
 

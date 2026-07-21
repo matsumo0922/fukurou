@@ -2,7 +2,7 @@
 
 ## 1. PR-2 / 観測 model とテーブル
 
-- [x] 1.1 `shadow/GateShadowObservation.kt` を新設し、`GateShadowOutcome`(CROSSED / UNKNOWN)、`ShadowDataQuality`（OK と欠落理由コード）、`GateShadowObservation`（`orderId` / `marketDataSessionId` / `startAdmissionOrdinal` / `windowStartTime` / geometry）、`GateShadowResolution` を定義する。`@Immutable` を付ける
+- [x] 1.1 `shadow/GateShadowObservation.kt` を新設し、`GateShadowOutcome`(CROSSED / UNKNOWN)、`ShadowDataQuality`（OK と欠落理由コード）、`GateShadowObservation`（`orderId` / `marketDataSessionId` / `startAdmissionOrdinal` / `windowStartTime` / geometry）、`GateShadowResolution` を定義する（`:trading` は Compose 非依存なので `@Immutable` は付けない）
 - [x] 1.2 `persistence/TradingTables.kt` に 3 テーブルを追加する（design.md D6）。`gate_shadow_observations`(append-only、`order_id` NOT NULL + UNIQUE / `start_admission_ordinal` / `window_start_time` / `market_data_session_id` / `data_quality` NOT NULL)、`gate_shadow_scan_progress`(mutable、`observation_id` PK / `last_scanned_admission_ordinal`)、`gate_shadow_resolutions`(`observation_id` PK / `outcome` / `data_quality` NOT NULL)
 - [x] 1.3 `paper_market_event_receipts` に `(session_id, admission_ordinal)` index を **`CREATE INDEX CONCURRENTLY`** で追加する。`ensureSchema()` の schema transaction の**外**の先行 provisioning stage とする（startup transaction 内の通常 `CREATE INDEX` は大規模テーブルの INSERT を止める、design.md D6）
 - [x] 1.4 `persistence/TradingPersistenceBootstrap.kt` の `ensureSchema()` 列挙に 3 テーブルを追加する（index は 1.3 の別 stage）
@@ -13,8 +13,10 @@
 - [x] 2.1 `shadow/GateShadowRepository.kt` を新設する。append-only observation + mutable scan-progress + 単調昇格 resolution。`Result<T>` + InMemory 実装併走。`CancellationException` は再 throw する
 - [x] 2.2 `persistence/ExposedGateShadowRepository.kt` を実装する。transaction 非依存の境界。resolution は **CROSSED-wins upsert**（`CROSSED` は `ON CONFLICT (observation_id) DO UPDATE SET outcome='CROSSED'`、`UNKNOWN` は `ON CONFLICT DO NOTHING`、design.md D4）
 - [x] 2.3 **production（Exposed）の失効 ledger transaction 内**で immutable capture payload を作る。失効 order 行から `order_id` / `market_data_session_id` / geometry / `expired_at` を、`start_admission_ordinal` は同 transaction 内で読む現在の admission high-watermark を取る（event admission と同じ session 直列化で線形化。**commit 後の post-hoc `MAX()` は使わない**）
+- [ ] 2.3a **（falsify F2）** capture の in-txn read（fence 読み・lineage read）を **SAVEPOINT で隔離**し、read が例外を投げても savepoint まで rollback して TTL cancel は commit させる。capture read 失敗が risk-reducing cancel を巻き戻さないことを回帰テストで証明する
 - [x] 2.4 in-memory ledger 経路は shadow 対象外（admission_ordinal 権威を持たない test 経路。production only）。in-memory では capture を no-op にする
 - [x] 2.5 capture payload を cancel 成功後に best-effort 保存する。**ledger transaction 外・cancel を巻き込まない**。LIMIT/STOP のみ対象
+- [ ] 2.5a **（falsify F3・async 分離）** 保存を **bounded channel + drain coroutine** で async best-effort にし、writer は non-blocking に enqueue して即 return する（global `tradingLock` の critical path に DB 保存を載せない）。channel 満杯時は drop（reconciliation が拾う）。scope は runtime 所有・shutdown で cancel。`PaperReconcileResult.gateShadowObservations` の上位露出は不要になるので削除または内部化する（N1）
 - [x] 2.6 取りこぼしを SQL reconciliation で算出する経路を用意する（design.md D7）。`cancel_reason=TTL_EXPIRY` かつ LIMIT/STOP の order 行に対し `order_id` join で observation 欠落を算出。in-memory counter は使わない
 - [x] 2.7 DI / runtime 配線に repository を追加する
 
@@ -36,7 +38,7 @@
 ## 5. PR-3 / decoder と scan
 
 - [ ] 5.1 `shadow/ReceiptPayloadDecoder.kt` を新設し、`normalized_payload`(`{exchangeAt, priceJpy, side, sizeBtc, symbol}`) を typed に decode する。decode 失敗は例外にせず不能として返す
-- [ ] 5.2 分類対象 event を design.md D2 の predicate で絞る: `session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at <= window_start_time + horizon`。終了境界の時刻は `socket_observed_at` に固定。`(session_id, admission_ordinal)` index で admission_ordinal 昇順に cursor 読み。session 内 `socket_observed_at` の非単調（wall-clock rollback）を検出したら `data_quality` に flag（design.md D4）
+- [ ] 5.2 分類対象 event を design.md D2 の predicate で絞る: `session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at >= window_start_time AND socket_observed_at <= window_start_time + horizon`。**（falsify F1）** ordinal 下界だけでなく `socket_observed_at >= window_start_time` の下界を必ず課す（admission race で失効前 event が ordinal 下界を満たしうるため）。終了境界の時刻は `socket_observed_at` に固定。`(session_id, admission_ordinal)` index で admission_ordinal 昇順に cursor 読み。session 内 `socket_observed_at` の非単調（wall-clock rollback）を検出したら `data_quality` に flag（design.md D4）
 - [ ] 5.3 **settle 判定**: observation は `now >= window_start_time + horizon + settlementGrace` を満たすまで走査しない（design.md D3、commit race 回避）。settle 済みは 1 observation あたり read row 上限を設け、打ち切り位置を `gate_shadow_scan_progress.last_scanned_admission_ordinal` に upsert して次 tick が再開する。欠番を gap 誤認して永久 pending にしない
 
 ## 6. PR-3 / resolver
@@ -53,7 +55,8 @@
 - [ ] 7.1 `daemon/LlmDaemonScheduler.tickUnsafe` に resolver を配線する。`launchEnabled=false` の早期 return（`:274`）**より前**に置く（shadow は分析であり launch 無効時も走る）。tick は既定 1 分
 - [ ] 7.2 `horizon`（既定 24 時間）と `settlementGrace`（既定 300 秒）を config 化する
 - [ ] 7.3 resolver 呼び出しを tick 全体の失敗から隔離する。1 tick の作業に **wall-time 予算 + DB statement / lock / connection 取得 timeout** を課す（row 上限だけでは DB 待ちを bound できない、design.md D8）。予算超過・timeout 時は cursor を壊さず pending のまま fail-open、次 tick へ
-- [ ] 7.4 receipts の複合 index（1.3）が未完成の間は resolver を default-off にする（capture は動いてよい）
+- [ ] 7.4 receipts の複合 index（1.3）が未完成の間は resolver を default-off にする（capture は動いてよい）。**（falsify F5）** ready 判定は index 名と `indisvalid/indisready/indislive` だけでなく `pg_index.indkey` の列定義（`session_id, admission_ordinal`）まで確認し、同名・別定義の index で誤って有効化しない
+- [ ] 7.5 **（falsify F4）** reconciliation に導入時刻の下界（`canceled_at >= baseline`）を渡し、deploy 前の TTL 失効を capture 欠落として計上しない。baseline は config または初回 observation 時刻から決める
 
 ## 8. PR-3 / テスト
 

@@ -50,13 +50,15 @@ geometry, window_start_time (= expired_at)
 
 - **この watermark 以降に admit される event は必ず失効後**であることを、admission sequence の **allocation fence** で確定する。単純な `MAX(admission_ordinal)`（committed row の最大値、`ExposedPaperLedgerWriter.kt:788`）は**採番済み・未 commit の receipt を見逃すため下界にならない**（falsify #1）: その receipt が後で commit されると、失効前に admission を開始した event が `ordinal > start_admission_ordinal` に紛れ込む。receipt admission は `nextval('paper_market_admission_ordinal_seq')` で採番する（`ExposedMarketDataIntegrityRepository.kt:305`）。**fence primitive は同 sequence の allocation 済み最大値**（`SELECT last_value, is_called FROM paper_market_admission_ordinal_seq`。sequence は非 transactional なので未 commit 含む採番済み最大が見える。`is_called=false` なら未採番として 0 相当）を使う。exclusive session lock で読む案は cancel（risk-reducing）を receipt commit 待ちに巻き込むため採らない（D7 と整合）。**`selectGlobalPaperMarketAdmissionBoundary`（`:788`）の committed `MAX()` は採番済み・未 commit の receipt を見逃すため使わない**。
 - `market_data_session_id` は order 行から取る。特定できなければ `data_quality` に理由を刻み resolver は `UNKNOWN`。
-- 分類対象 predicate: `session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at <= window_start_time + horizon`。開始は ordinal（因果・線形化）、終了は時刻（運用打ち切り、D3）。
+- 分類対象 predicate: `session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at >= window_start_time AND socket_observed_at <= window_start_time + horizon`。ordinal 下界（線形化・scan の起点）と **socket_observed_at 下界（因果の芯）** を両方課す。
+- **なぜ ordinal 下界だけでは不足か（falsify F1）**: receipt admission は shared session lock 下で `nextval` するが、fence は同 lock を取らず sequence の `last_value` を読む。lock 取得済み・**未採番**の receipt（失効前に callback で観測された event を含む）は fence に映らず、後で `nextval > fence` で commit されると ordinal 下界だけでは失効後と誤認される。allocation fence は「採番済み・未 commit」は囲うが「観測済み・未採番」は囲えない。よって **`socket_observed_at >= window_start_time`（失効時刻）を hard な下界に加え、失効前に観測された event を必ず排除する**。これは #193 の不変条件「activation 前の event で fill 判定しない」を守る。
+- wall-clock rollback で真に失効後の event が `socket_observed_at < window_start_time` になった場合はその event を除外する（`UNKNOWN` 方向＝非約定を主張しない安全側。過剰 `CROSSED` を作るより過小の方が真実性を破らない）。ordinal 下界は scan の pagination 起点として残す。
 
 ### D3: settle 後に 1 回走査する。live の commit race を避ける（agent 仮決め・falsify #3 対応）
 
 resolver は observation を `now >= window_start_time + horizon + settlementGrace` を満たすまで**触らない**（pending）。この時点で窓内の event は全て commit 済み（settle）なので、ordinal 順の走査で遅延 commit の低 ordinal を飛ばす race が無い。
 
-- settle 後、`(session_id, admission_ordinal)` index で `admission_ordinal > start_admission_ordinal` を昇順に読み、`socket_observed_at <= window_start_time + horizon` で窓内に絞る。境界クロス発見で `CROSSED`。窓を読み切ってクロス無しなら `UNKNOWN`。
+- settle 後、`(session_id, admission_ordinal)` index で `admission_ordinal > start_admission_ordinal` を昇順に読み、`window_start_time <= socket_observed_at <= window_start_time + horizon` で窓内に絞る（下界は D2 の因果の芯）。境界クロス発見で `CROSSED`。窓を読み切ってクロス無しなら `UNKNOWN`。
 - **admission_ordinal の欠番（rollback 由来）は settle 後は最終的**なので、「読み切った」は「窓の終了境界（`socket_observed_at > window_start+horizon` の最初の行、または session の現 high-watermark）に達した」で判定する。欠番を gap と誤認して永久 pending にしない（falsify #3）。
 - `settlementGrace` 既定 300 秒（**（agent 仮決め）** gap 検知 150 秒 + INSERT 遅延マージン）。grace を越えて遅延 commit された窓内 crossing は残余リスク（`UNKNOWN` は非約定を主張しないので真実性は破らない）。
 
@@ -84,7 +86,10 @@ resolver は observation を `now >= window_start_time + horizon + settlementGra
 ### D7: 捕捉は best-effort、取りこぼしは正本との reconciliation で durable に算出（ユーザー確認済み: 取りこぼし方針）
 
 - 失効 ledger transaction 内で capture payload を作り、**cancel（risk-reducing）を巻き込まない**よう transaction 外・commit 後に best-effort 保存。`CancellationException` は再 throw。
-- 取りこぼしは in-memory counter でなく **SQL reconciliation**: `cancel_reason=TTL_EXPIRY` かつ LIMIT/STOP の order 行のうち、対応する observation（`order_id` join）が無いものを欠落として算出。正本は捕捉と独立に durable。
+- **capture の in-txn read は cancel を rollback させない（falsify F2）**: fence 読みと lineage read は失効 ledger transaction 内で走るため、そこで例外が出ると Postgres が transaction を poison し cancel UPDATE ごと rollback しうる（stale order が失効せず居座る）。よって capture read は **SAVEPOINT で隔離**し、失敗しても savepoint まで rollback して cancel は commit させる。取りこぼしは reconciliation が拾う。
+- **保存は tradingLock の critical path に載せない（falsify F3・ユーザー確認済み: async 分離）**: `applyMarketEvent` は global `tradingLock` 下で writer を await するため、observation の同期 DB 保存が pool 取得待ち等で長引くと market-event 消費が停止し WebSocket buffer 溢れ → `MarketDataBackpressureException` で session 落ち（production market-data gap）。よって保存は **bounded channel + drain coroutine で async best-effort** とし、writer は非ブロッキングに enqueue して即 return する。channel 満杯時は drop（reconciliation が durable に拾う）。
+- 取りこぼしは in-memory counter でなく **SQL reconciliation**: `cancel_reason=TTL_EXPIRY`（wire code `resting_entry_order_ttl_expired`）かつ LIMIT/STOP の order 行のうち、対応する observation（`order_id` join）が無いものを欠落として算出。正本は捕捉と独立に durable。**導入前履歴の混入（falsify F4）**: reconciliation は導入時刻の下界（`canceled_at >= baseline`）を持たないと deploy 前失効を欠落計上する。PR-3 で daemon 配線時に baseline 下界を渡し、docs にも初回ベースライン差し引きを明記する。
+- **index ready 判定の定義ずれ（falsify F5・残余）**: 同名・別列定義の valid index があると `IF NOT EXISTS` が skip し flag 確認だけでは通す。PR-3 で resolver 有効化前に `pg_index.indkey` の列定義まで検証する。sequence の `CACHE` が 1 でない運用へ変えると `last_value` が cache 予約上端へ先行し fence が過剰除外側に振れる（安全側だが要運用注意）。
 
 ### D8: resolver は daemon tick に同期配線し、bounded delay 予算で有界化（ユーザー確認済み: bounded delay / launchEnabled 配置は要人間確認）
 
