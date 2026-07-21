@@ -12,6 +12,9 @@ enum class ReplayFidelity {
     /** 記録済み execution から一意に決まる事実。 */
     EXACT,
 
+    /** 台帳に記録済みの事実だが exit fill slippage 等を含み、market 事実そのものとは主張しない値 (tail 逆行など)。 */
+    LEDGER_FACT,
+
     /** 記録済みデータからは確定できず未知として開示する事実。 */
     UNKNOWN,
 }
@@ -71,6 +74,9 @@ enum class ReplayUnknownReason {
 
     /** 生存区間に receipt が 1 件も存在しない。 */
     NO_REPLAY_INPUT,
+
+    /** tail の最安値・entry stop が null、または risk width が非正で逆行を R 換算できない。 */
+    TAIL_BASIS_UNAVAILABLE,
 }
 
 /** 各短縮 TTL 候補の反実仮想判定。 */

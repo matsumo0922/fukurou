@@ -71,3 +71,12 @@ tasks.register<JavaExec>("runTtlReplay") {
     mainClass.set("me.matsumo.fukurou.trading.replay.TtlReplayMainKt")
     workingDir = rootProject.projectDir
 }
+
+tasks.register<JavaExec>("runTailReplay") {
+    group = "application"
+    description = "Runs the read-only tail fact sheet replay over recorded closed positions."
+    dependsOn(tasks.named("classes"))
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("me.matsumo.fukurou.trading.replay.TailReplayMainKt")
+    workingDir = rootProject.projectDir
+}

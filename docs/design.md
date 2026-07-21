@@ -4021,6 +4021,18 @@ queue 到達後に安全ゲートで棄却され execution を持たない order
 
 実行は `scripts/ttl-replay --from-ms <ms> --to-exclusive-ms <ms>`（対象期間は必須）。Gradle からは `:trading:runTtlReplay` task を用いる。
 
+#### 2. tail 事実シート（`scripts/tail-replay`）
+
+記録済みの closed long position に対し、実際の逆行がどこまで初期リスクへ迫ったかを台帳事実として集計する。初期リスク R は既存 evaluation と同じ fill-weighted stop から復元する。すなわち BUY execution の size 加重で求めた平均約定価格と、entry order の `protective_stop_price_jpy` を execution size で加重した stop の差を 1R の価格幅とする。close 時に NULL 化される `positions.current_stop_loss_jpy` は使わない。
+
+実際の逆行は `average_entry_price_jpy − positions.lowest_price_since_entry_jpy` である。この最安値は WS+REST の running min に exit fill を畳み込んだ台帳値であり、exit SELL fill の adverse slippage で trigger より低くなりうる。したがって出力は逆行を「台帳記録値、exit fill slippage を含みうる」と明記し、market が到達した最安値そのものとは主張しない。fidelity は `EXACT` ではなく `LEDGER_FACT` を自己申告する。
+
+各行は逆行を 1R 換算した `adverse_excursion_r`（既存 evaluation の MAE(R) と同じ計算）と、それが指定倍数（`--threshold-r`、既定 2.0）を超えたかの `breaches_threshold` を持つ。cohort ごとの集計は eligible 件数・閾値超過件数・部分決済件数・pyramiding 件数・理由別 `UNKNOWN` 件数を分けて開示する。閾値の既定 2.0 は、損切り必須のため逆行が 1R を超えるのは stop 超過を意味し、2R が計画リスクの倍に到達した壊滅的 tail を指す保守的な選択である。実データ分布に応じて `--threshold-r` で調整し、各行の `adverse_excursion_r` から分布を再集計できる。
+
+最安値または entry stop が null、あるいは fill-weighted stop が average entry 以上で risk width が非正になる position は、逆行を R 換算できないため `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とし、母数から外す。逆行は exit 理由に依らず出力する。部分決済（複数 SELL fill）や pyramiding で生存中に基準数量が変わる position はその旨を注記する。
+
+実行は `scripts/tail-replay --from-ms <ms> --to-exclusive-ms <ms>`（対象期間は position の `closed_at` に対する必須境界）。Gradle からは `:trading:runTailReplay` task を用いる。
+
 #### trailing / offset を除外した理由
 
 - **trailing 候補 exit ランキング（不可能）**: trailing stop を決める ATR14 値と、tighten を発火させる REST poll の時刻がどちらも未保存で、誤差が上下双方向であるため、候補間の相対順位づけを忠実にできない。ATR 値と poll cadence の永続化を要する別 change とする。
