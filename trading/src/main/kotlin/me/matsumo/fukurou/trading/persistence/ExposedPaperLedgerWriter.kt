@@ -900,41 +900,56 @@ private fun JdbcTransaction.expireRestingEntryOrders(processedAt: Instant, progr
     }
 }
 
-private inline fun <T> JdbcTransaction.captureGateShadowReadWithSavepoint(
+private fun <T> JdbcTransaction.captureGateShadowReadWithSavepoint(
     description: String,
     block: JdbcTransaction.() -> T,
 ): T? {
-    val connection = jdbcConnection()
-    val savepoint = try {
-        connection.setSavepoint()
+    return jdbcConnection().captureGateShadowReadWithSavepoint(description) {
+        block(this)
+    }
+}
+
+internal fun <T> Connection.captureGateShadowReadWithSavepoint(description: String, block: () -> T): T? {
+    val savepoint = setSavepoint()
+    val result = try {
+        block()
     } catch (cancellation: CancellationException) {
         throw cancellation
-    } catch (throwable: Throwable) {
+    } catch (captureFailure: Throwable) {
+        try {
+            rollback(savepoint)
+        } catch (cancellation: CancellationException) {
+            cancellation.addSuppressed(captureFailure)
+            throw cancellation
+        } catch (rollbackFailure: Throwable) {
+            captureFailure.addSuppressed(rollbackFailure)
+            throw captureFailure
+        }
+
         gateShadowLogger.log(
             Level.WARNING,
-            "gate-shadow capture savepoint creation failed; skipping $description",
-            throwable,
+            "gate-shadow capture read failed; rolled back savepoint and skipped $description",
+            captureFailure,
         )
         return null
     }
 
-    return try {
-        val result = block()
-        connection.releaseSavepoint(savepoint)
-        result
+    // release は cleanup であり、失敗しても savepoint は commit 時に解放される。
+    // ここで throw すると成功済み capture を含む reconcile transaction 全体が rollback し
+    // risk-reducing な cancel を巻き込むため、release 失敗は log して observation を残す。
+    try {
+        releaseSavepoint(savepoint)
     } catch (cancellation: CancellationException) {
         throw cancellation
-    } catch (throwable: Throwable) {
-        runCatching { connection.rollback(savepoint) }
-            .exceptionOrNull()
-            ?.let(throwable::addSuppressed)
+    } catch (releaseFailure: Throwable) {
         gateShadowLogger.log(
             Level.WARNING,
-            "gate-shadow capture read failed; rolled back savepoint and skipped $description",
-            throwable,
+            "gate-shadow capture savepoint release failed; keeping observation and cancel: $description",
+            releaseFailure,
         )
-        null
     }
+
+    return result
 }
 
 /** gate-shadow capture に補完する order lineage。 */
