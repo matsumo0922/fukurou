@@ -4,12 +4,17 @@ import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
@@ -191,6 +196,8 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorEvaluationPoints
 import me.matsumo.fukurou.trading.safety.SafetyFloorObservationReport
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
+import me.matsumo.fukurou.trading.shadow.AsyncGateShadowObservationSink
+import me.matsumo.fukurou.trading.shadow.DirectGateShadowObservationSink
 import me.matsumo.fukurou.trading.shadow.GateShadowObservation
 import me.matsumo.fukurou.trading.shadow.GateShadowOutcome
 import me.matsumo.fukurou.trading.shadow.GateShadowRepository
@@ -8256,10 +8263,11 @@ class PostgresPersistenceIntegrationTest {
     fun gate_shadow_ttl_capture_preserves_ledger_and_captures_geometry() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val shadowRepository = ExposedGateShadowRepository(database)
+        val shadowScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val ledgerRepository = ExposedPaperLedgerRepository(
             database = database,
             clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
-            gateShadowRepository = shadowRepository,
+            gateShadowObservationSink = AsyncGateShadowObservationSink(shadowScope, shadowRepository),
         )
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
@@ -8312,7 +8320,15 @@ class PostgresPersistenceIntegrationTest {
             simulator = FillSimulator(),
         ).getOrThrow()
 
-        val observation = shadowRepository.findObservationByOrderId(orderId).getOrThrow()
+        val observation = withTimeout(5_000) {
+            var persisted = shadowRepository.findObservationByOrderId(orderId).getOrThrow()
+            while (persisted == null) {
+                delay(10)
+                persisted = shadowRepository.findObservationByOrderId(orderId).getOrThrow()
+            }
+            persisted
+        }
+        shadowScope.cancel()
         val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
         val closedTradesAfter = ExposedEvaluationRepository(database)
             .fetchKillCriterionStats()
@@ -8342,7 +8358,7 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
-    fun gate_shadow_capture_failure_does_not_rollback_ttl_cancel_and_reconciliation_detects_gap() = runPostgresTest {
+    fun gate_shadow_persistence_failure_keeps_ttl_cancel_reconcilable() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val captureFailure = IllegalStateException("synthetic gate-shadow capture failure")
         val failingRepository = object : GateShadowRepository by InMemoryGateShadowRepository() {
@@ -8353,7 +8369,7 @@ class PostgresPersistenceIntegrationTest {
         val ledgerRepository = ExposedPaperLedgerRepository(
             database = database,
             clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
-            gateShadowRepository = failingRepository,
+            gateShadowObservationSink = DirectGateShadowObservationSink(failingRepository),
         )
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
@@ -8392,6 +8408,212 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun gate_shadow_capture_read_failure_keeps_ttl_cancel_and_reconciliation_detects_gap() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val shadowRepository = ExposedGateShadowRepository(database)
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowObservationSink = DirectGateShadowObservationSink(shadowRepository),
+        )
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val broker = PaperBroker(
+            ledgerRepository = ledgerRepository,
+            riskStateRepository = ExposedRiskStateRepository(database),
+            decisionRepository = decisionRepository,
+            restingEntryOrderTtl = Duration.ofSeconds(60),
+            marketDataSource = PostgresFakeMarketDataSource,
+            clock = fixedClock(),
+        )
+        val command = approvedPostgresEntryCommand(
+            repository = decisionRepository,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9900000"),
+                takeProfitPriceJpy = BigDecimal("10500000"),
+            ),
+        )
+
+        broker.placeOrder(command).getOrThrow()
+        val orderId = UUID.fromString(ledgerRepository.getOpenOrders().getOrThrow().single().orderId)
+        exposedTransaction(database) {
+            prepare("ALTER SEQUENCE paper_market_admission_ordinal_seq RENAME TO unavailable_admission_ordinal_seq")
+                .use { statement -> statement.execute() }
+        }
+
+        try {
+            ledgerRepository.reconcile(
+                tickSnapshot = stopTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(60)),
+                simulator = FillSimulator(),
+            ).getOrThrow()
+        } finally {
+            exposedTransaction(database) {
+                prepare("ALTER SEQUENCE unavailable_admission_ordinal_seq RENAME TO paper_market_admission_ordinal_seq")
+                    .use { statement -> statement.execute() }
+            }
+        }
+
+        assertEquals(
+            OrderStatus.CANCELED.name,
+            selectTextForTest(database, "SELECT status FROM orders WHERE id = '$orderId'"),
+        )
+        assertNull(shadowRepository.findObservationByOrderId(orderId).getOrThrow())
+        assertEquals(1L, shadowRepository.countMissingTtlExpiryObservations().getOrThrow())
+    }
+
+    @Test
+    fun gate_shadow_async_sink_does_not_block_reconcile_and_dropped_captures_remain_reconcilable() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val durableRepository = ExposedGateShadowRepository(database)
+        val appendStarted = CompletableDeferred<Unit>()
+        val releaseAppend = CompletableDeferred<Unit>()
+        val appendAttempts = AtomicInteger()
+        val blockingFailingRepository = object : GateShadowRepository by durableRepository {
+            override suspend fun appendObservation(observation: GateShadowObservation): Result<Unit> {
+                appendStarted.complete(Unit)
+                releaseAppend.await()
+                appendAttempts.incrementAndGet()
+                return Result.failure(SQLException("synthetic slow gate-shadow persistence failure"))
+            }
+        }
+        val shadowScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val shadowSink = AsyncGateShadowObservationSink(
+            scope = shadowScope,
+            repository = blockingFailingRepository,
+            capacity = 1,
+        )
+        val ledgerRepository = ExposedPaperLedgerRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowObservationSink = shadowSink,
+        )
+        val orderIds = List(4) { UUID.randomUUID() }
+        exposedTransaction(database) {
+            orderIds.forEach { orderId ->
+                prepare(
+                    """
+                        INSERT INTO orders (
+                            id, mode, symbol, side, order_type, status, size_btc,
+                            limit_price_jpy, expires_at, reason_ja, created_at, updated_at
+                        ) VALUES (?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'OPEN', 0.001,
+                                  9900000, ?, 'async sink fixture', ?, ?)
+                    """.trimIndent(),
+                ).use { statement ->
+                    statement.setObject(1, orderId)
+                    statement.setLong(2, fixedInstant().plusSeconds(60).toEpochMilli())
+                    statement.setLong(3, fixedInstant().toEpochMilli())
+                    statement.setLong(4, fixedInstant().toEpochMilli())
+                    assertEquals(1, statement.executeUpdate())
+                }
+            }
+        }
+        val accountBefore = ledgerRepository.getAccountSnapshot().getOrThrow()
+
+        withTimeout(2_000) {
+            ledgerRepository.reconcile(
+                tickSnapshot = stopTickSnapshot().copy(observedAt = fixedInstant().plusSeconds(60)),
+                simulator = FillSimulator(),
+            ).getOrThrow()
+        }
+        withTimeout(2_000) { appendStarted.await() }
+
+        assertEquals(
+            4L,
+            exposedTransaction(database) {
+                selectLongForTest("SELECT COUNT(*) FROM orders WHERE status = 'CANCELED'")
+            },
+        )
+        assertTrue(shadowSink.droppedObservationCount > 0)
+        val accountAfter = ledgerRepository.getAccountSnapshot().getOrThrow()
+        assertEquals(accountBefore.cashJpy, accountAfter.cashJpy)
+        assertEquals(accountBefore.btcQuantity, accountAfter.btcQuantity)
+        assertEquals(accountBefore.totalEquityJpy, accountAfter.totalEquityJpy)
+        assertTrue(ledgerRepository.getExecutions().getOrThrow().isEmpty())
+
+        releaseAppend.complete(Unit)
+        withTimeout(5_000) {
+            while (appendAttempts.get().toLong() + shadowSink.droppedObservationCount < orderIds.size.toLong()) {
+                delay(10)
+            }
+        }
+
+        assertEquals(4L, durableRepository.countMissingTtlExpiryObservations().getOrThrow())
+        shadowScope.cancel()
+    }
+
+    @Test
+    fun gate_shadow_async_sink_does_not_block_market_event_commit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000198")
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val appendStarted = CompletableDeferred<Unit>()
+        val releaseAppend = CompletableDeferred<Unit>()
+        val blockingRepository = object : GateShadowRepository by InMemoryGateShadowRepository() {
+            override suspend fun appendObservation(observation: GateShadowObservation): Result<Unit> {
+                appendStarted.complete(Unit)
+                releaseAppend.await()
+                return Result.failure(SQLException("synthetic delayed gate-shadow persistence failure"))
+            }
+        }
+        val shadowScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val writer = ExposedPaperLedgerWriter(
+            database = database,
+            fallbackSymbolRules = postgresSymbolRules(),
+            clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
+            gateShadowObservationSink = AsyncGateShadowObservationSink(shadowScope, blockingRepository),
+        )
+        val orderId = UUID.randomUUID()
+        exposedTransaction(database) {
+            prepare(
+                """
+                    INSERT INTO orders (
+                        id, mode, symbol, side, order_type, status, size_btc,
+                        limit_price_jpy, expires_at, reason_ja, created_at, updated_at
+                    ) VALUES (?, 'PAPER', 'BTC', 'BUY', 'LIMIT', 'OPEN', 0.001,
+                              9900000, ?, 'async market event fixture', ?, ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, orderId)
+                statement.setLong(2, fixedInstant().plusSeconds(60).toEpochMilli())
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.setLong(4, fixedInstant().toEpochMilli())
+                assertEquals(1, statement.executeUpdate())
+            }
+        }
+
+        val event = durablePaperTradeEvent(
+            database = database,
+            event = paperTradeEvent(
+                sessionId = sessionId,
+                sequence = 1,
+                sizeBtc = "0.0010",
+                receivedAt = fixedInstant().plusSeconds(60),
+            ),
+        )
+
+        withTimeout(2_000) {
+            writer.applyMarketEvent(
+                event = event,
+                simulator = FillSimulator(clock = fixedClock()),
+            ).getOrThrow()
+        }
+        withTimeout(2_000) { appendStarted.await() }
+
+        assertEquals(OrderStatus.CANCELED, selectOrderStatus(database, orderId))
+        assertEquals(
+            1L,
+            exposedTransaction(database) {
+                selectLongForTest(
+                    "SELECT last_processed_sequence FROM market_data_sessions WHERE id = '$sessionId'",
+                )
+            },
+        )
+
+        releaseAppend.complete(Unit)
+        shadowScope.cancel()
+    }
+
+    @Test
     fun gate_shadow_capture_rethrows_cancellation_after_ttl_cancel_commit() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val cancelingRepository = object : GateShadowRepository by InMemoryGateShadowRepository() {
@@ -8402,7 +8624,7 @@ class PostgresPersistenceIntegrationTest {
         val ledgerRepository = ExposedPaperLedgerRepository(
             database = database,
             clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
-            gateShadowRepository = cancelingRepository,
+            gateShadowObservationSink = DirectGateShadowObservationSink(cancelingRepository),
         )
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(
@@ -8449,7 +8671,7 @@ class PostgresPersistenceIntegrationTest {
         val ledgerRepository = ExposedPaperLedgerRepository(
             database = database,
             clock = Clock.fixed(fixedInstant().plusSeconds(60), ZoneOffset.UTC),
-            gateShadowRepository = shadowRepository,
+            gateShadowObservationSink = DirectGateShadowObservationSink(shadowRepository),
         )
         val decisionRepository = ExposedDecisionRepository(database, fixedClock())
         val broker = PaperBroker(

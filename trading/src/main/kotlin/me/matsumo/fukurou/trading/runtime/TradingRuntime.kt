@@ -4,6 +4,10 @@ package me.matsumo.fukurou.trading.runtime
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.activity.EmptyDecisionRunSafetyDenialReader
 import me.matsumo.fukurou.trading.audit.CommandEventLog
@@ -67,6 +71,9 @@ import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
+import me.matsumo.fukurou.trading.shadow.AsyncGateShadowObservationSink
+import me.matsumo.fukurou.trading.shadow.GateShadowObservationSink
+import me.matsumo.fukurou.trading.persistence.ExposedGateShadowRepository
 import me.matsumo.fukurou.trading.tool.CallerNoTradeGuard
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.time.Clock
@@ -408,34 +415,49 @@ object TradingRuntimeFactory {
         if (verifyApplicationSchema) verifyPostgresSchema(connection, context)
 
         val repositories = createPostgresRepositories(connection, context)
-        val services = createPostgresServices(connection, context, repositories)
-        val safetyDenialReader = ExposedDecisionRunProjectionRepository(connection.database, context.clock)
-        val closeAction = if (connection.closeDataSource) {
-            { connection.dataSource.close() }
-        } else {
-            {}
-        }
-
-        return TradingRuntime(
-            riskStateRepository = repositories.riskStateRepository,
-            riskStateCommandService = services.riskStateCommandService,
-            commandEventLog = repositories.commandEventLog,
-            llmRunRepository = repositories.llmRunRepository,
-            equitySnapshotRepository = repositories.equitySnapshotRepository,
-            evaluationRepository = repositories.evaluationRepository,
-            decisionRepository = repositories.decisionRepository,
-            decisionMaterialStateRepository = repositories.decisionMaterialStateRepository,
-            llmInputManifestRepository = repositories.llmInputManifestRepository,
-            decisionAccountSnapshotReader = repositories.decisionAccountSnapshotReader,
-            safetyViolationRepository = services.safetyViolationRepository,
-            safetyDenialReader = safetyDenialReader,
-            broker = services.broker,
-            tradingLock = services.tradingLock,
-            toolCallGuard = services.toolCallGuard,
-            callerNoTradeGuard = services.callerNoTradeGuard,
-            launchReservationRepository = ExposedLlmLaunchReservationRepository(connection.database),
-            close = closeAction,
+        val gateShadowScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val gateShadowObservationSink = AsyncGateShadowObservationSink(
+            scope = gateShadowScope,
+            repository = ExposedGateShadowRepository(connection.database),
         )
+
+        return try {
+            val services = createPostgresServices(
+                connection = connection,
+                context = context,
+                repositories = repositories,
+                gateShadowObservationSink = gateShadowObservationSink,
+            )
+            val safetyDenialReader = ExposedDecisionRunProjectionRepository(connection.database, context.clock)
+            val closeAction = {
+                gateShadowScope.cancel()
+                if (connection.closeDataSource) connection.dataSource.close()
+            }
+
+            TradingRuntime(
+                riskStateRepository = repositories.riskStateRepository,
+                riskStateCommandService = services.riskStateCommandService,
+                commandEventLog = repositories.commandEventLog,
+                llmRunRepository = repositories.llmRunRepository,
+                equitySnapshotRepository = repositories.equitySnapshotRepository,
+                evaluationRepository = repositories.evaluationRepository,
+                decisionRepository = repositories.decisionRepository,
+                decisionMaterialStateRepository = repositories.decisionMaterialStateRepository,
+                llmInputManifestRepository = repositories.llmInputManifestRepository,
+                decisionAccountSnapshotReader = repositories.decisionAccountSnapshotReader,
+                safetyViolationRepository = services.safetyViolationRepository,
+                safetyDenialReader = safetyDenialReader,
+                broker = services.broker,
+                tradingLock = services.tradingLock,
+                toolCallGuard = services.toolCallGuard,
+                callerNoTradeGuard = services.callerNoTradeGuard,
+                launchReservationRepository = ExposedLlmLaunchReservationRepository(connection.database),
+                close = closeAction,
+            )
+        } catch (throwable: Throwable) {
+            gateShadowScope.cancel()
+            throw throwable
+        }
     }
 }
 
@@ -516,6 +538,7 @@ private fun createPostgresServices(
     connection: PostgresRuntimeConnection,
     context: PostgresRuntimeContext,
     repositories: PostgresRuntimeRepositories,
+    gateShadowObservationSink: GateShadowObservationSink,
 ): PostgresRuntimeServices {
     val riskStateCommandService = ExposedRiskStateCommandService(connection.database, context.clock)
     val safetyViolationRepository = ExposedSafetyViolationRepository(connection.database)
@@ -526,6 +549,7 @@ private fun createPostgresServices(
         repositories = repositories,
         riskStateCommandService = riskStateCommandService,
         safetyViolationRepository = safetyViolationRepository,
+        gateShadowObservationSink = gateShadowObservationSink,
     )
     val callerNoTradeGuard = CallerNoTradeGuard(repositories.commandEventLog, context.clock)
     val toolCallGuard = ToolCallGuard(
@@ -545,12 +569,14 @@ private fun createPostgresServices(
     )
 }
 
+@Suppress("LongParameterList")
 private fun createPostgresBroker(
     connection: PostgresRuntimeConnection,
     context: PostgresRuntimeContext,
     repositories: PostgresRuntimeRepositories,
     riskStateCommandService: RiskStateCommandService,
     safetyViolationRepository: SafetyViolationRepository,
+    gateShadowObservationSink: GateShadowObservationSink,
 ): PaperBroker {
     val resolvedReconcilerStatusProvider = context.reconcilerStatusProvider
         ?: ExposedReconcilerStatusProvider(connection.database)
@@ -563,6 +589,7 @@ private fun createPostgresBroker(
             safetyFloorConfig = context.tradingConfig.safetyFloor,
             paperExecutionConfig = context.tradingConfig.paperExecution,
             maxDrawdownPolicy = context.maxDrawdownPolicy,
+            gateShadowObservationSink = gateShadowObservationSink,
         ),
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = riskStateCommandService,

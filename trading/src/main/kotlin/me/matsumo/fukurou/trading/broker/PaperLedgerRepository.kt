@@ -576,7 +576,6 @@ internal fun ReconcileProgress.toPaperReconcileResult(): PaperReconcileResult {
         closedPositionIds = closedPositionIds,
         executionIds = executionIds,
         divergenceMemos = divergenceMemos.toList(),
-        gateShadowObservations = gateShadowObservations.toList(),
     )
 }
 
