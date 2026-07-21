@@ -1,160 +1,136 @@
 ## Context
 
-Epic #180 の C3 (TTL/offset) と C1 (trailing) の候補を、適用前に記録済みデータで絞り込む手段が要る。decision を固定した執行層だけの replay は LLM 学習データのリークと無縁である。
+Epic #180 の C3 (TTL) の候補を、適用前に記録済みデータで絞り込む手段が要る。decision を固定した執行層だけの replay は LLM 学習データのリークと無縁である。
 
-本設計は独立反証を 2 周経ている。1 周目で offset と trailing の素朴案が「記録済みデータからは目的を達成できない」と判明し、2 周目に向けて trailing を stored fact ベースで再構成し、offset を除外した。以下は 2 周目に提出する設計であり、各判断が反証のどの指摘に対応するかを明記する。
+本設計は独立反証を 2 周経ている。1 周目で offset と trailing の素朴案が退けられ、2 周目で trailing の stored-fact ゲート案 (ATR と REST poll cadence が未保存のため偏り方向を保証できない) と、TTL 反実仮想の広い解釈 (延長・境界曖昧・安全ゲート) が退けられた。本 (3 周目に提出する) 設計は、オーナー判断で scope を「忠実に計算できるコア」に確定させたものである。
+
+### 忠実に計算できる範囲と、できない範囲
+
+| 対象 | 忠実性 | 根拠 |
+| --- | --- | --- |
+| resting LIMIT の約定レイテンシ | EXACT | 約定は記録済み receipt で発火し、`executions.source_*` に残る |
+| TTL を**短縮**した場合の retention | EXACT (境界帯を除く) | 短縮は記録済み約定を取りこぼす方向のみ。延命による口座状態変化が無い |
+| position の逆行 (tail) | 台帳事実 | `lowest_price_since_entry_jpy` は exit fill slippage を含む台帳値 |
+| TTL を**延長**した場合 | 不可 | 延命先の halt / 残高 / exposure を忠実に再現できない (`ExposedPaperLedgerWriter.kt:1052`) |
+| trailing 候補ランキング | 不可 | ATR14 値と REST poll cadence が未保存、誤差双方向 |
+| 指値 offset の反実仮想 | 不可 | 板 depth 未保存 |
 
 ### 現行実装の把握
 
-#### resting LIMIT entry の約定規則 — queue consumption
+#### resting LIMIT の約定規則と queue
 
-約定判定は価格クロスではなく queue 消費である (`ExposedPaperLedgerWriter.kt:1155-1170`)。
+約定は queue consumption で発火する (`ExposedPaperLedgerWriter.kt:1155-1170`)。`queue_ahead_btc` は発注時点に固定される値であり (`PaperBroker.kt:475-502`)、その order 自身の TTL を短縮しても変わらない。したがって各 order を独自の記録済み `queue_ahead_btc` と記録済み receipt 列で独立に評価でき、同価格 sibling の結合を考慮する必要がない (sibling は自身の作成時点の固定 queue にしか影響しない)。
 
-```
-fill ⇔ event.side == SELL ∧ event.priceJpy ≤ limitPrice
-     ∧ Σ(該当 event の sizeBtc) ≥ queue_ahead_btc + order.sizeBtc
-```
+#### TTL と失効判定
 
-`queue_ahead_btc` は発注時点に板から算出され、同一指値の自 open order 数量を含む (`PaperBroker.kt:490`)。板そのものは保存されない。
+`expiresAt = min(createdAt + restingEntryOrderTtl, trade_plans.time_stop_at)` (`PaperBroker.kt:795-811`)。config は TTL を短縮方向にしか許さない (`TradingBotConfig.kt:439`)。失効判定の処理時刻は writer の `clock.instant()` で保存されず (`ExposedPaperLedgerWriter.kt:806`)、receipt 永続化から処理までの遅延に厳密な上限は無い。
 
-#### TTL の決定と失効判定
+#### tail に使う stored fact
 
-`expiresAt = min(createdAt + restingEntryOrderTtl, trade_plans.time_stop_at)` (`PaperBroker.kt:795-811`)。`orders.expiry_source` には確定後の区分しか残らないため、TTL を延ばす反実仮想には `trade_plans.time_stop_at` の join が要る。失効判定の処理時刻は writer の `clock.instant()` であり (`ExposedPaperLedgerWriter.kt:806`)、保存されない。判定は REST tick (5 秒 poll) と WS event の両経路から呼ばれる。
+`positions.lowest_price_since_entry_jpy` は WS+REST の running min で、close 時に exit fill を畳み込む (`ExposedPaperLedgerWriter.kt:2288`)。exit SELL fill は adverse slippage で trigger より低くなりうる (`FillSimulator.kt:199`) ため、この値は市場最安値ではなく台帳値である。初期 R は既存 evaluation が fill-weighted stop から算出する (`EvaluationMath.kt`, `ExposedEvaluationRepository.kt:152`)。`lowest` と entry stop は nullable。
 
-#### trailing stop と、それを支える stored fact
-
-trailing stop = `highestPriceSinceEntry − ATR14 × 2.0` を tick step へ floor し単調 tighten する (`PaperLedgerRepository.kt:589-595`)。係数 `2.0` はコード固定値 (`SafetyFloorDefaults.trailingAtrMultiplier`)。tighten は REST tick 経路の ATR でのみ起きる (WS 経路は ATR=null で呼ぶ、`ExposedPaperLedgerWriter.kt:868`)。ATR14 系列は保存されない。
-
-一方で次は stored fact として保存されている (explore 検証済み)。
-
-| stored fact | 列 | 性質 |
-| --- | --- | --- |
-| production が到達した真の最高値 | `positions.highest_price_since_entry_jpy` | WS+REST 両経路の running max。close 後も exit 込みで保持 (`ExposedPaperLedgerWriter.kt:2287,2302`) |
-| production が到達した真の最安値 | `positions.lowest_price_since_entry_jpy` | 同上の running min。実際の最大逆行 (MAE) |
-| 初期保護 STOP | entry `orders.protective_stop_price_jpy` | trailing tighten で不変。初期 R 復元の唯一の immutable source |
-| 生存区間 | `positions.opened_at` / `closed_at` | epoch millis |
-| exit 価格・時刻 | `executions.price_jpy` / `executed_at` | SELL execution |
-
-`current_stop_loss_jpy` / `current_take_profit_jpy` は close 時に NULL 化される (`:2298`) ため、決済直前 trailing 値は closed 行から取れない。exit 理由は `executions` に無く `orders.reason_ja` / `order_type` から分類する。
-
-GMO klines は date 指定で過去日を取れる (`buildKlinesRequest`, `GmoPublicMarketDataSource.kt:365-371`)。ATR14 の warmup は 14 本、production は 64 本窓で計算する (`IndicatorCalculator.kt:459`)。取引所 API client は HTTP 試行ごとに `requestAuditSink.append` で `command_event_log` へ書きうる (`GmoPublicRequestAudit.kt:79`)。
-
-`admission_ordinal` は永続 sequence 由来で正当な欠番を含む。receipt の retention は正本上「最低 365 日」であり無期限ではない。cohort は lineage から `CASE` で導出される派生値である (`ExposedEvaluationRepository.kt:109-142`)。
+cohort は lineage から `CASE` で導出される派生値である (`ExposedEvaluationRepository.kt:109-142`)。gap は `market_data_gaps` (WS 由来) と `infrastructure_gap_events` (deploy 由来) の 2 系統で、後者のみ `EVALUATION_GAP_INTERVAL_CTE_V1` が投影し、1,000 件超で query を意図的に失敗させる (`EvaluationPopulationSqlV1.kt:35`)。`admission_ordinal` は永続 sequence 由来で正当な欠番を含む。receipt に時刻 index は無く、index は `(session_id, source_sequence)` と `admission_ordinal` のみ (`TradingPersistenceBootstrap.kt:487-496`)。receipt retention は「最低 365 日」。read-only role `fukurou_mcp` は receipt SELECT を持たず `command_event_log` INSERT を持つ (`mcp-role.sql`)。
 
 ## Goals / Non-Goals
 
-**Goals:**
+**Goals:** 各 order の約定レイテンシと短縮 TTL retention を EXACT で出す。position の逆行を台帳事実として集計する。cohort を分離し gap/unknown を母集団に残す。read-only を構造的に守る。
 
-- TTL 候補の約定 / 失効を、厳密性を保証できる対象について `EXACT` で再計算する
-- trailing の壊滅的 tail を stored fact から `EXACT` で確認する
-- trailing 候補の exit を、stored fact でゲートした忠実な部分集合について `APPROXIMATE` で順位づける
-- 忠実に扱えない対象を `UNKNOWN` として母集団に残し、理由を区別して開示する
-- cohort を分離し、read-only 境界を構造的に守る
-
-**Non-Goals:** proposal.md の「本 change で実施しないこと」に従う。特に offset の反実仮想、production ATR との厳密一致を含まない。
+**Non-Goals:** proposal の「本 change で実施しないこと」に従う。trailing ランキング、offset、TTL 延長、外部 API を含まない。
 
 ## Decisions
 
-各判断の末尾に、対応する反証指摘 (前回 ID) を付す。
+各判断の末尾に、対応する 2 周目反証 ID を付す。
 
-### D1. `EXACT` (TTL) の定義を限定し、崩れる対象を `UNKNOWN` へ落とす — [2-A, 2-B]
+### D1. TTL は短縮のみを反実仮想の対象とし、延長を扱わない — [B-06]
 
-`EXACT` は「論理期限 (`orders.expired_at`) の一致」と「約定を発火させた receipt が `executions.source_*` と一致」の 2 点だけを意味する。次を `UNKNOWN` にする。
+config が短縮しか許さない。短縮は記録済み約定を取りこぼす方向のみで、延命先の安全ゲート・口座状態を必要としないため B-06 が構造的に発生しない。TTL 延長は Non-Goal とする。
 
-- **処理時刻の曖昧性** [2-A]: 処理時刻は保存されない。候補期限の前後いずれか 1 poll 間隔 (5 秒) 以内に約定条件を満たす receipt がある対象は、production が失効と約定のどちらを先に見たか決定できない。**窓は片側ではなく両側** に取る (期限直前の約定は「約定が先か失効が先か」不定、期限直後の約定は「その poll で失効済みか」不定)。理由 `PROCESSING_CLOCK_AMBIGUOUS`。
-- **同価格 order の queue 結合** [2-B]: `queue_ahead_btc` は同一指値の自 open order 数量を含む。対象の生存区間と重なる同一指値の別 order が存在する対象は、候補 TTL でその重なりが変わるため記録済み queue を流用できない。理由 `QUEUE_COUPLED_SIBLING`。
+### D2. 出力の主軸を EXACT な約定レイテンシとし、retention は境界帯を UNKNOWN にする — [B-05, B-07]
 
-これにより本 replay は各 order を独立に変更した反実仮想に限定される。policy replay ではないことを出力に明記する。
+各 order について次を出す。
 
-### D2. 実効期限は `trade_plans.time_stop_at` を join して算出する — [2-C]
+- **記録済み結果** (ground truth): 約定 (`executions` に残る) か失効 (`orders.expired_at`)。
+- **約定レイテンシ** `L`: 発注 (`created_at`) から約定条件を満たした receipt までの経過。約定した order で EXACT に決まる。
+- **短縮 TTL retention**: 候補 TTL `T'` について、`T'` の論理期限 (`created_at + T'`) と約定の論理時刻を比較する。`T'` が約定の論理時刻より**十分後**なら約定を保つ (RETAINED)、**十分前**なら取りこぼす (DROPPED)。
 
-候補 TTL による期限と記録済み time stop の早い方を実効期限とする。`expiry_source` の区分値に依拠しない。time stop を解決できない対象は `TIME_STOP_UNRESOLVED` で `UNKNOWN`。
+処理時刻の遅延に上限が無い [B-05] ため、論理期限が約定時刻の近傍にある候補は `PROCESSING_CLOCK_AMBIGUOUS` で `UNKNOWN` とする。近傍の幅は reconciler の grace (`PaperOrderLifecyclePolicy` の poll 間隔 + grace) を下限とし、それを超える処理遅延を排除できないことを residual risk として出力に明記する。
 
-### D3. gap は 2 系統を別々に投影し、投影失敗は run 全体の失敗にする — [1-A, 3-B]
+fidelity 契約 [B-07]: 約定レイテンシと、境界帯の外の RETAINED / DROPPED は `EXACT`。境界帯は `UNKNOWN`。記録済み TTL の再現は当然に `EXACT`。本 replay は候補 TTL の延長を扱わないため、記録値と異なる論理期限を持つ候補でも「短縮による取りこぼし」しか主張せず、延長 fill を作らない。
 
-`EVALUATION_GAP_INTERVAL_CTE_V1` は `infrastructure_gap_events` のみを投影する [1-A]。`market_data_gaps` は `started_at` / `recovered_at` (未回復は現在まで開区間) として別途投影する。いずれかと交差する対象を `UNKNOWN` (`MARKET_DATA_GAP` / `INFRASTRUCTURE_GAP`) とする。
+### D3. 各 order を独自の記録済み queue で独立評価し、sibling ゲートを置かない — [N-01]
 
-既存 CTE は gap 1,000 件超で意図的にゼロ除算し query 全体を失敗させる [3-B]。この場合 replay は**部分結果を出さず run 全体を失敗**させ、run-level failure と per-target `UNKNOWN` を出力上で区別する。
+`queue_ahead_btc` は発注時点で固定され、その order の TTL 短縮で変わらない。したがって記録済み `queue_ahead_btc` と記録済み receipt 列だけで各 order を独立に評価する。前回設計の同価格 sibling UNKNOWN ゲートは過剰 [N-01] なので置かない。
 
-### D4. receipt の欠落判定は `(session_id, source_sequence)` で行う — [1-C]
+### D4. tail は fill-weighted R と台帳最安値から求め、ラベルを縮退する — [B-03, B-04, B-10]
 
-`admission_ordinal` の欠番は sequence 由来の正当な穴を含むため欠落判定に使わない [1-C]。ordinal は eligibility 境界比較にのみ使う。`source_sequence` の欠落区間を跨ぐ対象を `RECEIPT_SEQUENCE_GAP` で `UNKNOWN`。
+初期 R を既存 evaluation と同じ fill-weighted stop から復元する [B-03] (pyramiding でも同時点に存在した基準になる)。実際の逆行を `average_entry_price_jpy − lowest_price_since_entry_jpy` から求める。この最安値は exit fill slippage を含む台帳値であるため [B-04]、出力に「台帳記録値、exit fill slippage を含みうる」と明記し、市場最安値とは主張しない。
 
-### D5. cohort は lineage から導出し、入力欠如と独立に扱う — [1-B]
+`lowest` または entry stop が null の position は `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とする [B-04]。tail は exit 理由に依らず逆行幅を出すが、partial close で基準 size が変わる position はその旨を注記する [B-10]。
 
-cohort の正本は lineage であり receipt の有無ではない [1-B]。無約定時間帯の `CURRENT` order は receipt を持たないが `CURRENT` である。cohort は既存 `CASE` 規則で導出し、`NO_REPLAY_INPUT` は別軸の `population_status` として付与する。`LEGACY_PRE_WS` / `UNSUPPORTED_EXECUTION_SEMANTICS` を `CURRENT` 集計へ混ぜない。
+### D5. 実効期限は `trade_plans.time_stop_at` を join して算出する — [前回 2-C]
 
-### D6. 対象範囲を境界づけ、silent truncation を作らない — [5-A, 1-D]
+候補 TTL による期限と記録済み time stop の早い方を実効期限とする。短縮候補が time stop より後なら time stop が支配する。解決できない対象は `TIME_STOP_UNRESOLVED` で `UNKNOWN`。
 
-receipt journal は増加し続け retention 保証は 365 日である [1-D, 5-A]。対象期間の指定を必須引数とし、対象件数の上限を設け、超過時は打ち切らず run を失敗させる。receipt は期間で絞って streaming で読み、statement timeout を設定する。対象期間の receipt が無い対象は `NO_REPLAY_INPUT` とし推定しない。
+### D6. gap は 2 系統を別々に投影し、投影失敗は run 全体の失敗にする — [前回 1-A, 3-B]
 
-### D7. 約定規則は production の式を写し、価格算出のみ simulator を使う
+`infrastructure_gap_events` は既存 CTE、`market_data_gaps` は `started_at`/`recovered_at` として別途投影する。交差対象を `UNKNOWN`。CTE が 1,000 件超で失敗した場合は部分結果を出さず run 全体を失敗させ、run-level failure と per-target `UNKNOWN` を区別する。
 
-fill 発火条件は `consumeLimitQueue` の queue 式であり simulator の外にある。replay はこの式を同じ形で持ち、queue 累積をメモリ上でのみ進める (書かない)。約定価格と手数料は `simulatePendingLimit` を再利用する。乖離検知は fixture 突き合わせで行う。eligibility 境界 (`market_eligible_after_admission_ordinal`) 以前の receipt で約定させない [2-D は offset 除外により消滅]。
+### D7. receipt の欠落判定は `(session_id, source_sequence)` で行う — [前回 1-C]
 
-### D8. trailing の壊滅的 tail を stored fact から `EXACT` で確認する — [追加論点 B]
+`admission_ordinal` の欠番は欠落判定に使わない (正当な穴を含む)。ordinal は eligibility 比較のみ。`source_sequence` の欠落区間を跨ぐ対象を `RECEIPT_SEQUENCE_GAP` で `UNKNOWN`。
 
-初期 R = `average_entry_price_jpy − entry orders.protective_stop_price_jpy` (最古 entry order、pyramiding 考慮) [追加論点 B]。実際の最大逆行 = `average_entry_price_jpy − lowest_price_since_entry_jpy`。この 2 つは stored fact であり、ATR も外部 API も要らない。閾値 (初期 R の何倍で壊滅的とみなすか) を超えた trade の件数を `EXACT` で出す。これが issue の「壊滅的 tail の事前確認」に対応する。
+### D8. cohort は lineage から導出し、入力欠如と独立に扱う — [前回 1-B]
 
-`current_stop_loss_jpy` は close で NULL 化されるため使わない [追加論点 B]。
+cohort を既存 `CASE` 規則で導出し、`NO_REPLAY_INPUT` を別軸の `population_status` とする。`LEGACY_PRE_WS` / `UNSUPPORTED_EXECUTION_SEMANTICS` を `CURRENT` 集計へ混ぜない。
 
-### D9. trailing 候補 exit を stored fact でゲートして `APPROXIMATE` で順位づける — [2-E]
+### D9. receipt 読み取りを対象 order の session/sequence 範囲で駆動し、全期間 time scan を避ける — [B-11]
 
-反証 2-E は「REST が receipt に無い高値を観測し、receipt 経路が高値を取りこぼすと偏りの向きが不定になる」であった。stored fact でこれをゲートする。
+receipt に時刻 index は無い [B-11]。対象 order は `market_data_session_id` と eligibility ordinal を持つため、対象 order が跨ぐ session と source_sequence 範囲を先に確定し、indexed な `(session_id, source_sequence)` で必要な receipt だけを読む。全 receipt の time predicate scan を発行しない。対象件数の上限と statement timeout を設け、超過時は打ち切らず run を失敗させる。
 
-1. receipt から position 生存区間 `[opened_at, closed_at]` の WS 価格経路を復元し、その最高値 `receiptMax` を求める。
-2. `receiptMax` を保存済みの真の最高値 `positions.highest_price_since_entry_jpy` (exit fill を除いた生存中の値) と照合する。**一致しない (`receiptMax < storedMax`) 対象は、REST が receipt 外の高値を観測したことが確定するため `PRICE_PATH_INCOMPLETE` で `UNKNOWN`** とする [2-E への直接処置]。
-3. 一致する対象では、running max の軌跡は receipt から忠実に復元できる。production が同じ最高値へ到達する時刻は replay 以前でありうる (REST が先に観測)。trailing は running max に対し単調に tighten するため、replay は production より遅く tighten し、**exit は production より早くならない (より緩い) 側へ一方向に偏る**。この偏りの向きが保証されるため候補間の相対順位づけに使える。
-4. ATR14 は date 指定 klines を再取得して `IndicatorCalculator` で再構成する。production が各 tick で使った candle 窓の終端は保存されないため、ATR は production 値と厳密一致しない。これは APPROXIMATE の主因であり、候補間の相対順位づけにのみ使う。
+### D10. 全入力を単一の read-only snapshot で読み、read-only を構造的に守る — [B-09]
 
-出力は各行に `fidelity=APPROXIMATE`、`basis`、`usage=relative_ranking_only`、偏りの向きを持つ。ATR 再構成用の candle を取得できない対象は `ATR_UNAVAILABLE` で `UNKNOWN` とし、代替値で exit を確定させない [3-A]。
+全入力を単一の `REPEATABLE READ` read-only transaction で読み、query 間の mixed snapshot (order を読んだ後に receipt が追加され、存在しなかった組合せを EXACT 判定する) を防ぐ [B-09]。既存に `REPEATABLE READ, readOnly=true` の先例がある (`ExposedLlmDecisionReconstructionRepository.kt:167`)。
 
-### D10. historical candle reader と外部 API の隔離 — [3-A, 4-A]
+replay の実行には receipt を含む read set への SELECT 権を持ち write 権を持たない専用 read-only credential を前提とする。既存 `fukurou_mcp` role は要件を満たさない [B-09] ため、本 change は必要な read-only 権限の付与を運用前提として文書化する (role 定義の変更は本 change のコードには含めない。付与はオーナー承認の運用作業)。`ExposedPaperLedgerWriter` / `PaperBroker` を依存に含めない。回帰テストで完走前後のテーブル内容一致を検証する。
 
-trailing replay は過去日の 5 分足を取得する。既存 `getCandles` は現在から遡るため過去時点を指定できない [3-A]。`buildKlinesRequest` の date 対応 wire を read-only で使う薄い reader を作り、対象 trade の日付とその前日 (warmup 14 本ぶん) を fetch する。production の 64 本窓と終端が異なるため ATR は近似であることを D9 で申告済み。
+### D11. 約定規則は production の式を写し、価格算出のみ simulator を使う — [前回 D7]
 
-取引所 API client は audit sink 経由で `command_event_log` へ書きうる [4-A]。trailing reader には**書き込みを行わない audit sink を注入**し、DB write を発生させない。TTL replay はそもそも外部 API を呼ばない。
+fill 発火条件は `consumeLimitQueue` の queue 式を同じ形で持ち、queue 累積をメモリ上でのみ進める。約定価格と手数料は `simulatePendingLimit` を再利用する。eligibility 境界以前の receipt で約定させない。乖離検知は fixture 突き合わせで行う。
 
-### D11. 読み取り専用の保証 — [4-A]
+### D12. 配置と PR 分割・全 task の帰属 — [B-12]
 
-- DB 接続を read-only role の DataSource として構築する
-- `ExposedPaperLedgerWriter` / `PaperBroker` を依存に含めない
-- TTL replay は取引所 API client を依存に含めない。trailing replay は書き込みなし audit sink 付きの reader のみを含める
-- 回帰テストで、replay 完走前後の対象テーブル内容が同一であることを検証する
+`:trading` に `me.matsumo.fukurou.trading.replay` を置き、`build.gradle.kts` に `runOneShotLlm` 同型の `JavaExec` task を 2 本登録する。出力は JSON Lines、集計は cohort ごとに分離する。
 
-### D12. 配置と PR 分割 — [追加論点 D]
-
-`:trading` に `me.matsumo.fukurou.trading.replay` を置き、`build.gradle.kts` に `runOneShotLlm` 同型の `JavaExec` task を 2 本登録する。新 module は作らない。出力は JSON Lines (1 行 1 対象)、集計は cohort ごとに分離する。
-
-反証の PR 規模指摘 [追加論点 D] に対し、実装を 2 PR に分ける。**PR 1 = TTL replay** (pure DB、外部 API 非依存、tasks 群 1〜4)。**PR 2 = trailing tail & exit replay** (historical reader を含む、tasks 群 5〜7)。各 PR が独立にレビュー可能で、PR 1 は外部依存を持たない強い read-only 境界を保つ。
+PR を 2 本に分ける。**PR 1 = 共通基盤 + TTL 短縮感度** (tasks 群 1〜4、および 6 の PR1 分)。**PR 2 = tail 事実シート** (tasks 群 5、および 6 の PR2 分)。tasks 群 6 (JavaExec / wrapper / docs / 母数実測 / detekt) は各 PR が自分のスクリプト分を担う形で明示的に割り当てる [B-12]。共通基盤は PR 1 で確定し PR 2 が再利用する。どちらの PR も pure DB で、1 実装者 / 1 レビュアーが独立にレビューできる規模とする。
 
 ## Risks / Trade-offs
 
-- **[`UNKNOWN` が多すぎて母数が残らない]** → D1 (曖昧性・queue 結合)、D9 (最高値不一致) の除外で母数が減る。実装後に実データで cohort 別・理由別の母数を実測し、絞り込みに足りるかを報告に含める。足りなければ「母数不足で絞り込み不能」を結論とし、候補を無理に順位づけしない。
-- **[trailing ランキングが ATR 近似で歪む]** → 価格経路の偏りは D9 のゲートにより一方向 (より緩い) に固定されるが、ATR 近似は別軸で残る。usage を relative_ranking_only に限定し、絶対 exit 価格を主張しない。採否は 2〜4 週の実適用観察で決める Epic #180 の運用を変えない。
-- **[offset 軸が欠ける]** → C3 の絞り込みは TTL 軸と、記録済み offset の約定レイテンシ提示に留まる。offset の反実仮想はオーナー判断待ちとして proposal に明記する。
-- **[replay が production の約定規則から乖離する]** → fill 発火条件は simulator の外にあり型では守れない。fixture 回帰テストで `executions.source_*` と突き合わせる。
-- **[read-only 前提が破れる]** → D11 の依存排除と回帰テスト、D10 の書き込みなし audit sink で担保する。
+- **[短縮 TTL の境界帯が処理遅延で広がりうる]** → D2 の `UNKNOWN` 帯は poll grace を下限とし、上限を保証できないことを residual risk として出力に明記する。境界帯の外は EXACT。
+- **[tail の最安値が exit slippage で過大評価]** → D4 で台帳値であることを明記し、市場最大逆行とは主張しない。tail 方向には保守的 (やや多めに検出) である。
+- **[`UNKNOWN` / `NO_REPLAY_INPUT` が多く母数が残らない]** → 実装後に実データで cohort 別・理由別の母数を実測し、絞り込みに足りるかを報告に含める。足りなければ「母数不足」を結論とする。
+- **[replay が production の約定規則から乖離]** → fill 発火条件は simulator の外にあり型で守れない。fixture 回帰テストで `executions.source_*` と突き合わせる。
+- **[read-only credential が未整備]** → D10 で運用前提として文書化し、単一 snapshot txn と回帰テストで多重防御する。role 付与はオーナー承認。
 
 ## Migration Plan
 
-production への deploy を伴わない。read-only 接続から実行する。rollback 不要。
+production への deploy を伴わない。read-only 接続から実行する。rollback 不要。role 付与を伴う場合はオーナー承認の運用作業として別に行う。
 
 ## Open Questions
 
-- TTL 探索格子は既存 order 分布から決める。現行 30 分 (`TradingBotConfig.kt:764`) を必ず含め、1800 秒以下に収める。
-- trailing の係数候補は現行 `2.0` を必ず含める。起動条件は即時 / 0.5R / 1R。
-- 壊滅的 tail の閾値 (初期 R の倍数) と対象件数上限は実装時に実データ分布から決める。
+- TTL 短縮の探索格子は既存 order 分布から決める。現行 30 分 (`TradingBotConfig.kt:764`) を上限に含め、それ以下の短縮候補を並べる。
+- 壊滅的 tail の閾値 (初期 R の倍数) と対象件数上限は実データ分布から決める。
+- 境界帯の下限 (poll grace) の具体値は `PaperOrderLifecyclePolicy` の値に合わせる。
 
 ## Next steps (本 change では実施しない)
 
-- offset 反実仮想 (板 depth の永続化、または C3 の絞り込み手段の変更) — オーナー判断
-- production ATR 窓の記録により trailing ランキングを `EXACT` にする
+- trailing ランキング: ATR 値と REST poll cadence の永続化を前提に別 change
+- offset 反実仮想: 板 depth の永続化を前提に別 change
 
 ## 帰属タグ一覧
 
 | 決定 | タグ |
 | --- | --- |
+| scope を忠実なコアに確定 (trailing ランキング・offset の除外) | ユーザー確認済み |
 | D1〜D12 | agent 仮決め |
 
-offset の反実仮想は忠実に計算できないため本 change から除外し、扱いを **人間判断待ち** として PR の「人間に確認してほしいこと」へ転記する。trailing の近似実施はオーナーが以前承認したが、承認の前提 (偏り一様) が反証で否定されたため、D9 の stored-fact ゲートで偏り方向を保証し直した設計として提示する。この再設計自体の妥当性を reviewer の必須確認事項とする。
+trailing ランキングと offset を「記録済みデータでは不可能」として除外することはオーナーが確定した。read-only credential の付与 (D10) はオーナー承認を要する運用前提として PR の「人間に確認してほしいこと」へ転記する。
