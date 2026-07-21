@@ -6,7 +6,7 @@
 
 対象は production 経路の TTL 失効の LIMIT / STOP long entry に限定する。EV 拒否その他の gate、in-memory ledger 経路、MARKET order type、非 BUY は対象にしない（SHALL NOT）。
 
-`start_admission_ordinal` は、commit 後に読む high-watermark ではなく、失効 ledger transaction 内（event admission と同じ session 直列化が効く地点）で確定した値でなければならない（MUST）。これにより、この watermark より後に admit される event が必ず失効後であることが保証されなければならない（MUST）。
+`start_admission_ordinal` は、commit 後に読む high-watermark ではなく、失効 ledger transaction 内（event admission と同じ session 直列化が効く地点）で確定した値でなければならない（MUST）。ただし ordinal watermark 単独では因果境界を保証できない（receipt admission は fence と同一 lock を取らないため、失効前に観測されたが fence 後に採番される event が `admission_ordinal > start_admission_ordinal` を満たしうる）。因果境界は **`admission_ordinal` 下界と `socket_observed_at >= window_start_time` の複合** で完成し、分類はこの両方を課さなければならない（MUST。「分類対象は因果境界より後」Requirement 参照）。
 
 捕捉は best-effort とする。捕捉の失敗は失効・注文処理の判定を変えてはならず（MUST NOT）、risk-reducing な cancel を巻き戻してはならない（MUST NOT）。捕捉の取りこぼしは、正本（`cancel_reason=TTL_EXPIRY` かつ LIMIT/STOP の order 行）に対する `order_id` join で SQL で算出できなければならない（MUST）。
 
