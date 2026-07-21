@@ -77,6 +77,9 @@ enum class ReplayUnknownReason {
 
     /** tail の最安値・entry stop が null、または risk width が非正で逆行を R 換算できない。 */
     TAIL_BASIS_UNAVAILABLE,
+
+    /** operator が evaluation_exclusions で戦略評価から外すと宣言した (infrastructure failure 由来など)。 */
+    EVALUATION_EXCLUDED,
 }
 
 /** 各短縮 TTL 候補の反実仮想判定。 */

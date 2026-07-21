@@ -90,7 +90,11 @@ object TailReplayQuery {
             ef.average_entry_price_jpy,
             ef.protective_stop_price_jpy,
             COALESCE(sc.sell_count, 0) AS sell_count,
-            el.cohort
+            el.cohort,
+            EXISTS (
+                SELECT 1 FROM evaluation_exclusions x
+                WHERE x.entity_type = 'POSITION' AND x.entity_id = p.id::text
+            ) AS is_excluded
         FROM target_positions p
         LEFT JOIN entry_fills ef ON ef.position_id = p.id
         LEFT JOIN sell_counts sc ON sc.position_id = p.id
@@ -138,6 +142,7 @@ object TailReplayQuery {
             lowestPriceSinceEntryJpy = getBigDecimal("lowest_price_since_entry_jpy"),
             pyramidAddCount = getInt("pyramid_add_count"),
             sellExecutionCount = getInt("sell_count"),
+            isEvaluationExcluded = getBoolean("is_excluded"),
         )
     }
 

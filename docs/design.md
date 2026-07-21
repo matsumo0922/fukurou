@@ -4031,6 +4031,8 @@ queue 到達後に安全ゲートで棄却され execution を持たない order
 
 最安値または entry stop が null、あるいは fill-weighted stop が average entry 以上で risk width が非正になる position は、逆行を R 換算できないため `TAIL_BASIS_UNAVAILABLE` で `UNKNOWN` とし、母数から外す。逆行は exit 理由に依らず出力する。部分決済（複数 SELL fill）や pyramiding で生存中に基準数量が変わる position はその旨を注記する。
 
+operator が `evaluation_exclusions`（`entity_type = 'POSITION'`）で戦略評価から外すと宣言した position は、既存 evaluation と同じく `EVALUATION_EXCLUDED` で `UNKNOWN` とし母数から外す。この宣言は gap の時間交差では導けない operator の帰属判断であり、gap 交差判定とは独立に honor する（infrastructure failure を戦略評価へ混ぜない）。
+
 実行は `scripts/tail-replay --from-ms <ms> --to-exclusive-ms <ms>`（対象期間は position の `closed_at` に対する必須境界）。Gradle からは `:trading:runTailReplay` task を用いる。
 
 #### trailing / offset を除外した理由

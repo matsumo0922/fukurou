@@ -74,6 +74,10 @@ class TailFactSheet(private val runtime: ReplayReadOnlyRuntime) {
         gapProjection: ReplayGapProjection,
         thresholdRMultiple: BigDecimal,
     ): TailTargetResult {
+        if (row.isEvaluationExcluded) {
+            return unknownResult(row, ReplayUnknownReason.EVALUATION_EXCLUDED, buildNotes(row))
+        }
+
         val gapReason = gapProjection.intersectingReason(row.openedAtMs, row.closedAtMs)
         if (gapReason != null) {
             return unknownResult(row, gapReason, buildNotes(row))

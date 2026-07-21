@@ -24,6 +24,7 @@ data class TailPositionRow(
     val lowestPriceSinceEntryJpy: BigDecimal?,
     val pyramidAddCount: Int,
     val sellExecutionCount: Int,
+    val isEvaluationExcluded: Boolean,
 ) {
     /** 部分決済 (scale-out) で基準数量が生存中に変わったか。SELL execution が複数あれば真。 */
     val hasPartialClose: Boolean
@@ -144,6 +145,8 @@ data class TailRunSummaryLine(
                 "(BUY execution の size 加重 average entry と、entry order の protective stop の size 加重値の差)。",
             "最安値または entry stop が null、あるいは risk width が非正 (fill-weighted stop ≥ average entry) の " +
                 "position は TAIL_BASIS_UNAVAILABLE で UNKNOWN とし、母数から外す。逆行は exit 理由に依らず出力する。",
+            "operator が evaluation_exclusions で戦略評価から外すと宣言した position は EVALUATION_EXCLUDED で " +
+                "UNKNOWN とし、母数から外す (既存 evaluation と同じ扱い。infrastructure failure を戦略評価へ混ぜない)。",
         )
     }
 }

@@ -17,6 +17,7 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -125,6 +126,39 @@ class TailFactSheetIntegrationTest {
         val line = output.targets.single()
         assertEquals(ReplayPopulationStatus.UNKNOWN, line.populationStatus)
         assertEquals(ReplayUnknownReason.MARKET_DATA_GAP, line.unknownReason)
+    }
+
+    @Test
+    fun evaluationExcludedPositionIsUnknownAndOutOfDenominator() = runReplayTest { database ->
+        val windowFrom = 7_000_000L
+        val breachingId = UUID.randomUUID()
+        val excludedId = UUID.randomUUID()
+
+        exposedTransaction(database) {
+            // 母数に入る breach position。
+            seedClosedPosition(breachingId, openedAtMs = windowFrom, closedAtMs = windowFrom + 10L, lowestPriceJpy = BigDecimal("6700000"))
+            seedBuyFill(breachingId, priceJpy = BigDecimal("10000000"), sizeBtc = BigDecimal("0.010"), stopJpy = BigDecimal("9000000"))
+            seedSellFill(breachingId, priceJpy = BigDecimal("6700000"), sizeBtc = BigDecimal("0.010"))
+
+            // operator が評価不能と宣言した position。逆行自体は閾値超過だが母数から外れる。
+            seedClosedPosition(excludedId, openedAtMs = windowFrom, closedAtMs = windowFrom + 20L, lowestPriceJpy = BigDecimal("6000000"))
+            seedBuyFill(excludedId, priceJpy = BigDecimal("10000000"), sizeBtc = BigDecimal("0.010"), stopJpy = BigDecimal("9000000"))
+            seedSellFill(excludedId, priceJpy = BigDecimal("6000000"), sizeBtc = BigDecimal("0.010"))
+            seedEvaluationExclusion(excludedId)
+        }
+
+        val output = buildOutput(database, window(windowFrom, windowFrom + 2_000_000L))
+
+        val excludedLine = output.targets.single { line -> line.positionId == excludedId.toString() }
+        assertEquals(ReplayPopulationStatus.UNKNOWN, excludedLine.populationStatus)
+        assertEquals(ReplayUnknownReason.EVALUATION_EXCLUDED, excludedLine.unknownReason)
+        assertFalse(excludedLine.breachesThreshold)
+
+        // seed は account_epoch を設定しないため両 position とも LEGACY_PRE_WS の 1 cohort。
+        val summary = output.cohortSummaries.single()
+        assertEquals(1, summary.eligibleCount)
+        assertEquals(1, summary.thresholdBreachCount)
+        assertEquals(1, summary.unknownCountByReason[ReplayUnknownReason.EVALUATION_EXCLUDED])
     }
 
     @Test
@@ -272,6 +306,41 @@ class TailFactSheetIntegrationTest {
             "INSERT INTO market_data_gaps (id, session_id, reason, started_at, recovered_at) VALUES (?, ?, 'STALL', ?, ?)",
         ) { statement ->
             statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, sessionId)
+            statement.setLong(3, startedAtMs)
+            statement.setLong(4, recoveredAtMs)
+        }
+    }
+
+    /**
+     * position を評価除外に登録する。exclusion は gap 紐付き必須なので、position 生存区間と交差しない
+     * gap を張って参照する (gap 時間交差では導けない operator 帰属を直接 honor することの検証)。
+     */
+    private fun JdbcTransaction.seedEvaluationExclusion(positionId: UUID) {
+        val sessionId = UUID.randomUUID()
+        val gapId = UUID.randomUUID()
+        seedSession(sessionId)
+        seedMarketDataGapWithId(gapId, sessionId, startedAtMs = 0L, recoveredAtMs = 1L)
+        execUpdate(
+            "INSERT INTO evaluation_exclusions (id, gap_id, entity_type, entity_id, reason, created_at) " +
+                "VALUES (?, ?, 'POSITION', ?, 'OPERATOR_DECLARED', 0)",
+        ) { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, gapId)
+            statement.setString(3, positionId.toString())
+        }
+    }
+
+    private fun JdbcTransaction.seedMarketDataGapWithId(
+        gapId: UUID,
+        sessionId: UUID,
+        startedAtMs: Long,
+        recoveredAtMs: Long,
+    ) {
+        execUpdate(
+            "INSERT INTO market_data_gaps (id, session_id, reason, started_at, recovered_at) VALUES (?, ?, 'STALL', ?, ?)",
+        ) { statement ->
+            statement.setObject(1, gapId)
             statement.setObject(2, sessionId)
             statement.setLong(3, startedAtMs)
             statement.setLong(4, recoveredAtMs)
