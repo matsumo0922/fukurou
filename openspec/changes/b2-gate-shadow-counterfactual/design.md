@@ -48,7 +48,7 @@ order_id, market_data_session_id, start_admission_ordinal (= 同 transaction 内
 geometry, window_start_time (= expired_at)
 ```
 
-- **この watermark 以降に admit される event は必ず失効後**であることを、admission sequence の **allocation fence** で確定する。単純な `MAX(admission_ordinal)`（committed row の最大値、`ExposedPaperLedgerWriter.kt:788`）は**採番済み・未 commit の receipt を見逃すため下界にならない**（falsify #1）: その receipt が後で commit されると、失効前に admission を開始した event が `ordinal > start_admission_ordinal` に紛れ込む。receipt admission は shared session lock 下で `nextval` 採番する（`ExposedMarketDataIntegrityRepository.kt:209`）ので、そのとき採番済みの最大 ordinal（未 commit 含む）を境界にする。exclusive session lock で読む案は cancel（risk-reducing）を receipt commit 待ちに巻き込むため採らない（D7 と整合）。具体 primitive（sequence の current value 参照 or advisory な fence）は実装時に既存 seam へ合わせるが、**単純な committed `MAX()` は使わない**。
+- **この watermark 以降に admit される event は必ず失効後**であることを、admission sequence の **allocation fence** で確定する。単純な `MAX(admission_ordinal)`（committed row の最大値、`ExposedPaperLedgerWriter.kt:788`）は**採番済み・未 commit の receipt を見逃すため下界にならない**（falsify #1）: その receipt が後で commit されると、失効前に admission を開始した event が `ordinal > start_admission_ordinal` に紛れ込む。receipt admission は `nextval('paper_market_admission_ordinal_seq')` で採番する（`ExposedMarketDataIntegrityRepository.kt:305`）。**fence primitive は同 sequence の allocation 済み最大値**（`SELECT last_value, is_called FROM paper_market_admission_ordinal_seq`。sequence は非 transactional なので未 commit 含む採番済み最大が見える。`is_called=false` なら未採番として 0 相当）を使う。exclusive session lock で読む案は cancel（risk-reducing）を receipt commit 待ちに巻き込むため採らない（D7 と整合）。**`selectGlobalPaperMarketAdmissionBoundary`（`:788`）の committed `MAX()` は採番済み・未 commit の receipt を見逃すため使わない**。
 - `market_data_session_id` は order 行から取る。特定できなければ `data_quality` に理由を刻み resolver は `UNKNOWN`。
 - 分類対象 predicate: `session_id = observation.market_data_session_id AND admission_ordinal > observation.start_admission_ordinal AND socket_observed_at <= window_start_time + horizon`。開始は ordinal（因果・線形化）、終了は時刻（運用打ち切り、D3）。
 
@@ -88,7 +88,7 @@ resolver は observation を `now >= window_start_time + horizon + settlementGra
 
 ### D8: resolver は daemon tick に同期配線し、bounded delay 予算で有界化（ユーザー確認済み: bounded delay / launchEnabled 配置は要人間確認）
 
-- resolver を `OpportunityEpisodeLifecycleObserver` 同型 hook として `tickUnsafe` 先頭付近に同期配線。**（高リスク・要人間確認）** `launchEnabled=false`（`:273`）より前（shadow は分析、仮決め）。
+- resolver を `OpportunityEpisodeLifecycleObserver` 同型 hook として `tickUnsafe` 先頭付近に同期配線。**（2026-07-21 ユーザー確認済み）** `launchEnabled=false`（`:273`）より前に配置する（shadow は分析なので取引停止中も観測を続ける）。
 - **保証は「launch を一切遅延させない」ではなく「設定した wall-time 予算 N までの bounded delay」とする**（ユーザー確認済みの縮退。falsify #6: 同期逐次 tick では resolver の実行時間分だけ launch 開始が必ず遅れるため、絶対保証は原理的に不可能）。resolver に wall-time 予算 N + statement/lock/connection acquire timeout を課し、予算超過・timeout 時は cursor を壊さず pending のまま fail-open にして次 tick に回す。これにより launch 遅延は毎 tick 最大 N に bound される。1 tick の処理 observation 数と 1 observation の read row も上限を持つ。打ち切りは log（silent cap 禁止）。予算値 N は **（agent 仮決め）** 既定を置き（例: tick interval の数 % に相当する数百 ms）、運用で調整可能にする。
 - resolver は独自 transaction、失敗は 1 observation 単位で隔離。tick 全体を落とさない。
 

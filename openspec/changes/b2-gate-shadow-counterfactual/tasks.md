@@ -29,8 +29,9 @@
 
 ## 4. PR-2 / 仕上げ
 
-- [ ] 4.1 `make detekt` と関連テストを通す
-- [ ] 4.2 PR-2 を出す（change は open のまま）
+- [ ] 4.1 `docs/deploy.md` に `paper_market_event_receipts` への `(session_id, admission_ordinal)` index を `CREATE INDEX CONCURRENTLY` で追加する運用手順を書く（10.3 ユーザー確認済み）: 実行主体・deploy 順序・fresh DB 初期化順序・invalid index の drop/retry・既存行数/index size/WAL 増加の確認（新規ファイルは作らず deploy.md に追記）
+- [ ] 4.2 `make detekt` と関連テストを通す
+- [ ] 4.3 PR-2 を出す（change は open のまま）
 
 ## 5. PR-3 / decoder と scan
 
@@ -75,9 +76,8 @@
 - [ ] 9.3 change を archive する（`openspec archive`、specs sync 付き）。**PR-3 マージ後に 1 回だけ**
 - [ ] 9.4 完了報告に residual risk（EV を落とした / NOT_CROSSED を取らない / grace 超過遅延 crossing の取りこぼし / 捕捉取りこぼし / horizon 打ち切り / レコード無期限増加 / receipts index 追加コスト）と scope 外に残した既存例外リスクを列挙する
 
-## 10. 人間に確認してほしいこと
+## 10. 人間に確認してほしいこと（2026-07-21 ユーザー確認済み）
 
-- [ ] 10.1 **（高リスク・要人間確認）** resolver を `launchEnabled=false` でも走らせる配置でよいか（shadow は分析なので走らせる方針で仮決め。取引停止中は shadow も止めたい運用なら逆にする）
-- [ ] 10.2 **（agent 仮決め）** horizon 24 時間 / settlementGrace 300 秒 / resolver wall-time 予算 N（例: 数百 ms）でよいか。grace 超過の遅延 commit crossing は取りこぼす（残余リスク・受容済み）。resolver は同期配置で毎 tick 最大 N の launch 遅延（bounded delay・受容済み）
-- [ ] 10.3 **（運用）** `CREATE INDEX CONCURRENTLY` の実行主体・deploy 順序・fresh DB での初期化順序・invalid index の drop/retry 手順を deploy ドキュメントに定義する
-- [ ] 10.3 **（agent 仮決め）** `paper_market_event_receipts` への `(session_id, admission_ordinal)` index 追加は既存大規模テーブルへの additive migration。運用手順で追加コストを確認する
+- [x] 10.1 **（ユーザー確認済み）** resolver を `launchEnabled=false` でも走らせる。`launchEnabled` 早期 return **より前**に配置する（shadow は分析なので取引停止中も観測を続ける）。→ PR-3 §7.1
+- [x] 10.2 **（ユーザー確認済み）** horizon 24 時間 / settlementGrace 300 秒 / resolver wall-time 予算 数百 ms を初期値として採用し config 化する（後で変更可）。grace 超過の遅延 commit crossing は取りこぼす（残余リスク・受容済み）。resolver は同期配置で毎 tick 最大 N の launch 遅延（bounded delay・受容済み）。→ PR-3 §7.2/§7.3
+- [x] 10.3 **（ユーザー確認済み）** `CREATE INDEX CONCURRENTLY` の実行主体・deploy 順序・fresh DB 初期化順序・invalid index の drop/retry・additive migration の追加コスト（既存行数/index size/WAL）を `docs/deploy.md` に書く。→ PR-2 §4.1
