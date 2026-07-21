@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly ENV_FILE="${REPO_ROOT}/.env"
+
+usage() {
+  cat >&2 <<EOF
+Usage: ${SCRIPT_NAME} --from-ms <epoch-ms> --to-exclusive-ms <epoch-ms> [options]
+
+Read-only tail fact sheet replay over recorded closed positions.
+Reads DB_URL / DB_USER / DB_PASSWORD from ${ENV_FILE} (or the environment).
+A read-only DB credential is required; the replay never writes.
+
+Options:
+  --from-ms <ms>             Inclusive lower bound on position closed_at (epoch millis). Required.
+  --to-exclusive-ms <ms>     Exclusive upper bound on position closed_at (epoch millis). Required.
+  --threshold-r <decimal>    Catastrophic-tail threshold as a multiple of initial risk R. Optional.
+  --max-targets <n>          Fail the run when targets exceed this count. Optional.
+  --statement-timeout-s <n>  Per-transaction statement timeout in seconds. Optional.
+
+Output is JSON Lines on stdout: one line per position, then per-cohort summaries, then a run summary.
+Adverse excursion is a ledger value (positions.lowest_price_since_entry_jpy) and may include exit fill slippage.
+EOF
+}
+
+fail() {
+  echo "${SCRIPT_NAME}: $*" >&2
+  exit 1
+}
+
+source_env_file() {
+  [[ -f "${ENV_FILE}" ]] || return 0
+
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+}
+
+main() {
+  local from_ms="" to_exclusive_ms="" threshold_r="" max_targets="" statement_timeout_s=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-ms) from_ms="${2:-}"; shift 2 ;;
+      --to-exclusive-ms) to_exclusive_ms="${2:-}"; shift 2 ;;
+      --threshold-r) threshold_r="${2:-}"; shift 2 ;;
+      --max-targets) max_targets="${2:-}"; shift 2 ;;
+      --statement-timeout-s) statement_timeout_s="${2:-}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage; fail "unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -n "${from_ms}" ]] || { usage; fail "--from-ms is required."; }
+  [[ -n "${to_exclusive_ms}" ]] || { usage; fail "--to-exclusive-ms is required."; }
+
+  source_env_file
+
+  export FUKUROU_TAIL_REPLAY_FROM_MS="${from_ms}"
+  export FUKUROU_TAIL_REPLAY_TO_EXCLUSIVE_MS="${to_exclusive_ms}"
+  [[ -n "${threshold_r}" ]] && export FUKUROU_TAIL_REPLAY_THRESHOLD_R="${threshold_r}"
+  [[ -n "${max_targets}" ]] && export FUKUROU_TAIL_REPLAY_MAX_TARGETS="${max_targets}"
+  [[ -n "${statement_timeout_s}" ]] && export FUKUROU_TAIL_REPLAY_STATEMENT_TIMEOUT_SECONDS="${statement_timeout_s}"
+
+  (cd "${REPO_ROOT}" && ./gradlew --quiet --console=plain :trading:runTailReplay)
+}
+
+main "$@"
