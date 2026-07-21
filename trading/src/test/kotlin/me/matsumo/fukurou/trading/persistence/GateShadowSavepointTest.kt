@@ -7,6 +7,7 @@ import java.sql.Savepoint
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -56,12 +57,14 @@ class GateShadowSavepointTest {
     }
 
     @Test
-    fun release_failure_keeps_observation_and_does_not_rollback_cancel() {
-        val connection = savepointConnection(onReleaseSavepoint = { throw SQLException("synthetic release failure") })
+    fun success_does_not_release_savepoint_and_defers_to_commit() {
+        val releaseCalled = AtomicBoolean()
+        val connection = savepointConnection(onReleaseSavepoint = { releaseCalled.set(true) })
 
         val result = connection.captureGateShadowReadWithSavepoint("test capture") { "captured" }
 
         assertSame("captured", result)
+        assertFalse(releaseCalled.get())
     }
 
     private fun savepointConnection(

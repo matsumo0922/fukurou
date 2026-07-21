@@ -911,7 +911,13 @@ private fun <T> JdbcTransaction.captureGateShadowReadWithSavepoint(
 
 internal fun <T> Connection.captureGateShadowReadWithSavepoint(description: String, block: () -> T): T? {
     val savepoint = setSavepoint()
-    val result = try {
+
+    // 成功時は明示 RELEASE SAVEPOINT を発行しない。capture read は read-only なので release は不要で、
+    // savepoint は outer transaction の commit が自動解放する。ここで RELEASE SAVEPOINT を発行すると、
+    // それ自体が server-side error（statement cancel 等）になった場合に transaction を failed state にし、
+    // pgjdbc の commit が silent rollback となって TTL cancel を失いつつ capture だけを enqueue する
+    // phantom observation を生む。
+    return try {
         block()
     } catch (cancellation: CancellationException) {
         throw cancellation
@@ -931,25 +937,8 @@ internal fun <T> Connection.captureGateShadowReadWithSavepoint(description: Stri
             "gate-shadow capture read failed; rolled back savepoint and skipped $description",
             captureFailure,
         )
-        return null
+        null
     }
-
-    // release は cleanup であり、失敗しても savepoint は commit 時に解放される。
-    // ここで throw すると成功済み capture を含む reconcile transaction 全体が rollback し
-    // risk-reducing な cancel を巻き込むため、release 失敗は log して observation を残す。
-    try {
-        releaseSavepoint(savepoint)
-    } catch (cancellation: CancellationException) {
-        throw cancellation
-    } catch (releaseFailure: Throwable) {
-        gateShadowLogger.log(
-            Level.WARNING,
-            "gate-shadow capture savepoint release failed; keeping observation and cancel: $description",
-            releaseFailure,
-        )
-    }
-
-    return result
 }
 
 /** gate-shadow capture に補完する order lineage。 */
