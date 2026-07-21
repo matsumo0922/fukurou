@@ -38,12 +38,22 @@ class ExposedSafetyFloorMarginRepository(
         return withContext(Dispatchers.IO) {
             safetyFloorMarginResult(SafetyFloorMarginPersistenceStage.REPORT) {
                 transaction(database) {
+                    // 監査書き込みが lock 待ちで注文処理を長時間ブロックしないよう、
+                    // 短い timeout を transaction 局所で設定する。
+                    applyWriteTimeouts()
                     insertReport(report)
                     report.observations.forEach { observation ->
                         insertObservation(report.id, observation, report.observedAt)
                     }
                 }
             }
+        }
+    }
+
+    private fun JdbcTransaction.applyWriteTimeouts() {
+        jdbcConnection().createStatement().use { statement ->
+            statement.execute("SET LOCAL lock_timeout = '2s'")
+            statement.execute("SET LOCAL statement_timeout = '2s'")
         }
     }
 

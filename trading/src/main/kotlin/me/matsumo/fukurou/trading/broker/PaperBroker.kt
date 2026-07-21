@@ -390,27 +390,8 @@ private class PaperBrokerTradeDelegate(
 
             val preparedOrder = preparePlaceOrder(command)
 
-            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
-                preparedOrder.command,
-                preparedOrder.safetyContext,
-            )
-            val rejectedResult = safetyGate.enforceSafetyFloor(
-                verdict = verdict,
-                command = preparedOrder.command,
-                ticker = preparedOrder.ticker,
-                symbolRules = preparedOrder.symbolRules,
-            )
-
-            // enforceSafetyFloor が HARD_HALT の掃引を終えた後に観測する。risk-reducing な
-            // 掃引を監査書き込みで遅延させないため、観測は掃引より後に置く。
-            runtime.recordSafetyFloorMargin(
-                command = preparedOrder.command,
-                context = preparedOrder.safetyContext,
-                verdict = verdict,
-                callSite = SafetyFloorCallSite.PLACE,
-            )
-
-            if (rejectedResult != null) return@runCatching rejectedResult
+            safetyGate.enforceSafetyFloorAndObserve(preparedOrder)
+                ?.let { rejectedResult -> return@runCatching rejectedResult }
 
             validateSymbolRules(preparedOrder.command, preparedOrder.symbolRules)
             validateEntryPriceContract(preparedOrder.command, preparedOrder.ticker)
@@ -1100,6 +1081,36 @@ private class PaperBrokerEntryIntentConsumer(
 private class PaperBrokerSafetyGate(
     private val runtime: PaperBrokerRuntime,
 ) {
+    /**
+     * SafetyFloor を強制し、その直後に margin を観測する。
+     *
+     * enforceSafetyFloor が HARD_HALT の掃引を終えた後に観測する。掃引が例外で終了しても
+     * 観測を 1 回試み、掃引の例外はそのまま伝播させる（観測の失敗で掃引の例外を覆い隠さない）。
+     * risk-reducing な掃引を監査書き込みで遅延させないため、観測は掃引より後に置く。
+     */
+    suspend fun enforceSafetyFloorAndObserve(preparedOrder: PreparedPlaceOrder): PaperTradeResult? {
+        val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
+            preparedOrder.command,
+            preparedOrder.safetyContext,
+        )
+
+        return try {
+            enforceSafetyFloor(
+                verdict = verdict,
+                command = preparedOrder.command,
+                ticker = preparedOrder.ticker,
+                symbolRules = preparedOrder.symbolRules,
+            )
+        } finally {
+            runtime.recordSafetyFloorMargin(
+                command = preparedOrder.command,
+                context = preparedOrder.safetyContext,
+                verdict = verdict,
+                callSite = SafetyFloorCallSite.PLACE,
+            )
+        }
+    }
+
     suspend fun enforceSafetyFloor(
         verdict: SafetyFloorVerdict,
         command: Any,
@@ -1233,6 +1244,13 @@ private suspend fun PaperBrokerRuntime.recordSafetyFloorMargin(
     callSite: SafetyFloorCallSite,
 ) {
     val report = safety.marginObserver.observe(command, context, verdict, callSite)
+
+    if (report.divergence) {
+        paperBrokerLogger.log(
+            Level.WARNING,
+            "SafetyFloor margin observation diverged from the verdict for command ${report.commandId}.",
+        )
+    }
 
     safety.marginRepository.append(report).onFailure { throwable ->
         paperBrokerLogger.log(Level.WARNING, "Failed to persist SafetyFloor margin observation.", throwable)

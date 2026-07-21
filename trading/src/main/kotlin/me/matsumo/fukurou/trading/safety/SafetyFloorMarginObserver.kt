@@ -268,7 +268,9 @@ internal class SafetyFloorMarginObserver(
     }
 
     private fun averagingDownStatus(point: EvaluationPointId, preconditions: Preconditions): StatusResult {
-        val positions = preconditions.targetPositions
+        // verdict は tradeGroupId が null でも全 open position を対象にするため、pyramid 用の
+        // group 限定集合ではなく filterTargetPositions(tradeGroupId) の結果を使う。
+        val positions = preconditions.averagingPositions
 
         if (positions.isEmpty()) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
 
@@ -331,7 +333,7 @@ internal class SafetyFloorMarginObserver(
         val tradeGroupId = preconditions.tradeGroupId ?: return RuleStatus.NA to NaReason.PRECONDITION_UNMET
         val budget = riskCalculator.initialTradeGroupRiskBudget(context, tradeGroupId)
             ?: riskCalculator.groupRiskBeforeOrder(context, tradeGroupId)
-        val addRiskLimit = budget.multiply(PYRAMID_ADD_RISK_RATIO)
+        val addRiskLimit = budget.multiply(PYRAMID_ADD_RISK_RATIO).safetyScale()
 
         return failWhen(riskCalculator.orderRisk(command, context) > addRiskLimit)
     }
@@ -361,7 +363,7 @@ internal class SafetyFloorMarginObserver(
     ): StatusResult {
         if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
 
-        val limit = context.account.totalEquityJpy.toBigDecimal().multiply(config.maxRiskPerTradeRatio)
+        val limit = context.account.totalEquityJpy.toBigDecimal().multiply(config.maxRiskPerTradeRatio).safetyScale()
 
         return failWhen(riskCalculator.groupRiskAfterOrder(command, context) > limit)
     }
@@ -373,9 +375,10 @@ internal class SafetyFloorMarginObserver(
     ): StatusResult {
         if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
 
-        val limit = context.account.totalEquityJpy.toBigDecimal().multiply(config.maxTotalExposureRatio)
+        val limit = context.account.totalEquityJpy.toBigDecimal().multiply(config.maxTotalExposureRatio).safetyScale()
         val exposureAfterOrder = riskCalculator.currentExposure(context)
             .add(riskCalculator.orderExposure(command, context))
+            .safetyScale()
 
         return failWhen(exposureAfterOrder > limit)
     }
@@ -416,8 +419,8 @@ internal class SafetyFloorMarginObserver(
             return failWhen(expectedValueR <= BigDecimal.ZERO)
         }
 
-        if (expectedValueR <= BigDecimal.ZERO) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
-
+        // EV が非正でも gate 条件（EV >= minExpectedValueR）は不成立なので FAIL とする。
+        // NA にすると verdict が拒否した decision の FAIL 分布を欠落させる。
         return failWhen(expectedValueR < config.minExpectedValueR)
     }
 
@@ -445,7 +448,8 @@ internal class SafetyFloorMarginObserver(
      * 明示的な事前条件として持つ。
      *
      * @param tradeGroupId 対象 trade group
-     * @param targetPositions 対象 trade group の open position
+     * @param averagingPositions ナンピン判定の対象 position。tradeGroupId が null なら全 open position
+     * @param targetPositions pyramiding gate の対象 position。tradeGroupId が null なら空
      * @param pyramidEvaluable pyramiding gate 由来の point を評価できるか
      * @param feeParseable fee 文字列が数値として解釈できるか
      * @param unsafeFeeReason fee rate が許容範囲外である理由。安全なら null
@@ -453,6 +457,7 @@ internal class SafetyFloorMarginObserver(
      */
     private data class Preconditions(
         val tradeGroupId: String?,
+        val averagingPositions: List<Position>,
         val targetPositions: List<Position>,
         val pyramidEvaluable: Boolean,
         val feeParseable: Boolean,
@@ -467,9 +472,10 @@ internal class SafetyFloorMarginObserver(
                 riskCalculator: SafetyFloorRiskCalculator,
             ): Preconditions {
                 val tradeGroupId = command.tradeGroupId?.toString()
-                val targetPositions = tradeGroupId
-                    ?.let { groupId -> context.positions.filterTargetPositions(groupId) }
-                    .orEmpty()
+                // verdict の validateNoAveragingDown は tradeGroupId が null でも全 open position を
+                // 対象にする（filterTargetPositions(null) は全件を返す）。pyramid gate だけが null で対象外。
+                val averagingPositions = context.positions.filterTargetPositions(tradeGroupId)
+                val targetPositions = if (tradeGroupId != null) averagingPositions else emptyList()
                 val feeParseable = context.symbolRules.takerFee.toBigDecimalOrNull() != null &&
                     context.symbolRules.makerFee.toBigDecimalOrNull() != null
                 val stopBelowEntry = feeParseable && runCatching {
@@ -478,6 +484,7 @@ internal class SafetyFloorMarginObserver(
 
                 return Preconditions(
                     tradeGroupId = tradeGroupId,
+                    averagingPositions = averagingPositions,
                     targetPositions = targetPositions,
                     pyramidEvaluable = tradeGroupId != null && targetPositions.isNotEmpty(),
                     feeParseable = feeParseable,

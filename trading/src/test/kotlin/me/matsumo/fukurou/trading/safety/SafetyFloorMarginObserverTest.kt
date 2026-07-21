@@ -28,6 +28,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -77,14 +78,64 @@ class SafetyFloorMarginObserverTest {
     }
 
     @Test
-    fun `flags divergence when the verdict accepts but an observation fails`() {
-        val observations = SafetyFloorEvaluationPoints.placeOrderPoints.map { point ->
-            val status = if (point.rule == SafetyFloorRule.MAX_TOTAL_EXPOSURE) RuleStatus.FAIL else RuleStatus.PASS
+    fun `flags divergence when the observer is stricter than the verdict`() {
+        // verdict は既定の 2% risk 上限で通過するが、observer に極端に厳しい上限を与えると
+        // MAX_RISK_PER_TRADE などが FAIL になり、Accepted と食い違う。乖離検査がこれを捕らえる。
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val verdict = safetyFloor().evaluatePlaceOrder(command, context)
+        assertIs<SafetyFloorVerdict.Accepted>(verdict)
 
-            RuleObservation(point = point, status = status)
-        }
+        val strictObserver = SafetyFloorMarginObserver(
+            config = SafetyFloorConfig(maxRiskPerTradeRatio = BigDecimal("0.0000001")),
+            clock = fixedClock(),
+        )
+        val report = strictObserver.observe(command, context, verdict, SafetyFloorCallSite.PLACE)
 
-        assertTrue(observations.any { observation -> observation.status == RuleStatus.FAIL })
+        assertTrue(report.divergence, "An observer stricter than the verdict must be flagged as divergent.")
+    }
+
+    @Test
+    fun `does not flag divergence when the verdict rejects and the rule fails`() {
+        val command = entryCommand(protectiveStopPriceJpy = BigDecimal("11000000"))
+        val report = observe(command, baseContext())
+
+        assertFalse(report.divergence)
+        assertEquals(RuleStatus.FAIL, report.statusOf(SafetyFloorRule.STOP_LOSS_REQUIRED, POINT_BELOW_ENTRY))
+    }
+
+    @Test
+    fun `agrees with the verdict on an approved entry that reaches deep predicates`() {
+        // approved intent を与えると falsifier gate を越え、stop / risk / EV / exposure の
+        // 述語まで実際に評価される。全 27 point が verdict と整合することを確認する。
+        val command = acceptedEntry()
+        val context = acceptedContext(command)
+        val verdict = safetyFloor().evaluatePlaceOrder(command, context)
+        assertIs<SafetyFloorVerdict.Accepted>(verdict)
+
+        val report = observer().observe(command, context, verdict, SafetyFloorCallSite.PLACE)
+
+        assertFalse(report.divergence)
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.MISSING_FRESH_FALSIFICATION))
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.STOP_LOSS_REQUIRED, POINT_BELOW_ENTRY))
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.MAX_RISK_PER_TRADE))
+        assertEquals(RuleStatus.PASS, report.statusOf(SafetyFloorRule.EXPECTED_VALUE_GATE))
+    }
+
+    @Test
+    fun `evaluates averaging down across all open positions without a trade group`() {
+        // verdict は tradeGroupId が null でも全 open position でナンピンを判定する。
+        val losing = openPosition(currentPriceJpy = "9000000", unrealizedPnlJpy = "-5000")
+        val command = entryCommand()
+        val context = baseContext(positions = listOf(losing)).copy(entryIntent = approvedIntentSnapshot(command))
+        val verdict = safetyFloor().evaluatePlaceOrder(command, context)
+        assertIs<SafetyFloorVerdict.Rejected>(verdict)
+        assertEquals(SafetyFloorRule.NO_AVERAGING_DOWN, verdict.violation.rule)
+
+        val report = observer().observe(command, context, verdict, SafetyFloorCallSite.PLACE)
+
+        assertFalse(report.divergence, "NO_AVERAGING_DOWN must be evaluated on all open positions when no trade group.")
+        assertEquals(RuleStatus.FAIL, report.statusOf(SafetyFloorRule.NO_AVERAGING_DOWN, POINT_UNREALIZED_PNL))
     }
 
     @Test
@@ -285,6 +336,8 @@ class SafetyFloorMarginObserverTest {
         const val POINT_THRESHOLD = SafetyFloorEvaluationPoints.POINT_THRESHOLD
         const val POINT_FEE = SafetyFloorEvaluationPoints.POINT_FEE
         const val POINT_CASH = SafetyFloorEvaluationPoints.POINT_CASH
+        const val POINT_BELOW_ENTRY = SafetyFloorEvaluationPoints.POINT_BELOW_ENTRY
+        const val POINT_UNREALIZED_PNL = SafetyFloorEvaluationPoints.POINT_UNREALIZED_PNL
     }
 }
 
@@ -333,6 +386,32 @@ private fun entryCommand(
         estimatedWinProbability = estimatedWinProbability,
         reasonJa = "margin observer test entry",
         auditContext = PaperTradeAuditContext.EMPTY,
+    )
+}
+
+/** verdict が Accepted になる entry。大きな reward と高い勝率で EV gate を確実に通す。 */
+private fun acceptedEntry(): PlaceOrderCommand {
+    return entryCommand(
+        takeProfitPriceJpy = BigDecimal("11000000"),
+        estimatedWinProbability = BigDecimal("0.90"),
+    )
+}
+
+/** [acceptedEntry] を通す context。approved intent と余裕のある残高を与える。 */
+private fun acceptedContext(command: PlaceOrderCommand): SafetyFloorContext {
+    return baseContext().copy(
+        account = AccountSnapshot(
+            mode = TradingMode.PAPER,
+            cashJpy = "100000.00000000",
+            initialCashJpy = "200000.00000000",
+            btcQuantity = "0.000000000000",
+            btcMarkPriceJpy = "10000000.00000000",
+            totalEquityJpy = "200000.00000000",
+            equityPeakJpy = "200000.00000000",
+            drawdownRatio = "0",
+        ),
+        entryIntent = approvedIntentSnapshot(command),
+        marketDataObservedAt = fixedInstant(),
     )
 }
 
