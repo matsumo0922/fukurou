@@ -58,10 +58,7 @@ enum class SafetyFloorMarginPersistenceStage {
  * coroutine のキャンセルを観測の失敗として扱うと、キャンセル中に取引処理を
  * 続行させてしまうため、必ず再 throw する。
  */
-internal inline fun <T> safetyFloorMarginResult(
-    stage: SafetyFloorMarginPersistenceStage,
-    block: () -> T,
-): Result<T> {
+internal inline fun <T> safetyFloorMarginResult(stage: SafetyFloorMarginPersistenceStage, block: () -> T): Result<T> {
     return try {
         Result.success(block())
     } catch (throwable: CancellationException) {

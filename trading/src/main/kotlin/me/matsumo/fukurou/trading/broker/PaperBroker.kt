@@ -39,10 +39,14 @@ import me.matsumo.fukurou.trading.reconciler.requireTicker
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateCommandService
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
+import me.matsumo.fukurou.trading.safety.InMemorySafetyFloorMarginRepository
 import me.matsumo.fukurou.trading.safety.InMemorySafetyViolationRepository
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.safety.SafetyFloorCallSite
 import me.matsumo.fukurou.trading.safety.SafetyFloorContext
+import me.matsumo.fukurou.trading.safety.SafetyFloorMarginObserver
+import me.matsumo.fukurou.trading.safety.SafetyFloorMarginRepository
 import me.matsumo.fukurou.trading.safety.SafetyFloorVerdict
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
@@ -55,6 +59,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeParseException
 import java.util.UUID
+import java.util.logging.Level
 import java.util.logging.Logger
 
 /**
@@ -106,6 +111,7 @@ class PaperBroker private constructor(
         safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
         safetyFloor: SafetyFloor? = null,
         maxDrawdownPolicy: MaxDrawdownPolicy = safetyFloor?.maxDrawdownPolicy ?: MaxDrawdownPolicy(),
+        safetyFloorMarginRepository: SafetyFloorMarginRepository = InMemorySafetyFloorMarginRepository(),
         marketDataSource: MarketDataSource? = null,
         paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
         fillSimulator: PaperExecutionSimulator? = null,
@@ -124,16 +130,22 @@ class PaperBroker private constructor(
                 riskStateRepository = riskStateRepository,
                 decisionRepository = decisionRepository,
             ),
-            safety = PaperBrokerSafetyServices(
-                riskStateCommandService = riskStateCommandService,
-                safetyViolationRepository = safetyViolationRepository,
-                safetyFloor = safetyFloor ?: SafetyFloor(
+            safety = run {
+                val resolvedSafetyFloor = safetyFloor ?: SafetyFloor(
                     clock = clock,
                     paperExecutionConfig = paperExecutionConfig,
                     maxDrawdownPolicy = maxDrawdownPolicy,
-                ),
-                maxDrawdownPolicy = maxDrawdownPolicy,
-            ),
+                )
+
+                PaperBrokerSafetyServices(
+                    riskStateCommandService = riskStateCommandService,
+                    safetyViolationRepository = safetyViolationRepository,
+                    safetyFloor = resolvedSafetyFloor,
+                    maxDrawdownPolicy = maxDrawdownPolicy,
+                    marginObserver = SafetyFloorMarginObserver.sharing(resolvedSafetyFloor),
+                    marginRepository = safetyFloorMarginRepository,
+                )
+            },
             market = PaperBrokerMarketServices(
                 marketDataSource = marketDataSource,
                 paperExecutionConfig = paperExecutionConfig,
@@ -183,6 +195,8 @@ private data class PaperBrokerSafetyServices(
     val safetyViolationRepository: SafetyViolationRepository,
     val safetyFloor: SafetyFloor,
     val maxDrawdownPolicy: MaxDrawdownPolicy,
+    val marginObserver: SafetyFloorMarginObserver,
+    val marginRepository: SafetyFloorMarginRepository,
 ) {
     init {
         require(safetyFloor.maxDrawdownPolicy === maxDrawdownPolicy) {
@@ -376,15 +390,27 @@ private class PaperBrokerTradeDelegate(
 
             val preparedOrder = preparePlaceOrder(command)
 
-            safetyGate.enforceSafetyFloor(
-                verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
-                    preparedOrder.command,
-                    preparedOrder.safetyContext,
-                ),
+            val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
+                preparedOrder.command,
+                preparedOrder.safetyContext,
+            )
+            val rejectedResult = safetyGate.enforceSafetyFloor(
+                verdict = verdict,
                 command = preparedOrder.command,
                 ticker = preparedOrder.ticker,
                 symbolRules = preparedOrder.symbolRules,
-            )?.let { rejectedResult -> return@runCatching rejectedResult }
+            )
+
+            // enforceSafetyFloor が HARD_HALT の掃引を終えた後に観測する。risk-reducing な
+            // 掃引を監査書き込みで遅延させないため、観測は掃引より後に置く。
+            runtime.recordSafetyFloorMargin(
+                command = preparedOrder.command,
+                context = preparedOrder.safetyContext,
+                verdict = verdict,
+                callSite = SafetyFloorCallSite.PLACE,
+            )
+
+            if (rejectedResult != null) return@runCatching rejectedResult
 
             validateSymbolRules(preparedOrder.command, preparedOrder.symbolRules)
             validateEntryPriceContract(preparedOrder.command, preparedOrder.ticker)
@@ -603,6 +629,14 @@ private class PaperBrokerTradeDelegate(
             val verdict = runtime.safety.safetyFloor.evaluatePlaceOrder(
                 preparedOrder.command,
                 preparedOrder.safetyContext,
+            )
+
+            // preview は掃引を起動しないため、verdict 直後に観測する。
+            runtime.recordSafetyFloorMargin(
+                command = preparedOrder.command,
+                context = preparedOrder.safetyContext,
+                verdict = verdict,
+                callSite = SafetyFloorCallSite.PREVIEW,
             )
 
             if (verdict is SafetyFloorVerdict.Rejected) {
@@ -1184,6 +1218,25 @@ private suspend fun PaperBrokerRuntime.findExistingPlaceOrderResult(command: Pla
         ?: return null
 
     return stores.ledgerRepository.findPlaceOrderResultByClientRequestId(clientRequestId).getOrThrow()
+}
+
+/**
+ * SafetyFloor の evaluation point を観測し、専用テーブルへ保存する。
+ *
+ * 観測と保存の失敗は取引判断を変えてはならないため、永続化の失敗はログのみで握る。
+ * ただし coroutine のキャンセルは握り潰さず伝播させる。
+ */
+private suspend fun PaperBrokerRuntime.recordSafetyFloorMargin(
+    command: PlaceOrderCommand,
+    context: SafetyFloorContext,
+    verdict: SafetyFloorVerdict,
+    callSite: SafetyFloorCallSite,
+) {
+    val report = safety.marginObserver.observe(command, context, verdict, callSite)
+
+    safety.marginRepository.append(report).onFailure { throwable ->
+        paperBrokerLogger.log(Level.WARNING, "Failed to persist SafetyFloor margin observation.", throwable)
+    }
 }
 
 private suspend fun PaperBrokerRuntime.tickerFor(symbol: TradingSymbol): Result<Ticker> {

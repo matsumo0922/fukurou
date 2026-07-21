@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.safety
 import me.matsumo.fukurou.trading.broker.PaperExecutionConfig
 import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.config.FomcBlackoutCalendarState
+import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.unsafeOrderFeeRateReasonOrNull
 import me.matsumo.fukurou.trading.risk.RiskHaltState
@@ -76,10 +77,7 @@ internal class SafetyFloorMarginObserver(
      * 拒否を生んだ evaluation point を識別しないため、同一 rule の別 point の乖離までは
      * 絞り込めない。
      */
-    private fun hasDivergence(
-        observations: List<RuleObservation>,
-        rejectedRule: SafetyFloorRule?,
-    ): Boolean {
+    private fun hasDivergence(observations: List<RuleObservation>, rejectedRule: SafetyFloorRule?): Boolean {
         if (rejectedRule == null) {
             return observations.any { observation -> observation.status == RuleStatus.FAIL }
         }
@@ -234,16 +232,17 @@ internal class SafetyFloorMarginObserver(
 
         if (snapshot.consumed || !snapshot.freshApproved) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
 
-        val draft = snapshot.tradeIntent.draft
-        val matches = command.symbol == draft.symbol &&
+        return failWhen(!intentMatchesCommand(command, snapshot.tradeIntent.draft))
+    }
+
+    private fun intentMatchesCommand(command: PlaceOrderCommand, draft: EntryIntentDraft): Boolean {
+        return command.symbol == draft.symbol &&
             command.side == draft.side &&
             command.orderType == draft.orderType &&
             command.sizeBtc.compareTo(draft.sizeBtc) == 0 &&
             nullableAmountMatches(command.priceJpy, draft.priceJpy) &&
             command.protectiveStopPriceJpy.compareTo(draft.protectiveStopPriceJpy) == 0 &&
             nullableAmountMatches(command.takeProfitPriceJpy, draft.takeProfitPriceJpy)
-
-        return failWhen(!matches)
     }
 
     private fun nullableAmountMatches(left: BigDecimal?, right: BigDecimal?): Boolean {
@@ -492,9 +491,23 @@ internal class SafetyFloorMarginObserver(
         }
     }
 
-    private companion object {
+    companion object {
         /** 観測が保持する情報の世代。Stage 1 は status のみを保持する。 */
-        const val OBSERVATION_SCHEMA_VERSION: Int = 1
+        private const val OBSERVATION_SCHEMA_VERSION: Int = 1
+
+        /**
+         * SafetyFloor と同一の設定を共有する observer を作る。
+         *
+         * config を並行して渡すのではなく SafetyFloor が持つインスタンスをそのまま使うため、
+         * 閾値の乖離が構造的に起こらない。
+         */
+        fun sharing(safetyFloor: SafetyFloor): SafetyFloorMarginObserver {
+            return SafetyFloorMarginObserver(
+                config = safetyFloor.config,
+                clock = safetyFloor.clock,
+                paperExecutionConfig = safetyFloor.paperExecutionConfig,
+            )
+        }
     }
 }
 

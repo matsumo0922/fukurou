@@ -1279,6 +1279,38 @@ object DedupeShadowResolutionsTable : Table("dedupe_shadow_resolutions") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** SafetyFloor の evaluation point 観測の親 record。1 decision 分の判定をまとめる。 */
+object SafetyFloorMarginReportsTable : Table("safety_floor_margin_reports") {
+    val id = uuid("id")
+    val evaluationPath = varchar("evaluation_path", 32)
+    val callSite = varchar("call_site", 16)
+    val decisionRunId = varchar("decision_run_id", 128).nullable()
+    val commandId = uuid("command_id")
+    val verdict = varchar("verdict", 16)
+    val rejectedRule = varchar("rejected_rule", 48).nullable()
+    val policyVersion = varchar("policy_version", 32)
+    val runtimeConfigVersion = varchar("runtime_config_version", 128).nullable()
+    val observationSchemaVersion = integer("observation_schema_version")
+    val divergence = bool("divergence")
+    val collectionFailed = bool("collection_failed")
+    val observedAt = long("observed_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** SafetyFloor の evaluation point 観測の子 record。1 point の判定を保持する。 */
+object SafetyFloorRuleMarginsTable : Table("safety_floor_rule_margins") {
+    val id = uuid("id")
+    val reportId = reference("report_id", SafetyFloorMarginReportsTable.id)
+    val rule = varchar("rule", 48)
+    val pointId = varchar("point_id", 32)
+    val status = varchar("status", 8)
+    val naReason = varchar("na_reason", 24).nullable()
+    val marginValue = decimal("margin_value", precision = 30, scale = 12).nullable()
+    val marginUnit = varchar("margin_unit", 16).nullable()
+    val observedAt = long("observed_at")
+    override val primaryKey = PrimaryKey(id)
+}
+
 object DecisionsTable : Table("decisions") {
     /**
      * decision ID。

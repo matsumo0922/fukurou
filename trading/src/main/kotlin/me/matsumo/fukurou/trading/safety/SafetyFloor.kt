@@ -486,9 +486,9 @@ data class SafetyFloorPlaceOrderRiskDetails(
  */
 @Suppress("LargeClass") // placement と fill が同じ rule authority を共有するため、rule set を分散させない。
 class SafetyFloor(
-    private val config: SafetyFloorConfig = SafetyFloorConfig(),
-    private val clock: Clock = Clock.systemUTC(),
-    private val paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
+    internal val config: SafetyFloorConfig = SafetyFloorConfig(),
+    internal val clock: Clock = Clock.systemUTC(),
+    internal val paperExecutionConfig: PaperExecutionConfig = PaperExecutionConfig(),
     internal val maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(config.maxDrawdownRatio),
 ) {
     private val riskCalculator = SafetyFloorRiskCalculator(config, clock, paperExecutionConfig)
