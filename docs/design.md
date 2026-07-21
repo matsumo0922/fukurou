@@ -3686,6 +3686,29 @@ Private POSTは取引所上限より安全側に、bot内部の実効上限を `
 
 最大 drawdown 閾値は active runtime config から composition root ごとに1回生成する `MaxDrawdownPolicy` が正本である。SafetyFloor、PaperBroker、ProtectionReconciler、in-memory / PostgreSQL ledger は同じpolicy instanceと `BigDecimal.compareTo` 境界を使う。閾値到達passではresting entryを約定させず、sticky `HARD_HALT` と durable cleanup evidence `UNKNOWN` を設定してから、`ALL_OPEN_RISK` transaction で全 risk-increasing BUY order の取消、全 open position の close、account 更新、zero-open-risk readbackを行う。readback 成功時だけ cleanup evidence を `SAFE` にする。重複 halt は既存 `SAFE` を保存するが cleanup の skip 条件には使わず、response loss 後の retry は open risk の再読から冪等に収束する。position close に必要な fresh REST source timestamp または causal realtime event がなければ execution mutation を作らず `UNKNOWN` を維持し、flat / order-only は ticker なしで `SAFE` になる。自動再開はせず、手動再開は reason 付き audit に加えて同一 transaction 内の `SAFE` と zero-open-risk readback を必須とする。stale `SAFE` と open risk を検出した場合は `UNKNOWN` へ戻して拒否する。receipt-aware reader から旧 reader へ rollback するときは、`GET /ops/risk-state` は `HARD_HALT` の確認だけに使い、API に存在しない cleanup field を仮定しない。durable cleanup `SAFE` は read-only SQL で `risk_state.hard_halt_cleanup_state` を直接読み、zero-open-risk readback と resting BUY zero-row query の一致を別途要求する。CLI失敗連発やデータstale長期化は `SOFT_HALT`。
 
+PLACE_ORDER の SafetyFloor margin ベクトルは `safety_floor_margin_reports` と `safety_floor_rule_margins` を report ID で結合して照会する。margin を保持するのは `observation_schema_version >= 2` の cohort であり、version 1 の既存行には backfill しない。
+
+```sql
+SELECT
+    reports.observed_at,
+    reports.call_site,
+    reports.verdict,
+    margins.rule,
+    margins.point_id,
+    margins.status,
+    margins.margin_value,
+    margins.margin_unit
+FROM safety_floor_margin_reports AS reports
+JOIN safety_floor_rule_margins AS margins
+    ON margins.report_id = reports.id
+WHERE reports.observation_schema_version >= 2
+  AND reports.observed_at >= (
+      EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') * 1000
+  )::BIGINT
+  AND margins.rule = 'EXPECTED_VALUE_GATE'
+ORDER BY reports.observed_at, margins.point_id;
+```
+
 ---
 
 ### 14.6 PostgreSQL backup / restore

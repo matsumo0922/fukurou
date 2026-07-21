@@ -9,6 +9,7 @@ import me.matsumo.fukurou.trading.domain.unsafeOrderFeeRateReasonOrNull
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import java.math.BigDecimal
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 
@@ -111,10 +112,18 @@ internal class SafetyFloorMarginObserver(
         observedAt: Instant,
         preconditions: Preconditions,
     ): RuleObservation {
-        return runCatching {
+        val evaluation = runCatching {
             statusOf(point, command, context, observedAt, preconditions)
-        }.getOrElse { RuleStatus.NA to NaReason.EVALUATION_ERROR }
-            .let { (status, reason) -> RuleObservation(point = point, status = status, naReason = reason) }
+        }.getOrElse {
+            PointEvaluation(status = RuleStatus.NA, naReason = NaReason.EVALUATION_ERROR)
+        }
+
+        return RuleObservation(
+            point = point,
+            status = evaluation.status,
+            naReason = evaluation.naReason,
+            marginValue = evaluation.marginValue,
+        )
     }
 
     @Suppress("CyclomaticComplexMethod")
@@ -124,7 +133,7 @@ internal class SafetyFloorMarginObserver(
         context: SafetyFloorContext,
         observedAt: Instant,
         preconditions: Preconditions,
-    ): StatusResult {
+    ): PointEvaluation {
         return when (point.rule) {
             SafetyFloorRule.MAX_DRAWDOWN_HALT -> drawdownStatus(point, context)
             SafetyFloorRule.SOFT_HALT_ENTRY_BLOCKED -> failWhen(context.riskState.state == RiskHaltState.SOFT_HALT)
@@ -157,11 +166,11 @@ internal class SafetyFloorMarginObserver(
             SafetyFloorRule.EXPECTED_MOVE_TO_COST_RATIO -> expectedMoveStatus(command, context, preconditions)
             SafetyFloorRule.ATR_TRAILING_FLOOR,
             SafetyFloorRule.IMMEDIATE_STOP_TRIGGER,
-            -> RuleStatus.NA to NaReason.NOT_APPLICABLE_PATH
+            -> PointEvaluation(status = RuleStatus.NA, naReason = NaReason.NOT_APPLICABLE_PATH)
         }
     }
 
-    private fun drawdownStatus(point: EvaluationPointId, context: SafetyFloorContext): StatusResult {
+    private fun drawdownStatus(point: EvaluationPointId, context: SafetyFloorContext): PointEvaluation {
         if (point.pointId == SafetyFloorEvaluationPoints.POINT_STICKY_STATE) {
             return failWhen(context.riskState.state == RiskHaltState.HARD_HALT)
         }
@@ -170,8 +179,12 @@ internal class SafetyFloorMarginObserver(
             context.account.drawdownRatio.toBigDecimal(),
             context.riskState.drawdownRatio,
         )
+        val threshold = maxDrawdownPolicy.thresholdRatio
 
-        return failWhen(maxDrawdownPolicy.isHardHalt(measuredDrawdown))
+        return numericMargin(
+            failed = maxDrawdownPolicy.isHardHalt(measuredDrawdown),
+            margin = difference(measuredDrawdown, threshold),
+        )
     }
 
     /**
@@ -180,31 +193,50 @@ internal class SafetyFloorMarginObserver(
      * calendar state は排他なので、state が確定しない point は `NA` とする。
      * `validThrough` は MISSING / INVALID のとき null なので、expiry は評価できない。
      */
-    private fun calendarStatus(point: EvaluationPointId, observedAt: Instant): StatusResult {
+    private fun calendarStatus(point: EvaluationPointId, observedAt: Instant): PointEvaluation {
         val state = config.fomcBlackoutCalendar.stateAt(observedAt)
 
         return when (point.rule) {
             SafetyFloorRule.FOMC_CALENDAR_MISSING -> failWhen(state == FomcBlackoutCalendarState.MISSING)
             SafetyFloorRule.FOMC_CALENDAR_INVALID -> failWhen(state == FomcBlackoutCalendarState.INVALID)
-            SafetyFloorRule.FOMC_CALENDAR_EXPIRED -> expiryStatus(state)
+            SafetyFloorRule.FOMC_CALENDAR_EXPIRED -> expiryStatus(state, observedAt)
             else -> blackoutStatus(state, observedAt)
         }
     }
 
-    private fun expiryStatus(state: FomcBlackoutCalendarState): StatusResult {
+    private fun expiryStatus(state: FomcBlackoutCalendarState, observedAt: Instant): PointEvaluation {
         val evaluable = state == FomcBlackoutCalendarState.ACTIVE || state == FomcBlackoutCalendarState.EXPIRED
 
-        if (!evaluable) return RuleStatus.NA to NaReason.MISSING_INPUT
+        if (!evaluable) return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.MISSING_INPUT)
 
-        return failWhen(state == FomcBlackoutCalendarState.EXPIRED)
+        val validThrough = requireNotNull(config.fomcBlackoutCalendar.validThrough)
+        val margin = durationSeconds(Duration.between(observedAt, validThrough))
+
+        return numericMargin(
+            failed = state == FomcBlackoutCalendarState.EXPIRED,
+            margin = margin,
+        )
     }
 
-    private fun blackoutStatus(state: FomcBlackoutCalendarState, observedAt: Instant): StatusResult {
-        if (state != FomcBlackoutCalendarState.ACTIVE) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    private fun blackoutStatus(state: FomcBlackoutCalendarState, observedAt: Instant): PointEvaluation {
+        if (state != FomcBlackoutCalendarState.ACTIVE) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
+
+        val margin = config.fomcBlackoutCalendar.events.minOf { event ->
+            val window = requireNotNull(event.toSafeWindow())
+            val untilStart = durationSeconds(Duration.between(observedAt, window.startsAt))
+            val sinceEnd = durationSeconds(Duration.between(window.endsAt, observedAt))
+
+            maxOf(untilStart, sinceEnd)
+        }
 
         val inBlackout = config.fomcBlackoutCalendar.events.any { event -> event.contains(observedAt) }
 
-        return failWhen(inBlackout)
+        return numericMargin(
+            failed = inBlackout,
+            margin = margin,
+        )
     }
 
     /**
@@ -217,7 +249,7 @@ internal class SafetyFloorMarginObserver(
         point: EvaluationPointId,
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
-    ): StatusResult {
+    ): PointEvaluation {
         val snapshot = context.entryIntent
 
         if (point.rule == SafetyFloorRule.MISSING_FRESH_FALSIFICATION) {
@@ -226,11 +258,15 @@ internal class SafetyFloorMarginObserver(
             return failWhen(missing)
         }
 
-        if (command.intentId == null || snapshot == null) return RuleStatus.NA to NaReason.MISSING_INPUT
+        if (command.intentId == null || snapshot == null) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.MISSING_INPUT)
+        }
 
         if (point.rule == SafetyFloorRule.INTENT_CONSUMED) return failWhen(snapshot.consumed)
 
-        if (snapshot.consumed || !snapshot.freshApproved) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+        if (snapshot.consumed || !snapshot.freshApproved) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
         return failWhen(!intentMatchesCommand(command, snapshot.tradeIntent.draft))
     }
@@ -255,24 +291,43 @@ internal class SafetyFloorMarginObserver(
         point: EvaluationPointId,
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
-    ): StatusResult {
+    ): PointEvaluation {
         val stopPrice = command.protectiveStopPriceJpy
 
         if (point.pointId == SafetyFloorEvaluationPoints.POINT_POSITIVE) {
-            return failWhen(stopPrice <= BigDecimal.ZERO)
+            return numericMargin(
+                failed = stopPrice <= BigDecimal.ZERO,
+                margin = stopPrice,
+            )
         }
 
         val entryPrice = riskCalculator.estimatedEntryPrice(command, context)
 
-        return failWhen(stopPrice >= entryPrice)
+        return numericMargin(
+            failed = stopPrice >= entryPrice,
+            margin = difference(entryPrice, stopPrice),
+        )
     }
 
-    private fun averagingDownStatus(point: EvaluationPointId, preconditions: Preconditions): StatusResult {
+    private fun averagingDownStatus(point: EvaluationPointId, preconditions: Preconditions): PointEvaluation {
         // verdict は tradeGroupId が null でも全 open position を対象にするため、pyramid 用の
         // group 限定集合ではなく filterTargetPositions(tradeGroupId) の結果を使う。
         val positions = preconditions.averagingPositions
 
-        if (positions.isEmpty()) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+        if (positions.isEmpty()) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
+
+        val margin = if (point.pointId == SafetyFloorEvaluationPoints.POINT_UNREALIZED_PNL) {
+            positions.minOf { position -> position.unrealizedPnlJpy.toBigDecimal().safetyScale() }
+        } else {
+            positions.minOf { position ->
+                difference(
+                    left = position.currentPriceJpy.toBigDecimal(),
+                    right = position.averageEntryPriceJpy.toBigDecimal(),
+                )
+            }
+        }
 
         val losing = if (point.pointId == SafetyFloorEvaluationPoints.POINT_UNREALIZED_PNL) {
             positions.any { position -> position.unrealizedPnlJpy.toBigDecimal() < BigDecimal.ZERO }
@@ -282,7 +337,7 @@ internal class SafetyFloorMarginObserver(
             }
         }
 
-        return failWhen(losing)
+        return numericMargin(failed = losing, margin = margin)
     }
 
     /**
@@ -292,50 +347,79 @@ internal class SafetyFloorMarginObserver(
      * trade group が未指定または対象 position が空なら評価そのものが行われない。
      * 対象 position を絞らずに評価すると、無関係な position で FAIL を作る。
      */
-    private fun stopLooseningStatus(command: PlaceOrderCommand, preconditions: Preconditions): StatusResult {
-        if (!preconditions.pyramidEvaluable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    private fun stopLooseningStatus(command: PlaceOrderCommand, preconditions: Preconditions): PointEvaluation {
+        if (!preconditions.pyramidEvaluable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
         val comparable = preconditions.targetPositions.mapNotNull { position ->
             position.currentStopLossJpy?.toBigDecimal()
         }
 
-        if (comparable.isEmpty()) return RuleStatus.NA to NaReason.MISSING_INPUT
+        if (comparable.isEmpty()) return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.MISSING_INPUT)
 
-        return failWhen(comparable.any { currentStop -> command.protectiveStopPriceJpy < currentStop })
+        val stopPrice = command.protectiveStopPriceJpy
+        val margin = comparable.minOf { currentStop -> difference(stopPrice, currentStop) }
+        val loosened = comparable.any { currentStop -> stopPrice < currentStop }
+
+        return numericMargin(failed = loosened, margin = margin)
     }
 
-    private fun pyramidAddLimitStatus(preconditions: Preconditions): StatusResult {
-        if (!preconditions.pyramidEvaluable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    private fun pyramidAddLimitStatus(preconditions: Preconditions): PointEvaluation {
+        if (!preconditions.pyramidEvaluable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
         val maxAddCount = preconditions.targetPositions.maxOf { position -> position.pyramidAddCount }
+        val margin = difference(BigDecimal(MAX_PYRAMID_ADD_COUNT), BigDecimal(maxAddCount))
 
-        return failWhen(maxAddCount >= MAX_PYRAMID_ADD_COUNT)
+        return numericMargin(
+            failed = maxAddCount >= MAX_PYRAMID_ADD_COUNT,
+            margin = margin,
+        )
     }
 
-    private fun pyramidProfitStatus(preconditions: Preconditions): StatusResult {
-        if (!preconditions.pyramidEvaluable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    private fun pyramidProfitStatus(preconditions: Preconditions): PointEvaluation {
+        if (!preconditions.pyramidEvaluable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
+
+        val margin = preconditions.targetPositions.minOf { position ->
+            difference(
+                left = position.unrealizedR.toBigDecimal(),
+                right = BigDecimal(position.pyramidAddCount + 1),
+            )
+        }
 
         val insufficient = preconditions.targetPositions.any { position ->
             position.unrealizedR.toBigDecimal() < BigDecimal(position.pyramidAddCount + 1)
         }
 
-        return failWhen(insufficient)
+        return numericMargin(failed = insufficient, margin = margin)
     }
 
     private fun pyramidAddRiskStatus(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
         preconditions: Preconditions,
-    ): StatusResult {
-        if (!preconditions.pyramidEvaluable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
-        if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    ): PointEvaluation {
+        if (!preconditions.pyramidEvaluable || !preconditions.feeParseable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
-        val tradeGroupId = preconditions.tradeGroupId ?: return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+        val tradeGroupId = preconditions.tradeGroupId
+            ?: return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
         val budget = riskCalculator.initialTradeGroupRiskBudget(context, tradeGroupId)
             ?: riskCalculator.groupRiskBeforeOrder(context, tradeGroupId)
-        val addRiskLimit = budget.multiply(PYRAMID_ADD_RISK_RATIO).safetyScale()
+        val addRiskLimit = budget
+            .multiply(PYRAMID_ADD_RISK_RATIO)
+            .safetyScale()
+        val orderRisk = riskCalculator.orderRisk(command, context)
 
-        return failWhen(riskCalculator.orderRisk(command, context) > addRiskLimit)
+        return numericMargin(
+            failed = orderRisk > addRiskLimit,
+            margin = difference(addRiskLimit, orderRisk),
+        )
     }
 
     private fun balanceStatus(
@@ -343,47 +427,67 @@ internal class SafetyFloorMarginObserver(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
         preconditions: Preconditions,
-    ): StatusResult {
+    ): PointEvaluation {
         if (point.pointId == SafetyFloorEvaluationPoints.POINT_FEE) {
             return failWhen(!preconditions.feeParseable || preconditions.unsafeFeeReason != null)
         }
 
-        if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+        if (!preconditions.feeParseable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
         val availableCash = riskCalculator.availableCash(context)
         val requiredCash = riskCalculator.orderRequiredCash(command, context)
 
-        return failWhen(requiredCash > availableCash)
+        return numericMargin(
+            failed = requiredCash > availableCash,
+            margin = difference(availableCash, requiredCash),
+        )
     }
 
     private fun groupRiskStatus(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
         preconditions: Preconditions,
-    ): StatusResult {
-        if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    ): PointEvaluation {
+        if (!preconditions.feeParseable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
-        val limit = context.account.totalEquityJpy.toBigDecimal().multiply(config.maxRiskPerTradeRatio).safetyScale()
+        val limit = context.account.totalEquityJpy.toBigDecimal()
+            .multiply(config.maxRiskPerTradeRatio)
+            .safetyScale()
+        val measured = riskCalculator.groupRiskAfterOrder(command, context)
 
-        return failWhen(riskCalculator.groupRiskAfterOrder(command, context) > limit)
+        return numericMargin(
+            failed = measured > limit,
+            margin = difference(limit, measured),
+        )
     }
 
     private fun totalExposureStatus(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
         preconditions: Preconditions,
-    ): StatusResult {
-        if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    ): PointEvaluation {
+        if (!preconditions.feeParseable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
-        val limit = context.account.totalEquityJpy.toBigDecimal().multiply(config.maxTotalExposureRatio).safetyScale()
+        val limit = context.account.totalEquityJpy.toBigDecimal()
+            .multiply(config.maxTotalExposureRatio)
+            .safetyScale()
         val exposureAfterOrder = riskCalculator.currentExposure(context)
             .add(riskCalculator.orderExposure(command, context))
             .safetyScale()
 
-        return failWhen(exposureAfterOrder > limit)
+        return numericMargin(
+            failed = exposureAfterOrder > limit,
+            margin = difference(limit, exposureAfterOrder),
+        )
     }
 
-    private fun winProbabilityStatus(command: PlaceOrderCommand): StatusResult {
+    private fun winProbabilityStatus(command: PlaceOrderCommand): PointEvaluation {
         val probability = command.estimatedWinProbability
         val inRange = probability >= BigDecimal.ZERO && probability <= BigDecimal.ONE
 
@@ -402,43 +506,76 @@ internal class SafetyFloorMarginObserver(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
         preconditions: Preconditions,
-    ): StatusResult {
-        if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
-        if (!preconditions.stopBelowEntry) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+    ): PointEvaluation {
+        if (!preconditions.feeParseable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
 
-        val takeProfitPrice = command.takeProfitPriceJpy ?: return RuleStatus.NA to NaReason.MISSING_INPUT
+        val takeProfitPrice = command.takeProfitPriceJpy
+        if (takeProfitPrice == null) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.MISSING_INPUT)
+        }
         val probability = command.estimatedWinProbability
 
         if (probability < BigDecimal.ZERO || probability > BigDecimal.ONE) {
-            return RuleStatus.NA to NaReason.PRECONDITION_UNMET
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
+
+        if (!preconditions.stopBelowEntry) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
         }
 
         val expectedValueR = riskCalculator.expectedValueDetails(command, context, takeProfitPrice).expectedValueR
 
         if (point.rule == SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE) {
-            return failWhen(expectedValueR <= BigDecimal.ZERO)
+            return numericMargin(
+                failed = expectedValueR <= BigDecimal.ZERO,
+                margin = expectedValueR,
+            )
         }
 
-        // EV が非正でも gate 条件（EV >= minExpectedValueR）は不成立なので FAIL とする。
-        // NA にすると verdict が拒否した decision の FAIL 分布を欠落させる。
-        return failWhen(expectedValueR < config.minExpectedValueR)
+        return numericMargin(
+            failed = expectedValueR < config.minExpectedValueR,
+            margin = difference(expectedValueR, config.minExpectedValueR),
+        )
     }
 
     private fun expectedMoveStatus(
         command: PlaceOrderCommand,
         context: SafetyFloorContext,
         preconditions: Preconditions,
-    ): StatusResult {
-        if (!preconditions.feeParseable) return RuleStatus.NA to NaReason.PRECONDITION_UNMET
-
+    ): PointEvaluation {
+        if (!preconditions.feeParseable) {
+            return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.PRECONDITION_UNMET)
+        }
         val ratio = riskCalculator.expectedMoveToCostRatioOrNull(command, context)
-            ?: return RuleStatus.NA to NaReason.MISSING_INPUT
+            ?: return PointEvaluation(status = RuleStatus.NA, naReason = NaReason.MISSING_INPUT)
 
-        return failWhen(ratio < config.minExpectedMoveToCostRatio)
+        return numericMargin(
+            failed = ratio < config.minExpectedMoveToCostRatio,
+            margin = difference(ratio, config.minExpectedMoveToCostRatio),
+        )
     }
 
-    private fun failWhen(failed: Boolean): StatusResult {
-        return if (failed) RuleStatus.FAIL to null else RuleStatus.PASS to null
+    private fun failWhen(failed: Boolean): PointEvaluation {
+        return PointEvaluation(status = if (failed) RuleStatus.FAIL else RuleStatus.PASS)
+    }
+
+    /** SafetyFloor と同一精度の述語結果に、保存用に丸めた margin を付与する。 */
+    private fun numericMargin(failed: Boolean, margin: BigDecimal): PointEvaluation {
+        return PointEvaluation(
+            status = if (failed) RuleStatus.FAIL else RuleStatus.PASS,
+            marginValue = margin.safetyScale(),
+        )
+    }
+
+    private fun difference(left: BigDecimal, right: BigDecimal): BigDecimal {
+        return left.subtract(right)
+    }
+
+    private fun durationSeconds(duration: Duration): BigDecimal {
+        return BigDecimal.valueOf(duration.seconds)
+            .add(BigDecimal.valueOf(duration.nano.toLong(), NANOSECOND_SCALE))
     }
 
     /**
@@ -453,7 +590,7 @@ internal class SafetyFloorMarginObserver(
      * @param pyramidEvaluable pyramiding gate 由来の point を評価できるか
      * @param feeParseable fee 文字列が数値として解釈できるか
      * @param unsafeFeeReason fee rate が許容範囲外である理由。安全なら null
-     * @param stopBelowEntry STOP が想定 entry 価格を下回るか
+     * @param riskDetails placeOrderRiskDetails の共有結果。fee がパース不能な場合は null
      */
     private data class Preconditions(
         val tradeGroupId: String?,
@@ -478,7 +615,7 @@ internal class SafetyFloorMarginObserver(
                 val targetPositions = if (tradeGroupId != null) averagingPositions else emptyList()
                 val feeParseable = context.symbolRules.takerFee.toBigDecimalOrNull() != null &&
                     context.symbolRules.makerFee.toBigDecimalOrNull() != null
-                val stopBelowEntry = feeParseable && runCatching {
+                val stopBelowEntry = runCatching {
                     command.protectiveStopPriceJpy < riskCalculator.estimatedEntryPrice(command, context)
                 }.getOrDefault(false)
 
@@ -499,8 +636,11 @@ internal class SafetyFloorMarginObserver(
     }
 
     companion object {
-        /** 観測が保持する情報の世代。Stage 1 は status のみを保持する。 */
-        private const val OBSERVATION_SCHEMA_VERSION: Int = 1
+        /** 観測が保持する情報の世代。Stage 2 は numeric point の margin を保持する。 */
+        private const val OBSERVATION_SCHEMA_VERSION: Int = 2
+
+        /** nanoseconds を seconds の小数へ変換する scale。 */
+        private const val NANOSECOND_SCALE: Int = 9
 
         /**
          * SafetyFloor と同一の設定を共有する observer を作る。
@@ -518,5 +658,9 @@ internal class SafetyFloorMarginObserver(
     }
 }
 
-/** evaluation point の判定結果と、`NA` の場合の理由。 */
-private typealias StatusResult = Pair<RuleStatus, NaReason?>
+/** evaluation point の判定結果。 */
+private data class PointEvaluation(
+    val status: RuleStatus,
+    val naReason: NaReason? = null,
+    val marginValue: BigDecimal? = null,
+)
