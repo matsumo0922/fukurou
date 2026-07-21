@@ -40,8 +40,8 @@
 - [ ] 4.4 **`CancellationException` は捕捉せず再 throw する**。素の `runCatching` を使わない
 - [ ] 4.5 書き込みに短い statement timeout を設ける
 - [ ] 4.6 `evaluateRestingEntryFill` / `evaluateUpdateProtection` / `evaluateCancelOrder` / `evaluateClosePosition` には配線しない（scope 外）
-- [ ] 4.7 DI / runtime 配線に repository と observer を追加する。runtime config version は評価時点の値を observer へ明示的に渡し、observer が ambient な現在値を読まないようにする
-- [ ] 4.8 **observer に SafetyFloor と同一の `SafetyFloorConfig` インスタンスを注入する**。`SafetyFloor.config` は `private`（`SafetyFloor.kt:489`）で読めず、observer が既定値を独自構築すると status 一致・margin のみ誤りとなり乖離検査で検出できない
+- [ ] 4.7 DI / runtime 配線に repository と observer を追加する。runtime config version は `command.auditContext.decisionRunContext.runtimeConfigVersionId` から best-effort で取り、取れない場合は null を記録する（ambient な現在値は読まない）
+- [ ] 4.8 **observer に SafetyFloor と同一の `SafetyFloorConfig` / `Clock` / `PaperExecutionConfig` を注入する**。`SafetyFloor.config` は `private`（`SafetyFloor.kt:489`）、`riskCalculator` も `private`（`:494`）、`SafetyFloorRiskCalculator` は `internal class`（`SafetyFloorRiskCalculator.kt:35`）なので、observer は同じ引数で calculator を自前構築する。既定値を独自構築すると status 一致・margin のみ誤りとなり乖離検査で検出できない
 
 ## 5. Stage 1 / テスト
 
