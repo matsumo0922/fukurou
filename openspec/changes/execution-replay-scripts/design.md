@@ -45,22 +45,26 @@ cohort は lineage から `CASE` で導出される派生値である (`ExposedE
 
 config が短縮しか許さない。短縮は記録済み約定を取りこぼす方向のみで、延命先の安全ゲート・口座状態を必要としないため B-06 が構造的に発生しない。TTL 延長は Non-Goal とする。
 
-### D2. fill の権威を記録済み execution に置き、retention を処理時刻 `executed_at` で判定する — [F1, F2, B-05, B-07]
+### D2. fill の権威を記録済み execution に置き、DROPPED だけを EXACT とする — [F1, F2, B-05, B-07]
 
 fill を queue から再導出して判定に使わない。約定の権威は記録済み execution 行とする [F1]。各 order について次を出す。
 
-- **記録済み結果** (ground truth): entry execution 行が存在すれば約定、`orders.expired_at` が立てば TTL 失効、`cancel_reason` が立てば非 TTL 終端 (D2b)。
-- **約定レイテンシ** `L`: `executions.executed_at − orders.created_at`。resting entry fill は全量一括で 1 execution なので (`ExposedPaperLedgerWriter.kt:1058`) `executed_at` は一意。EXACT。
-- **短縮 TTL retention**: 候補 TTL `T'` の論理期限 `E' = created_at + T'` を、約定の**処理時刻** `executed_at` と比較する。
+- **記録済み結果** (ground truth): entry execution 行が存在すれば約定、`orders.expired_at` が立てば TTL 失効、`cancel_reason` (execution 無し・`expired_at` NULL) が立てば非 TTL 終端 (D2b)、いずれも無ければ snapshot 時点で OPEN (D2c)。
+- **market 応答レイテンシ** `L`: `executions.executed_at − orders.created_at`。`executed_at` は fill を発火させた market event の **socket 受信時刻** (`fill.executedAt = event.receivedAt`, `ExposedPaperLedgerWriter.kt:1058`, `PaperMarketTradeEvent.kt:48`) である。したがって `L` は「発注から、約定を発火させた market event が到着するまで」の EXACT なレイテンシであり、処理 wall-clock ではない。
+- **短縮 TTL の confirmed-DROPPED**: 候補 TTL `T'` の論理期限 `E' = created_at + T'` を `executed_at` (= 約定を発火させた market event の socket 時刻) と比較する。
 
-`executed_at` は fill を書いた writer clock の処理時刻であり (`fill.executedAt`)、失効判定に使う `clock.instant()` (`ExposedPaperLedgerWriter.kt:806`) と同一の clock である。fill event の処理は expiry を fill より**前**に評価する (`:869` が `:873` より前)。したがって:
+失効判定は WS event 経路 (`:869`) と、それとは独立な REST 周期 tick 経路 (`:421`, 5 秒間隔) の両方で、保存されない処理 wall-clock (`clock.instant()`) を用いて評価される [F2 再指摘]。処理は socket 受信から無上限に遅延しうる [B-05]。したがって:
 
-- `E' ≤ executed_at` なら、fill event の処理時点で expiry が先に発火し **DROPPED**。
-- `E' > executed_at` なら、fill 処理までに `E'` を跨ぐ処理が無く **RETAINED**。
+- `E' ≤ executed_at` なら、`E' ≤ executed_at ≤ (fill の処理時刻)` により、fill が処理されるまでに必ず `E'` を過ぎた失効判定が挟まる。**DROPPED は EXACT**。
+- `E' > executed_at` の場合、production が fill を処理した時刻 (socket + 無上限遅延) と、その間に走る REST tick の失効判定を復元できないため、**RETAINED か DROPPED かを確定できない**。この候補は `RETENTION_UNCONFIRMED` で `UNKNOWN` とし、**RETAINED を主張しない**。
 
-この判定は socket-to-処理の遅延に依存しない。遅延の無上限 [B-05] は receipt の socket 時刻を anchor にした場合の問題であり、本設計は処理時刻 `executed_at` を anchor にするため発生しない。両方向とも EXACT である [F2]。intra-transaction の μ秒差 (`:869` と `:873` の間) は TTL の秒粒度を大きく下回るため無視できるが、`E'` が `executed_at` とミリ秒単位で一致する退化ケースは `PROCESSING_CLOCK_TIE` で `UNKNOWN` とする。
+fidelity 契約 [B-07, F2]: `L` (market 応答レイテンシ) と confirmed-DROPPED は `EXACT`。`E' > executed_at` の retention は `UNKNOWN`。本 replay は延長を扱わず、延長 fill も RETAINED も主張しない。
 
-fidelity 契約 [B-07]: 約定レイテンシと、RETAINED / DROPPED は `EXACT` (退化ケースのみ `UNKNOWN`)。本 replay は延長を扱わないため延長 fill を作らない。
+主出力はこの EXACT な market 応答レイテンシ分布と、各短縮 TTL 候補が確実に取りこぼす fill 件数 (confirmed-DROPPED) である。これにより「どこまで TTL を短縮すると fill を確実に失い始めるか」を保守的に (取りこぼしを過小評価しない形で不確定分を UNKNOWN として開示しつつ) 絞り込める。RETAINED を確定できないことは C3 の TTL 短縮方向の選択には支障しない (短縮は fill を増やさないため、confirmed-DROPPED が意思決定の主軸になる)。
+
+### D2c. snapshot 時点で OPEN の order を明示する — [F2 再確認で判明した非 blocking]
+
+window 終端付近で作られ snapshot 時点でまだ OPEN (execution 無し・`expired_at` NULL・`cancel_reason` NULL) の resting entry order は、約定 / TTL 失効 / 非 TTL 終端のどれにも当たらない。system はこれを `OPEN_AT_SNAPSHOT` として母数開示に明示し、黙って落とさない。fill を主張しない。
 
 ### D2b. execution 行を持たない order に fill を合成しない — [F1]
 

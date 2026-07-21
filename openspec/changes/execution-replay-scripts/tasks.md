@@ -11,23 +11,23 @@
 
 - [ ] 2.1 JSON Lines の出力モデルを定義する。`fidelity` / `cohort` / `population_status` / `unknown_reason` を全行の必須項目にする
 - [ ] 2.2 cohort ごとに分離した集計行を出力する。run-level failure と per-target `UNKNOWN` を区別する
-- [ ] 2.3 eligible 件数、理由別の `UNKNOWN` 件数、入力欠如の件数、各 order 独立の反実仮想である旨を summary に出す
+- [ ] 2.3 eligible 件数、理由別の `UNKNOWN` 件数、入力欠如・`NON_TTL_TERMINAL`・`OPEN_AT_SNAPSHOT` の件数、各 order 独立の反実仮想である旨を summary に出す。終端状態を黙って落とさない
 
 ## 3. TTL 短縮感度 (PR 1)
 
 - [ ] 3.1 対象 resting LIMIT entry order を選択する query を実装する。`created_at` / `expires_at` / `expiry_source` / `expired_at` / `cancel_reason` / limit 価格 / size / eligibility 境界 / `market_data_session_id` を取得し、`trade_plans` を join して `time_stop_at`、`executions` を join して entry execution の `executed_at` を取得する
-- [ ] 3.2 記録済み結果を分類する。entry execution 行あり → 約定 (L = `executed_at − created_at`)、`expired_at` あり → TTL 失効、`cancel_reason` あり (execution 無し・`expired_at` NULL) → `NON_TTL_TERMINAL` で TTL retention 母数から除外。execution 行を持たない order に fill を合成しない
-- [ ] 3.3 約定 order の L を EXACT として出力する。`DefaultPaperExecutionSimulator.simulatePendingLimit` は約定価格・手数料の照合 (fixture cross-check) にのみ用い、fill 生成に使わない
-- [ ] 3.4 短縮 TTL 候補ごとに retention を判定する。論理期限 `E' = created_at + T'` を execution の処理時刻 `executed_at` と比較し、`E' ≤ executed_at` なら DROPPED、後なら RETAINED。実効期限は候補 TTL と `time_stop_at` の早い方とし、解決不能な time stop を `TIME_STOP_UNRESOLVED` で `UNKNOWN`
-- [ ] 3.5 `E'` が `executed_at` とミリ秒単位で一致する退化ケースを `PROCESSING_CLOCK_TIE` で `UNKNOWN` とする
+- [ ] 3.2 記録済み結果を分類する。entry execution 行あり → 約定 (L = `executed_at − created_at`、`executed_at` は約定発火 market event の socket 受信時刻)、`expired_at` あり → TTL 失効、`cancel_reason` あり (execution 無し・`expired_at` NULL) → `NON_TTL_TERMINAL` で TTL retention 母数から除外、いずれも無し → `OPEN_AT_SNAPSHOT`。execution 行を持たない order に fill を合成しない
+- [ ] 3.3 約定 order の market 応答レイテンシ L を EXACT として出力する。`DefaultPaperExecutionSimulator.simulatePendingLimit` は約定価格・手数料の照合 (fixture cross-check) にのみ用い、fill 生成に使わない
+- [ ] 3.4 短縮 TTL 候補ごとに confirmed-DROPPED を判定する。論理期限 `E' = created_at + T'` が `executed_at` 以下なら DROPPED (EXACT)、後なら `RETENTION_UNCONFIRMED` で `UNKNOWN` (RETAINED を主張しない)。実効期限は候補 TTL と `time_stop_at` の早い方とし、解決不能な time stop を `TIME_STOP_UNRESOLVED` で `UNKNOWN`
+- [ ] 3.5 各短縮 TTL 候補の confirmed-DROPPED 件数と、`RETENTION_UNCONFIRMED` 件数を集計出力する
 - [ ] 3.6 eligibility 境界より前の receipt を約定 anchor に選ばないガードを実装する (cross-check 用)
 - [ ] 3.7 TTL 短縮の探索格子を既存 order 分布から決める。現行 30 分を上限に含める
 
 ## 4. TTL 検証 (PR 1)
 
 - [ ] 4.1 fixture cross-check 回帰テスト。約定した既知 order 1 件で、記録済み execution の source receipt が queue 理解と整合し、約定価格と手数料が記録済み execution と一致する
-- [ ] 4.2 短縮 retention の回帰テスト。execution の `executed_at` より前で失効する候補が DROPPED、後の候補が RETAINED になる
-- [ ] 4.3 fill 非合成の回帰テスト。`cancel_reason` を持ち execution 行を持たない order が `NON_TTL_TERMINAL` に分類され、約定を主張されず retention 母数に入らない。`PROCESSING_CLOCK_TIE` の退化ケースが `UNKNOWN` になる
+- [ ] 4.2 confirmed-DROPPED の回帰テスト。`executed_at` (約定発火 event の socket 時刻) 以下で失効する候補が DROPPED (EXACT)、後の候補が `RETENTION_UNCONFIRMED` で `UNKNOWN` になり RETAINED を主張しない
+- [ ] 4.3 fill 非合成・母数開示の回帰テスト。`cancel_reason` を持ち execution 行を持たない order が `NON_TTL_TERMINAL` に分類され約定を主張されず retention 母数に入らない。execution・`expired_at`・`cancel_reason` いずれも持たない order が `OPEN_AT_SNAPSHOT` として開示され黙って落ちない
 - [ ] 4.4 read-only 回帰テスト。replay 完走前後で対象テーブル内容が同一である。取引所 API client が依存グラフに含まれない
 - [ ] 4.5 time stop 優先・ordinal 欠番・gap 交差・cohort 分離・境界超過の各 `UNKNOWN` / 失敗経路の回帰テスト
 
