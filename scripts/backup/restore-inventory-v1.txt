@@ -16,6 +16,9 @@ table public evaluation_report_revisions
 table public evaluation_report_snapshots
 table public executions
 table public falsifications
+table public gate_shadow_observations
+table public gate_shadow_resolutions
+table public gate_shadow_scan_progress
 table public infrastructure_gap_events
 table public llm_decision_phase_evidence_coverage
 table public llm_invocation_audit_roots

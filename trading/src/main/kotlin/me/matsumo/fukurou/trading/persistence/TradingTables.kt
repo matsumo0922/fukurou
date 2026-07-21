@@ -1279,6 +1279,51 @@ object DedupeShadowResolutionsTable : Table("dedupe_shadow_resolutions") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** TTL 失効した resting entry の append-only gate-shadow observation。 */
+object GateShadowObservationsTable : Table("gate_shadow_observations") {
+    val id = uuid("id")
+    val orderId = uuid("order_id").uniqueIndex()
+    val decisionId = uuid("decision_id").nullable()
+    val opportunityEpisodeId = uuid("opportunity_episode_id").nullable()
+    val geometryHash = varchar("geometry_hash", 80).nullable()
+    val symbol = varchar("symbol", 32)
+    val side = varchar("side", 8)
+    val orderType = varchar("order_type", 16)
+    val sizeBtc = decimal("size_btc", precision = 24, scale = 12)
+    val limitPriceJpy = decimal("limit_price_jpy", precision = 24, scale = 8).nullable()
+    val triggerPriceJpy = decimal("trigger_price_jpy", precision = 24, scale = 8).nullable()
+    val stopPriceJpy = decimal("stop_price_jpy", precision = 24, scale = 8).nullable()
+    val takeProfitPriceJpy = decimal("take_profit_price_jpy", precision = 24, scale = 8).nullable()
+    val queueAheadBtc = decimal("queue_ahead_btc", precision = 24, scale = 12).nullable()
+    val marketDataSessionId = uuid("market_data_session_id").nullable()
+    val startAdmissionOrdinal = long("start_admission_ordinal")
+    val windowStartTime = long("window_start_time")
+    val dataQuality = varchar("data_quality", 64)
+    val observedAt = long("observed_at").index()
+    override val primaryKey = PrimaryKey(id)
+}
+
+/** settle 後の gate-shadow receipt 走査 cursor。 */
+object GateShadowScanProgressTable : Table("gate_shadow_scan_progress") {
+    val observationId = uuid("observation_id")
+    val lastScannedAdmissionOrdinal = long("last_scanned_admission_ordinal")
+    val lastScannedAt = long("last_scanned_at")
+    override val primaryKey = PrimaryKey(observationId)
+}
+
+/** observation ごとに 1 行だけ保持する gate-shadow resolution。 */
+object GateShadowResolutionsTable : Table("gate_shadow_resolutions") {
+    val observationId = uuid("observation_id")
+    val outcome = varchar("outcome", 16)
+    val crossingEventSequence = long("crossing_event_sequence").nullable()
+    val crossingExchangeAt = long("crossing_exchange_at").nullable()
+    val crossingPriceJpy = decimal("crossing_price_jpy", precision = 24, scale = 8).nullable()
+    val distanceJpy = decimal("distance_jpy", precision = 24, scale = 8).nullable()
+    val dataQuality = varchar("data_quality", 64)
+    val resolvedAt = long("resolved_at")
+    override val primaryKey = PrimaryKey(observationId)
+}
+
 /** SafetyFloor の evaluation point 観測の親 record。1 decision 分の判定をまとめる。 */
 object SafetyFloorMarginReportsTable : Table("safety_floor_margin_reports") {
     val id = uuid("id")

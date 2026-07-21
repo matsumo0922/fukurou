@@ -30,6 +30,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.logging.Level
 import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -101,6 +102,9 @@ internal data class EconomicEventAttemptMigrationAudit(
 /** economic-event migration の運用 log。 */
 private val ECONOMIC_EVENT_ATTEMPT_MIGRATION_LOGGER =
     Logger.getLogger("me.matsumo.fukurou.trading.persistence.EconomicEventAttemptMigration")
+
+private val GATE_SHADOW_INDEX_LOGGER =
+    Logger.getLogger("me.matsumo.fukurou.trading.persistence.GateShadowReceiptIndex")
 
 /** integration test が structured migration audit を観測する module-internal sink。 */
 internal object EconomicEventAttemptMigrationAuditSink {
@@ -494,6 +498,27 @@ private const val ENSURE_PAPER_MARKET_RECEIPT_SOURCE_UNIQUE_INDEX_SQL = """
 private const val ENSURE_PAPER_MARKET_RECEIPT_ORDINAL_UNIQUE_INDEX_SQL = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_market_receipts_admission_ordinal_unique
     ON paper_market_event_receipts (admission_ordinal)
+"""
+
+/** gate-shadow の session/admission range scan 用 index を transaction 外で作る SQL。 */
+private const val ENSURE_GATE_SHADOW_RECEIPT_SCAN_INDEX_SQL = """
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_paper_market_receipts_session_admission_ordinal
+    ON paper_market_event_receipts (session_id, admission_ordinal)
+"""
+
+/** gate-shadow の receipt scan index が利用可能か確認する SQL。 */
+private const val VERIFY_GATE_SHADOW_RECEIPT_SCAN_INDEX_SQL = """
+    SELECT 1
+    FROM pg_index AS index_state
+    JOIN pg_class AS index_relation ON index_relation.oid = index_state.indexrelid
+    JOIN pg_namespace AS index_namespace ON index_namespace.oid = index_relation.relnamespace
+    JOIN pg_class AS table_relation ON table_relation.oid = index_state.indrelid
+    WHERE index_namespace.nspname = current_schema()
+        AND table_relation.relname = 'paper_market_event_receipts'
+        AND index_relation.relname = 'idx_paper_market_receipts_session_admission_ordinal'
+        AND index_state.indisvalid
+        AND index_state.indisready
+        AND index_state.indislive
 """
 
 /** symbol ごとの open opportunity episode を一意にする partial unique index。 */
@@ -1302,6 +1327,18 @@ private const val VERIFY_TRADE_INTENT_CONSUMPTIONS_SCHEMA_SQL = """
 /**
  * equity snapshot の取引日判定に使う timezone。
  */
+/** gate-shadow receipt scan index の provisioning 結果。 */
+private enum class GateShadowReceiptIndexProvisioning {
+    /** fresh DB で対象 table がまだ存在しない。 */
+    TABLE_MISSING,
+
+    /** index が catalog validity を満たす。 */
+    READY,
+
+    /** index は存在するが catalog validity を満たさない。 */
+    INVALID,
+}
+
 /**
  * trading persistence の最小 schema を起動時に用意する bootstrapper。
  *
@@ -1333,6 +1370,9 @@ class TradingPersistenceBootstrap(
      */
     @Suppress("LongMethod")
     fun ensureSchema(): Result<Unit> {
+        val initialReceiptIndexProvisioning = provisionGateShadowReceiptIndex()
+        logGateShadowReceiptIndexProvisioning(initialReceiptIndexProvisioning)
+
         val migrationObservation = EconomicEventAttemptMigrationObservation()
         var recoveredCount = 0
         val schemaResult = runCatching {
@@ -1384,6 +1424,9 @@ class TradingPersistenceBootstrap(
                     OpportunityEpisodesTable,
                     DedupeShadowObservationsTable,
                     DedupeShadowResolutionsTable,
+                    GateShadowObservationsTable,
+                    GateShadowScanProgressTable,
+                    GateShadowResolutionsTable,
                     SafetyFloorMarginReportsTable,
                     SafetyFloorRuleMarginsTable,
                     DecisionsTable,
@@ -1460,6 +1503,10 @@ class TradingPersistenceBootstrap(
         )?.let(::emitEconomicEventAttemptMigrationAudit)
         if (schemaResult.isFailure) return schemaResult
 
+        if (initialReceiptIndexProvisioning.getOrNull() == GateShadowReceiptIndexProvisioning.TABLE_MISSING) {
+            logGateShadowReceiptIndexProvisioning(provisionGateShadowReceiptIndex())
+        }
+
         if (recoveredCount > 0) {
             onStaleLlmRunsRecovered(recoveredCount)
         }
@@ -1522,6 +1569,53 @@ class TradingPersistenceBootstrap(
                 )
             """.trimIndent(),
         )
+    }
+
+    private fun provisionGateShadowReceiptIndex(): Result<GateShadowReceiptIndexProvisioning> {
+        return runCatching {
+            val exposedConnection = database.connector()
+
+            try {
+                exposedConnection.autoCommit = true
+                val connection = exposedConnection.connection as Connection
+                val tableExists = connection.prepareStatement(
+                    "SELECT to_regclass('paper_market_event_receipts') IS NOT NULL",
+                ).use { statement ->
+                    statement.executeQuery().use { rows ->
+                        check(rows.next()) { "Receipt table existence was not returned." }
+                        rows.getBoolean(1)
+                    }
+                }
+                if (!tableExists) return@runCatching GateShadowReceiptIndexProvisioning.TABLE_MISSING
+
+                connection.createStatement().use { statement ->
+                    statement.execute(ENSURE_GATE_SHADOW_RECEIPT_SCAN_INDEX_SQL)
+                }
+                val indexReady = connection.prepareStatement(VERIFY_GATE_SHADOW_RECEIPT_SCAN_INDEX_SQL).use { statement ->
+                    statement.executeQuery().use { rows -> rows.next() }
+                }
+
+                if (indexReady) GateShadowReceiptIndexProvisioning.READY else GateShadowReceiptIndexProvisioning.INVALID
+            } finally {
+                exposedConnection.close()
+            }
+        }
+    }
+
+    private fun logGateShadowReceiptIndexProvisioning(result: Result<GateShadowReceiptIndexProvisioning>) {
+        result.exceptionOrNull()?.let { failure ->
+            GATE_SHADOW_INDEX_LOGGER.log(
+                Level.WARNING,
+                "gate-shadow receipt scan index provisioning failed; capture remains enabled and resolver stays disabled",
+                failure,
+            )
+        }
+
+        if (result.getOrNull() == GateShadowReceiptIndexProvisioning.INVALID) {
+            GATE_SHADOW_INDEX_LOGGER.warning(
+                "gate-shadow receipt scan index is invalid; drop and retry it before enabling the resolver",
+            )
+        }
     }
 
     /**

@@ -26,6 +26,7 @@ import me.matsumo.fukurou.trading.market.UnavailablePaperMarketEventReceiptRepos
 import me.matsumo.fukurou.trading.persistence.ExposedCommandEventLog
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedGateShadowRepository
 import me.matsumo.fukurou.trading.persistence.ExposedMarketDataIntegrityRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperLedgerRepository
 import me.matsumo.fukurou.trading.persistence.ExposedPaperMarketEventReceiptRepository
@@ -41,6 +42,7 @@ import me.matsumo.fukurou.trading.reconciler.ProtectionReconciler
 import me.matsumo.fukurou.trading.reconciler.RestPollingTickStream
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
 import me.matsumo.fukurou.trading.safety.SafetyFloor
+import me.matsumo.fukurou.trading.shadow.AsyncGateShadowObservationSink
 import java.time.Clock
 import java.time.Duration
 import java.util.logging.Logger
@@ -136,37 +138,46 @@ internal fun startProtectionReconcilerWorker(
     latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
 ): ProtectionReconcilerWorker {
     val maxDrawdownPolicy = MaxDrawdownPolicy(tradingConfig.safetyFloor.maxDrawdownRatio)
-    val inputs = ProtectionReconcilerWorkerInputs(
-        dataSource = dataSource,
-        database = database,
-        status = status,
-        clock = clock,
-        tradingConfig = tradingConfig,
-        latestMarketQuoteStore = latestMarketQuoteStore,
-        maxDrawdownPolicy = maxDrawdownPolicy,
-    )
-    val runtimeComponents = inputs.createRuntimeComponents()
-    val reconciler = runtimeComponents.createReconciler()
+    val workerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    return ProtectionReconcilerWorker(
-        reconciler = reconciler,
-        bootstrap = {
-            val schemaResult = TradingPersistenceBootstrap(
-                database = database,
-                clock = clock,
-                paperAccountConfig = tradingConfig.paperAccount,
-                staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
-                onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
-            ).ensureSchema()
-            if (schemaResult.isFailure) {
-                schemaResult
-            } else {
-                runtimeComponents.repositories.marketDataIntegrityRepository
-                    .recoverStaleSession(clock.instant())
-            }
-        },
-        clock = clock,
-    ).start()
+    return try {
+        val inputs = ProtectionReconcilerWorkerInputs(
+            dataSource = dataSource,
+            database = database,
+            status = status,
+            clock = clock,
+            tradingConfig = tradingConfig,
+            latestMarketQuoteStore = latestMarketQuoteStore,
+            maxDrawdownPolicy = maxDrawdownPolicy,
+            workerScope = workerScope,
+        )
+        val runtimeComponents = inputs.createRuntimeComponents()
+        val reconciler = runtimeComponents.createReconciler()
+
+        ProtectionReconcilerWorker(
+            reconciler = reconciler,
+            bootstrap = {
+                val schemaResult = TradingPersistenceBootstrap(
+                    database = database,
+                    clock = clock,
+                    paperAccountConfig = tradingConfig.paperAccount,
+                    staleLlmRunRecoveryThreshold = tradingConfig.staleLlmRunRecoveryThreshold(),
+                    onStaleLlmRunsRecovered = onStaleLlmRunsRecovered,
+                ).ensureSchema()
+                if (schemaResult.isFailure) {
+                    schemaResult
+                } else {
+                    runtimeComponents.repositories.marketDataIntegrityRepository
+                        .recoverStaleSession(clock.instant())
+                }
+            },
+            clock = clock,
+            scope = workerScope,
+        ).start()
+    } catch (throwable: Throwable) {
+        workerScope.cancel()
+        throw throwable
+    }
 }
 
 private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents(): ProtectionReconcilerRuntimeComponents {
@@ -223,6 +234,10 @@ private fun ProtectionReconcilerWorkerInputs.createRepositories(): ProtectionRec
             safetyFloorConfig = tradingConfig.safetyFloor,
             paperExecutionConfig = tradingConfig.paperExecution,
             maxDrawdownPolicy = maxDrawdownPolicy,
+            gateShadowObservationSink = AsyncGateShadowObservationSink(
+                scope = workerScope,
+                repository = ExposedGateShadowRepository(database),
+            ),
         ),
         marketDataIntegrityRepository = ExposedMarketDataIntegrityRepository(database),
         marketEventReceiptRepository = ExposedPaperMarketEventReceiptRepository(database),
@@ -297,6 +312,7 @@ private fun ProtectionReconcilerRuntimeComponents.createReconciler(): Protection
  * @param tradingConfig 取引 bot 全体の typed config
  * @param latestMarketQuoteStore Activity API と共有する最新気配値 store
  * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
+ * @param workerScope reconciler loop と gate-shadow consumer を所有する scope
  */
 private data class ProtectionReconcilerWorkerInputs(
     val dataSource: HikariDataSource,
@@ -306,6 +322,7 @@ private data class ProtectionReconcilerWorkerInputs(
     val tradingConfig: TradingBotConfig,
     val latestMarketQuoteStore: LatestMarketQuoteStore,
     val maxDrawdownPolicy: MaxDrawdownPolicy,
+    val workerScope: CoroutineScope,
 )
 
 /**

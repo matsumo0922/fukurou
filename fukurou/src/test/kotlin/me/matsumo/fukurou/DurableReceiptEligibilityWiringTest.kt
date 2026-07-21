@@ -29,6 +29,9 @@ class DurableReceiptEligibilityWiringTest {
         val worker = repositoryRoot().read(
             "fukurou/src/main/kotlin/me/matsumo/fukurou/ProtectionReconcilerWorker.kt",
         )
+        val workerFactoryRoot = worker
+            .substringAfter("internal fun startProtectionReconcilerWorker(")
+            .substringBefore("private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents()")
         val componentsRoot = worker
             .substringAfter("private fun ProtectionReconcilerWorkerInputs.createRuntimeComponents()")
             .substringBefore("internal fun createGmoMarketEventStream(")
@@ -39,7 +42,12 @@ class DurableReceiptEligibilityWiringTest {
             .substringAfter("private fun ProtectionReconcilerWorkerInputs.createBroker(")
             .substringBefore("private fun ProtectionReconcilerRuntimeComponents.createReconciler()")
 
+        assertTrue(workerFactoryRoot.contains("val workerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)"))
+        assertTrue(workerFactoryRoot.contains("scope = workerScope"))
         assertTrue(repositoryRoot.contains("ledgerRepository = ExposedPaperLedgerRepository("))
+        assertTrue(repositoryRoot.contains("gateShadowObservationSink = AsyncGateShadowObservationSink("))
+        assertTrue(repositoryRoot.contains("scope = workerScope"))
+        assertTrue(repositoryRoot.contains("repository = ExposedGateShadowRepository(database)"))
         assertTrue(repositoryRoot.contains("marketEventReceiptRepository = ExposedPaperMarketEventReceiptRepository(database)"))
         assertTrue(componentsRoot.contains("receiptRepository = repositories.marketEventReceiptRepository"))
         assertTrue(brokerRoot.contains("ledgerRepository = repositories.ledgerRepository"))

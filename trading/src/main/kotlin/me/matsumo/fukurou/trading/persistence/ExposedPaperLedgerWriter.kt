@@ -2,6 +2,7 @@
 
 package me.matsumo.fukurou.trading.persistence
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
@@ -84,6 +85,10 @@ import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyFloorVerdict
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.safety.MaxDrawdownPolicy
+import me.matsumo.fukurou.trading.shadow.DirectGateShadowObservationSink
+import me.matsumo.fukurou.trading.shadow.GateShadowObservation
+import me.matsumo.fukurou.trading.shadow.GateShadowObservationSink
+import me.matsumo.fukurou.trading.shadow.ShadowDataQuality
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -92,8 +97,12 @@ import java.sql.PreparedStatement
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
+import java.util.logging.Level
+import java.util.logging.Logger
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
+
+private val gateShadowLogger = Logger.getLogger(ExposedPaperLedgerWriter::class.java.name)
 
 /**
  * paper ledger mutation 用 writer。
@@ -102,6 +111,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
  * @param fallbackSymbolRules tick に symbol rules がない場合の fallback 取引ルール
  * @param clock DB 更新時刻に使う clock
  * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
+ * @param gateShadowObservationSink TTL 失効 capture の post-commit 保存経路
  */
 internal class ExposedPaperLedgerWriter(
     private val database: ExposedDatabase,
@@ -111,6 +121,9 @@ internal class ExposedPaperLedgerWriter(
         SafetyFloor(),
     ),
     private val maxDrawdownPolicy: MaxDrawdownPolicy = MaxDrawdownPolicy(),
+    private val gateShadowObservationSink: GateShadowObservationSink = DirectGateShadowObservationSink(
+        ExposedGateShadowRepository(database),
+    ),
 ) : PaperLedgerMutationRepository {
 
     /**
@@ -400,7 +413,7 @@ internal class ExposedPaperLedgerWriter(
         reconcileScope: PaperLedgerReconcileScope,
     ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
-            runCatching {
+            val ledgerResult = runCatching {
                 exposedTransaction(database) {
                     val riskState = lockPaperLedgerMutationRows()
                     val writeContext = resolvePaperWriteContext(PaperTradeAuditContext.EMPTY, riskState)
@@ -433,9 +446,13 @@ internal class ExposedPaperLedgerWriter(
                         triggerPositionProtections(reconcileContext, progress, writeContext, clock)
                     }
 
-                    progress.toPaperReconcileResult()
+                    progress.toGateShadowLedgerResult()
                 }
             }
+
+            ledgerResult.getOrNull()?.let { result -> persistGateShadowObservations(result.observations) }
+
+            ledgerResult.map { result -> result.reconcileResult }
         }
     }
 
@@ -444,12 +461,12 @@ internal class ExposedPaperLedgerWriter(
         simulator: PaperExecutionSimulator,
     ): Result<PaperReconcileResult> {
         return withContext(Dispatchers.IO) {
-            runCatching {
+            val ledgerResult = runCatching {
                 exposedTransaction(database) {
                     val cursor = lockMarketDataCursor(event.connectionSessionId)
 
                     if (event.sequence <= cursor) {
-                        return@exposedTransaction emptyReconcileProgress().toPaperReconcileResult()
+                        return@exposedTransaction emptyReconcileProgress().toGateShadowLedgerResult()
                     }
                     require(event.sequence == cursor + 1) {
                         "market-data sequence gap: expected ${cursor + 1}, received ${event.sequence}"
@@ -469,8 +486,29 @@ internal class ExposedPaperLedgerWriter(
                     )
                 }
             }
+
+            ledgerResult.getOrNull()?.let { result -> persistGateShadowObservations(result.observations) }
+
+            ledgerResult.map { result -> result.reconcileResult }
         }
     }
+
+    private suspend fun persistGateShadowObservations(observations: List<GateShadowObservation>) {
+        gateShadowObservationSink.enqueue(observations)
+    }
+}
+
+/** ledger transaction の結果と post-commit observation payload。 */
+private data class GateShadowLedgerResult(
+    val reconcileResult: PaperReconcileResult,
+    val observations: List<GateShadowObservation>,
+)
+
+private fun ReconcileProgress.toGateShadowLedgerResult(): GateShadowLedgerResult {
+    return GateShadowLedgerResult(
+        reconcileResult = toPaperReconcileResult(),
+        observations = gateShadowObservations.toList(),
+    )
 }
 
 private data class ExposedRiskExitTargets(
@@ -804,37 +842,185 @@ private fun JdbcTransaction.lockRowsInIdOrder(query: String) {
 }
 
 private fun JdbcTransaction.expireRestingEntryOrders(processedAt: Instant, progress: ReconcileProgress) {
-    selectOpenOrders()
+    val expiringOrders = selectOpenOrders()
         .asSequence()
         .filter(Order::isRestingEntryLifecycleCandidate)
         .mapNotNull { order -> order.expiresAt?.let(Instant::parse)?.let { expiresAt -> order to expiresAt } }
         .filter { (_, expiresAt) -> !processedAt.isBefore(expiresAt) }
-        .forEach { (order, expiresAt) ->
-            prepare(
-                """
-                    UPDATE orders
-                    SET status = ?,
-                        expired_at = ?,
-                        canceled_at = ?,
-                        cancel_reason = ?,
-                        reason_ja = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                        AND status = ?
-                """,
-            ).use { statement ->
-                statement.setString(1, OrderStatus.CANCELED.name)
-                statement.setLong(2, expiresAt.toEpochMilli())
-                statement.setLong(3, processedAt.toEpochMilli())
-                statement.setString(4, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
-                statement.setString(5, "resting entry order expired")
-                statement.setLong(6, processedAt.toEpochMilli())
-                statement.setObject(7, UUID.fromString(order.orderId))
-                statement.setString(8, order.status.name)
+        .toList()
+    if (expiringOrders.isEmpty()) return
 
-                if (statement.executeUpdate() == 1) progress.canceledOrderIds += order.orderId
+    val canceledOrders = mutableListOf<Pair<Order, Instant>>()
+    expiringOrders.forEach { (order, expiresAt) ->
+        prepare(
+            """
+                UPDATE orders
+                SET status = ?,
+                    expired_at = ?,
+                    canceled_at = ?,
+                    cancel_reason = ?,
+                    reason_ja = ?,
+                    updated_at = ?
+                WHERE id = ?
+                    AND status = ?
+            """,
+        ).use { statement ->
+            statement.setString(1, OrderStatus.CANCELED.name)
+            statement.setLong(2, expiresAt.toEpochMilli())
+            statement.setLong(3, processedAt.toEpochMilli())
+            statement.setString(4, PaperOrderCancelReason.TTL_EXPIRY.wireCode)
+            statement.setString(5, "resting entry order expired")
+            statement.setLong(6, processedAt.toEpochMilli())
+            statement.setObject(7, UUID.fromString(order.orderId))
+            statement.setString(8, order.status.name)
+
+            if (statement.executeUpdate() == 1) {
+                progress.canceledOrderIds += order.orderId
+                canceledOrders += order to expiresAt
             }
         }
+    }
+    if (canceledOrders.isEmpty()) return
+
+    val admissionFence = captureGateShadowReadWithSavepoint("admission allocation fence") {
+        selectPaperMarketAdmissionAllocationFence()
+    } ?: return
+
+    canceledOrders.forEach { (order, expiresAt) ->
+        val observation = captureGateShadowReadWithSavepoint("order lineage: orderId=${order.orderId}") {
+            captureGateShadowObservation(
+                order = order,
+                expiresAt = expiresAt,
+                processedAt = processedAt,
+                admissionFence = admissionFence,
+            )
+        }
+
+        observation?.let(progress.gateShadowObservations::add)
+    }
+}
+
+private fun <T> JdbcTransaction.captureGateShadowReadWithSavepoint(
+    description: String,
+    block: JdbcTransaction.() -> T,
+): T? {
+    return jdbcConnection().captureGateShadowReadWithSavepoint(description) {
+        block(this)
+    }
+}
+
+internal fun <T> Connection.captureGateShadowReadWithSavepoint(description: String, block: () -> T): T? {
+    val savepoint = setSavepoint()
+
+    // 成功時は明示 RELEASE SAVEPOINT を発行しない。capture read は read-only なので release は不要で、
+    // savepoint は outer transaction の commit が自動解放する。ここで RELEASE SAVEPOINT を発行すると、
+    // それ自体が server-side error（statement cancel 等）になった場合に transaction を failed state にし、
+    // pgjdbc の commit が silent rollback となって TTL cancel を失いつつ capture だけを enqueue する
+    // phantom observation を生む。
+    return try {
+        block()
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (captureFailure: Throwable) {
+        try {
+            rollback(savepoint)
+        } catch (cancellation: CancellationException) {
+            cancellation.addSuppressed(captureFailure)
+            throw cancellation
+        } catch (rollbackFailure: Throwable) {
+            captureFailure.addSuppressed(rollbackFailure)
+            throw captureFailure
+        }
+
+        gateShadowLogger.log(
+            Level.WARNING,
+            "gate-shadow capture read failed; rolled back savepoint and skipped $description",
+            captureFailure,
+        )
+        null
+    }
+}
+
+/** gate-shadow capture に補完する order lineage。 */
+private data class GateShadowOrderLineage(
+    val decisionId: UUID?,
+    val opportunityEpisodeId: UUID?,
+    val geometryHash: String?,
+    val queueAheadBtc: BigDecimal?,
+    val marketDataSessionId: UUID?,
+)
+
+private fun JdbcTransaction.selectPaperMarketAdmissionAllocationFence(): Long {
+    return prepare("SELECT last_value, is_called FROM paper_market_admission_ordinal_seq").use { statement ->
+        statement.executeQuery().use { rows ->
+            check(rows.next()) { "Paper market admission sequence state was not returned." }
+            if (rows.getBoolean("is_called")) rows.getLong("last_value") else 0L
+        }
+    }
+}
+
+private fun JdbcTransaction.captureGateShadowObservation(
+    order: Order,
+    expiresAt: Instant,
+    processedAt: Instant,
+    admissionFence: Long,
+): GateShadowObservation {
+    val lineage = selectGateShadowOrderLineage(UUID.fromString(order.orderId))
+    val dataQuality = when {
+        lineage.marketDataSessionId == null -> ShadowDataQuality.MISSING_MARKET_DATA_SESSION_ID
+        lineage.geometryHash == null -> ShadowDataQuality.MISSING_GEOMETRY_HASH
+        else -> ShadowDataQuality.OK
+    }
+
+    return GateShadowObservation(
+        id = UUID.randomUUID(),
+        orderId = UUID.fromString(order.orderId),
+        decisionId = lineage.decisionId,
+        opportunityEpisodeId = lineage.opportunityEpisodeId,
+        geometryHash = lineage.geometryHash,
+        symbol = order.symbol,
+        side = order.side,
+        orderType = order.orderType,
+        sizeBtc = order.sizeBtc.toBigDecimal(),
+        limitPriceJpy = order.limitPriceJpy?.toBigDecimal(),
+        triggerPriceJpy = order.triggerPriceJpy?.toBigDecimal(),
+        stopPriceJpy = order.protectiveStopPriceJpy?.toBigDecimal(),
+        takeProfitPriceJpy = order.takeProfitPriceJpy?.toBigDecimal(),
+        queueAheadBtc = lineage.queueAheadBtc,
+        marketDataSessionId = lineage.marketDataSessionId,
+        startAdmissionOrdinal = admissionFence,
+        windowStartTime = expiresAt,
+        dataQuality = dataQuality,
+        observedAt = processedAt,
+    )
+}
+
+private fun JdbcTransaction.selectGateShadowOrderLineage(orderId: UUID): GateShadowOrderLineage {
+    return prepare(
+        """
+            SELECT intent.decision_id,
+                intent.opportunity_episode_id,
+                intent.geometry_hash,
+                orders.queue_ahead_btc,
+                orders.market_data_session_id
+            FROM orders AS orders
+            LEFT JOIN trade_intents AS intent ON intent.id = orders.intent_id
+            WHERE orders.id = ?
+        """,
+    ).use { statement ->
+        statement.setObject(1, orderId)
+        statement.executeQuery().use { rows ->
+            check(rows.next()) { "TTL-expired order disappeared during gate-shadow capture." }
+
+            GateShadowOrderLineage(
+                decisionId = rows.getObject("decision_id", UUID::class.java),
+                opportunityEpisodeId = rows.getObject("opportunity_episode_id", UUID::class.java),
+                geometryHash = rows.getString("geometry_hash"),
+                queueAheadBtc = rows.getBigDecimal("queue_ahead_btc"),
+                marketDataSessionId = rows.getObject("market_data_session_id", UUID::class.java),
+            )
+        }
+    }
 }
 
 @Suppress("LongParameterList")
@@ -847,7 +1033,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
     fillInvariantEvaluator: RestingEntryFillInvariantEvaluator,
     clock: Clock,
     maxDrawdownPolicy: MaxDrawdownPolicy,
-): PaperReconcileResult {
+): GateShadowLedgerResult {
     check(event.sequence == cursor + 1) { "market-data cursor changed inside event transaction." }
 
     val receiptEligibility = resolveMarketEventReceiptEligibility(event)
@@ -885,7 +1071,7 @@ private fun JdbcTransaction.applyPaperMarketEvent(
 
     advanceMarketDataCursor(event)
 
-    return progress.toPaperReconcileResult()
+    return progress.toGateShadowLedgerResult()
 }
 
 private fun JdbcTransaction.lockMarketDataCursor(sessionId: UUID): Long {
