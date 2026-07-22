@@ -25,7 +25,12 @@ readonly RESTIC_BIN="${FUKUROU_RESTIC_BIN:-restic}"
 readonly OPENSSL_BIN="${FUKUROU_OPENSSL_BIN:-openssl}"
 readonly TIMEOUT_BIN="${FUKUROU_TIMEOUT_BIN:-timeout}"
 readonly SETSID_BIN="${FUKUROU_SETSID_BIN:-setsid}"
-readonly PROFILE_DIRECTORY="${FUKUROU_BACKUP_SHARE_DIRECTORY:-${SCRIPT_DIRECTORY}}"
+# backup-common の BACKUP_SHARE_DIRECTORY と同じ理由でデフォルトを固定する。
+# install-fukurou-backup は restore-inventory-v1.txt 等の SHARE_ARTIFACTS を
+# /usr/local/share/fukurou へ配置するため、script 自身のディレクトリをデフォルトに
+# すると、FUKUROU_BACKUP_SHARE_DIRECTORY を明示指定しない呼び出しでファイルが
+# 見つからない。
+readonly PROFILE_DIRECTORY="${FUKUROU_BACKUP_SHARE_DIRECTORY:-/usr/local/share/fukurou}"
 readonly INVENTORY_FILE="${FUKUROU_RESTORE_INVENTORY_FILE:-${PROFILE_DIRECTORY}/restore-inventory-v1.txt}"
 readonly CRITICAL_TABLES_FILE="${FUKUROU_RESTORE_CRITICAL_TABLES_FILE:-${PROFILE_DIRECTORY}/restore-critical-tables-v1.txt}"
 readonly INVARIANTS_FILE="${FUKUROU_RESTORE_INVARIANTS_FILE:-${PROFILE_DIRECTORY}/restore-readonly-invariants-v1.sql}"
