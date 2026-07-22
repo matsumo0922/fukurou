@@ -1609,7 +1609,6 @@ class OpsRouteTest {
 
         assertEquals(HttpStatusCode.OK, response.status)
         assertEquals("codex", details.getValue("provider").jsonPrimitive.content)
-        assertEquals("true", details.getValue("rawOutputOmitted").jsonPrimitive.content)
         assertEquals("42", inputTokens)
         assertFalse(details.containsKey("stdout"))
         assertFalse(details.containsKey("stderr"))

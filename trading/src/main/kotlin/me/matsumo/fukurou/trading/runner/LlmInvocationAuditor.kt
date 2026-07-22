@@ -18,6 +18,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmInvocationTimedOutException
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
+import me.matsumo.fukurou.trading.invoker.CODEX_STDERR_AUTH_FAILURES
 import me.matsumo.fukurou.trading.invoker.DEFAULT_MCP_MANIFEST_DIRECTORY
 import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -360,7 +361,12 @@ class LlmInvocationAuditor(
                 put("adapterSchemaVersion", failure.adapterSchemaVersion)
             }
             if (auditSignals.providerFailure != null) {
-                put("rawOutputOmitted", "true")
+                processResult?.let { completedProcess ->
+                    if (isSafeCodexLifecycleFailure(request, auditSignals, completedProcess)) {
+                        put("stdout", redactor.redactAndTruncate(completedProcess.stdout))
+                        put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
+                    }
+                }
             } else {
                 when (request.provider) {
                     LlmProvider.CLAUDE -> processResult?.let { completedProcess ->
@@ -368,11 +374,7 @@ class LlmInvocationAuditor(
                         put("stderr", redactor.redactAndTruncate(completedProcess.stderr))
                     }
 
-                    LlmProvider.CODEX -> {
-                        if (processResult != null) {
-                            put("rawOutputOmitted", "true")
-                        }
-                    }
+                    LlmProvider.CODEX -> Unit
                 }
             }
             if (auditSignals.authFailureSuspected) {
@@ -522,6 +524,32 @@ private fun primaryProviderFailure(
         ?: startFailure?.let { lifecycleFailure(LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE) }
 }
 
+/**
+ * Codex の raw output を監査 payload へ記録してよいかを判定する。
+ *
+ * 次の3条件をすべて満たす場合だけ安全とみなす。
+ * 1. primary category が process lifecycle 由来（`PROCESS_EXIT`/`PROCESS_TIMEOUT`/`CLEANUP`）
+ * 2. adapter（parser）が Codex の出力を解釈した failure を一切返していない（`cliErrorReported == false`）
+ * 3. stderr に Codex の既知認証失敗文言が含まれていない
+ *
+ * 条件1だけでは、adapter が output text から `UNKNOWN_PROVIDER_FAILURE` を導出しつつ process が
+ * lifecycle 理由で失敗する複合ケースを排除できない（条件2で排除する）。条件1・2だけでも、
+ * parser の stderr 認証判定が `terminalCount == 0` のときしか働かないため、完全な成功 event stream
+ * と既知認証文言 stderr が併存するケースを排除できない（条件3で排除する）。
+ */
+private fun isSafeCodexLifecycleFailure(
+    request: LlmInvocationRequest,
+    auditSignals: LlmPhaseAuditSignals,
+    processResult: ProcessRunResult,
+): Boolean {
+    val category = auditSignals.providerFailure?.category
+
+    return request.provider == LlmProvider.CODEX &&
+        category in CODEX_SAFE_LIFECYCLE_FAILURE_CATEGORIES &&
+        !auditSignals.cliErrorReported &&
+        CODEX_STDERR_AUTH_FAILURES.none { knownFailure -> processResult.stderr.contains(knownFailure) }
+}
+
 private fun LlmInvocationResult?.observedModels(): List<String> {
     return (
         listOfNotNull(this?.observedModelIdentity?.name) +
@@ -615,4 +643,15 @@ private val STRUCTURED_PROVIDER_FAILURE_CATEGORIES = setOf(
     LlmProviderFailureCategory.AUTHENTICATION,
     LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT,
     LlmProviderFailureCategory.QUOTA_EXHAUSTED,
+)
+
+/**
+ * Codex の raw output 記録を許可する、process の事実だけから決まる failure category。
+ *
+ * Codex の出力テキストを一切解釈せずに決まるカテゴリに限定する。
+ */
+private val CODEX_SAFE_LIFECYCLE_FAILURE_CATEGORIES = setOf(
+    LlmProviderFailureCategory.PROCESS_EXIT,
+    LlmProviderFailureCategory.PROCESS_TIMEOUT,
+    LlmProviderFailureCategory.CLEANUP,
 )

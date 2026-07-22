@@ -2359,7 +2359,8 @@ class OneShotLlmRunnerTest {
         assertEquals("EXITED", proposerDetails.stringValue("status"))
         assertEquals("0", proposerDetails.stringValue("exitCode"))
         assertFalse(proposerDetails.containsKey("error"))
-        assertEquals("true", proposerDetails.stringValue("rawOutputOmitted"))
+        assertFalse(proposerDetails.containsKey("stdout"))
+        assertFalse(proposerDetails.containsKey("stderr"))
         assertFalse(proposerPhase.payload.contains("test-password"))
         assertFalse(proposerPhase.payload.contains("fukurou-token"))
     }

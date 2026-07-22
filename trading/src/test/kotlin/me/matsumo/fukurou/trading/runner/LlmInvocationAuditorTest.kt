@@ -19,6 +19,8 @@ import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
 import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
+import me.matsumo.fukurou.trading.invoker.CODEX_OUTPUT_ADAPTER_VERSION
+import me.matsumo.fukurou.trading.invoker.CODEX_STDERR_AUTH_FAILURES
 import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -28,6 +30,8 @@ import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmMcpServerConfig
 import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import me.matsumo.fukurou.trading.invoker.LlmProviderFailure
+import me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory
 import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
@@ -188,7 +192,6 @@ class LlmInvocationAuditorTest {
         assertTrue(result.isFailure)
         assertEquals("1", details["exitCode"]?.jsonPrimitive?.content)
         assertEquals("2", auditUsage["usage"]?.jsonObject?.get("reasoningOutputTokens")?.jsonPrimitive?.content)
-        assertEquals("true", details["rawOutputOmitted"]?.jsonPrimitive?.content)
         assertEquals("true", details["authFailureSuspected"]?.jsonPrimitive?.content)
         assertFalse(details.containsKey("stdout"))
         assertFalse(details.containsKey("stderr"))
@@ -250,6 +253,273 @@ class LlmInvocationAuditorTest {
         assertFalse(commandEventLog.events().single().payload.contains("path-marker"))
         assertFalse(commandEventLog.events().single().payload.contains("path-message-marker"))
         assertEquals(emptyList(), humanLogs)
+    }
+
+    @Test
+    fun invokeAndAudit_recordsRedactedOutputForCodexCleanupFailureWithNoAdapterFailure() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        // turn 完走・exit 0 の後、一時 artifact の cleanup にだけ失敗したケース
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 0,
+                stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
+                stderr = "",
+            ),
+            cleanupFailure = FileSystemException("/private/codex-home/session", null, "cleanup failed"),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("CLEANUP", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals(COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM, details["stdout"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun invokeAndAudit_recordsRedactedOutputForCodexProcessExitWithNoAdapterFailure() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        // stdout は DefaultLlmOutputParser.parseCodex() が providerFailure=null（完全な成功 turn）を
+        // 返す形にする。ガード条件2（cliErrorReported==false）が本番で実際に成立しうるのは、
+        // ここに示すような「turn 自体は完走したが、その後の process 終了が非ゼロになった」ケースであり、
+        // launcher 起動失敗のような非 JSON 出力では schemaDrift により OUTPUT_CONTRACT になるため
+        // このガードには到達しない
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 1,
+                stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
+                stderr = "post-turn teardown crashed with exit 1",
+            ),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("PROCESS_EXIT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals(COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM, details["stdout"]?.jsonPrimitive?.content)
+        assertEquals(
+            "post-turn teardown crashed with exit 1",
+            details["stderr"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun invokeAndAudit_recordsRedactedOutputForCodexProcessTimeoutWithNoAdapterFailure() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        // turn 完走後、process 自体が終了せず timeout したケース（起動失敗ではない）
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.TIMED_OUT,
+                exitCode = null,
+                stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
+                stderr = "",
+            ),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("PROCESS_TIMEOUT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals(COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM, details["stdout"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun invokeAndAudit_omitsRawOutputForCodexStructuredFailureCategories() = runBlocking {
+        val structuredFailures = listOf(
+            LlmProviderFailure(LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT, "RATE_LIMIT", CODEX_OUTPUT_ADAPTER_VERSION),
+            LlmProviderFailure(LlmProviderFailureCategory.QUOTA_EXHAUSTED, "QUOTA", CODEX_OUTPUT_ADAPTER_VERSION),
+            LlmProviderFailure(LlmProviderFailureCategory.OUTPUT_CONTRACT, "SCHEMA_DRIFT", CODEX_OUTPUT_ADAPTER_VERSION),
+            LlmProviderFailure(LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE, null, CODEX_OUTPUT_ADAPTER_VERSION),
+        )
+
+        structuredFailures.forEach { failure ->
+            val commandEventLog = InMemoryCommandEventLog()
+            val auditor = LlmInvocationAuditor(
+                commandEventLog = commandEventLog,
+                redactor = SecretRedactor(emptySet()),
+                clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            )
+            val request = auditRequest(LlmProvider.CODEX)
+            val invoker = ConfigurableAuditLlmInvoker(
+                processResult = ProcessRunResult(
+                    status = ProcessRunStatus.EXITED,
+                    // exitCode=0 なので、この category が process lifecycle 側の category に
+                    // 上書きされず、adapter が返した category がそのまま primary になる
+                    exitCode = 0,
+                    stdout = "structured failure output",
+                    stderr = "structured failure stderr",
+                ),
+                providerFailure = failure,
+            )
+
+            auditor.invokeAndAudit(
+                phaseName = "falsifier",
+                context = request.decisionRunContext,
+                request = request,
+                llmInvoker = invoker,
+            )
+
+            val details = auditedDetails(commandEventLog)
+
+            assertEquals(failure.category.name, details["failureCategory"]?.jsonPrimitive?.content)
+            assertFalse(details.containsKey("stdout"), "${failure.category} should not expose stdout")
+            assertFalse(details.containsKey("stderr"), "${failure.category} should not expose stderr")
+        }
+    }
+
+    @Test
+    fun invokeAndAudit_omitsRawOutputWhenAdapterFailureCoexistsWithProcessExit() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        // stdout は DefaultLlmOutputParser.parseCodex() が実際に UNKNOWN_PROVIDER_FAILURE を
+        // 返しうる形にする: turn.failed の error.message が既知の互換カテゴリ文言に一致しない場合
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 1,
+                stdout = """{"type":"turn.failed","error":{"message":"unrecognized diagnostic marker"}}""",
+                stderr = "Not logged in",
+            ),
+            providerFailure = LlmProviderFailure(
+                LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE,
+                "CODEX_ERROR_COMPATIBILITY",
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            ),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        // primaryProviderFailure() は non-zero exitCode を adapter の UNKNOWN_PROVIDER_FAILURE より
+        // 優先するため、表示される category は PROCESS_EXIT になる。それでも adapter が output text
+        // から何かを検出している（cliErrorReported=true）ので、raw output は記録されないことを確認する
+        assertEquals("PROCESS_EXIT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals("true", details["cliErrorReported"]?.jsonPrimitive?.content)
+        assertFalse(details.containsKey("stdout"))
+        assertFalse(details.containsKey("stderr"))
+    }
+
+    @Test
+    fun invokeAndAudit_omitsRawOutputWhenStderrCarriesKnownAuthSignatureAlongsideProcessExit() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 1,
+                stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
+                stderr = CODEX_STDERR_AUTH_FAILURES.first(),
+            ),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("PROCESS_EXIT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertFalse(details.containsKey("stdout"))
+        assertFalse(details.containsKey("stderr"))
+    }
+
+    @Test
+    fun invokeAndAudit_masksKnownSecretInCodexLifecycleFailureOutput() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(setOf("super-secret-db-password")),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        // stdout は正常な success event stream の中に secret 値を埋め込み、DefaultLlmOutputParser
+        // が providerFailure=null を返しうる形を維持する
+        val secretBearingStdout = """
+            {"type":"thread.started","thread_id":"thread-1"}
+            {"type":"item.completed","item":{"type":"agent_message","text":"connecting with password=super-secret-db-password"}}
+            {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+        """.trimIndent()
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 1,
+                stdout = secretBearingStdout,
+                stderr = "auth failed for super-secret-db-password",
+            ),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = invoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("PROCESS_EXIT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals(
+            secretBearingStdout.replace("super-secret-db-password", "[REDACTED]"),
+            details["stdout"]?.jsonPrimitive?.content,
+        )
+        assertEquals("auth failed for [REDACTED]", details["stderr"]?.jsonPrimitive?.content)
+        assertFalse(commandEventLog.events().single().payload.contains("super-secret-db-password"))
     }
 
     @Test
@@ -765,6 +1035,44 @@ private class StaticAuditUsageInvoker(private val usage: LlmUsageDetails) : LlmI
         )
     }
 }
+
+private suspend fun auditedDetails(commandEventLog: InMemoryCommandEventLog): kotlinx.serialization.json.JsonObject {
+    val payload = Json.parseToJsonElement(commandEventLog.events().single().payload).jsonObject
+    return requireNotNull(payload["details"]).jsonObject
+}
+
+/**
+ * Codex の raw output allowlist を検証するための、process 結果と adapter failure を自由に組める invoker。
+ */
+private class ConfigurableAuditLlmInvoker(
+    private val processResult: ProcessRunResult,
+    private val providerFailure: LlmProviderFailure? = null,
+    private val cleanupFailure: Throwable? = null,
+) : LlmInvoker {
+    override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+        return Result.success(
+            LlmInvocationResult(
+                request = request,
+                processResult = processResult,
+                responseText = "response",
+                usage = null,
+                providerFailure = providerFailure,
+                cleanupFailure = cleanupFailure,
+            ),
+        )
+    }
+}
+
+/**
+ * `DefaultLlmOutputParser.parseCodex()` が `providerFailure=null`（完全な成功 turn）を返す、
+ * 有効な Codex JSONL event stream。lifecycle failure ガードのテストで、実際に production の
+ * parser を通しても到達しうる状態を模すために使う。
+ */
+private val COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM = """
+    {"type":"thread.started","thread_id":"thread-1"}
+    {"type":"item.completed","item":{"type":"agent_message","text":"final response"}}
+    {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+""".trimIndent()
 
 private fun auditRequest(provider: LlmProvider): LlmInvocationRequest {
     return LlmInvocationRequest(
