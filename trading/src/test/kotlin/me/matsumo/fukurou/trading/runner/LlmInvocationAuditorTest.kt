@@ -362,7 +362,7 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
-    fun invokeAndAudit_retainsRawOutputForCodexOutputInterpretedFailureCategoriesWhenNoAuthEvidenceObserved() = runBlocking {
+    fun invokeAndAudit_retainsRawOutputForOutputInterpretedCategoriesWithoutEvidence() = runBlocking {
         // issue #295: OUTPUT_CONTRACT/RATE_OR_SESSION_LIMIT/QUOTA_EXHAUSTED/UNKNOWN_PROVIDER_FAILURE は
         // authEvidenceObserved == false（既知の認証 evidence 文言が独立に観測されなかった場合）に限り、
         // 新設の output-interpreted 経路で raw output を記録できるようになった
@@ -402,15 +402,16 @@ class LlmInvocationAuditorTest {
             )
 
             val details = auditedDetails(commandEventLog)
+            val expectedMessage = "${failure.category} should expose"
 
             assertEquals(failure.category.name, details["failureCategory"]?.jsonPrimitive?.content)
-            assertEquals("structured failure output", details["stdout"]?.jsonPrimitive?.content, "${failure.category} should expose stdout")
-            assertEquals("structured failure stderr", details["stderr"]?.jsonPrimitive?.content, "${failure.category} should expose stderr")
+            assertEquals("structured failure output", details["stdout"]?.jsonPrimitive?.content, "$expectedMessage stdout")
+            assertEquals("structured failure stderr", details["stderr"]?.jsonPrimitive?.content, "$expectedMessage stderr")
         }
     }
 
     @Test
-    fun invokeAndAudit_omitsRawOutputForCodexOutputInterpretedFailureCategoriesWhenAuthEvidenceObserved() = runBlocking {
+    fun invokeAndAudit_omitsRawOutputForOutputInterpretedCategoriesWithEvidence() = runBlocking {
         val outputInterpretedFailures = listOf(
             LlmProviderFailure(LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT, "RATE_LIMIT", CODEX_OUTPUT_ADAPTER_VERSION),
             LlmProviderFailure(LlmProviderFailureCategory.QUOTA_EXHAUSTED, "QUOTA", CODEX_OUTPUT_ADAPTER_VERSION),
@@ -1019,7 +1020,7 @@ class LlmInvocationAuditorTest {
      * 埋め込まれている場合は raw output が記録されないことを証明する（受け入れ条件2）。
      */
     @Test
-    fun invokeAndAudit_omitsRawOutputForCodexOutputContractThroughProductionWiringWhenAuthEvidencePresent() = runBlocking {
+    fun invokeAndAudit_omitsRawOutputForOutputContractProductionWiringWithEvidence() = runBlocking {
         val commandEventLog = InMemoryCommandEventLog()
         val auditor = LlmInvocationAuditor(
             commandEventLog = commandEventLog,
