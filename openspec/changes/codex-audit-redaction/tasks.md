@@ -36,10 +36,10 @@
 
 ## 5. Follow-up issue の起票
 
-- [ ] 5.1 PR 作成時に、issue #282 と同形の `OUTPUT_CONTRACT`/`SCHEMA_DRIFT` 障害を安全に診断可能にするための follow-up issue を起票する（design.md の Follow-up 参照: parser が primary category と独立に認証 evidence の有無を追跡する設計が必要）
+- [x] 5.1 PR 作成時に、issue #282 と同形の `OUTPUT_CONTRACT`/`SCHEMA_DRIFT` 障害を安全に診断可能にするための follow-up issue を起票する（design.md の Follow-up 参照: parser が primary category と独立に認証 evidence の有無を追跡する設計が必要）— issue #295 として起票済み
 
 ## 6. 検証
 
-- [x] 6.1 `make test` を実行する（対象モジュールのターゲットテストは pass 済み、全体は実行中）
-- [ ] 6.2 `make detekt` を実行する
-- [ ] 6.3 `make build` を実行する
+- [x] 6.1 `make test` を実行する — 全体では `PostgresPersistenceIntegrationTest.safety_violation_repository_persists_rejection_audit` のみ失敗するが、原因はポート5432を別プロジェクト（onenavi-postgis）のコンテナが占有していることによる `HikariPool` 接続タイムアウトであり、本 PR の変更とは無関係な環境要因と確認済み。本 PR の対象テスト（`LlmInvocationAuditorTest`/`OneShotLlmRunnerTest`/`DefaultLlmOutputParserTest`/`OpsRouteTest`）は個別実行ですべて pass
+- [x] 6.2 `make detekt` を実行する — pass（`--auto-correct` が KDoc 前の空行を自動修正）
+- [x] 6.3 `make build` を実行する — BUILD SUCCESSFUL
