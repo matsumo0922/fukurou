@@ -546,10 +546,7 @@ private fun primaryProviderFailure(
  * （design.md の Risks 参照。特に `OUTPUT_CONTRACT`/`UNKNOWN_PROVIDER_FAILURE` はこの限界の影響を
  * 受けやすいカテゴリとしてユーザー確認済みで受容している）。
  */
-private fun isSafeCodexLifecycleFailure(
-    request: LlmInvocationRequest,
-    auditSignals: LlmPhaseAuditSignals,
-): Boolean {
+private fun isSafeCodexLifecycleFailure(request: LlmInvocationRequest, auditSignals: LlmPhaseAuditSignals): Boolean {
     if (request.provider != LlmProvider.CODEX) return false
     if (auditSignals.authEvidenceObserved) return false
 
