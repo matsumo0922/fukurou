@@ -1,0 +1,37 @@
+name: PR Quality
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-quality-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Verify JVM quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run JVM quality gates
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-pr-quality
+        run: |
+          set -euo pipefail
+          make test
+          make detekt
+          git diff --exit-code
