@@ -22,6 +22,8 @@ import java.sql.ResultSet
 import java.sql.Types
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.Executor
+import java.util.concurrent.ForkJoinPool
 
 /**
  * PostgreSQL の gate-shadow repository。
@@ -31,7 +33,18 @@ import java.util.UUID
 @Suppress("TooManyFunctions")
 class ExposedGateShadowRepository(
     private val database: Database,
+    private val transactionTimeout: java.time.Duration = java.time.Duration.ofSeconds(2),
+    private val networkTimeoutMillis: Int? = null,
 ) : GateShadowRepository {
+
+    init {
+        require(!transactionTimeout.isNegative && !transactionTimeout.isZero) {
+            "Gate-shadow transaction timeout must be positive."
+        }
+        require(networkTimeoutMillis == null || networkTimeoutMillis > 0) {
+            "Gate-shadow network timeout must be positive when configured."
+        }
+    }
 
     override suspend fun appendObservation(observation: GateShadowObservation): Result<Unit> {
         return writeResult {
@@ -103,7 +116,9 @@ class ExposedGateShadowRepository(
             jdbcConnection().prepareStatement(UPSERT_SCAN_PROGRESS_SQL).use { statement ->
                 statement.setObject(1, progress.observationId)
                 statement.setLong(2, progress.lastScannedAdmissionOrdinal)
-                statement.setLong(3, progress.lastScannedAt.toEpochMilli())
+                statement.setString(3, progress.dataQuality.name)
+                statement.setNullableLong(4, progress.lastSocketObservedAt?.toEpochMilli())
+                statement.setLong(5, progress.lastScannedAt.toEpochMilli())
                 statement.executeUpdate()
             }
         }
@@ -142,9 +157,12 @@ class ExposedGateShadowRepository(
         }
     }
 
-    override suspend fun countMissingTtlExpiryObservations(): Result<Long> {
+    override suspend fun countMissingTtlExpiryObservations(baseline: Instant?): Result<Long?> {
+        if (baseline == null) return Result.success(null)
+
         return readResult {
             jdbcConnection().prepareStatement(COUNT_MISSING_TTL_OBSERVATIONS_SQL).use { statement ->
+                statement.setLong(1, baseline.toEpochMilli())
                 statement.executeQuery().use { rows ->
                     check(rows.next()) { "Gate-shadow reconciliation count was not returned." }
                     rows.getLong(1)
@@ -163,7 +181,12 @@ class ExposedGateShadowRepository(
 
     private suspend fun <T> readResult(block: JdbcTransaction.() -> T): Result<T> {
         return withContext(Dispatchers.IO) {
-            gateShadowResult { transaction(database) { block() } }
+            gateShadowResult {
+                transaction(database) {
+                    applyTransactionTimeouts()
+                    block()
+                }
+            }
         }
     }
 
@@ -171,17 +194,23 @@ class ExposedGateShadowRepository(
         return withContext(Dispatchers.IO) {
             gateShadowResult {
                 transaction(database) {
-                    applyWriteTimeouts()
+                    applyTransactionTimeouts()
                     block()
                 }
             }
         }
     }
 
-    private fun JdbcTransaction.applyWriteTimeouts() {
-        jdbcConnection().createStatement().use { statement ->
-            statement.execute("SET LOCAL lock_timeout = '2s'")
-            statement.execute("SET LOCAL statement_timeout = '2s'")
+    private fun JdbcTransaction.applyTransactionTimeouts() {
+        val timeoutMillis = transactionTimeout.toMillis()
+        val connection = jdbcConnection()
+
+        networkTimeoutMillis?.let { timeout ->
+            connection.setNetworkTimeout(NETWORK_TIMEOUT_EXECUTOR, timeout)
+        }
+        connection.createStatement().use { statement ->
+            statement.execute("SET LOCAL lock_timeout = '${timeoutMillis}ms'")
+            statement.execute("SET LOCAL statement_timeout = '${timeoutMillis}ms'")
         }
     }
 
@@ -279,9 +308,15 @@ class ExposedGateShadowRepository(
     }
 
     private fun ResultSet.toScanProgress(): GateShadowScanProgress {
+        val lastSocketObservedAt = getLong("last_socket_observed_at")
+            .takeUnless { wasNull() }
+            ?.let(Instant::ofEpochMilli)
+
         return GateShadowScanProgress(
             observationId = getObject("observation_id", UUID::class.java),
             lastScannedAdmissionOrdinal = getLong("last_scanned_admission_ordinal"),
+            dataQuality = ShadowDataQuality.valueOf(getString("data_quality")),
+            lastSocketObservedAt = lastSocketObservedAt,
             lastScannedAt = Instant.ofEpochMilli(getLong("last_scanned_at")),
         )
     }
@@ -302,6 +337,8 @@ class ExposedGateShadowRepository(
     }
 
     private companion object {
+        val NETWORK_TIMEOUT_EXECUTOR: Executor = ForkJoinPool.commonPool()
+
         const val INSERT_OBSERVATION_SQL = """
             INSERT INTO gate_shadow_observations (
                 id, order_id, decision_id, opportunity_episode_id, geometry_hash,
@@ -322,6 +359,8 @@ class ExposedGateShadowRepository(
             LEFT JOIN gate_shadow_resolutions AS resolutions
                 ON resolutions.observation_id = observations.id
             WHERE resolutions.observation_id IS NULL
+                AND observations.order_type IN ('LIMIT', 'STOP')
+                AND observations.side = 'BUY'
             ORDER BY observations.observed_at, observations.id
             LIMIT ?
         """
@@ -345,13 +384,33 @@ class ExposedGateShadowRepository(
 
         const val UPSERT_SCAN_PROGRESS_SQL = """
             INSERT INTO gate_shadow_scan_progress (
-                observation_id, last_scanned_admission_ordinal, last_scanned_at
-            ) VALUES (?, ?, ?)
+                observation_id, last_scanned_admission_ordinal, data_quality,
+                last_socket_observed_at, last_scanned_at
+            ) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (observation_id) DO UPDATE SET
                 last_scanned_admission_ordinal = GREATEST(
                     gate_shadow_scan_progress.last_scanned_admission_ordinal,
                     EXCLUDED.last_scanned_admission_ordinal
                 ),
+                data_quality = CASE
+                    WHEN array_position(
+                        ARRAY['OK', 'NON_MONOTONIC_SOCKET_TIME', 'MISSING_MARKET_DATA_SESSION_ID',
+                              'MISSING_GEOMETRY_HASH', 'PAYLOAD_DECODE_FAILED'],
+                        EXCLUDED.data_quality
+                    ) >= array_position(
+                        ARRAY['OK', 'NON_MONOTONIC_SOCKET_TIME', 'MISSING_MARKET_DATA_SESSION_ID',
+                              'MISSING_GEOMETRY_HASH', 'PAYLOAD_DECODE_FAILED'],
+                        gate_shadow_scan_progress.data_quality
+                    )
+                    THEN EXCLUDED.data_quality
+                    ELSE gate_shadow_scan_progress.data_quality
+                END,
+                last_socket_observed_at = CASE
+                    WHEN EXCLUDED.last_scanned_admission_ordinal >=
+                        gate_shadow_scan_progress.last_scanned_admission_ordinal
+                    THEN EXCLUDED.last_socket_observed_at
+                    ELSE gate_shadow_scan_progress.last_socket_observed_at
+                END,
                 last_scanned_at = CASE
                     WHEN EXCLUDED.last_scanned_admission_ordinal >=
                         gate_shadow_scan_progress.last_scanned_admission_ordinal
@@ -399,6 +458,7 @@ class ExposedGateShadowRepository(
             WHERE orders.cancel_reason = '${PaperOrderCancelReason.TTL_EXPIRY.wireCode}'
                 AND orders.side = 'BUY'
                 AND orders.order_type IN ('LIMIT', 'STOP')
+                AND orders.canceled_at >= ?
                 AND observations.order_id IS NULL
         """
 
@@ -408,12 +468,27 @@ class ExposedGateShadowRepository(
             JOIN pg_class AS index_relation ON index_relation.oid = index_state.indexrelid
             JOIN pg_namespace AS index_namespace ON index_namespace.oid = index_relation.relnamespace
             JOIN pg_class AS table_relation ON table_relation.oid = index_state.indrelid
+            JOIN pg_am AS access_method ON access_method.oid = index_relation.relam
+            JOIN pg_attribute AS session_attribute
+                ON session_attribute.attrelid = table_relation.oid
+                AND session_attribute.attname = 'session_id'
+                AND NOT session_attribute.attisdropped
+            JOIN pg_attribute AS ordinal_attribute
+                ON ordinal_attribute.attrelid = table_relation.oid
+                AND ordinal_attribute.attname = 'admission_ordinal'
+                AND NOT ordinal_attribute.attisdropped
             WHERE index_namespace.nspname = current_schema()
                 AND table_relation.relname = 'paper_market_event_receipts'
                 AND index_relation.relname = 'idx_paper_market_receipts_session_admission_ordinal'
                 AND index_state.indisvalid
                 AND index_state.indisready
                 AND index_state.indislive
+                AND access_method.amname = 'btree'
+                AND index_state.indpred IS NULL
+                AND index_state.indexprs IS NULL
+                AND index_state.indnkeyatts = 2
+                AND index_state.indkey::text =
+                    session_attribute.attnum::text || ' ' || ordinal_attribute.attnum::text
         """
     }
 }

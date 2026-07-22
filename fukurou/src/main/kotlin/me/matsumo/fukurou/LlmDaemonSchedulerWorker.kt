@@ -233,6 +233,8 @@ private fun createLlmDaemonScheduler(inputs: LlmLaunchRuntimeInputs): LlmDaemonS
             entryFillReader = components.paperLedgerRepository.entryFillReader(),
             restingOrderMaintenanceService = restingMaintenance,
             episodeLifecycleObserver = restingMaintenance,
+            gateShadowRepository = components.tradingRuntime.gateShadowRepository,
+            gateShadowResolver = components.tradingRuntime.gateShadowResolver,
             launchAvailability = createLlmDaemonLaunchAvailability(components.marketDataSource),
         ),
         runtime = LlmDaemonSchedulerRuntime(

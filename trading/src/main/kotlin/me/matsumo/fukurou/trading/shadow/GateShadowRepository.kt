@@ -3,6 +3,8 @@ package me.matsumo.fukurou.trading.shadow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.domain.OrderSide
+import me.matsumo.fukurou.trading.domain.OrderType
 import java.time.Instant
 import java.util.UUID
 
@@ -66,8 +68,11 @@ interface GateShadowRepository {
     /** observation の resolution を返す。 */
     suspend fun findResolution(observationId: UUID): Result<GateShadowResolution?>
 
-    /** TTL 失効の正本に存在し observation がない order 数を返す。 */
-    suspend fun countMissingTtlExpiryObservations(): Result<Long>
+    /**
+     * activation baseline 以降の TTL 失効正本に存在し observation がない order 数を返す。
+     * baseline 未設定時は DB を走査せず null を返す。
+     */
+    suspend fun countMissingTtlExpiryObservations(baseline: Instant?): Result<Long?>
 
     /** receipt の session/admission index が走査可能な状態なら true を返す。 */
     suspend fun isReceiptScanIndexReady(): Result<Boolean>
@@ -132,6 +137,12 @@ class InMemoryGateShadowRepository : GateShadowRepository {
 
                 observationsByOrderId.values
                     .asSequence()
+                    .filter { observation ->
+                        val supportedOrderType = observation.orderType == OrderType.LIMIT ||
+                            observation.orderType == OrderType.STOP
+
+                        observation.side == OrderSide.BUY && supportedOrderType
+                    }
                     .filterNot { observation -> observation.id in resolvedObservationIds }
                     .sortedWith(compareBy(GateShadowObservation::observedAt, GateShadowObservation::id))
                     .take(limit)
@@ -185,8 +196,16 @@ class InMemoryGateShadowRepository : GateShadowRepository {
                 val cursorMovesForward = existing == null ||
                     progress.lastScannedAdmissionOrdinal >= existing.lastScannedAdmissionOrdinal
 
-                if (cursorMovesForward) {
+                if (existing == null) {
                     scanProgressByObservationId[progress.observationId] = progress
+                    return@gateShadowResult
+                }
+
+                val worstDataQuality = worstShadowDataQuality(existing.dataQuality, progress.dataQuality)
+                scanProgressByObservationId[progress.observationId] = if (cursorMovesForward) {
+                    progress.copy(dataQuality = worstDataQuality)
+                } else {
+                    existing.copy(dataQuality = worstDataQuality)
                 }
             }
         }
@@ -214,7 +233,9 @@ class InMemoryGateShadowRepository : GateShadowRepository {
         return mutex.withLock { gateShadowResult { resolutionsByObservationId[observationId] } }
     }
 
-    override suspend fun countMissingTtlExpiryObservations(): Result<Long> = Result.success(0L)
+    override suspend fun countMissingTtlExpiryObservations(baseline: Instant?): Result<Long?> {
+        return Result.success(if (baseline == null) null else 0L)
+    }
 
     override suspend fun isReceiptScanIndexReady(): Result<Boolean> = Result.success(false)
 }

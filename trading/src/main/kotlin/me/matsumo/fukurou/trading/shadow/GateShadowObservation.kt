@@ -37,6 +37,20 @@ enum class ShadowDataQuality {
     NON_MONOTONIC_SOCKET_TIME,
 }
 
+/** 2 つの観測品質から劣化順序が悪い方を返す。 */
+internal fun worstShadowDataQuality(first: ShadowDataQuality, second: ShadowDataQuality): ShadowDataQuality {
+    return if (first.degradationRank >= second.degradationRank) first else second
+}
+
+private val ShadowDataQuality.degradationRank: Int
+    get() = when (this) {
+        ShadowDataQuality.OK -> 0
+        ShadowDataQuality.NON_MONOTONIC_SOCKET_TIME -> 1
+        ShadowDataQuality.MISSING_MARKET_DATA_SESSION_ID -> 2
+        ShadowDataQuality.MISSING_GEOMETRY_HASH -> 3
+        ShadowDataQuality.PAYLOAD_DECODE_FAILED -> 4
+    }
+
 /**
  * TTL 失効した resting entry の geometry と因果境界。
  *
@@ -87,11 +101,15 @@ data class GateShadowObservation(
  *
  * @param observationId observation ID
  * @param lastScannedAdmissionOrdinal 最後に走査した admission ordinal
+ * @param dataQuality 走査済み page で累積した最悪の観測品質
+ * @param lastSocketObservedAt 最後に走査した receipt の socket observed time
  * @param lastScannedAt 最後に cursor を更新した時刻
  */
 data class GateShadowScanProgress(
     val observationId: UUID,
     val lastScannedAdmissionOrdinal: Long,
+    val dataQuality: ShadowDataQuality,
+    val lastSocketObservedAt: Instant?,
     val lastScannedAt: Instant,
 )
 
