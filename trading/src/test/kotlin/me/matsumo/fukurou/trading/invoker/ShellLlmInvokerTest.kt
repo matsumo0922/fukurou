@@ -50,7 +50,7 @@ class ShellLlmInvokerTest {
         )
         val outputParser = LlmOutputParser { _, _, _, _, _ ->
             assertTrue(Files.exists(artifact))
-            ParsedLlmOutput(responseText = "semantic response", usage = null)
+            ParsedLlmOutput(responseText = "semantic response", usage = null, authEvidenceObserved = false)
         }
         val invoker = ShellLlmInvoker(
             commandRenderer = StaticCommandRenderer(command),

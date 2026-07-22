@@ -3424,6 +3424,7 @@ private class RequestCapturingLlmInvoker(
                 request = request,
                 processResult = cleanExit(),
                 responseText = "",
+                authEvidenceObserved = false,
             ),
         )
     }
