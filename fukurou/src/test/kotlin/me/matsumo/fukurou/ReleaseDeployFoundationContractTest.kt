@@ -1,9 +1,5 @@
 package me.matsumo.fukurou
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.Test
@@ -16,250 +12,160 @@ class ReleaseDeployFoundationContractTest {
     private val root = repositoryRoot()
 
     @Test
-    fun `production image publication is gated by exact target quality`() {
+    fun `deploy workflow resolves builds and deploys an immutable digest`() {
         val workflow = Files.readString(root.resolve(".github/workflows/deploy.yml"))
-        val resolver = Files.readString(root.resolve("scripts/deploy/deploy-intent-resolver"))
-        val resolveJob = workflow.substringAfter("\n  resolve:").substringBefore("\n  quality:")
-        val qualityJob = workflow.substringAfter("\n  quality:").substringBefore("\n  build:")
-        val buildJob = workflow.substringAfter("\n  build:").substringBefore("\n  deploy:")
-
-        assertTrue(resolveJob.contains("deploy_sha: \${{ steps.resolve.outputs.deploy_sha }}"))
-        assertTrue(resolveJob.contains("GITHUB_EVENT_NAME"))
-        assertTrue(resolveJob.contains("scripts/deploy/deploy-intent-resolver"))
-        assertTrue(resolver.contains("origin/main"))
-        assertTrue(resolver.contains("AUTHORIZED_ROLLBACK"))
-        assertTrue(resolver.contains("AUTO_IMAGE_ROLLBACK"))
-        assertTrue(resolver.contains("SCHEMA_SENSITIVE_AUTOMATIC_DEPLOY_REQUIRES_MANUAL_REVIEW"))
-        assertFalse(resolveJob.contains("packages: write"))
-
-        assertTrue(qualityJob.contains("needs: resolve"))
-        assertTrue(qualityJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
-        assertTrue(qualityJob.contains("make test"))
-        assertTrue(qualityJob.contains("make detekt"))
-        assertTrue(qualityJob.contains("git diff --exit-code"))
-        assertFalse(qualityJob.contains("packages: write"))
-
-        assertTrue(buildJob.contains("needs: [resolve, quality]"))
-        assertTrue(buildJob.contains("if: always()"))
-        assertTrue(buildJob.contains("needs.resolve.result == 'success'"))
-        assertTrue(buildJob.contains("needs.quality.result == 'success'"))
-        assertFalse(buildJob.contains("needs.quality.result == 'skipped'"))
-        assertFalse(buildJob.contains("requires_quality"))
-        assertTrue(buildJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
-        assertTrue(buildJob.contains("FUKUROU_REVISION=\${{ needs.resolve.outputs.deploy_sha }}"))
-        assertFalse(buildJob.contains("steps.resolve.outputs.deploy_sha"))
-        assertTrue(buildJob.indexOf("Verify exact target checkout") < buildJob.indexOf("Login to GHCR"))
-        assertTrue(buildJob.contains("packages: write"))
-    }
-
-    @Test
-    fun `workflow emits event-derived bundle v2 and requires installed contract v2`() {
-        val workflow = Files.readString(root.resolve(".github/workflows/deploy.yml"))
-        val resolver = Files.readString(root.resolve("scripts/deploy/deploy-intent-resolver"))
+        val resolveJob = workflow.substringAfter("\n  resolve:").substringBefore("\n  build:")
         val buildJob = workflow.substringAfter("\n  build:").substringBefore("\n  deploy:")
         val deployJob = workflow.substringAfter("\n  deploy:")
 
-        assertTrue(workflow.contains("rollback_reason:"))
-        assertTrue(workflow.contains("migration_rollback_mode:"))
-        assertTrue(resolver.contains("workflow_event="))
-        assertTrue(resolver.contains("deploy_intent="))
-        assertTrue(resolver.contains("operator_reason="))
-        assertTrue(resolver.contains("migration_rollback_mode="))
-        assertTrue(resolver.contains("schema_sensitive_paths_sha256="))
-        assertTrue(resolver.contains("SECRET_LIKE_REASON_PATTERN"))
-        assertTrue(buildJob.contains("bundleSchemaVersion:2"))
-        assertTrue(buildJob.contains("minimumContractVersion:2"))
-        assertTrue(buildJob.contains("workflowEvent:${'$'}workflowEvent"))
-        assertTrue(buildJob.contains("deployIntent:${'$'}deployIntent"))
-        assertTrue(buildJob.contains("operatorReason:${'$'}operatorReason"))
-        assertTrue(buildJob.contains("migrationRollbackMode:${'$'}migrationRollbackMode"))
-        assertTrue(buildJob.contains("schemaSensitivePathsSha256:${'$'}schemaSensitivePathsSha256"))
-        assertTrue(deployJob.contains("--print-contract-version") && deployJob.contains("== \"2\""))
-        assertTrue(deployJob.contains("--print-schema-sensitive-paths-sha256"))
+        assertFalse(workflow.contains("\n  quality:"))
+        assertFalse(workflow.contains("rollback_reason:"))
+        assertFalse(workflow.contains("migration_rollback_mode:"))
+        assertFalse(workflow.contains("deploy-intent-resolver"))
+        assertFalse(workflow.contains("deploy-bundle"))
+        assertFalse(workflow.contains("DEPLOY_SIGNING_PRIVATE_KEY"))
+
+        assertTrue(resolveJob.contains("git merge-base --is-ancestor \"\${deploy_sha}\" origin/main"))
+        assertTrue(resolveJob.contains("if [[ \"\${GITHUB_EVENT_NAME}\" == \"push\" ]]"))
+        assertTrue(resolveJob.contains("PRODUCTION_REVISION_URL"))
+        assertTrue(resolveJob.contains("git merge-base --is-ancestor \"\${current_revision}\" \"\${deploy_sha}\""))
+        assertFalse(resolveJob.contains("packages: write"))
+
+        assertTrue(buildJob.contains("needs: resolve"))
+        assertTrue(buildJob.contains("ref: \${{ needs.resolve.outputs.deploy_sha }}"))
+        assertTrue(buildJob.contains("image_digest: \${{ steps.build_push.outputs.digest }}"))
+        assertTrue(buildJob.contains("FUKUROU_REVISION=\${{ needs.resolve.outputs.deploy_sha }}"))
+        assertTrue(buildJob.contains("packages: write"))
+
+        assertTrue(deployJob.contains("--event \"\${{ needs.resolve.outputs.workflow_event }}\""))
+        assertTrue(deployJob.contains("--image-digest \"\${{ needs.build.outputs.image_digest }}\""))
+        assertTrue(deployJob.contains("--deployment-id \"github-\${{ github.run_id }}-\${{ github.run_attempt }}\""))
+        assertFalse(deployJob.contains("--print-contract-version"))
+        assertFalse(deployJob.contains("--print-schema-sensitive-paths-sha256"))
     }
 
     @Test
-    fun `deploy intent resolver closes event reason and early diff cases`() {
-        val process = ProcessBuilder("scripts/deploy/deploy-intent-resolver-selftest")
-            .directory(root.toFile())
-            .redirectErrorStream(true)
-            .start()
-        val output = process.inputStream.bufferedReader().use { it.readText() }
-
-        assertEquals(0, process.waitFor(), output)
-        assertTrue(output.contains("DEPLOY_INTENT_RESOLVER_SELFTEST_OK"), output)
-    }
-
-    @Test
-    fun `bundle schema and executor enforce revision and migration admission v2`() {
-        val schema = Json.parseToJsonElement(
-            Files.readString(root.resolve("scripts/deploy/deploy-bundle.schema.json")),
-        ).jsonObject
-        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
-        val inventory = Files.readAllLines(root.resolve("scripts/deploy/deploy-schema-sensitive-paths-v1.txt"))
-        val requiredFields = schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }
-
-        assertEquals("Fukurou signed deploy bundle v2", schema.getValue("title").jsonPrimitive.content)
-        assertEquals(2, schema.getValue("properties").jsonObject.getValue("bundleSchemaVersion").jsonObject.getValue("const").jsonPrimitive.content.toInt())
-        assertEquals(2, schema.getValue("properties").jsonObject.getValue("minimumContractVersion").jsonObject.getValue("const").jsonPrimitive.content.toInt())
-        assertEquals(
-            4,
-            schema.getValue("allOf").jsonArray.single().jsonObject.getValue("oneOf").jsonArray.size,
-        )
-        assertTrue(
-            requiredFields.containsAll(
-                listOf(
-                    "workflowEvent",
-                    "deployIntent",
-                    "operatorReason",
-                    "migrationRollbackMode",
-                    "schemaSensitivePathsSha256",
-                ),
-            ),
-        )
-        assertTrue(executor.contains("readonly CONTRACT_VERSION=2"))
-        assertTrue(executor.contains("observe_and_admit_deploy"))
-        assertTrue(executor.contains("AUTHORIZED_ROLLBACK"))
-        assertTrue(executor.contains("UNKNOWN_CURRENT_REVISION"))
-        assertTrue(executor.contains("SCHEMA_SENSITIVE_MODE_MISMATCH"))
-        assertTrue(executor.contains("CANDIDATE_ABORTED"))
-        assertTrue(executor.contains("ROLL_FORWARD_ONLY"))
-        assertTrue(inventory.contains("scripts/deploy/sql"))
-        assertTrue(inventory.contains("trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence"))
-    }
-
-    @Test
-    fun `typed operations and hooks remain cumulative and allowlisted`() {
-        val contract = Json.parseToJsonElement(
-            Files.readString(root.resolve("scripts/deploy/deploy-contract-v1.json")),
-        ).jsonObject
-
-        assertEquals(1, contract.getValue("contractVersion").jsonPrimitive.content.toInt())
-        assertEquals(
-            setOf(
-                "CREATE_DIR_V1",
-                "INSTALL_SECRET_REF_V1",
-                "RUN_COMPOSE_PROJECT_V1",
-                "DB_MAINTENANCE_V1",
-                "DB_MIGRATION_V1",
-                "SMOKE_HOOK_V1",
-            ),
-            contract.getValue("requiredCapabilities").jsonArray.map { it.jsonPrimitive.content }.toSet(),
-        )
-        val catalog = Json.parseToJsonElement(
-            Files.readString(root.resolve("scripts/deploy/deploy-capability-catalog-v1.json")),
-        ).jsonObject
-        assertEquals(1, catalog.getValue("catalogVersion").jsonPrimitive.content.toInt())
-        assertTrue(catalog.getValue("operations").jsonArray.size >= 9)
-        assertEquals(
-            listOf("FOUNDATION_PREFLIGHT_V1"),
-            contract.getValue("requiredHooks").jsonArray.map { it.jsonPrimitive.content },
-        )
-        val hooksByIntent = contract.getValue("requiredHooksByIntent").jsonObject
-        assertEquals(
-            listOf("CLI_AUTH_PREFLIGHT_V1", "FOUNDATION_PREFLIGHT_V1"),
-            hooksByIntent.getValue("FORWARD").jsonArray.map { it.jsonPrimitive.content },
-        )
-        assertEquals(
-            listOf("FOUNDATION_PREFLIGHT_V1"),
-            hooksByIntent.getValue("AUTHORIZED_ROLLBACK").jsonArray.map { it.jsonPrimitive.content },
-        )
-    }
-
-    @Test
-    fun `rollback capture precedes every deploy mutation`() {
+    fun `executor keeps a straight digest pinned cutover flow`() {
         val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
         val main = executor.substringAfter("main() {")
-        val capture = main.indexOf("capture_rollback_state")
+        val deployCompose = executor.substringAfter("deploy_compose() {").substringBefore("\n}\n\nmain()")
+        val composeCutover = executor.substringAfter("compose_cutover() {").substringBefore("\n}\n\nrestore_paused_maintenance")
 
-        assertTrue(capture >= 0)
-        assertTrue(capture < main.indexOf("provision_fence_root"))
-        assertTrue(capture < main.indexOf("disable_launches"))
-        assertTrue(capture < main.indexOf("run_candidate_preflight"))
-        assertTrue(capture < main.indexOf("deploy_compose"))
-        val captureBody = executor.substringAfter("capture_rollback_state() {").substringBefore("rollback_on_error() {")
-        assertFalse(captureBody.contains("${'$'}{ENV_FILE}"))
+        assertFalse(executor.contains("--bundle"))
+        assertFalse(executor.contains("--signature"))
+        assertFalse(executor.contains("verify_bundle_signature"))
+        assertFalse(executor.contains("capabilityCatalog"))
+        assertFalse(executor.contains("run_candidate_preflight"))
+        assertFalse(executor.contains("run_cli_acceptance_gate"))
+        assertFalse(executor.contains("recover_unfinished_deployments"))
+        assertFalse(executor.contains("journal_state"))
+
+        assertTrue(main.indexOf("exec 9>") < main.indexOf("authoritative_descendant_check"))
+        assertTrue(main.indexOf("authoritative_descendant_check") < main.indexOf("deploy_compose"))
+        assertTrue(executor.contains("[[ \"\${WORKFLOW_EVENT}\" == \"push\" ]] || return 0"))
+        assertTrue(executor.contains("IMAGE_REFERENCE=\"\${IMAGE_REPOSITORY}@\${CANDIDATE_DIGEST}\""))
+
+        assertTrue(deployCompose.indexOf("pull_candidate") < deployCompose.indexOf("perform_migration"))
+        assertTrue(deployCompose.indexOf("perform_migration") < deployCompose.indexOf("compose_cutover"))
+        assertTrue(composeCutover.indexOf("docker compose") < composeCutover.indexOf("wait_for_health"))
+        assertTrue(composeCutover.indexOf("wait_for_health") < composeCutover.indexOf("verify_running_digest"))
+        assertTrue(composeCutover.indexOf("verify_running_revision") < composeCutover.indexOf("verify_running_digest"))
     }
 
     @Test
-    fun `production compose uses code owned PID one and durable fence`() {
-        val compose = Files.readString(root.resolve("docker-compose.prod.yml"))
+    fun `paused state preserves one maintenance incident until gap close`() {
+        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+        val startPause = executor.substringAfter("start_new_pause() {").substringBefore("\n}\n\nadopt_acknowledged_pause")
+        val adoptPause = executor.substringAfter("adopt_acknowledged_pause() {").substringBefore("\n}\nperform_migration")
+        val completeClose = executor.substringAfter("complete_pending_close() {").substringBefore("\n}\nrecover_healthy_pending_close")
+
+        listOf(
+            "PAUSED_BEFORE_MIGRATION",
+            "MIGRATION_DONE",
+            "CUTOVER_STARTED",
+            "CUTOVER_HEALTHY_PENDING_CLOSE",
+            "ACKNOWLEDGED_FOR_REDEPLOY",
+        ).forEach { phase -> assertTrue(executor.contains(phase)) }
+        assertTrue(executor.contains("--acknowledge-paused-state"))
+        assertTrue(executor.contains("MARKER_INCIDENT_DEPLOYMENT_ID"))
+        assertTrue(executor.contains("MARKER_GAP_ID"))
+        assertTrue(executor.contains("MARKER_MAINTENANCE_GENERATION"))
+
+        assertTrue(startPause.indexOf("persist_paused_state") < startPause.indexOf("request_supervisor DISABLE"))
+        assertTrue(startPause.indexOf("drain_launches") < startPause.indexOf("append_gap_event OPEN"))
+        assertFalse(adoptPause.contains("drain_launches"))
+        assertFalse(adoptPause.contains("request_supervisor DISABLE"))
+        assertTrue(completeClose.indexOf("resume_launches_idempotently") < completeClose.indexOf("close_gap_idempotently"))
+        assertTrue(completeClose.indexOf("close_gap_idempotently") < completeClose.indexOf("clear_paused_state"))
+        assertTrue(executor.contains("running_digest_matches_marker && health_is_currently_ready"))
+        assertTrue(executor.contains("LEGACY_DRAIN_SENTINEL"))
+        assertTrue(executor.contains("legacy_path_is_empty \"\${LEGACY_STATE_ROOT}\""))
+    }
+
+    @Test
+    fun `DB helper marker and deploy backup use the closed interfaces`() {
+        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+        val databaseHelper = Files.readString(root.resolve("scripts/deploy/fukurou-deploy-db"))
+        val backup = Files.readString(root.resolve("scripts/backup/backup-fukurou"))
         val dockerfile = Files.readString(root.resolve("Dockerfile"))
-        val agentLauncher = Files.readString(root.resolve("scripts/runtime/fukurou-llm-agent-launcher.c"))
-        val mcpLauncher = Files.readString(root.resolve("scripts/runtime/fukurou-mcp-launcher.c"))
 
-        assertFalse(compose.contains("init: true"))
-        assertTrue(compose.contains("/srv/fukurou/runtime/launch-fence"))
-        assertTrue(dockerfile.contains("ENTRYPOINT [\"/usr/local/libexec/fukurou-runtime-supervisor\"]"))
-        assertTrue(agentLauncher.contains("fukurou_supervisor_proxy"))
-        assertFalse(agentLauncher.contains("execve(executable"))
-        assertTrue(mcpLauncher.contains("fukurou_supervisor_proxy"))
-        assertFalse(mcpLauncher.contains("execve(\"/opt/java/openjdk/bin/java\""))
+        listOf(
+            "scripts/deploy/fukurou-deploy-db",
+            "scripts/deploy/sql/deploy-foundation-v1-indexes.sql",
+            "scripts/deploy/sql/deploy-foundation-v1.sql",
+            "scripts/deploy/sql/mcp-role.sql",
+        ).forEach { path ->
+            assertTrue(executor.contains(path))
+            assertTrue(databaseHelper.contains(path))
+        }
+        assertTrue(executor.contains("LC_ALL=C sort"))
+        assertTrue(executor.contains("printf '%s\\0%s\\0'"))
+        assertTrue(executor.contains("ROOT_DB_HELPER_INSTALLATION_CHANGED"))
+        assertTrue(executor.contains("CANDIDATE_DB_HELPER_MARKER_MISMATCH"))
+        assertTrue(databaseHelper.contains("write-install-marker"))
+        assertTrue(databaseHelper.contains("sync -f \"\${marker_directory}\""))
+        assertTrue(dockerfile.contains("FROM debian:bookworm-slim AS db-helper-manifest"))
+        assertTrue(dockerfile.contains("/usr/local/share/fukurou/db-helper-manifest.sha256"))
+
+        assertTrue(executor.contains("\"\${BACKUP_HELPER}\" --invoked-by-deploy"))
+        assertTrue(backup.contains("if [[ \"\${1:-}\" == \"--invoked-by-deploy\" ]]"))
+        assertTrue(backup.contains("if [[ \"\${BACKUP_INVOKED_BY_DEPLOY}\" != \"true\" ]]"))
+        assertTrue(backup.contains("backup_probe_deploy_lock"))
     }
 
     @Test
-    fun `candidate preflight uses the same PID one without production credentials`() {
-        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
-        val supervisor = Files.readString(root.resolve("scripts/runtime/fukurou-runtime-supervisor.c"))
-
-        assertTrue(executor.contains("--canary-preflight"))
-        assertTrue(executor.contains("docker compose --env-file"))
-        assertTrue(executor.contains("run --rm --no-deps -T ktor"))
-        assertTrue(executor.contains("internal: true"))
-        assertFalse(executor.contains("docker run --rm --read-only --network none"))
-        assertTrue(executor.contains("FUKUROU_CANDIDATE_DIGEST"))
-        assertFalse(executor.contains("--entrypoint java"))
-        assertTrue(supervisor.contains("run_canary_preflight"))
-        assertTrue(supervisor.contains("DeploymentPreflightMain"))
-        assertTrue(supervisor.contains("CLI_AUTH_PREFLIGHT_V1"))
-        assertTrue(supervisor.contains("strcmp(argv[6], \"cli-auth\")"))
-    }
-
-    @Test
-    fun `foundation uses immutable facts digest cutover and durable recovery`() {
-        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
-        val migration = Files.readString(root.resolve("scripts/deploy/sql/deploy-foundation-v1.sql"))
+    fun `production compose and sudoers keep the existing authority boundary`() {
         val compose = Files.readString(root.resolve("docker-compose.prod.yml"))
-        val main = executor.substringAfter("main() {")
+        val sudoers = Files.readString(root.resolve("scripts/deploy/sudoers-fukurou"))
+        val dockerfile = Files.readString(root.resolve("Dockerfile"))
 
-        assertTrue(migration.contains("infrastructure_gap_events"))
-        assertFalse(migration.contains("UPDATE infrastructure_gap_events"))
-        assertTrue(migration.contains("llm_pid_registrations"))
-        assertTrue(compose.contains("FUKUROU_IMAGE_REFERENCE"))
+        assertTrue(compose.contains("image: \${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}"))
         assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
-        assertFalse(compose.contains("image: ghcr.io/matsumo0922/fukurou:\${FUKUROU_IMAGE_TAG"))
-        assertTrue(executor.contains("MANUAL_RECOVERY_REQUIRED"))
-        assertTrue(executor.contains("maintenance-cas"))
-        assertTrue(executor.contains("CAPABILITY_CATALOG_REDEFINITION_OR_FORK"))
-        assertTrue(executor.contains("FORWARD_DEADLINE_BOOTTIME=\$((DEPLOY_START_BOOTTIME + 1200))"))
-        assertTrue(executor.contains("RECOVERY_LIMIT_BOOTTIME=\$((DEPLOY_START_BOOTTIME + 1500))"))
-        assertTrue(
-            main.substringAfter("recover_unfinished_deployments")
-                .substringBefore("probe_candidate_operations")
-                .contains("start_forward_deadline_watchdog"),
+        assertTrue(dockerfile.contains("ENTRYPOINT [\"/usr/local/libexec/fukurou-runtime-supervisor\"]"))
+        assertEquals(
+            "github-runner ALL=(root) NOPASSWD: /usr/local/sbin/deploy-fukurou",
+            sudoers.lineSequence().first { it.startsWith("github-runner ") },
         )
-        assertTrue(main.indexOf("validate_production_compose") < main.indexOf("capture_rollback_state"))
-        assertTrue(main.indexOf("run_cli_acceptance_gate") < main.indexOf("capture_rollback_state"))
-        assertTrue(executor.contains("FORWARD_DEADLINE_BOOTTIME=\$(( \$(boottime_seconds) + 750 ))"))
-        assertTrue(executor.contains("--cli-acceptance --runs 1"))
-        assertTrue(executor.contains("selftest=false"))
-        assertTrue(executor.contains("legacy_journal_transition_allowed"))
-        assertTrue(executor.contains("load_prepared_gap_event OPEN"))
+        assertFalse(sudoers.contains("docker"))
+        assertFalse(sudoers.contains("/bin/bash"))
+        assertFalse(sudoers.contains("/bin/sh"))
     }
 
     @Test
-    fun `terminal evidence activation is wired into runtime canary and bounded maintenance`() {
-        val application = Files.readString(root.resolve("fukurou/src/main/kotlin/me/matsumo/fukurou/Application.kt"))
-        val canary = Files.readString(root.resolve("scripts/mcp-credential-isolation-check"))
-        val releaseBarrier = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
-
-        assertTrue(application.contains("llmAuditMaintenanceWorker = startLlmAuditMaintenanceWorker("))
-        assertTrue(application.contains("private fun startLlmAuditMaintenanceWorker("))
-        assertTrue(application.contains("ExposedLlmDecisionReconstructionRepository(database)"))
-        assertTrue(application.contains("backgroundWorkers.llmAuditMaintenanceWorker?.let { worker -> worker::close }"))
-        assertTrue(canary.contains("llm_tool_evidence_activation_boundaries"))
-        assertTrue(canary.contains("TERMINAL_BUNDLE_CAPTURED"))
-        assertFalse(releaseBarrier.contains("PREFILTER_ACTIVATION_RELEASED"))
+    fun `retired deploy artifacts are absent`() {
+        listOf(
+            "scripts/deploy/deploy-contract-selftest",
+            "scripts/deploy/deploy-e2e-selftest",
+            "scripts/deploy/deploy-runtime-selftest",
+            "scripts/deploy/deploy-intent-resolver",
+            "scripts/deploy/deploy-intent-resolver-selftest",
+            "scripts/deploy/canary-compose-selftest",
+            "scripts/deploy/deploy-bundle.schema.json",
+            "scripts/deploy/deploy-capability-catalog-v1.json",
+            "scripts/deploy/deploy-contract-v1.json",
+            "scripts/deploy/deploy-public-key.pem",
+            "scripts/deploy/deploy-schema-sensitive-paths-v1.txt",
+        ).forEach { path -> assertFalse(Files.exists(root.resolve(path)), path) }
     }
 }
 

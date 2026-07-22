@@ -10,25 +10,13 @@ on:
         description: "Commit SHA on main to build and deploy. Leave empty to use the workflow ref."
         required: false
         type: string
-      rollback_reason:
-        description: "Required for a historical target or an explicit migration rollback mode (maximum 240 characters)."
-        required: false
-        type: string
-      migration_rollback_mode:
-        description: "Recovery policy reviewed for the exact current-to-target diff."
-        required: true
-        default: AUTO_IMAGE_ROLLBACK
-        type: choice
-        options:
-          - AUTO_IMAGE_ROLLBACK
-          - BACKWARD_COMPATIBLE
-          - ROLL_FORWARD_ONLY
 
 permissions: {}
 
 env:
   IMAGE_REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/matsumo0922/fukurou
+  PRODUCTION_REVISION_URL: https://fukurou.matsumo.me/revision
 
 jobs:
   resolve:
@@ -38,12 +26,7 @@ jobs:
       contents: read
     outputs:
       deploy_sha: ${{ steps.resolve.outputs.deploy_sha }}
-      foundation_sha: ${{ steps.resolve.outputs.foundation_sha }}
       workflow_event: ${{ steps.resolve.outputs.workflow_event }}
-      deploy_intent: ${{ steps.resolve.outputs.deploy_intent }}
-      operator_reason: ${{ steps.resolve.outputs.operator_reason }}
-      migration_rollback_mode: ${{ steps.resolve.outputs.migration_rollback_mode }}
-      schema_sensitive_paths_sha256: ${{ steps.resolve.outputs.schema_sensitive_paths_sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,55 +37,52 @@ jobs:
         id: resolve
         shell: bash
         env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-          INPUT_IMAGE_SHA: ${{ github.event.inputs.image_sha }}
-          INPUT_ROLLBACK_REASON: ${{ github.event.inputs.rollback_reason }}
-          INPUT_MIGRATION_ROLLBACK_MODE: ${{ github.event.inputs.migration_rollback_mode }}
-        run: scripts/deploy/deploy-intent-resolver
-
-  quality:
-    name: Verify JVM quality
-    needs: resolve
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout exact deploy target
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.deploy_sha }}
-
-      - name: Verify exact target checkout
-        shell: bash
-        env:
-          EXPECTED_SHA: ${{ needs.resolve.outputs.deploy_sha }}
+          INPUT_IMAGE_SHA: ${{ inputs.image_sha }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CLOUDFLARED_TUNNEL_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CLOUDFLARED_TUNNEL_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "${EXPECTED_SHA}" ]]
 
-      - name: Set up Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          requested_sha="${INPUT_IMAGE_SHA:-${GITHUB_SHA}}"
+          deploy_sha="$(git rev-parse --verify "${requested_sha}^{commit}")"
+          [[ "${deploy_sha}" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "${deploy_sha}" origin/main
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            # このチェックは fast-fail の最適化に過ぎない。正本の descendant check は
+            # deploy-fukurou が NAS 上の docker state を直接見て行う（外部ネットワークに
+            # 依存しない）。本番 /revision に到達できない場合（＝まさに hotfix push が
+            # 必要な障害時である可能性がある）は、ここでは deploy を止めずスキップする。
+            curl_args=(-fsS --retry 2 --retry-all-errors)
+            if [[ -n "${CF_ACCESS_CLIENT_ID}" && -n "${CF_ACCESS_CLIENT_SECRET}" ]]; then
+              curl_args+=(
+                -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}"
+                -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}"
+              )
+            fi
+            if revision_response="$(curl "${curl_args[@]}" "${PRODUCTION_REVISION_URL}" 2>/dev/null)" &&
+              [[ "${revision_response}" =~ ([0-9a-f]{40}) ]]; then
+              current_revision="${BASH_REMATCH[1]}"
+              if git cat-file -e "${current_revision}^{commit}" 2>/dev/null; then
+                git merge-base --is-ancestor "${current_revision}" "${deploy_sha}" || {
+                  echo "::error::Push target is not a descendant of production revision ${current_revision}"
+                  exit 1
+                }
+              else
+                echo "::warning::Production revision ${current_revision} is not a known commit; skipping fast-fail check"
+              fi
+            else
+              echo "::warning::Production revision endpoint is unavailable; skipping fast-fail check (authoritative check runs on the NAS executor)"
+            fi
+          fi
 
-      - name: Run JVM quality gates
-        env:
-          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-deploy-quality
-        run: |
-          set -euo pipefail
-          make test
-          make detekt
-          git diff --exit-code
+          echo "deploy_sha=${deploy_sha}" >> "${GITHUB_OUTPUT}"
+          echo "workflow_event=${GITHUB_EVENT_NAME}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build image
-    needs: [resolve, quality]
-    if: always() && needs.resolve.result == 'success' && needs.quality.result == 'success'
+    needs: resolve
     runs-on: ubuntu-latest
     concurrency:
       group: fukurou-build-${{ needs.resolve.outputs.deploy_sha }}
@@ -112,8 +92,7 @@ jobs:
       packages: write
     outputs:
       deploy_sha: ${{ needs.resolve.outputs.deploy_sha }}
-      image_name: ${{ env.IMAGE_NAME }}
-      schema_sensitive_paths_sha256: ${{ needs.resolve.outputs.schema_sensitive_paths_sha256 }}
+      image_digest: ${{ steps.build_push.outputs.digest }}
     steps:
       - name: Checkout exact deploy target
         uses: actions/checkout@v4
@@ -168,103 +147,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Checkout current deploy foundation
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          ref: ${{ needs.resolve.outputs.foundation_sha }}
-          path: deploy-foundation-source
-          sparse-checkout: |
-            scripts/deploy
-            scripts/mcp-credential-isolation-check
-
-      - name: Create signed typed deploy bundle
-        shell: bash
-        env:
-          DEPLOY_SIGNING_PRIVATE_KEY: ${{ secrets.DEPLOY_SIGNING_PRIVATE_KEY }}
-          CANDIDATE_DIGEST: ${{ steps.build_push.outputs.digest }}
-          DEPLOY_SHA: ${{ needs.resolve.outputs.deploy_sha }}
-          WORKFLOW_EVENT: ${{ needs.resolve.outputs.workflow_event }}
-          DEPLOY_INTENT: ${{ needs.resolve.outputs.deploy_intent }}
-          OPERATOR_REASON: ${{ needs.resolve.outputs.operator_reason }}
-          MIGRATION_ROLLBACK_MODE: ${{ needs.resolve.outputs.migration_rollback_mode }}
-          SCHEMA_SENSITIVE_PATHS_SHA256: ${{ needs.resolve.outputs.schema_sensitive_paths_sha256 }}
-        run: |
-          set -euo pipefail
-
-          [[ -n "${DEPLOY_SIGNING_PRIVATE_KEY}" ]] || {
-            echo "::error::DEPLOY_SIGNING_PRIVATE_KEY is required"
-            exit 1
-          }
-          [[ "${CANDIDATE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
-
-          install -d -m 0700 deploy-artifact
-          foundation_root=deploy-foundation-source
-          executor_hash="$(sha256sum "${foundation_root}/scripts/deploy/deploy-fukurou" | awk '{print $1}')"
-          foundation_harness_hash="$(sha256sum "${foundation_root}/scripts/mcp-credential-isolation-check" "${foundation_root}/scripts/deploy/sql/mcp-role.sql" | awk '{print $1}' | sha256sum | awk '{print $1}')"
-          public_key_hash="$(sha256sum "${foundation_root}/scripts/deploy/deploy-public-key.pem" | awk '{print $1}')"
-          capability_catalog="$(jq -cS . "${foundation_root}/scripts/deploy/deploy-capability-catalog-v1.json")"
-          catalog_hash="$(printf '%s' "${capability_catalog}" | sha256sum | awk '{print $1}')"
-          inventory="${foundation_root}/scripts/deploy/deploy-schema-sensitive-paths-v1.txt"
-          [[ "$(sha256sum "${inventory}" | awk '{print $1}')" == "${SCHEMA_SENSITIVE_PATHS_SHA256}" ]]
-          install -m 0444 "${inventory}" deploy-artifact/deploy-schema-sensitive-paths-v1.txt
-          deployment_id="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          jq -cS -n \
-            --arg deploymentId "${deployment_id}" \
-            --arg workflowEvent "${WORKFLOW_EVENT}" \
-            --arg deployIntent "${DEPLOY_INTENT}" \
-            --arg operatorReason "${OPERATOR_REASON}" \
-            --arg migrationRollbackMode "${MIGRATION_ROLLBACK_MODE}" \
-            --arg schemaSensitivePathsSha256 "${SCHEMA_SENSITIVE_PATHS_SHA256}" \
-            --arg candidateSha "${DEPLOY_SHA}" \
-            --arg candidateImageDigest "${CANDIDATE_DIGEST}" \
-            --arg executorSha256 "${executor_hash}" \
-            --arg foundationHarnessSha256 "${foundation_harness_hash}" \
-            --arg publicKeySha256 "${public_key_hash}" \
-            --argjson capabilityCatalog "${capability_catalog}" \
-            --arg capabilityCatalogHash "${catalog_hash}" \
-            '{deploymentId:$deploymentId,bundleSchemaVersion:2,workflowEvent:$workflowEvent,
-              deployIntent:$deployIntent,operatorReason:$operatorReason,migrationRollbackMode:$migrationRollbackMode,
-              schemaSensitivePathsSha256:$schemaSensitivePathsSha256,
-              candidateSha:$candidateSha,candidateImageDigest:$candidateImageDigest,
-              minimumContractVersion:2,
-              requiredCapabilities:["CREATE_DIR_V1","DB_MAINTENANCE_V1","DB_MIGRATION_V1","INSTALL_SECRET_REF_V1","RUN_COMPOSE_PROJECT_V1","SMOKE_HOOK_V1"],
-              requiredHooks:(if $deployIntent=="FORWARD" then ["CLI_AUTH_PREFLIGHT_V1","FOUNDATION_PREFLIGHT_V1"] else ["FOUNDATION_PREFLIGHT_V1"] end),
-              capabilityCatalog:$capabilityCatalog,capabilityCatalogHash:$capabilityCatalogHash,
-              executorSha256:$executorSha256,publicKeySha256:$publicKeySha256,foundationHarnessSha256:$foundationHarnessSha256,
-              operations:[
-                {capability:"CREATE_DIR_V1",operationId:"LAUNCH_FENCE_ROOT"},
-                {capability:"INSTALL_SECRET_REF_V1",operationId:"LLM_LAUNCH_SIGNING_KEY_V1"},
-                {capability:"DB_MIGRATION_V1",operationId:"INSTALL_FOUNDATION_V1"},
-                {capability:"DB_MAINTENANCE_V1",operationId:"SET_LAUNCH_MAINTENANCE"},
-                {capability:"DB_MAINTENANCE_V1",operationId:"OPEN_INFRASTRUCTURE_GAP"},
-                (if $deployIntent=="FORWARD" then {capability:"SMOKE_HOOK_V1",operationId:"CLI_AUTH_PREFLIGHT_V1"} else empty end),
-                {capability:"SMOKE_HOOK_V1",operationId:"FOUNDATION_PREFLIGHT_V1"},
-                {capability:"RUN_COMPOSE_PROJECT_V1",operationId:"PRODUCTION"},
-                {capability:"DB_MAINTENANCE_V1",operationId:"CLOSE_INFRASTRUCTURE_GAP"},
-                {capability:"DB_MAINTENANCE_V1",operationId:"CLEAR_LAUNCH_MAINTENANCE"}
-              ]}' > deploy-artifact/deploy-bundle.json
-
-          key_file="$(mktemp)"
-          trap 'shred -u "${key_file}"' EXIT
-          chmod 0600 "${key_file}"
-          printf '%s\n' "${DEPLOY_SIGNING_PRIVATE_KEY}" > "${key_file}"
-          openssl pkeyutl -sign -rawin -inkey "${key_file}" \
-            -in deploy-artifact/deploy-bundle.json \
-            -out deploy-artifact/deploy-bundle.sig
-
-      - name: Upload signed deploy bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-bundle-${{ needs.resolve.outputs.deploy_sha }}
-          path: deploy-artifact/
-          if-no-files-found: error
-          retention-days: 1
-
   deploy:
     name: Deploy on NAS
-    needs: build
+    needs: [resolve, build]
     concurrency:
       group: fukurou-production-deploy
       cancel-in-progress: false
@@ -274,24 +159,10 @@ jobs:
       - fukurou-prod
     permissions: {}
     steps:
-      - name: Download signed deploy bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: deploy-bundle-${{ needs.build.outputs.deploy_sha }}
-          path: deploy-artifact
-
-      - name: Verify installed deploy contract
-        shell: bash
-        env:
-          EXPECTED_SCHEMA_SENSITIVE_PATHS_SHA256: ${{ needs.build.outputs.schema_sensitive_paths_sha256 }}
-        run: |
-          set -euo pipefail
-          [[ "$(sudo /usr/local/sbin/deploy-fukurou --print-contract-version)" == "2" ]]
-          [[ "$(sudo /usr/local/sbin/deploy-fukurou --print-schema-sensitive-paths-sha256)" == "${EXPECTED_SCHEMA_SENSITIVE_PATHS_SHA256}" ]]
-
       - name: Deploy pinned image
         run: >-
           sudo /usr/local/sbin/deploy-fukurou
-          --bundle "${GITHUB_WORKSPACE}/deploy-artifact/deploy-bundle.json"
-          --signature "${GITHUB_WORKSPACE}/deploy-artifact/deploy-bundle.sig"
-          ${{ needs.build.outputs.deploy_sha }}
+          --event "${{ needs.resolve.outputs.workflow_event }}"
+          --image-digest "${{ needs.build.outputs.image_digest }}"
+          --deployment-id "github-${{ github.run_id }}-${{ github.run_attempt }}"
+          "${{ needs.build.outputs.deploy_sha }}"

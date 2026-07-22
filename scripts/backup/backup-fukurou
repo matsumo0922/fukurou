@@ -26,6 +26,7 @@ readonly DUMP_DEADLINE_SECONDS="${FUKUROU_BACKUP_DUMP_DEADLINE_SECONDS:-60}"
 readonly WATCHDOG_TERMINATION_GRACE_SECONDS=5
 readonly POSTGRES_CONTROL_TIMEOUT_SECONDS=5
 
+BACKUP_INVOKED_BY_DEPLOY=false
 ATTEMPT_STARTED_AT=""
 ATTEMPT_STARTED_EPOCH=""
 ATTEMPT_TAG=""
@@ -355,6 +356,10 @@ resolve_authoritative_snapshot() {
 
 run_backup() {
   local candidate_snapshot authoritative_snapshot producer_status restic_status watchdog_result
+  if [[ "${1:-}" == "--invoked-by-deploy" ]]; then
+    BACKUP_INVOKED_BY_DEPLOY=true
+    shift
+  fi
   (( $# == 0 )) || { backup_emit_result INVALID_CONFIGURATION; return 2; }
   ATTEMPT_STARTED_AT="$(backup_now)"
   ATTEMPT_STARTED_EPOCH="$(backup_epoch)"
@@ -372,7 +377,9 @@ run_backup() {
     backup_require_command "${command_name}" || { fail_attempt INVALID_CONFIGURATION; return 1; }
   done
   backup_acquire_shared_lock || { backup_emit_result BACKUP_BUSY; return 1; }
-  backup_probe_deploy_lock || { backup_emit_result DEPLOY_IN_PROGRESS; return 1; }
+  if [[ "${BACKUP_INVOKED_BY_DEPLOY}" != "true" ]]; then
+    backup_probe_deploy_lock || { backup_emit_result DEPLOY_IN_PROGRESS; return 1; }
+  fi
   backup_load_status >/dev/null || { backup_emit_result INVALID_STATUS; return 1; }
   validate_secret_file || { fail_attempt INVALID_CONFIGURATION; return 1; }
   validate_runtime_paths || { fail_attempt INVALID_CONFIGURATION; return 1; }

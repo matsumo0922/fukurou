@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/deploy*.yml"
       - ".env.example"
+      - "Dockerfile"
       - "docker-compose.prod.yml"
       - "scripts/deploy/**"
       - "scripts/backup/**"
@@ -22,7 +23,7 @@ permissions:
 
 jobs:
   deploy-contract:
-    name: Deploy contract and PostgreSQL 16
+    name: Deploy executor and PostgreSQL 16
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -33,24 +34,14 @@ jobs:
         run: >-
           bash -n
           scripts/deploy/deploy-fukurou
-          scripts/deploy/deploy-intent-resolver
-          scripts/deploy/deploy-intent-resolver-selftest
           scripts/deploy/fukurou-deploy-db
-          scripts/deploy/deploy-contract-selftest
-          scripts/deploy/deploy-runtime-selftest
           scripts/deploy/deploy-db-selftest
           scripts/deploy/deploy-postgres-selftest
-          scripts/deploy/canary-compose-selftest
-          scripts/deploy/deploy-e2e-selftest
 
-      - name: Run deploy semantic selftests
+      - name: Run deploy DB selftests
         run: |
-          scripts/deploy/deploy-intent-resolver-selftest
-          scripts/deploy/deploy-contract-selftest
-          scripts/deploy/deploy-runtime-selftest
           scripts/deploy/deploy-db-selftest
           scripts/deploy/deploy-postgres-selftest
-          scripts/deploy/canary-compose-selftest
 
       - name: Install backup validation tools
         run: sudo apt-get update && sudo apt-get install --yes restic

@@ -1,4 +1,0 @@
-scripts/deploy/sql
-scripts/deploy/fukurou-deploy-db
-fukurou/src/main/kotlin/me/matsumo/fukurou/EvaluationReportPersistence.kt
-trading/src/main/kotlin/me/matsumo/fukurou/trading/persistence

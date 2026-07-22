@@ -3,14 +3,22 @@ set -Eeuo pipefail
 
 readonly SELFTEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
-touch "${SELFTEST_ROOT}/foundation.sql" "${SELFTEST_ROOT}/indexes.sql"
+touch "${SELFTEST_ROOT}/foundation.sql" "${SELFTEST_ROOT}/indexes.sql" "${SELFTEST_ROOT}/mcp-role.sql"
 export FUKUROU_FOUNDATION_SQL="${SELFTEST_ROOT}/foundation.sql"
 export FUKUROU_FOUNDATION_INDEX_SQL="${SELFTEST_ROOT}/indexes.sql"
+export FUKUROU_MCP_ROLE_SQL="${SELFTEST_ROOT}/mcp-role.sql"
+export FUKUROU_DEPLOY_DB_HELPER_SOURCE="$(dirname "$0")/fukurou-deploy-db"
 export FUKUROU_MCP_DB_USER=fukurou_mcp_fixture
 
 # shellcheck source=fukurou-deploy-db
 source "$(dirname "$0")/fukurou-deploy-db"
 grep -Fq 'command timeout --foreground --signal=TERM --kill-after=5' < <(declare -f psql_exec_impl)
+
+initial_manifest="$(calculate_db_helper_manifest)"
+[[ "${initial_manifest}" =~ ^[0-9a-f]{64}$ ]]
+[[ "$(calculate_db_helper_manifest)" == "${initial_manifest}" ]]
+printf 'changed\n' >"${SELFTEST_ROOT}/mcp-role.sql"
+[[ "$(calculate_db_helper_manifest)" != "${initial_manifest}" ]]
 
 MODE=PRE_FOUNDATION
 LAST_PSQL_ARGS="${SELFTEST_ROOT}/psql-args"
@@ -76,4 +84,4 @@ runtime_snapshot="$(snapshot)"
 grep -Fq "c.relkind::text" "${LAST_SNAPSHOT_QUERY}"
 grep -Fxq -- '-Atq' "${LAST_PSQL_ARGS}"
 
-echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact snapshots=pre-foundation,foundation-v1,runtime-config"
+echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact manifest=deterministic-change-sensitive snapshots=pre-foundation,foundation-v1,runtime-config"

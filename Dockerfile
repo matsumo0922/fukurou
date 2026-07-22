@@ -40,6 +40,29 @@ RUN gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-llm-agent-launcher fukurou
     && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-mcp-launcher fukurou-mcp-launcher.c \
     && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-runtime-supervisor fukurou-runtime-supervisor.c -lcrypto
 
+FROM debian:bookworm-slim AS db-helper-manifest
+WORKDIR /src
+COPY scripts/deploy/fukurou-deploy-db scripts/deploy/fukurou-deploy-db
+COPY scripts/deploy/sql/deploy-foundation-v1-indexes.sql scripts/deploy/sql/deploy-foundation-v1-indexes.sql
+COPY scripts/deploy/sql/deploy-foundation-v1.sql scripts/deploy/sql/deploy-foundation-v1.sql
+COPY scripts/deploy/sql/mcp-role.sql scripts/deploy/sql/mcp-role.sql
+# このファイル集合は scripts/deploy/deploy-fukurou の db_helper_manifest_entries() と
+# scripts/deploy/fukurou-deploy-db の db_helper_manifest_entries() の一覧に一致させること
+# （NAS root install 側は個別ファイル配置で scripts/deploy/sql/ ディレクトリを持たないため、
+#   3箇所とも動的 find ではなく同じ固定リストを使う）。SQL を追加/削除する場合は3箇所を同時に更新する。
+RUN { \
+      printf '%s\n' scripts/deploy/fukurou-deploy-db; \
+      printf '%s\n' scripts/deploy/sql/deploy-foundation-v1-indexes.sql; \
+      printf '%s\n' scripts/deploy/sql/deploy-foundation-v1.sql; \
+      printf '%s\n' scripts/deploy/sql/mcp-role.sql; \
+    } \
+    | LC_ALL=C sort \
+    | while IFS= read -r path; do \
+        printf '%s\0%s\0' "${path}" "$(sha256sum "${path}" | awk '{print $1}')"; \
+      done \
+    | sha256sum \
+    | awk '{print $1}' > /db-helper-manifest.sha256
+
 # ---- runtime stage: 実行は軽量 JRE のみ ----
 FROM eclipse-temurin:21-jre AS runtime
 WORKDIR /app
@@ -65,6 +88,7 @@ RUN apt-get update \
 COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-llm-agent-launcher /usr/local/libexec/fukurou-llm-agent-launcher
 COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-mcp-launcher /usr/local/libexec/fukurou-mcp-launcher
 COPY --from=launcher-build --chown=root:root --chmod=0555 /src/fukurou-runtime-supervisor /usr/local/libexec/fukurou-runtime-supervisor
+COPY --from=db-helper-manifest --chown=root:root --chmod=0444 /db-helper-manifest.sha256 /usr/local/share/fukurou/db-helper-manifest.sha256
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-canary-client.mjs /usr/local/libexec/fukurou-mcp-canary-client.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-cli-canary-mcp.mjs /usr/local/libexec/fukurou-cli-canary-mcp.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/validate-llm-launcher-probe.mjs /usr/local/libexec/validate-llm-launcher-probe.mjs

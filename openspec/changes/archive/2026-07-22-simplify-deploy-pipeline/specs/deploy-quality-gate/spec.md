@@ -1,12 +1,9 @@
-# deploy-quality-gate Specification
-
-## Purpose
-
-Production image publication is gated by JVM tests, static analysis, and exact target identity while preserving the explicit historical rollback path.
-
-## Requirements
+## REMOVED Requirements
 
 ### Requirement: Target commit quality gates image publication
+**Reason**: JVM quality gating moves from deploy-time to PR-time. Stage 1（`add-pr-ci-workflow` change、`pr-quality-gate` capability）が `make test`/`make detekt` を pull_request で実行するため、deploy.yml が main マージ後に再度品質ゲートを行う必要がなくなった。owner の要求（main マージ = 承認）により、マージ済みコミットは無条件でデプロイされる
+**Migration**: PR 時点の quality gate は `pr-quality-gate` capability（Stage 1）が担う。deploy 時点の quality gate は存在しなくなる
+
 Issue #190 CI DoD stage 1: For automatic main pushes and a workflow_dispatch target equal to the resolved `origin/main` tip, the deploy workflow MUST run the repository JVM test suite and detekt against the exact resolved target commit. It MUST NOT authenticate to GHCR, build or push a production image, create a deploy bundle, or start production deployment until both quality commands and the clean-tree check succeed. Deploy-gated fixtures MUST exercise Linux supervisor semantics on Linux CI and MUST exercise platform-independent gateway path semantics on Linux CI and supported macOS development environments. A platform capability skip MUST NOT be reported as executed contract evidence.
 
 #### Scenario: Push target passes quality
@@ -50,6 +47,9 @@ Issue #190 CI DoD stage 1: For automatic main pushes and a workflow_dispatch tar
 - **AND** JDBC transport timeout を成功条件にしない
 
 ### Requirement: Historical manual rollback remains available until explicit intent exists
+**Reason**: この Requirement は署名 intent（`AUTHORIZED_ROLLBACK`）導入前の一時的な移行措置だった。`deploy-revision-safety` の signed deploy intent 自体を撤去するため、この一時例外も意味を失う
+**Migration**: rollback は `deploy-pipeline-baseline` capability の「過去 SHA を workflow_dispatch で指定して再デプロイする」という素朴な運用に置き換わる。historical/latest の区別や quality gate のスキップ判定は行わない（quality gate 自体が deploy.yml から撤去されるため）
+
 Stage 1 MUST preserve the existing workflow_dispatch recovery path for a target SHA older than the resolved `origin/main` tip. Such a historical manual target SHALL skip this stage's quality job and MAY build/deploy only through an explicit closed dependency condition. This temporary exception MUST NOT apply to automatic pushes or the latest main target and SHALL be replaced by signed `AUTHORIZED_ROLLBACK` intent in stage 2.
 
 #### Scenario: Historical main target is selected manually
@@ -65,6 +65,9 @@ Stage 1 MUST preserve the existing workflow_dispatch recovery path for a target 
 - **THEN** build remains blocked and cannot use the historical rollback exception
 
 ### Requirement: Quality jobs retain least privilege
+**Reason**: deploy.yml から quality job 自体が撤去されるため、その権限境界を定義するこの Requirement は対象を失う
+**Migration**: `pr-quality-gate`（Stage 1）が同等の least-privilege 制約（`contents: read` のみ、パッケージ公開・NAS executor 起動権限なし）を PR 時点の quality gate に対して持つ
+
 The resolved-SHA and quality jobs MUST have no package-write or production-runner authority. The image build job SHALL retain package publication authority and MUST depend explicitly on successful resolved-SHA and quality jobs.
 
 #### Scenario: Quality executes on GitHub-hosted runner
@@ -76,6 +79,9 @@ The resolved-SHA and quality jobs MUST have no package-write or production-runne
 - **THEN** the image build job has explicit dependencies on both target resolution and quality success
 
 ### Requirement: Existing deploy authority remains unchanged
+**Reason**: この Requirement が保護していた「署名 bundle・immutable image identity・self-hosted deploy 直列化・installed root executor contract・post-deploy 検証/recovery」のうち、署名 bundle と root executor contract（v2）は本 change で撤去する。immutable image identity と self-hosted deploy 直列化は `deploy-pipeline-baseline` に引き継ぐが、post-deploy recovery は journal state machine ごと撤去するため同一の保証は持たない
+**Migration**: `deploy-pipeline-baseline` capability が simple executor の post-deploy health 確認（`/health/live`・`/health/ready`・`/revision` の確認）を定義する。recovery は自動化せず、再デプロイという手動運用に委ねる
+
 This stage MUST preserve the signed bundle fields, immutable image identity, self-hosted deploy serialization, installed root executor contract, and existing post-deploy verification/recovery behavior.
 
 #### Scenario: Quality succeeds and deploy continues
