@@ -2,8 +2,12 @@
 
 # Sourced by the root-only backup and restore entrypoints.
 
-readonly BACKUP_SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly BACKUP_SHARE_DIRECTORY="${FUKUROU_BACKUP_SHARE_DIRECTORY:-${BACKUP_SCRIPT_DIRECTORY}}"
+# install-fukurou-backup は backup-status.schema.json 等の SHARE_ARTIFACTS を
+# /usr/local/share/fukurou へ配置する（backup-fukurou 等の LIBEXEC_ARTIFACTS とは別ディレクトリ）。
+# デフォルトを script 自身のディレクトリにすると、systemd unit の
+# FUKUROU_BACKUP_SHARE_DIRECTORY 明示指定に頼らない呼び出し（deploy-fukurou からの
+# 直接呼び出し等）でこれらのファイルが見つからずINVALID_CONFIGURATIONになる。
+readonly BACKUP_SHARE_DIRECTORY="${FUKUROU_BACKUP_SHARE_DIRECTORY:-/usr/local/share/fukurou}"
 readonly BACKUP_RESULT_CODES_FILE="${FUKUROU_BACKUP_RESULT_CODES_FILE:-${BACKUP_SHARE_DIRECTORY}/backup-result-codes-v1.txt}"
 readonly BACKUP_STATUS_SCHEMA="${FUKUROU_BACKUP_STATUS_SCHEMA:-${BACKUP_SHARE_DIRECTORY}/backup-status.schema.json}"
 readonly BACKUP_STATUS_FILE="${FUKUROU_BACKUP_STATUS_FILE:-/srv/fukurou/monitoring/backup-status.json}"
