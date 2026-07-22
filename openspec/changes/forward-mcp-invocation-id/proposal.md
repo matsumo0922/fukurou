@@ -21,4 +21,5 @@
 
 - `trading/src/main/kotlin/me/matsumo/fukurou/trading/runner/OneShotLlmRunner.kt`（`mcpServerConfig()`）
 - `trading/src/test/kotlin/me/matsumo/fukurou/trading/runner/OneShotLlmRunnerTest.kt`（回帰テスト追加）
+- `docs/mcp-runtime.md`（Codex MCP config の env 転送挙動を追記）
 - 対象外: fd 3/4/5 経路、C launcher (`scripts/runtime/fukurou-mcp-launcher.c`)、supervisor、Claude 経路（既に env allowlist に含まれ対象外）、`CliAcceptanceCanaryMain.kt` / `McpIsolationCanaryArtifacts.kt` 等の他の Codex MCP config 構築箇所（falsify で確認済み: `forwardedEnvironmentVariables` 未設定のままで、本 issue のスコープ外）
