@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.shadow.GateShadowObservation
 import me.matsumo.fukurou.trading.shadow.GateShadowOutcome
+import me.matsumo.fukurou.trading.shadow.GateShadowReceipt
 import me.matsumo.fukurou.trading.shadow.GateShadowRepository
 import me.matsumo.fukurou.trading.shadow.GateShadowResolution
 import me.matsumo.fukurou.trading.shadow.GateShadowScanProgress
@@ -27,6 +28,7 @@ import java.util.UUID
  *
  * 各メソッドは独立 transaction で動作し、ledger transaction に参加しない。
  */
+@Suppress("TooManyFunctions")
 class ExposedGateShadowRepository(
     private val database: Database,
 ) : GateShadowRepository {
@@ -45,6 +47,53 @@ class ExposedGateShadowRepository(
             jdbcConnection().prepareStatement(SELECT_OBSERVATION_BY_ORDER_ID_SQL).use { statement ->
                 statement.setObject(1, orderId)
                 statement.executeQuery().use { rows -> if (rows.next()) rows.toObservation() else null }
+            }
+        }
+    }
+
+    override suspend fun findUnresolvedObservations(limit: Int): Result<List<GateShadowObservation>> {
+        return readResult {
+            require(limit > 0) { "Gate-shadow observation limit must be positive." }
+
+            jdbcConnection().prepareStatement(SELECT_UNRESOLVED_OBSERVATIONS_SQL).use { statement ->
+                statement.setInt(1, limit)
+                statement.executeQuery().use { rows -> rows.mapRows { row -> row.toObservation() } }
+            }
+        }
+    }
+
+    override suspend fun scanReceipts(
+        sessionId: UUID,
+        startAdmissionOrdinal: Long,
+        windowStartTime: Instant,
+        windowEndTime: Instant,
+        cursorOrdinal: Long,
+        limit: Int,
+    ): Result<List<GateShadowReceipt>> {
+        return readResult {
+            require(limit > 0) { "Gate-shadow receipt limit must be positive." }
+            require(windowEndTime >= windowStartTime) { "Gate-shadow receipt window must not be negative." }
+
+            jdbcConnection().prepareStatement(SCAN_RECEIPTS_SQL).use { statement ->
+                statement.setObject(1, sessionId)
+                statement.setLong(2, startAdmissionOrdinal)
+                statement.setLong(3, cursorOrdinal)
+                statement.setLong(4, windowStartTime.toEpochMilli())
+                statement.setLong(5, windowEndTime.toEpochMilli())
+                statement.setInt(6, limit)
+                statement.executeQuery().use { rows -> rows.mapRows { row -> row.toReceipt() } }
+            }
+        }
+    }
+
+    override suspend fun findSessionAdmissionHighWatermark(sessionId: UUID): Result<Long> {
+        return readResult {
+            jdbcConnection().prepareStatement(SELECT_SESSION_ADMISSION_HIGH_WATERMARK_SQL).use { statement ->
+                statement.setObject(1, sessionId)
+                statement.executeQuery().use { rows ->
+                    check(rows.next()) { "Gate-shadow session admission high-watermark was not returned." }
+                    rows.getLong(1)
+                }
             }
         }
     }
@@ -185,6 +234,26 @@ class ExposedGateShadowRepository(
         if (value == null) setNull(index, Types.NUMERIC) else setBigDecimal(index, value)
     }
 
+    private fun <T> ResultSet.mapRows(transform: (ResultSet) -> T): List<T> {
+        val values = mutableListOf<T>()
+
+        while (next()) {
+            values += transform(this)
+        }
+
+        return values
+    }
+
+    private fun ResultSet.toReceipt(): GateShadowReceipt {
+        return GateShadowReceipt(
+            sessionId = getObject("session_id", UUID::class.java),
+            admissionOrdinal = getLong("admission_ordinal"),
+            socketObservedAt = Instant.ofEpochMilli(getLong("socket_observed_at")),
+            sourceSequence = getLong("source_sequence"),
+            normalizedPayload = getString("normalized_payload"),
+        )
+    }
+
     private fun ResultSet.toObservation(): GateShadowObservation {
         return GateShadowObservation(
             id = getObject("id", UUID::class.java),
@@ -245,6 +314,33 @@ class ExposedGateShadowRepository(
 
         const val SELECT_OBSERVATION_BY_ORDER_ID_SQL = """
             SELECT * FROM gate_shadow_observations WHERE order_id = ?
+        """
+
+        const val SELECT_UNRESOLVED_OBSERVATIONS_SQL = """
+            SELECT observations.*
+            FROM gate_shadow_observations AS observations
+            LEFT JOIN gate_shadow_resolutions AS resolutions
+                ON resolutions.observation_id = observations.id
+            WHERE resolutions.observation_id IS NULL
+            ORDER BY observations.observed_at, observations.id
+            LIMIT ?
+        """
+
+        const val SCAN_RECEIPTS_SQL = """
+            SELECT session_id, admission_ordinal, socket_observed_at, source_sequence, normalized_payload
+            FROM paper_market_event_receipts
+            WHERE session_id = ?
+                AND admission_ordinal > GREATEST(?, ?)
+                AND socket_observed_at >= ?
+                AND socket_observed_at <= ?
+            ORDER BY admission_ordinal
+            LIMIT ?
+        """
+
+        const val SELECT_SESSION_ADMISSION_HIGH_WATERMARK_SQL = """
+            SELECT COALESCE(MAX(admission_ordinal), 0)
+            FROM paper_market_event_receipts
+            WHERE session_id = ?
         """
 
         const val UPSERT_SCAN_PROGRESS_SQL = """
