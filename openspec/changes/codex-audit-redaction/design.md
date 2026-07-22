@@ -97,7 +97,15 @@ issue #282 の実際の production 障害は `failureCategory=OUTPUT_CONTRACT, p
 `OUTPUT_CONTRACT` を安全に公開するには、parser が primary category と独立に「認証 evidence を観測したか」を追跡する仕組みが必要であり、`DefaultLlmOutputParser` と `LlmProviderFailure` モデルの拡張を伴う、本 PR のスコープを超える変更になる。ユーザー確認の上、今回は次の理由でこの変更を見送り、別 issue（follow-up）に切り出す。
 
 - 実装コストとレビュー負荷が本 issue の受け入れ条件に対して不釣り合いに大きい
-- 本 PR は `PROCESS_EXIT`/`PROCESS_TIMEOUT`/`CLEANUP` という別クラスの診断可能性ギャップ（例: プロセスが起動さえできず即座に非ゼロ終了するケース）を安全に改善するという、独立した価値を持つ
+- 本 PR は `PROCESS_EXIT`/`PROCESS_TIMEOUT`/`CLEANUP` という別クラスの診断可能性ギャップを安全に改善するという、独立した価値を持つ
+
+### レビューで判明した実効範囲の訂正（reviewer 指摘）
+
+当初、本 PR の価値を「プロセスが起動さえできず即座に非ゼロ終了するケース（launcher 起動失敗等）を診断可能にする」と説明していたが、これは誤りだった。`DefaultLlmOutputParser.parseCodex()` は、有効な JSONL イベントを一切生成できない起動失敗（stdout が空・非 JSON 等）を `schemaDrift` 経由で `OUTPUT_CONTRACT` に分類する。`OUTPUT_CONTRACT` は除外カテゴリのままなので、**launcher 起動失敗のような「一度も成功 turn を生成できない」失敗は、本 PR 後も引き続き診断できない**。
+
+`isSafeCodexLifecycleFailure()` が実際に成立しうるのは、`invocationResult.providerFailure == null`（= `successfulContractComplete` が成立、つまり `thread.started`/`item.completed`/`turn.completed` が揃った**完全な成功 turn**）が先に確定した上で、**その後**の process 終了処理が非ゼロ終了・timeout・cleanup 例外のいずれかになった場合だけである。つまり本 PR が実際に診断可能にするのは「会話 turn 自体は完走したが、teardown/終了処理レベルで失敗した」という、当初の想定より狭いクラスの障害である。
+
+タスク・テスト（`LlmInvocationAuditorTest.kt`）はこの実効範囲に合わせて、stdout に完全な成功 event stream を伴う fixture に修正済み。
 
 ## Risks / Trade-offs
 
