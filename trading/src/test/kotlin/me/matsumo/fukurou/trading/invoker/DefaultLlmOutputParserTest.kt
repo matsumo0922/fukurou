@@ -261,6 +261,124 @@ class DefaultLlmOutputParserTest {
     }
 
     @Test
+    fun parseCodex_tracksAuthEvidenceFromTurnFailedMessageEvenWhenAnEarlierEventDeterminesTheCategory() {
+        val thread = """{"type":"thread.started","thread_id":"thread-evidence"}"""
+        // 先行する error event が providerCategory を RATE_OR_SESSION_LIMIT に確定させる（first-win）。
+        // 後続の turn.failed の message は AUTHENTICATION に分類されるが、first-win では category を
+        // 上書きしない。authEvidenceObserved はそれとは独立に true になるべき
+        val stdout = """
+            $thread
+            {"type":"error","message":"Session limit reached"}
+            {"type":"turn.failed","error":{"message":"Not logged in"}}
+        """.trimIndent()
+
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-evidence-turn-failed-test")),
+            processResult(stdout, exitCode = 1),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertEquals(LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT, output.providerFailure?.category)
+        assertEquals(true, output.authEvidenceObserved)
+    }
+
+    @Test
+    fun parseCodex_tracksAuthEvidenceFromErrorEventMessageEvenWhenAnEarlierEventDeterminesTheCategory() {
+        val thread = """{"type":"thread.started","thread_id":"thread-evidence"}"""
+        // 先行する error event が providerCategory を QUOTA_EXHAUSTED に確定させる（first-win）。
+        // 後続の error の message は AUTHENTICATION に分類されるが、first-win では category を
+        // 上書きしない。authEvidenceObserved はそれとは独立に true になるべき
+        val stdout = """
+            $thread
+            {"type":"error","message":"Quota exhausted"}
+            {"type":"error","message":"Invalid authentication credentials"}
+            {"type":"turn.failed","error":{"message":"turn failed"}}
+        """.trimIndent()
+
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-evidence-error-test")),
+            processResult(stdout, exitCode = 1),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertEquals(LlmProviderFailureCategory.QUOTA_EXHAUSTED, output.providerFailure?.category)
+        assertEquals(true, output.authEvidenceObserved)
+    }
+
+    @Test
+    fun parseCodex_tracksAuthEvidenceFromStderrAlongsideACompleteSuccessfulEventStream() {
+        val stdout = """
+            {"type":"thread.started","thread_id":"thread-evidence"}
+            {"type":"item.completed","item":{"type":"agent_message","text":"final response"}}
+            {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+        """.trimIndent()
+
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-evidence-success-stream-test")),
+            processResult(stdout, exitCode = 0).copy(stderr = "Not logged in"),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertNull(output.providerFailure)
+        assertEquals(true, output.authEvidenceObserved)
+    }
+
+    @Test
+    fun parseCodex_doesNotObserveAuthEvidenceForSchemaDriftWithNoKnownAuthText() {
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-evidence-schema-drift-no-evidence-test")),
+            processResult("mcp handshake failed: unexpected token at position 0", exitCode = 1)
+                .copy(stderr = "codex: failed to initialize MCP server"),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertEquals(LlmProviderFailureCategory.OUTPUT_CONTRACT, output.providerFailure?.category)
+        assertEquals(false, output.authEvidenceObserved)
+    }
+
+    @Test
+    fun parseCodex_observesAuthEvidenceForSchemaDriftWhenStdoutCarriesAShortKnownAuthText() {
+        // "Not logged in" は CODEX_STDERR_AUTH_FAILURES の2長文とは異なる、
+        // knownCompatibilityFailureCategory() 由来の短い既知文言（Finding 1 の回帰防止）
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-evidence-schema-drift-stdout-evidence-test")),
+            processResult("Not logged in - mcp handshake failed: unexpected token", exitCode = 1),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertEquals(LlmProviderFailureCategory.OUTPUT_CONTRACT, output.providerFailure?.category)
+        assertEquals(true, output.authEvidenceObserved)
+    }
+
+    @Test
+    fun parseCodex_observesAuthEvidenceWhenOnlyStderrCarriesAKnownAuthTextAlongsideUnrelatedStdoutGarbage() {
+        // exitCode=0 にすることで、旧来の stderrAuthFailure（exitCode!=0 前提の完全一致判定）を
+        // 経由しない形で、新設の evidence 追跡（stdout/stderr 全文への .contains() 検査）が
+        // 単独で authEvidenceObserved を true にすることを確認する
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-evidence-stderr-only-test")),
+            processResult("unrelated diagnostic garbage", exitCode = 0)
+                .copy(stderr = CODEX_STDERR_AUTH_FAILURES.first()),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertEquals(LlmProviderFailureCategory.OUTPUT_CONTRACT, output.providerFailure?.category)
+        assertEquals(true, output.authEvidenceObserved)
+    }
+
+    @Test
     fun parseClaudeMapsSupportedStructuredFailureCodes() {
         val cases = mapOf(
             "authentication_error" to LlmProviderFailureCategory.AUTHENTICATION,
