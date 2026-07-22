@@ -54,11 +54,13 @@
 
 - [ ] 7.1 `daemon/LlmDaemonScheduler.tickUnsafe` に resolver を配線する。`launchEnabled=false` の早期 return（`:274`）**より前**に置く（shadow は分析であり launch 無効時も走る）。tick は既定 1 分
 - [ ] 7.2 `horizon`（既定 24 時間）と `settlementGrace`（既定 300 秒）を config 化する
-- [ ] 7.3 resolver 呼び出しを tick 全体の失敗から隔離する。1 tick の作業に **wall-time 予算 + DB statement / lock / connection 取得 timeout** を課す（row 上限だけでは DB 待ちを bound できない、design.md D8）。予算超過・timeout 時は cursor を壊さず pending のまま fail-open、次 tick へ
-- [ ] 7.4 receipts の複合 index（1.3）が未完成の間は resolver を default-off にする（capture は動いてよい）。**（falsify F5）** ready 判定は index 名と `indisvalid/indisready/indislive` だけでなく `pg_index.indkey` の列定義（`session_id, admission_ordinal`）まで確認し、同名・別定義の index で誤って有効化しない
-- [ ] 7.5 **（falsify F4）** reconciliation に導入時刻の下界（`canceled_at >= baseline`）を渡し、deploy 前の TTL 失効を capture 欠落として計上しない。baseline は config または初回 observation 時刻から決める
+- [ ] 7.3 resolver 呼び出しを tick 全体の失敗から隔離する。1 tick の作業に **wall-time 予算 + DB statement / lock / connection 取得 timeout** を課す（row 上限だけでは DB 待ちを bound できない、design.md D8）。予算超過・timeout 時は cursor を壊さず pending のまま fail-open、次 tick へ。**（falsify V3/V5）** index ready probe と `resolver.observe` を同一 fail-open catch boundary に入れ（probe の failure も shadow-disabled 扱い、`CancellationException` は再throw）、JDBC `socketTimeout`（driver read timeout）を resolver の DB 呼び出しに設定する（coroutine timeout は blocking JDBC read を止めないため）。cursor・累積 data_quality・last socket time は同一 atomic upsert で進める
+- [ ] 7.4 receipts の複合 index（1.3）が未完成の間は resolver を default-off にする（capture は動いてよい）。**（falsify F5 + V1/V5）** ready 判定は index 名 + `indisvalid/indisready/indislive` + `pg_index.indkey` の列定義（`session_id, admission_ordinal`）に加え、`pg_am.amname='btree'`・`indpred IS NULL`（非 partial）・`indexprs IS NULL`（非 expression）・`indnkeyatts=2` まで確認し、hash/partial/expression の同名 index で誤活性しない（range scan 不能で seq scan になるため）
+- [ ] 7.5 **（falsify F4 + V1/V2）** reconciliation に導入時刻の下界（`canceled_at >= baseline`）を渡し、deploy 前の TTL 失効を capture 欠落として計上しない。baseline は **capture 開始以前に確定した immutable な activation timestamp**（明示 config を deploy で固定、または専用 boundary row）に限定し、**「初回 observation 時刻」fallback は使わない**（activation 後・初回保存前の欠落を隠すため）。baseline 未設定なら「未確定」を明示し 0 と誤計上しない
+- [ ] 7.6 **（PR-3 adversary B1）** `gate_shadow_scan_progress` に `data_quality`（累積・劣化方向）と `last_socket_observed_at` を追加（`TradingTables.kt` / `restore-inventory-v1.txt` / Exposed の upsert・select / `GateShadowScanProgress` / InMemory）。resolver は tick 開始時に progress から復元して `scanForCrossing` の起点にし、pending 時に累積 data_quality + last socket time を保存、読み切り時に累積 data_quality で resolution 確定（design.md D9、劣化順序 `OK < NON_MONOTONIC < MISSING_* < DECODE_FAILED` で最悪値を保持）
+- [ ] 7.7 **（PR-3 adversary B2）** `findUnresolvedObservations` の SQL に `order_type IN ('LIMIT','STOP') AND side='BUY'` を課す（Exposed / InMemory 両方。head-of-line blocking を構造的に防ぐ）
 
-## 8. PR-3 / テスト（resolver correctness。8.2/8.10 は daemon 経路のため PR-4）
+## 8. PR-4 / テスト（PR-3 未了の resolver correctness + activation 経路 + adversary B3）
 
 - [ ] 8.1 **DoD**: 因果境界以前（`admission_ordinal <= start_admission_ordinal`）の event が分類に使われないこと。別 session の event も使われないこと
 - [ ] 8.2 **（PR-4・DoD）**: shadow の resolution 書き込みが cash / position / strategy PnL を変更しないこと
@@ -71,12 +73,15 @@
 - [ ] 8.9 並行に `UNKNOWN` と `CROSSED` を書いても `CROSSED` が残ること（CROSSED-wins）
 - [ ] 8.10 **（PR-4）** resolver が wall-time 予算を超過しても pending のまま打ち切られ、launch を妨げないこと
 - [ ] 8.11 resolution / scan-progress の往復テスト（Exposed）
+- [ ] 8.12 **（PR-3 adversary B3）** read 上限の複数 tick 分割走査で、前 page の `PAYLOAD_DECODE_FAILED` が後続 page へ持ち越され、読み切り時の UNKNOWN が `data_quality=PAYLOAD_DECODE_FAILED` になること（page 跨ぎで data_quality を失わない）
+- [ ] 8.13 **（PR-3 adversary B3）** settle 前は走査されず `gate_shadow_scan_progress` も書かれないこと（resolution=null だけでなく cursor 未書き込みも検査）
+- [ ] 8.14 **（PR-3 adversary B3）** page 境界を跨ぐ非単調 socket time（前 page 末尾 > 次 page 先頭）で `NON_MONOTONIC_SOCKET_TIME` が保持されること
 
 ## 9. PR-4 / 仕上げ
 
 - [ ] 9.1 `make detekt` と関連テストを通す（`:trading` と `:fukurou` 両方）
 - [ ] 9.2 shadow を SQL 照会する例を `docs/` に追記する。**`CROSSED` は約定ではない・`UNKNOWN` は非約定ではない**旨、取りこぼしを reconciliation で見る旨、grace 超過の遅延 crossing を取りこぼす残余リスクを明記する（新規ファイルは作らない）
-- [ ] 9.3 change を archive する（`openspec archive`、specs sync 付き）。**PR-3 マージ後に 1 回だけ**
+- [ ] 9.3 change を archive する（`openspec archive`、specs sync 付き）。**PR-4 マージ後に 1 回だけ**
 - [ ] 9.4 完了報告に residual risk（EV を落とした / NOT_CROSSED を取らない / grace 超過遅延 crossing の取りこぼし / 捕捉取りこぼし / horizon 打ち切り / レコード無期限増加 / receipts index 追加コスト）と scope 外に残した既存例外リスクを列挙する
 
 ## 10. 人間に確認してほしいこと（2026-07-21 ユーザー確認済み）
