@@ -1,8 +1,10 @@
 package me.matsumo.fukurou.trading.shadow
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import java.math.BigDecimal
 import java.time.Duration
 import java.time.Instant
@@ -48,9 +50,9 @@ class GateShadowResolverTest {
         assertEquals(11L, resolution?.crossingEventSequence)
     }
 
-    // 8.4: settle 前（windowStart + horizon + grace 未経過）は走査せず resolution を書かない。
+    // 8.13: settle 前（windowStart + horizon + grace 未経過）は走査せず resolution も cursor も書かない。
     @Test
-    fun doesNotResolveBeforeSettlement() = runBlocking {
+    fun doesNotResolveOrPersistCursorBeforeSettlement() = runBlocking {
         val repository = InMemoryGateShadowRepository()
         val observation = limitObservation(id = 3, startAdmissionOrdinal = 10L)
         repository.appendObservation(observation).getOrThrow()
@@ -61,6 +63,7 @@ class GateShadowResolverTest {
         resolver(repository).observe(beforeSettle).getOrThrow()
 
         assertNull(repository.findResolution(observation.id).getOrThrow())
+        assertNull(repository.findScanProgress(observation.id).getOrThrow())
     }
 
     // 8.4: read 上限で未読を残す間は pending（resolution を書かず cursor を前進）。読み切ってクロス未発見で UNKNOWN。
@@ -161,6 +164,140 @@ class GateShadowResolverTest {
 
         assertEquals(GateShadowOutcome.UNKNOWN, repository.findResolution(observation.id).getOrThrow()?.outcome)
     }
+
+    // 7.7: unresolved 候補は BUY LIMIT / STOP だけに絞る。
+    @Test
+    fun unresolvedCandidatesExcludeUnsupportedOrderTypeAndSide() = runBlocking {
+        val repository = InMemoryGateShadowRepository()
+        val supported = limitObservation(id = 16, startAdmissionOrdinal = 10L)
+        val market = limitObservation(id = 17, startAdmissionOrdinal = 10L).copy(
+            orderType = OrderType.MARKET,
+            limitPriceJpy = null,
+        )
+        val sell = limitObservation(id = 18, startAdmissionOrdinal = 10L).copy(side = OrderSide.SELL)
+        repository.appendObservation(market).getOrThrow()
+        repository.appendObservation(sell).getOrThrow()
+        repository.appendObservation(supported).getOrThrow()
+
+        val candidates = repository.findUnresolvedObservations(limit = 10).getOrThrow()
+
+        assertEquals(listOf(supported.id), candidates.map(GateShadowObservation::id))
+    }
+
+    // 8.2: resolution 書き込みは paper account / position / PnL を変更しない。
+    @Test
+    fun resolutionDoesNotChangeCashPositionsOrPnl() = runBlocking {
+        val runtime = TradingRuntimeFactory.inMemory()
+        val repository = InMemoryGateShadowRepository()
+        val observation = limitObservation(id = 10, startAdmissionOrdinal = 10L)
+        repository.appendObservation(observation).getOrThrow()
+        seedReceipt(repository, sessionA, ordinal = 11L, socketObservedAt = windowStart.plusSeconds(60), priceJpy = "9850000")
+        val balanceBefore = runtime.broker.getBalance().getOrThrow()
+        val positionsBefore = runtime.broker.getPositions().getOrThrow()
+
+        resolver(repository).observe(afterSettle).getOrThrow()
+
+        assertEquals(balanceBefore, runtime.broker.getBalance().getOrThrow())
+        assertEquals(positionsBefore, runtime.broker.getPositions().getOrThrow())
+        runtime.close()
+    }
+
+    // 8.5: decode 不能 event を跳ばし、後続 crossing を CROSSED として記録する。
+    @Test
+    fun skipsDecodeFailureAndFindsLaterCrossing() = runBlocking {
+        val repository = InMemoryGateShadowRepository()
+        val observation = limitObservation(id = 11, startAdmissionOrdinal = 10L)
+        repository.appendObservation(observation).getOrThrow()
+        seedInvalidReceipt(repository, ordinal = 11L, socketObservedAt = windowStart.plusSeconds(60))
+        seedReceipt(repository, sessionA, ordinal = 12L, socketObservedAt = windowStart.plusSeconds(120), priceJpy = "9850000")
+
+        resolver(repository).observe(afterSettle).getOrThrow()
+
+        val resolution = repository.findResolution(observation.id).getOrThrow()
+        assertEquals(GateShadowOutcome.CROSSED, resolution?.outcome)
+        assertEquals(ShadowDataQuality.PAYLOAD_DECODE_FAILED, resolution?.dataQuality)
+    }
+
+    // 8.6: admission ordinal の欠番は gap とみなさず、存在する行を読み切れば UNKNOWN で確定する。
+    @Test
+    fun resolvesUnknownDespiteAdmissionOrdinalGaps() = runBlocking {
+        val repository = InMemoryGateShadowRepository()
+        val observation = limitObservation(id = 12, startAdmissionOrdinal = 10L)
+        repository.appendObservation(observation).getOrThrow()
+        seedReceipt(repository, sessionA, ordinal = 20L, socketObservedAt = windowStart.plusSeconds(60), priceJpy = "9950000")
+        seedReceipt(repository, sessionA, ordinal = 50L, socketObservedAt = windowStart.plusSeconds(120), priceJpy = "9950000")
+
+        resolver(repository).observe(afterSettle).getOrThrow()
+
+        assertEquals(GateShadowOutcome.UNKNOWN, repository.findResolution(observation.id).getOrThrow()?.outcome)
+    }
+
+    // 8.10: wall-time 予算超過は成功扱いで fail-open し、resolution と cursor を書かず pending を保つ。
+    @Test
+    fun stopsPendingResolutionWhenWallTimeBudgetExpires() = runBlocking {
+        val durableRepository = InMemoryGateShadowRepository()
+        val observation = limitObservation(id = 13, startAdmissionOrdinal = 10L)
+        durableRepository.appendObservation(observation).getOrThrow()
+        val delayedRepository = object : GateShadowRepository by durableRepository {
+            override suspend fun findUnresolvedObservations(limit: Int): Result<List<GateShadowObservation>> {
+                delay(100)
+                return durableRepository.findUnresolvedObservations(limit)
+            }
+        }
+        val boundedResolver = resolver(
+            repository = delayedRepository,
+            wallTimeBudget = Duration.ofMillis(20),
+        )
+
+        boundedResolver.observe(afterSettle).getOrThrow()
+
+        assertNull(durableRepository.findResolution(observation.id).getOrThrow())
+        assertNull(durableRepository.findScanProgress(observation.id).getOrThrow())
+    }
+
+    // 8.12: page 1 の decode 劣化を progress に保存し、page 2 の UNKNOWN まで持ち越す。
+    @Test
+    fun carriesDecodeFailureAcrossPagesIntoUnknownResolution() = runBlocking {
+        val repository = InMemoryGateShadowRepository()
+        val observation = limitObservation(id = 14, startAdmissionOrdinal = 10L)
+        repository.appendObservation(observation).getOrThrow()
+        seedInvalidReceipt(repository, ordinal = 11L, socketObservedAt = windowStart.plusSeconds(60))
+        seedReceipt(repository, sessionA, ordinal = 12L, socketObservedAt = windowStart.plusSeconds(120), priceJpy = "9950000")
+        seedReceipt(repository, sessionA, ordinal = 13L, socketObservedAt = windowStart.plusSeconds(180), priceJpy = "9950000")
+        val boundedResolver = resolver(repository, maxReceipts = 2)
+
+        boundedResolver.observe(afterSettle).getOrThrow()
+
+        assertEquals(
+            ShadowDataQuality.PAYLOAD_DECODE_FAILED,
+            repository.findScanProgress(observation.id).getOrThrow()?.dataQuality,
+        )
+
+        boundedResolver.observe(afterSettle).getOrThrow()
+
+        val resolution = repository.findResolution(observation.id).getOrThrow()
+        assertEquals(GateShadowOutcome.UNKNOWN, resolution?.outcome)
+        assertEquals(ShadowDataQuality.PAYLOAD_DECODE_FAILED, resolution?.dataQuality)
+    }
+
+    // 8.14: page 1 末尾の socket 時刻を progress に保存し、page 2 先頭との非単調を検出する。
+    @Test
+    fun carriesLastSocketTimeAcrossPagesForNonMonotonicDetection() = runBlocking {
+        val repository = InMemoryGateShadowRepository()
+        val observation = limitObservation(id = 15, startAdmissionOrdinal = 10L)
+        repository.appendObservation(observation).getOrThrow()
+        seedReceipt(repository, sessionA, ordinal = 11L, socketObservedAt = windowStart.plusSeconds(120), priceJpy = "9950000")
+        seedReceipt(repository, sessionA, ordinal = 12L, socketObservedAt = windowStart.plusSeconds(180), priceJpy = "9950000")
+        seedReceipt(repository, sessionA, ordinal = 13L, socketObservedAt = windowStart.plusSeconds(60), priceJpy = "9950000")
+        val boundedResolver = resolver(repository, maxReceipts = 2)
+
+        boundedResolver.observe(afterSettle).getOrThrow()
+        boundedResolver.observe(afterSettle).getOrThrow()
+
+        val resolution = repository.findResolution(observation.id).getOrThrow()
+        assertEquals(GateShadowOutcome.UNKNOWN, resolution?.outcome)
+        assertEquals(ShadowDataQuality.NON_MONOTONIC_SOCKET_TIME, resolution?.dataQuality)
+    }
 }
 
 private val sessionA: UUID = UUID.fromString("00000000-0000-0000-0000-0000000a0001")
@@ -171,11 +308,16 @@ private val grace: Duration = Duration.ofSeconds(300)
 private val windowEnd: Instant = windowStart.plus(horizon)
 private val afterSettle: Instant = windowEnd.plus(grace).plusSeconds(60)
 
-private fun resolver(repository: InMemoryGateShadowRepository, maxReceipts: Int = 1000): GateShadowResolver {
+private fun resolver(
+    repository: GateShadowRepository,
+    maxReceipts: Int = 1000,
+    wallTimeBudget: Duration = Duration.ofSeconds(5),
+): GateShadowResolver {
     return GateShadowResolver(
         repository = repository,
         horizon = horizon,
         settlementGrace = grace,
+        wallTimeBudget = wallTimeBudget,
         maxObservationsPerTick = 100,
         maxReceiptsPerObservation = maxReceipts,
     )
@@ -245,6 +387,22 @@ private suspend fun seedReceipt(
             socketObservedAt = socketObservedAt,
             sourceSequence = ordinal,
             normalizedPayload = payloadJson(priceJpy),
+        ),
+    )
+}
+
+private suspend fun seedInvalidReceipt(
+    repository: InMemoryGateShadowRepository,
+    ordinal: Long,
+    socketObservedAt: Instant,
+) {
+    repository.appendReceipt(
+        GateShadowReceipt(
+            sessionId = sessionA,
+            admissionOrdinal = ordinal,
+            socketObservedAt = socketObservedAt,
+            sourceSequence = ordinal,
+            normalizedPayload = "{invalid-json",
         ),
     )
 }

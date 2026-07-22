@@ -73,10 +73,13 @@ import me.matsumo.fukurou.trading.safety.SafetyFloor
 import me.matsumo.fukurou.trading.safety.SafetyViolationRepository
 import me.matsumo.fukurou.trading.shadow.AsyncGateShadowObservationSink
 import me.matsumo.fukurou.trading.shadow.GateShadowObservationSink
+import me.matsumo.fukurou.trading.shadow.GateShadowRepository
+import me.matsumo.fukurou.trading.shadow.GateShadowResolver
 import me.matsumo.fukurou.trading.persistence.ExposedGateShadowRepository
 import me.matsumo.fukurou.trading.tool.CallerNoTradeGuard
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 
@@ -108,6 +111,15 @@ private const val INITIALIZATION_RETRY_WINDOW_MILLIS = 30_000L
 /** runtime DB poolからconnectionを取得するときの最大待機時間。 */
 private const val CONNECTION_TIMEOUT_MILLIS = 500L
 
+/** 1 tick で解決する gate-shadow observation 上限。 */
+private const val GATE_SHADOW_MAX_OBSERVATIONS_PER_TICK = 100
+
+/** 1 observation・1 tick で読む receipt 上限。 */
+private const val GATE_SHADOW_MAX_RECEIPTS_PER_OBSERVATION = 1000
+
+/** PgJDBC socketTimeout の最小設定単位。 */
+private const val MINIMUM_GATE_SHADOW_SOCKET_TIMEOUT_SECONDS = 1L
+
 /**
  * trading module が提供する runtime repository 一式。
  *
@@ -124,6 +136,8 @@ private const val CONNECTION_TIMEOUT_MILLIS = 500L
  * @param tradingLock global trading lock
  * @param toolCallGuard MCP tool call guard
  * @param callerNoTradeGuard MCP caller boundary guard
+ * @param gateShadowRepository daemon の index probe と reconciliation に使う repository
+ * @param gateShadowResolver settle 済み gate-shadow observation の resolver
  * @param close runtime resource cleanup
  */
 data class TradingRuntime(
@@ -145,6 +159,8 @@ data class TradingRuntime(
     val decisionMaterialStateRepository: DecisionMaterialStateRepository,
     val llmInputManifestRepository: LlmInputManifestRepository,
     val decisionAccountSnapshotReader: DecisionAccountSnapshotReader,
+    val gateShadowRepository: GateShadowRepository? = null,
+    val gateShadowResolver: GateShadowResolver? = null,
 ) {
     /**
      * runtime resource を閉じる。
@@ -393,6 +409,7 @@ object TradingRuntimeFactory {
     /**
      * 既存 DataSource / Exposed database から Postgres runtime を構築する。
      */
+    @Suppress("LongMethod")
     fun connectedPostgres(
         dataSource: HikariDataSource,
         database: ExposedDatabase,
@@ -420,6 +437,26 @@ object TradingRuntimeFactory {
             scope = gateShadowScope,
             repository = ExposedGateShadowRepository(connection.database),
         )
+        val gateShadowDataSource = createGateShadowDataSource(
+            source = dataSource,
+            wallTimeBudget = tradingConfig.daemon.gateShadowWallTimeBudget,
+        )
+        val gateShadowDatabase = ExposedDatabase.connect(gateShadowDataSource)
+        val gateShadowRepository = ExposedGateShadowRepository(
+            database = gateShadowDatabase,
+            transactionTimeout = tradingConfig.daemon.gateShadowWallTimeBudget,
+            networkTimeoutMillis = tradingConfig.daemon.gateShadowWallTimeBudget.toMillis()
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt(),
+        )
+        val gateShadowResolver = GateShadowResolver(
+            repository = gateShadowRepository,
+            horizon = tradingConfig.daemon.gateShadowHorizon,
+            settlementGrace = tradingConfig.daemon.gateShadowSettlementGrace,
+            wallTimeBudget = tradingConfig.daemon.gateShadowWallTimeBudget,
+            maxObservationsPerTick = GATE_SHADOW_MAX_OBSERVATIONS_PER_TICK,
+            maxReceiptsPerObservation = GATE_SHADOW_MAX_RECEIPTS_PER_OBSERVATION,
+        )
 
         return try {
             val services = createPostgresServices(
@@ -431,6 +468,7 @@ object TradingRuntimeFactory {
             val safetyDenialReader = ExposedDecisionRunProjectionRepository(connection.database, context.clock)
             val closeAction = {
                 gateShadowScope.cancel()
+                gateShadowDataSource.close()
                 if (connection.closeDataSource) connection.dataSource.close()
             }
 
@@ -452,10 +490,13 @@ object TradingRuntimeFactory {
                 toolCallGuard = services.toolCallGuard,
                 callerNoTradeGuard = services.callerNoTradeGuard,
                 launchReservationRepository = ExposedLlmLaunchReservationRepository(connection.database),
+                gateShadowRepository = gateShadowRepository,
+                gateShadowResolver = gateShadowResolver,
                 close = closeAction,
             )
         } catch (throwable: Throwable) {
             gateShadowScope.cancel()
+            gateShadowDataSource.close()
             throw throwable
         }
     }
@@ -697,6 +738,27 @@ private fun createDataSource(config: TradingDatabaseConfig): HikariDataSource {
         maximumPoolSize = MAXIMUM_POOL_SIZE
         initializationFailTimeout = INITIALIZATION_RETRY_WINDOW_MILLIS
         connectionTimeout = CONNECTION_TIMEOUT_MILLIS
+    }
+
+    return HikariDataSource(hikariConfig)
+}
+
+/** resolver 専用の socket read timeout 付き single-connection pool を作る。 */
+private fun createGateShadowDataSource(source: HikariDataSource, wallTimeBudget: Duration): HikariDataSource {
+    val budgetMillis = wallTimeBudget.toMillis()
+    val socketTimeoutSeconds = maxOf(
+        MINIMUM_GATE_SHADOW_SOCKET_TIMEOUT_SECONDS,
+        (budgetMillis + 999L) / 1000L,
+    )
+    val hikariConfig = HikariConfig().apply {
+        jdbcUrl = source.jdbcUrl
+        username = source.username
+        password = source.password
+        maximumPoolSize = 1
+        minimumIdle = 0
+        initializationFailTimeout = -1L
+        connectionTimeout = maxOf(250L, budgetMillis)
+        addDataSourceProperty("socketTimeout", socketTimeoutSeconds.toString())
     }
 
     return HikariDataSource(hikariConfig)

@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.daemon
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -35,6 +36,10 @@ import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
 import me.matsumo.fukurou.trading.runner.OneShotRunnerStatus
 import me.matsumo.fukurou.trading.safety.EconomicEventBlackout
 import me.matsumo.fukurou.trading.safety.SafetyFloorConfig
+import me.matsumo.fukurou.trading.shadow.GateShadowObservation
+import me.matsumo.fukurou.trading.shadow.GateShadowRepository
+import me.matsumo.fukurou.trading.shadow.GateShadowResolver
+import me.matsumo.fukurou.trading.shadow.InMemoryGateShadowRepository
 import java.math.BigDecimal
 import java.nio.file.Path
 import java.time.Clock
@@ -62,6 +67,107 @@ class LlmDaemonSchedulerTest {
     @AfterTest
     fun tearDownAdmissionHealth() {
         LlmExecutionAdmissionHealth.resetForTest()
+    }
+
+    // 8.10: resolver の wall-time 予算超過は fail-open し、同じ tick の launch を継続する。
+    @Test
+    fun gateShadowBudgetExpiryDoesNotPreventLaunch() = runBlocking {
+        val durableRepository = InMemoryGateShadowRepository()
+        val delayedRepository = object : GateShadowRepository by durableRepository {
+            override suspend fun findUnresolvedObservations(limit: Int): Result<List<GateShadowObservation>> {
+                delay(100)
+                return durableRepository.findUnresolvedObservations(limit)
+            }
+
+            override suspend fun isReceiptScanIndexReady(): Result<Boolean> = Result.success(true)
+        }
+        val resolver = GateShadowResolver(
+            repository = delayedRepository,
+            horizon = Duration.ofHours(24),
+            settlementGrace = Duration.ofSeconds(300),
+            wallTimeBudget = Duration.ofMillis(20),
+            maxObservationsPerTick = 10,
+            maxReceiptsPerObservation = 10,
+        )
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = true,
+                    gateShadowReconciliationBaseline = fixedInstant().minusSeconds(1),
+                ),
+            ),
+            gateShadowRepository = delayedRepository,
+            gateShadowResolver = resolver,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(1, fixture.launches.size)
+    }
+
+    @Test
+    fun gateShadowRunsBeforeLaunchDisabledReturn() = runBlocking {
+        val durableRepository = InMemoryGateShadowRepository()
+        var resolverCallCount = 0
+        val recordingRepository = object : GateShadowRepository by durableRepository {
+            override suspend fun findUnresolvedObservations(limit: Int): Result<List<GateShadowObservation>> {
+                resolverCallCount += 1
+                return durableRepository.findUnresolvedObservations(limit)
+            }
+
+            override suspend fun isReceiptScanIndexReady(): Result<Boolean> = Result.success(true)
+        }
+        val resolver = GateShadowResolver(
+            repository = recordingRepository,
+            horizon = Duration.ofHours(24),
+            settlementGrace = Duration.ofSeconds(300),
+            maxObservationsPerTick = 10,
+            maxReceiptsPerObservation = 10,
+        )
+        val fixture = schedulerFixture(
+            tradingConfig = tradingConfig(
+                daemon = LlmDaemonConfig(
+                    enabled = true,
+                    launchEnabled = false,
+                    gateShadowReconciliationBaseline = fixedInstant().minusSeconds(1),
+                ),
+            ),
+            gateShadowRepository = recordingRepository,
+            gateShadowResolver = resolver,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertEquals(1, resolverCallCount)
+        assertEquals(LLM_LAUNCH_DISABLED, assertIs<LlmDaemonTickResult.Skipped>(result).reason)
+    }
+
+    @Test
+    fun gateShadowIndexProbeFailureDoesNotPreventLaunch() = runBlocking {
+        val durableRepository = InMemoryGateShadowRepository()
+        val failingProbeRepository = object : GateShadowRepository by durableRepository {
+            override suspend fun isReceiptScanIndexReady(): Result<Boolean> {
+                return Result.failure(IllegalStateException("synthetic index probe failure"))
+            }
+        }
+        val resolver = GateShadowResolver(
+            repository = failingProbeRepository,
+            horizon = Duration.ofHours(24),
+            settlementGrace = Duration.ofSeconds(300),
+            maxObservationsPerTick = 10,
+            maxReceiptsPerObservation = 10,
+        )
+        val fixture = schedulerFixture(
+            gateShadowRepository = failingProbeRepository,
+            gateShadowResolver = resolver,
+        )
+
+        val result = fixture.scheduler.tick()
+
+        assertIs<LlmDaemonTickResult.Launched>(result)
+        assertEquals(1, fixture.launches.size)
     }
 
     @Test
@@ -1880,6 +1986,8 @@ private fun schedulerFixture(
     episodeLifecycleObserver: OpportunityEpisodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
         Result.success(Unit)
     },
+    gateShadowRepository: GateShadowRepository? = null,
+    gateShadowResolver: GateShadowResolver? = null,
     launchAvailability: LlmDaemonLaunchAvailability = AlwaysAvailableLlmDaemonLaunchAvailability,
     launchHandler: suspend (OneShotRunnerRequest) -> OneShotRunnerResult = { request -> successfulRunnerResult(request) },
 ): SchedulerFixture {
@@ -1898,6 +2006,8 @@ private fun schedulerFixture(
             entryFillReader = entryFillReader,
             restingOrderMaintenanceService = restingOrderMaintenanceService,
             episodeLifecycleObserver = episodeLifecycleObserver,
+            gateShadowRepository = gateShadowRepository,
+            gateShadowResolver = gateShadowResolver,
             launchAvailability = launchAvailability,
         ),
         runtime = LlmDaemonSchedulerRuntime(

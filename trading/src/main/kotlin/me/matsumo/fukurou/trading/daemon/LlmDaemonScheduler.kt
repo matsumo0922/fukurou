@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -37,6 +38,8 @@ import me.matsumo.fukurou.trading.runner.MAX_INVOCATION_COUNT_WINDOW
 import me.matsumo.fukurou.trading.runner.OneShotLlmRunner
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
 import me.matsumo.fukurou.trading.runner.OneShotRunnerResult
+import me.matsumo.fukurou.trading.shadow.GateShadowRepository
+import me.matsumo.fukurou.trading.shadow.GateShadowResolver
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Clock
@@ -199,6 +202,8 @@ class LlmDaemonScheduler(
     private val entryFillReader = dependencies.entryFillReader
     private val restingOrderMaintenanceService = dependencies.restingOrderMaintenanceService
     private val episodeLifecycleObserver = dependencies.episodeLifecycleObserver
+    private val gateShadowRepository = dependencies.gateShadowRepository
+    private val gateShadowResolver = dependencies.gateShadowResolver
     private val launchAvailability = dependencies.launchAvailability
     private val requestBase = runtime.requestBase
     private val launchOneShot = runtime.launchOneShot
@@ -269,8 +274,63 @@ class LlmDaemonScheduler(
         return tickResult
     }
 
+    private suspend fun observeGateShadowFailOpen(observedAt: Instant) {
+        val repository = gateShadowRepository ?: return
+        val resolver = gateShadowResolver ?: return
+
+        try {
+            val completedWithinBudget = withTimeoutOrNull(daemonConfig.gateShadowWallTimeBudget.toMillis()) {
+                observeGateShadowWithinBudget(repository, resolver, observedAt)
+                true
+            } ?: false
+
+            if (!completedWithinBudget) {
+                warnLogger.warn(
+                    key = GATE_SHADOW_FAILURE_LOG_KEY,
+                    message = "Gate-shadow wall-time budget expired; continuing daemon tick.",
+                )
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (throwable: Throwable) {
+            warnLogger.warn(
+                key = GATE_SHADOW_FAILURE_LOG_KEY,
+                message = "Gate-shadow index probe or resolver failed open.",
+                throwable = throwable,
+            )
+        }
+    }
+
+    private suspend fun observeGateShadowWithinBudget(
+        repository: GateShadowRepository,
+        resolver: GateShadowResolver,
+        observedAt: Instant,
+    ) {
+        val indexReady = repository.isReceiptScanIndexReady().getOrThrow()
+        if (indexReady) {
+            resolver.observe(observedAt).getOrThrow()
+        }
+
+        val missingCount = repository.countMissingTtlExpiryObservations(
+            daemonConfig.gateShadowReconciliationBaseline,
+        ).getOrThrow()
+        when {
+            missingCount == null -> warnLogger.warn(
+                key = GATE_SHADOW_BASELINE_UNCONFIRMED_LOG_KEY,
+                message = "Gate-shadow reconciliation baseline is not configured.",
+            )
+
+            missingCount > 0L -> warnLogger.warn(
+                key = GATE_SHADOW_RECONCILIATION_GAP_LOG_KEY,
+                message = "Gate-shadow reconciliation found missing observations: count=$missingCount",
+            )
+        }
+    }
+
     @Suppress("LongMethod", "CyclomaticComplexMethod")
     private suspend fun tickUnsafe(observedAt: Instant): LlmDaemonTickResult {
+        observeGateShadowFailOpen(observedAt)
+
         if (!daemonConfig.launchEnabled) {
             appendSkip(
                 reason = LLM_LAUNCH_DISABLED,
@@ -1114,6 +1174,8 @@ class LlmDaemonScheduler(
  * @param tickerReader 価格 trigger 用 ticker 読み取り境界
  * @param positionsReader STOP 接近 trigger 用 position 読み取り境界
  * @param entryFillReader entry fill trigger 用 execution 読み取り境界
+ * @param gateShadowRepository index probe と reconciliation の repository
+ * @param gateShadowResolver settle 済み observation の resolver
  * @param launchAvailability scheduler automatic launch 専用の取引所 availability gate
  */
 data class LlmDaemonSchedulerDependencies(
@@ -1130,6 +1192,8 @@ data class LlmDaemonSchedulerDependencies(
     val episodeLifecycleObserver: OpportunityEpisodeLifecycleObserver = OpportunityEpisodeLifecycleObserver {
         Result.success(Unit)
     },
+    val gateShadowRepository: GateShadowRepository? = null,
+    val gateShadowResolver: GateShadowResolver? = null,
     val launchAvailability: LlmDaemonLaunchAvailability = AlwaysAvailableLlmDaemonLaunchAvailability,
 )
 
@@ -1490,6 +1554,15 @@ private const val DAEMON_TICK_FAILURE_LOG_KEY = "llm-daemon-scheduler-tick-failu
  * daemon tick failure audit failure log の rate limit key。
  */
 private const val DAEMON_TICK_AUDIT_FAILURE_LOG_KEY = "llm-daemon-scheduler-tick-audit-failure"
+
+/** gate-shadow probe / resolver failure log の rate limit key。 */
+private const val GATE_SHADOW_FAILURE_LOG_KEY = "llm-daemon-gate-shadow-failure"
+
+/** gate-shadow reconciliation baseline 未設定 log の rate limit key。 */
+private const val GATE_SHADOW_BASELINE_UNCONFIRMED_LOG_KEY = "llm-daemon-gate-shadow-baseline-unconfirmed"
+
+/** gate-shadow capture 欠落 log の rate limit key。 */
+private const val GATE_SHADOW_RECONCILIATION_GAP_LOG_KEY = "llm-daemon-gate-shadow-reconciliation-gap"
 
 /**
  * ticker fetch failure log の rate limit key。

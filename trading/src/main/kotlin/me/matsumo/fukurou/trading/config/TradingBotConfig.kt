@@ -330,6 +330,10 @@ data class LlmRunnerConfig(
  * @param stopProximityTriggerEnabled STOP 接近 trigger を有効にするか
  * @param stopProximityRemainingRThreshold STOP 接近とみなす残り R
  * @param stopProximityCooldown STOP 接近 trigger の cooldown
+ * @param gateShadowHorizon TTL 失効後の gate-shadow 観測時間窓
+ * @param gateShadowSettlementGrace receipt commit を待つ settle 猶予
+ * @param gateShadowWallTimeBudget 1 daemon tick で gate-shadow resolver に与える wall-time 予算
+ * @param gateShadowReconciliationBaseline capture 有効化以前に固定する reconciliation 下界
  */
 data class LlmDaemonConfig(
     val enabled: Boolean = DEFAULT_LLM_DAEMON_ENABLED,
@@ -348,6 +352,10 @@ data class LlmDaemonConfig(
     val stopProximityTriggerEnabled: Boolean = DEFAULT_LLM_STOP_PROXIMITY_TRIGGER_ENABLED,
     val stopProximityRemainingRThreshold: BigDecimal = DEFAULT_LLM_STOP_PROXIMITY_REMAINING_R_THRESHOLD,
     val stopProximityCooldown: Duration = DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN,
+    val gateShadowHorizon: Duration = DEFAULT_GATE_SHADOW_HORIZON,
+    val gateShadowSettlementGrace: Duration = DEFAULT_GATE_SHADOW_SETTLEMENT_GRACE,
+    val gateShadowWallTimeBudget: Duration = DEFAULT_GATE_SHADOW_WALL_TIME_BUDGET,
+    val gateShadowReconciliationBaseline: Instant? = null,
 ) {
     init {
         val pollIntervalIsConservative = pollInterval >= DEFAULT_LLM_DAEMON_POLL_INTERVAL
@@ -360,6 +368,10 @@ data class LlmDaemonConfig(
         val entryFillCooldownFitsPoll = entryFillCooldown >= pollInterval
         val stopProximityThresholdIsPositive = stopProximityRemainingRThreshold > BigDecimal.ZERO
         val stopProximityCooldownFitsPoll = stopProximityCooldown >= pollInterval
+        val gateShadowHorizonIsPositive = !gateShadowHorizon.isNegative && !gateShadowHorizon.isZero
+        val gateShadowGraceIsNotNegative = !gateShadowSettlementGrace.isNegative
+        val gateShadowBudgetIsPositive = !gateShadowWallTimeBudget.isNegative && !gateShadowWallTimeBudget.isZero
+        val gateShadowBudgetHasMillis = gateShadowWallTimeBudget.toMillis() > 0L
 
         require(pollIntervalIsConservative) {
             "pollInterval must be greater than or equal to ${DEFAULT_LLM_DAEMON_POLL_INTERVAL.seconds} seconds."
@@ -390,6 +402,15 @@ data class LlmDaemonConfig(
         }
         require(stopProximityCooldownFitsPoll) {
             "stopProximityCooldown must be greater than or equal to pollInterval."
+        }
+        require(gateShadowHorizonIsPositive) {
+            "gateShadowHorizon must be greater than 0."
+        }
+        require(gateShadowGraceIsNotNegative) {
+            "gateShadowSettlementGrace must not be negative."
+        }
+        require(gateShadowBudgetIsPositive && gateShadowBudgetHasMillis) {
+            "gateShadowWallTimeBudget must be at least 1 ms."
         }
     }
 }
@@ -653,6 +674,13 @@ private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_REMAINING_R_THRESHOLD_ENV =
  */
 private const val FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS_ENV =
     "FUKUROU_LLM_TRIGGER_STOP_PROXIMITY_COOLDOWN_SECONDS"
+private const val FUKUROU_GATE_SHADOW_HORIZON_SECONDS_ENV = "FUKUROU_GATE_SHADOW_HORIZON_SECONDS"
+private const val FUKUROU_GATE_SHADOW_SETTLEMENT_GRACE_SECONDS_ENV =
+    "FUKUROU_GATE_SHADOW_SETTLEMENT_GRACE_SECONDS"
+private const val FUKUROU_GATE_SHADOW_WALL_TIME_BUDGET_MILLIS_ENV =
+    "FUKUROU_GATE_SHADOW_WALL_TIME_BUDGET_MILLIS"
+private const val FUKUROU_GATE_SHADOW_RECONCILIATION_BASELINE_ENV =
+    "FUKUROU_GATE_SHADOW_RECONCILIATION_BASELINE"
 
 /**
  * Obsidian writer 有効化の環境変数名。
@@ -827,6 +855,15 @@ const val DEFAULT_LLM_LAUNCH_ENABLED = false
  * LLM daemon loop poll 間隔の既定値。
  */
 val DEFAULT_LLM_DAEMON_POLL_INTERVAL: Duration = Duration.ofMinutes(1)
+
+/** gate-shadow の既定観測時間窓。 */
+val DEFAULT_GATE_SHADOW_HORIZON: Duration = Duration.ofHours(24)
+
+/** gate-shadow の既定 settle 猶予。 */
+val DEFAULT_GATE_SHADOW_SETTLEMENT_GRACE: Duration = Duration.ofSeconds(300)
+
+/** gate-shadow resolver の既定 wall-time 予算。 */
+val DEFAULT_GATE_SHADOW_WALL_TIME_BUDGET: Duration = Duration.ofMillis(750)
 
 /**
  * flat 状態 heartbeat 間隔の既定値。
@@ -1109,7 +1146,7 @@ private fun Map<String, String>.readLlmRunnerConfig(): LlmRunnerConfig {
     )
 }
 
-@Suppress("LongMethod")
+@Suppress("LongMethod", "CyclomaticComplexMethod")
 private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
     return LlmDaemonConfig(
         enabled = readOptional(FUKUROU_LLM_DAEMON_ENABLED_ENV)?.toBooleanStrictOrNull()
@@ -1169,6 +1206,23 @@ private fun Map<String, String>.readLlmDaemonConfig(): LlmDaemonConfig {
                 ?.toLong()
                 ?: DEFAULT_LLM_STOP_PROXIMITY_COOLDOWN.seconds,
         ),
+        gateShadowHorizon = Duration.ofSeconds(
+            readOptional(FUKUROU_GATE_SHADOW_HORIZON_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_GATE_SHADOW_HORIZON.seconds,
+        ),
+        gateShadowSettlementGrace = Duration.ofSeconds(
+            readOptional(FUKUROU_GATE_SHADOW_SETTLEMENT_GRACE_SECONDS_ENV)
+                ?.toLong()
+                ?: DEFAULT_GATE_SHADOW_SETTLEMENT_GRACE.seconds,
+        ),
+        gateShadowWallTimeBudget = Duration.ofMillis(
+            readOptional(FUKUROU_GATE_SHADOW_WALL_TIME_BUDGET_MILLIS_ENV)
+                ?.toLong()
+                ?: DEFAULT_GATE_SHADOW_WALL_TIME_BUDGET.toMillis(),
+        ),
+        gateShadowReconciliationBaseline = readOptional(FUKUROU_GATE_SHADOW_RECONCILIATION_BASELINE_ENV)
+            ?.let(Instant::parse),
     )
 }
 

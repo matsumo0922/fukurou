@@ -1307,6 +1307,8 @@ object GateShadowObservationsTable : Table("gate_shadow_observations") {
 object GateShadowScanProgressTable : Table("gate_shadow_scan_progress") {
     val observationId = uuid("observation_id")
     val lastScannedAdmissionOrdinal = long("last_scanned_admission_ordinal")
+    val dataQuality = varchar("data_quality", 64).default("OK")
+    val lastSocketObservedAt = long("last_socket_observed_at").nullable()
     val lastScannedAt = long("last_scanned_at")
     override val primaryKey = PrimaryKey(observationId)
 }

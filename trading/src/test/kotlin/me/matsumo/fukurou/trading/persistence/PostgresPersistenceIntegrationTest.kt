@@ -8404,7 +8404,13 @@ class PostgresPersistenceIntegrationTest {
             PaperOrderCancelReason.TTL_EXPIRY.wireCode,
             selectTextForTest(database, "SELECT cancel_reason FROM orders WHERE id = '$orderId'"),
         )
-        assertEquals(1L, ExposedGateShadowRepository(database).countMissingTtlExpiryObservations().getOrThrow())
+        val shadowRepository = ExposedGateShadowRepository(database)
+        assertNull(shadowRepository.countMissingTtlExpiryObservations(null).getOrThrow())
+        assertEquals(
+            0L,
+            shadowRepository.countMissingTtlExpiryObservations(fixedInstant().plusSeconds(120)).getOrThrow(),
+        )
+        assertEquals(1L, shadowRepository.countMissingTtlExpiryObservations(fixedInstant()).getOrThrow())
     }
 
     @Test
@@ -8458,7 +8464,7 @@ class PostgresPersistenceIntegrationTest {
             selectTextForTest(database, "SELECT status FROM orders WHERE id = '$orderId'"),
         )
         assertNull(shadowRepository.findObservationByOrderId(orderId).getOrThrow())
-        assertEquals(1L, shadowRepository.countMissingTtlExpiryObservations().getOrThrow())
+        assertEquals(1L, shadowRepository.countMissingTtlExpiryObservations(fixedInstant()).getOrThrow())
     }
 
     @Test
@@ -8537,7 +8543,7 @@ class PostgresPersistenceIntegrationTest {
             }
         }
 
-        assertEquals(4L, durableRepository.countMissingTtlExpiryObservations().getOrThrow())
+        assertEquals(4L, durableRepository.countMissingTtlExpiryObservations(fixedInstant()).getOrThrow())
         shadowScope.cancel()
     }
 
@@ -8762,7 +8768,20 @@ class PostgresPersistenceIntegrationTest {
         val progress = GateShadowScanProgress(
             observationId = observation.id,
             lastScannedAdmissionOrdinal = 12L,
+            dataQuality = ShadowDataQuality.NON_MONOTONIC_SOCKET_TIME,
+            lastSocketObservedAt = fixedInstant(),
             lastScannedAt = fixedInstant().plusSeconds(1),
+        )
+        val advancedProgress = progress.copy(
+            lastScannedAdmissionOrdinal = 13L,
+            dataQuality = ShadowDataQuality.OK,
+            lastSocketObservedAt = fixedInstant().plusSeconds(2),
+            lastScannedAt = fixedInstant().plusSeconds(2),
+        )
+        val staleDegradedProgress = progress.copy(
+            dataQuality = ShadowDataQuality.PAYLOAD_DECODE_FAILED,
+            lastSocketObservedAt = fixedInstant().minusSeconds(1),
+            lastScannedAt = fixedInstant().plusSeconds(3),
         )
         val unknown = GateShadowResolution(
             observationId = observation.id,
@@ -8787,6 +8806,8 @@ class PostgresPersistenceIntegrationTest {
 
         repository.appendObservation(observation).getOrThrow()
         repository.upsertScanProgress(progress).getOrThrow()
+        repository.upsertScanProgress(advancedProgress).getOrThrow()
+        repository.upsertScanProgress(staleDegradedProgress).getOrThrow()
         repository.upsertResolution(unknown).getOrThrow()
         repository.upsertResolution(crossed).getOrThrow()
         repository.upsertResolution(unknown.copy(resolvedAt = fixedInstant().plusSeconds(5))).getOrThrow()
@@ -8797,7 +8818,9 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(observation.id, restoredObservation?.id)
         assertEquals(observation.orderId, restoredObservation?.orderId)
-        assertEquals(progress.lastScannedAdmissionOrdinal, restoredProgress?.lastScannedAdmissionOrdinal)
+        assertEquals(advancedProgress.lastScannedAdmissionOrdinal, restoredProgress?.lastScannedAdmissionOrdinal)
+        assertEquals(ShadowDataQuality.PAYLOAD_DECODE_FAILED, restoredProgress?.dataQuality)
+        assertEquals(advancedProgress.lastSocketObservedAt, restoredProgress?.lastSocketObservedAt)
         assertEquals(GateShadowOutcome.CROSSED, restoredResolution?.outcome)
         assertEquals(crossed.crossingEventSequence, restoredResolution?.crossingEventSequence)
         assertEquals(0, requireNotNull(restoredResolution?.crossingPriceJpy).compareTo(crossed.crossingPriceJpy))
