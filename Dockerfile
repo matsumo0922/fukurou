@@ -43,8 +43,19 @@ RUN gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-llm-agent-launcher fukurou
 FROM debian:bookworm-slim AS db-helper-manifest
 WORKDIR /src
 COPY scripts/deploy/fukurou-deploy-db scripts/deploy/fukurou-deploy-db
-COPY scripts/deploy/sql scripts/deploy/sql
-RUN { printf '%s\n' scripts/deploy/fukurou-deploy-db; find scripts/deploy/sql -type f -print; } \
+COPY scripts/deploy/sql/deploy-foundation-v1-indexes.sql scripts/deploy/sql/deploy-foundation-v1-indexes.sql
+COPY scripts/deploy/sql/deploy-foundation-v1.sql scripts/deploy/sql/deploy-foundation-v1.sql
+COPY scripts/deploy/sql/mcp-role.sql scripts/deploy/sql/mcp-role.sql
+# このファイル集合は scripts/deploy/deploy-fukurou の db_helper_manifest_entries() と
+# scripts/deploy/fukurou-deploy-db の db_helper_manifest_entries() の一覧に一致させること
+# （NAS root install 側は個別ファイル配置で scripts/deploy/sql/ ディレクトリを持たないため、
+#   3箇所とも動的 find ではなく同じ固定リストを使う）。SQL を追加/削除する場合は3箇所を同時に更新する。
+RUN { \
+      printf '%s\n' scripts/deploy/fukurou-deploy-db; \
+      printf '%s\n' scripts/deploy/sql/deploy-foundation-v1-indexes.sql; \
+      printf '%s\n' scripts/deploy/sql/deploy-foundation-v1.sql; \
+      printf '%s\n' scripts/deploy/sql/mcp-role.sql; \
+    } \
     | LC_ALL=C sort \
     | while IFS= read -r path; do \
         printf '%s\0%s\0' "${path}" "$(sha256sum "${path}" | awk '{print $1}')"; \
