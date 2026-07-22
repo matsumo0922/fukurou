@@ -16,8 +16,8 @@
 
 ## 3. auditor: 安全条件の拡張
 
-- [ ] 3.1 `LlmPhaseAuditSignals` に `authEvidenceObserved: Boolean`（default なし）を追加する。他のフィールド（`authFailureSuspected`/`cliErrorReported`/`cleanupFailed`/`providerFailure`）は既存どおり default を維持し、`authEvidenceObserved` だけを fail-closed 対象とする（design.md D5、round 2 Blocking B 参照）
-- [ ] 3.2 `invokeAndAudit()` 内の唯一の `LlmPhaseAuditSignals` 構築箇所で `authEvidenceObserved = invocationResult?.authEvidenceObserved ?: false` を明示する（`invocationResult` が null になりうるのは invocation 自体が完了しなかった経路であり、その場合 evidence 未観測を false として扱うのは妥当。default 撤廃の目的は「明示を強制すること」であり、この1箇所での ?: false 自体は許容する）
+- [ ] 3.1 `LlmPhaseAuditSignals` の `authEvidenceObserved: Boolean` と `cliErrorReported: Boolean` から default を撤廃する。`authFailureSuspected`/`cleanupFailed`/`providerFailure` は既存どおり default を維持する（`isSafeCodexLifecycleFailure()` の safety 条件として直接使われるのはこの2フィールドのみのため。design.md D5、round 2 Blocking B・round 3 Blocking C 参照）
+- [ ] 3.2 `invokeAndAudit()` 内の唯一の `LlmPhaseAuditSignals` 構築箇所で `authEvidenceObserved = invocationResult?.authEvidenceObserved ?: false` と `cliErrorReported = invocationResult?.providerFailure != null` を明示する（`invocationResult` が null になりうるのは invocation 自体が完了しなかった経路であり、その場合 evidence 未観測・adapter failure 未検出を false として扱うのは妥当。default 撤廃の目的は「明示を強制すること」であり、この1箇所での `?:`/比較式自体は許容する）
 - [ ] 3.3 `CODEX_SAFE_OUTPUT_INTERPRETED_FAILURE_CATEGORIES`（`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE`）を定義する
 - [ ] 3.4 `isSafeCodexLifecycleFailure()` を、`authEvidenceObserved` チェックを最優先の否定条件として持つ2経路（lifecycle / output-interpreted）の disjunction に書き換え、`processResult` 引数を削除する。KDoc を新しい条件と Finding 1-4 の反証結果に合わせて更新する
 - [ ] 3.5 `isSafeCodexLifecycleFailure()` の呼び出し元（`phaseDetails()`）を新しいシグネチャに更新する

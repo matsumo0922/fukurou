@@ -61,6 +61,14 @@ delta spec のシナリオ title・THEN 節が「no authentication evidence is p
 
 falsifier から、「ユーザー確認済み」という帰属を teammate 経由の伝言としてではなく、質問と回答そのものを読める形で示してほしいという指摘があった。→ Finding 2 のセクションに `AskUserQuestion` の質問文・選択肢・実際の回答をそのまま転記した。
 
+## Falsification Round 3（Blocking A・B・Finding 2 は解消確認、新規 Blocking C）
+
+round 2 の修正を同じ falsifier に再反証させた結果、Blocking A・B・Finding 2 は解消と確認された。新たに1件の blocking が見つかった。
+
+### Blocking C（blocking, fail-open upgrade path。設計修正で解消）
+
+round 2 で「`cliErrorReported`/`authFailureSuspected`/`cleanupFailed`/`providerFailure` は security gate の否定証拠として直接使われないため default を維持してよい」と判断したが、この判断のうち `cliErrorReported` に関する部分が事実誤りだった。`isSafeCodexLifecycleFailure()` の lifecycle 経路は `!auditSignals.cliErrorReported` を直接安全条件として使っており、default `false` のまま構築箇所で明示が省略されると誤って安全側に倒れ、#296 の condition 2 が閉じた反例（adapter が output text から failure を検出しているのに lifecycle category が primary として選ばれる複合ケース）が再現する。→ D5 を再拡張し、`cliErrorReported` も default を撤廃することで解消した。最終的に default を撤廃するのは `authEvidenceObserved` と `cliErrorReported` の2フィールド。
+
 ## Goals / Non-Goals
 
 **Goals:**
@@ -150,7 +158,11 @@ private fun isSafeCodexLifecycleFailure(
 
 `ParsedLlmOutput.authEvidenceObserved` と `LlmInvocationResult.authEvidenceObserved` はどちらも default 値を持たない `Boolean` とする。これにより全ての構築箇所（`parseClaude()`、`contractFailure()`、`parseCodex()`、`LlmInvoker.kt` の `LlmInvocationResult` 構築、既存テストの `ParsedLlmOutput`/`LlmInvocationResult` 直接構築箇所）がコンパイル時にこの field の明示を強制される。
 
-再反証（round 2）で、`LlmInvocationAuditor.kt` 内部の集約構造体 `LlmPhaseAuditSignals.authEvidenceObserved` に `= false` の default が残っていることが blocking として指摘された。`LlmPhaseAuditSignals` は `private data class` で現時点の構築箇所は `invokeAndAudit()` 内の1箇所のみだが、default を残す限り、将来この構造体を構築する箇所が追加・変更されたときに `authEvidenceObserved` の明示を省略してもコンパイルが通ってしまい、`ParsedLlmOutput`/`LlmInvocationResult` 側で確立した fail-closed 不変条件が security gate 直前の1箇所で再び崩れうる。この指摘を受け、`LlmPhaseAuditSignals.authEvidenceObserved` も default を撤廃する（他のフィールド `authFailureSuspected`/`cliErrorReported`/`cleanupFailed`/`providerFailure` は security gate の否定証拠として直接使われないため default を維持する。`authEvidenceObserved` だけを対象にした最小の修正とする）。
+再反証（round 2）で、`LlmInvocationAuditor.kt` 内部の集約構造体 `LlmPhaseAuditSignals.authEvidenceObserved` に `= false` の default が残っていることが blocking として指摘された。`LlmPhaseAuditSignals` は `private data class` で現時点の構築箇所は `invokeAndAudit()` 内の1箇所のみだが、default を残す限り、将来この構造体を構築する箇所が追加・変更されたときに `authEvidenceObserved` の明示を省略してもコンパイルが通ってしまい、`ParsedLlmOutput`/`LlmInvocationResult` 側で確立した fail-closed 不変条件が security gate 直前の1箇所で再び崩れうる。この指摘を受け、`LlmPhaseAuditSignals.authEvidenceObserved` も default を撤廃する。
+
+**round 3 の再反証で追加指摘（Blocking C）**: 上記の「`cliErrorReported` は security gate の否定証拠として直接使われないため default を維持してよい」という判断が事実誤りだった。`isSafeCodexLifecycleFailure()` の lifecycle 経路は `!auditSignals.cliErrorReported` を直接安全条件として使っており（#296 の condition 2 に相当。adapter が output text から failure を検出しているのに lifecycle category が primary として選ばれる複合ケースへの防御）、`cliErrorReported` が default `false` のまま構築箇所で明示を省略されると `!cliErrorReported` が誤って `true` となり、#296 が閉じたはずの反例が再現する。よって `cliErrorReported` も `authEvidenceObserved` と同じ理由で default を撤廃する。
+
+最終的に default を撤廃するのは `authEvidenceObserved` と `cliErrorReported` の2フィールドのみとする。`authFailureSuspected`（運用ログ通知のみに使用され、raw output 記録可否には関与しない）と `cleanupFailed`（監査 payload の情報表示にのみ使用）は gate 判定に使われないため default を維持する。`providerFailure` は `isSafeCodexLifecycleFailure()` 内で `auditSignals.providerFailure?.category` として参照されるが、null の場合は `when` 式が `else -> false`（非公開側）に倒れるため、default `null` のままでも構造的に fail-closed であり撤廃不要。
 
 **代替案として検討したもの**: falsifier は `NOT_SCANNED`/`ABSENT`/`PRESENT` の tri-state enum を提案した。表現力は tri-state の方が高い（「scan を試みたが未実施」という中間状態を型で表現できる）が、本 change の実装範囲では `authEvidenceObserved` を計算する経路（Codex）と計算しない経路（Claude、明示的に `false`）の2択で全ケースを尽くせるため、Boolean + default なしで十分と判断した。将来 Codex 以外の provider で類似の evidence 追跡が必要になった場合は、その時点で tri-state 化を再検討する。
 
