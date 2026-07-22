@@ -30,10 +30,27 @@ psql_exec_impl() {
   )
   local stderr_file status=0
   stderr_file="$(mktemp)"
-  if [[ -n "${timeout_seconds}" ]]; then
-    command timeout --foreground --signal=TERM --kill-after=5 "${timeout_seconds}" "${psql_command[@]}" "$@" 2>"${stderr_file}" || status=$?
+  # docker exec -i は、コンテナ側で読まれるかに関わらずclient側で自分のstdin(fd 0)を
+  # read(2)しようとする。呼び出し元がstdinをheredoc/fileでリダイレクトしていない場合
+  # fd 0は端末(pty)を継承したままになり、sudoのuse_ptyやtimeoutのプロセスグループ分離が
+  # 絡むとそのptyのforegroundプロセスグループでなくなり、read(2)がSIGTTINで
+  # job-control停止する。停止したまま呼び出し元のtimeoutに殺されるまでハングし続け、
+  # このプロセス自体がRETURN前に強制終了されるためエラーハンドリングも一切効かない。
+  # stdinが不要な引数渡しクエリ（-c/-Atc）はfd 0がtty継承のままのため、明示的に
+  # /dev/nullを充ててread(2)自体を起こさせない。heredocでSQLを流し込む呼び出しは
+  # 既に呼び出し元でfd 0がファイルに差し替わっているため対象外。
+  if [[ -t 0 ]]; then
+    if [[ -n "${timeout_seconds}" ]]; then
+      command timeout --foreground --signal=TERM --kill-after=5 "${timeout_seconds}" "${psql_command[@]}" "$@" </dev/null 2>"${stderr_file}" || status=$?
+    else
+      "${psql_command[@]}" "$@" </dev/null 2>"${stderr_file}" || status=$?
+    fi
   else
-    "${psql_command[@]}" "$@" 2>"${stderr_file}" || status=$?
+    if [[ -n "${timeout_seconds}" ]]; then
+      command timeout --foreground --signal=TERM --kill-after=5 "${timeout_seconds}" "${psql_command[@]}" "$@" 2>"${stderr_file}" || status=$?
+    else
+      "${psql_command[@]}" "$@" 2>"${stderr_file}" || status=$?
+    fi
   fi
   if [[ "${status}" -ne 0 ]]; then
     echo "fukurou-deploy-db: psql_exec failed (exit=${status}, container=${POSTGRES_CONTAINER}): $(cat "${stderr_file}")" >&2
