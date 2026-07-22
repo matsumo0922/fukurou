@@ -15,10 +15,10 @@
 
 ### Modified Capabilities
 
-- `llm-cli-invocation-contract`: Codex MCP invocation が MCP subprocess へ `FUKUROU_INVOCATION_ID` を明示的に転送する要件を追加する
+- `llm-cli-invocation-contract`: `OneShotLlmRunner.mcpServerConfig()` が構築する Codex MCP invocation（decision run 用）が MCP subprocess へ `FUKUROU_INVOCATION_ID` を明示的に転送する要件を追加する。他の Codex MCP config 構築箇所（CLI acceptance canary、MCP isolation canary 等）は対象外
 
 ## Impact
 
 - `trading/src/main/kotlin/me/matsumo/fukurou/trading/runner/OneShotLlmRunner.kt`（`mcpServerConfig()`）
 - `trading/src/test/kotlin/me/matsumo/fukurou/trading/runner/OneShotLlmRunnerTest.kt`（回帰テスト追加）
-- 対象外: fd 3/4/5 経路、C launcher (`scripts/runtime/fukurou-mcp-launcher.c`)、supervisor、Claude 経路（既に env allowlist に含まれ対象外）
+- 対象外: fd 3/4/5 経路、C launcher (`scripts/runtime/fukurou-mcp-launcher.c`)、supervisor、Claude 経路（既に env allowlist に含まれ対象外）、`CliAcceptanceCanaryMain.kt` / `McpIsolationCanaryArtifacts.kt` 等の他の Codex MCP config 構築箇所（falsify で確認済み: `forwardedEnvironmentVariables` 未設定のままで、本 issue のスコープ外）

@@ -2108,6 +2108,7 @@ private class OneShotLlmRequestFactory(
                 manifestPath = capability.path,
                 terminalEvidenceCaptureEnabled = capability.terminalEvidenceCaptureEnabled,
                 autoApprovedTools = productionAutoApprovedTools(provider, allowedTools),
+                forwardedEnvironmentVariables = listOf(FUKUROU_INVOCATION_ID_ENV),
             )
         } catch (throwable: Throwable) {
             runCatching { Files.deleteIfExists(capability.path) }
