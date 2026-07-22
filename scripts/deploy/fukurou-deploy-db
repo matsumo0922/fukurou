@@ -5,6 +5,9 @@ readonly POSTGRES_CONTAINER="${FUKUROU_POSTGRES_CONTAINER:-fukurou-postgres}"
 readonly APPLICATION_CONTAINER="${FUKUROU_APPLICATION_CONTAINER:-fukurou-ktor}"
 readonly FOUNDATION_SQL="${FUKUROU_FOUNDATION_SQL:-/usr/local/share/fukurou/deploy-foundation-v1.sql}"
 readonly FOUNDATION_INDEX_SQL="${FUKUROU_FOUNDATION_INDEX_SQL:-/usr/local/share/fukurou/deploy-foundation-v1-indexes.sql}"
+readonly MCP_ROLE_SQL="${FUKUROU_MCP_ROLE_SQL:-/usr/local/share/fukurou/mcp-role.sql}"
+readonly DB_HELPER_SOURCE="${FUKUROU_DEPLOY_DB_HELPER_SOURCE:-$(readlink -f "${BASH_SOURCE[0]}")}"
+readonly DB_HELPER_MARKER="${FUKUROU_DB_HELPER_MARKER:-/usr/local/share/fukurou/db-helper-manifest.sha256}"
 readonly MCP_DATABASE_ROLE="${FUKUROU_MCP_DB_USER:-fukurou_mcp}"
 
 fail() { echo "fukurou-deploy-db: $*" >&2; exit 1; }
@@ -36,6 +39,41 @@ psql_exec_with_timeout() { local timeout_seconds="$1"; shift; psql_exec_impl "${
 validate_deployment_id() { [[ "$1" =~ ^[a-zA-Z0-9._-]{1,96}$ ]] || fail "invalid deployment id"; }
 validate_generation() { [[ "$1" =~ ^[0-9]+$ && "$1" -le 9223372036854775807 ]] || fail "invalid generation"; }
 validate_hash() { [[ "$1" =~ ^[0-9a-f]{64}$ ]] || fail "invalid payload hash"; }
+
+db_helper_manifest_entries() {
+  printf '%s\t%s\n' \
+    "scripts/deploy/fukurou-deploy-db" "${DB_HELPER_SOURCE}" \
+    "scripts/deploy/sql/deploy-foundation-v1-indexes.sql" "${FOUNDATION_INDEX_SQL}" \
+    "scripts/deploy/sql/deploy-foundation-v1.sql" "${FOUNDATION_SQL}" \
+    "scripts/deploy/sql/mcp-role.sql" "${MCP_ROLE_SQL}" |
+    LC_ALL=C sort
+}
+
+calculate_db_helper_manifest() {
+  local relative_path installed_path content_hash
+  {
+    while IFS=$'\t' read -r relative_path installed_path; do
+      [[ -f "${installed_path}" && ! -L "${installed_path}" ]] || fail "manifest input is missing or symbolic: ${installed_path}"
+      content_hash="$(sha256sum "${installed_path}" | awk '{print $1}')"
+      printf '%s\0%s\0' "${relative_path}" "${content_hash}"
+    done < <(db_helper_manifest_entries)
+  } | sha256sum | awk '{print $1}'
+}
+
+write_install_marker() {
+  local marker_directory temporary digest
+  marker_directory="$(dirname "${DB_HELPER_MARKER}")"
+  [[ -d "${marker_directory}" && ! -L "${marker_directory}" ]] || fail "marker directory is missing or invalid"
+  digest="$(calculate_db_helper_manifest)"
+  validate_hash "${digest}"
+  temporary="$(mktemp "${marker_directory}/.db-helper-manifest.sha256.tmp.XXXXXX")"
+  chown root:root "${temporary}"
+  chmod 0444 "${temporary}"
+  printf '%s\n' "${digest}" >"${temporary}"
+  sync -f "${temporary}"
+  mv -f "${temporary}" "${DB_HELPER_MARKER}"
+  sync -f "${marker_directory}"
+}
 
 install_foundation() {
   [[ -f "${FOUNDATION_SQL}" ]] || fail "foundation migration is missing"
@@ -256,6 +294,8 @@ SQL
 main() {
   require_root; local operation="${1:-}"; shift || true
   case "${operation}" in
+    print-manifest) [[ "$#" == 0 ]] || fail "unexpected arguments"; calculate_db_helper_manifest ;;
+    write-install-marker) [[ "$#" == 0 ]] || fail "unexpected arguments"; write_install_marker ;;
     install-foundation) [[ "$#" == 0 ]] || fail "unexpected arguments"; install_foundation ;;
     install-indexes) [[ "$#" == 0 ]] || fail "unexpected arguments"; install_indexes ;;
     timestamp) [[ "$#" == 0 ]] || fail "unexpected arguments"; database_timestamp ;;

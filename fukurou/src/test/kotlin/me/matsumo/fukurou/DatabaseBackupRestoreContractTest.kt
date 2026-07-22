@@ -178,7 +178,8 @@ class DatabaseBackupRestoreContractTest {
         )
         assertTrue(workflow.contains("sudo /usr/local/sbin/deploy-fukurou"))
         assertFalse(workflow.contains("backup-fukurou"))
-        assertFalse(executor.contains("backup-fukurou"))
+        assertTrue(executor.contains("backup-fukurou"))
+        assertTrue(executor.contains("--invoked-by-deploy"))
         assertTrue(compose.contains("container_name: fukurou-postgres"))
         assertTrue(backupSources.contains("fukurou-postgres"))
         assertFalse(compose.contains("backup-status.json"))
@@ -207,6 +208,8 @@ class DatabaseBackupRestoreContractTest {
         assertTrue(workflow.contains("TradingTables.kt"))
         assertTrue(workflow.contains("TradingPersistenceBootstrap.kt"))
         assertTrue(workflow.contains("deploy-foundation-v1.sql"))
+        assertTrue(workflow.contains("scripts/deploy/deploy-db-selftest"))
+        assertTrue(workflow.contains("scripts/deploy/deploy-postgres-selftest"))
     }
 
     @Test
