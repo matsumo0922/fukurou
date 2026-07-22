@@ -128,6 +128,7 @@ class ShellLlmInvoker(
             val invocationResult = LlmInvocationResult(
                 request = request,
                 responseText = parsedOutput.responseText,
+                authEvidenceObserved = parsedOutput.authEvidenceObserved,
                 usage = parsedOutput.usage,
                 processResult = processResult,
                 configuredModelIdentity = parsedOutput.configuredModelIdentity,
