@@ -28,11 +28,18 @@ psql_exec_impl() {
     docker exec -i "${POSTGRES_CONTAINER}"
     psql -X -v ON_ERROR_STOP=1 -U "${user}" -d "${database}"
   )
+  local stderr_file status=0
+  stderr_file="$(mktemp)"
   if [[ -n "${timeout_seconds}" ]]; then
-    command timeout --foreground --signal=TERM --kill-after=5 "${timeout_seconds}" "${psql_command[@]}" "$@"
+    command timeout --foreground --signal=TERM --kill-after=5 "${timeout_seconds}" "${psql_command[@]}" "$@" 2>"${stderr_file}" || status=$?
   else
-    "${psql_command[@]}" "$@"
+    "${psql_command[@]}" "$@" 2>"${stderr_file}" || status=$?
   fi
+  if [[ "${status}" -ne 0 ]]; then
+    echo "fukurou-deploy-db: psql_exec failed (exit=${status}, container=${POSTGRES_CONTAINER}): $(cat "${stderr_file}")" >&2
+  fi
+  rm -f "${stderr_file}"
+  return "${status}"
 }
 psql_exec() { psql_exec_impl "" "$@"; }
 psql_exec_with_timeout() { local timeout_seconds="$1"; shift; psql_exec_impl "${timeout_seconds}" "$@"; }
