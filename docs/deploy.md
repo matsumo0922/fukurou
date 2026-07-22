@@ -514,6 +514,8 @@ SELECT pg_wal_lsn_diff('<終了LSN>', '<開始LSN>') AS wal_bytes_generated;
 
 capture を有効にする deploy では、capture 開始以前の UTC timestamp を `FUKUROU_GATE_SHADOW_RECONCILIATION_BASELINE` に ISO-8601 で固定する。未設定時は reconciliation 件数を 0 とみなさず「baseline 未確定」として扱う。初回 observation 時刻から baseline を導出しない。観測窓と settle 猶予は `FUKUROU_GATE_SHADOW_HORIZON_SECONDS`（既定 86400 秒）と `FUKUROU_GATE_SHADOW_SETTLEMENT_GRACE_SECONDS`（既定 300 秒）、1 tick の resolver 予算は `FUKUROU_GATE_SHADOW_WALL_TIME_BUDGET_MILLIS`（既定 750 ms）で process 起動時に固定する。
 
+resolver の実行 gate は `(session_id, admission_ordinal)` index の catalog readiness 単独であり、`RECONCILIATION_BASELINE` は resolver を gate しない（reconciliation の下界専用）。index は起動時の `CREATE INDEX CONCURRENTLY` provisioning が完了した時点で活性化するため、deploy 完了で resolver が自動的に走り出す。resolver は shadow テーブルのみを書き ledger を変更しないため、baseline 未設定でも resolution の正しさは因果境界（`socket_observed_at >= window_start_time`）で保たれる。1 tick の resolver 遅延は wall-time 予算に加え、resolver 専用 pool の JDBC `socketTimeout`（秒粒度・最低 1 秒）と `connectionTimeout`（`max(250 ms, budget)`）で driver level に有界化する。したがって sub-second の budget でも実効の per-tick 遅延上限は socketTimeout + connectionTimeout ≈ 1.5 秒程度であり、宣言した budget 値そのものには一致しない（PgJDBC の socketTimeout が秒粒度のため）。
+
 ```dotenv
 FUKUROU_GATE_SHADOW_RECONCILIATION_BASELINE=2026-07-22T00:00:00Z
 ```
