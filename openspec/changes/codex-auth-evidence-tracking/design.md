@@ -6,7 +6,33 @@ PR #296（issue #291）は `LlmInvocationAuditor.isSafeCodexLifecycleFailure()` 
 2. adapter（`DefaultLlmOutputParser`）が Codex の出力から failure を一切検出していない（`cliErrorReported == false`）
 3. stderr に Codex の既知認証失敗文言（`CODEX_STDERR_AUTH_FAILURES`）が含まれない
 
-issue #295 は、issue #282 の実際の production 障害（`OUTPUT_CONTRACT`/`SCHEMA_DRIFT`）がこの3カテゴリに含まれないため、同じ障害が再発しても診断できないという limitation に対応する。`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` は Codex の出力テキストを解釈して分類されるカテゴリであり、`DefaultLlmOutputParser.parseCodex()` の先勝ち方式（`providerCategory = providerCategory ?: message?.knownCompatibilityFailureCategory() ?: UNKNOWN_PROVIDER_FAILURE`）により、認証 evidence が別カテゴリの陰に隠れて raw output に混入するリスクがある。
+issue #295 は、issue #282 の実際の production 障害（`OUTPUT_CONTRACT`/`SCHEMA_DRIFT`）がこの3カテゴリに含まれないため、同じ障害が再発しても診断できないという limitation に対応する。
+
+## Falsification Round 1（gpt-5.6-sol high、clean context）
+
+初回設計案は独立反証で4件の blocking 反例が見つかった。以下は反証内容と、各反例に対する処置。
+
+### Finding 1（blocking, 設計修正で解消）
+
+初回案の evidence 文字列 scan は `CODEX_STDERR_AUTH_FAILURES`（stderr 専用の複合文言2件）だけを対象にしていたため、`knownCompatibilityFailureCategory()` が `AUTHENTICATION` に分類する "Not logged in" / "Invalid authentication credentials" が非 JSON raw stdout に単独で現れるケース（#282 の起動失敗と同形）を検出できなかった。→ D2 で scan 対象文言集合を拡張して解消（下記）。
+
+### Finding 2（blocking, security。issue スコープとの trade-off）
+
+`UNKNOWN_PROVIDER_FAILURE` は定義上「既知パターンに一切マッチしなかった」任意テキストであり、有限の既知文言リストでは「認証 evidence が不存在であること」を証明できない。この不完全性は `OUTPUT_CONTRACT` カテゴリ（非 JSON の raw garbage である #282 のケースを含む）にも構造的に存在する。#296 では `OUTPUT_CONTRACT`/`UNKNOWN_PROVIDER_FAILURE` の raw output は一切公開しない設計だったため、この残存リスクは #296 には存在しなかった新規リスクである（design.md 初版の「#296 から変わらない」という記述は誤りだった）。
+
+**処置**: ユーザーに確認し、issue #295 の明示スコープどおり4カテゴリ全部（`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE`）を対象とすることで確定した（**帰属: ユーザー確認済み**）。この残存リスクは「Risks / Trade-offs」に明記する。
+
+### Finding 3（blocking, 設計修正で解消）
+
+`authEvidenceObserved: Boolean = false` という default 値は、「scan した結果 evidence が無かった」と「そもそも scan されていない（field が未設定のまま）」を区別できず、security gate の否定証拠が fail-open になる。将来 `LlmInvoker` の新しい実装やテスト double がこの field を指定し忘れると、暗黙に「安全」として扱われてしまう。→ D5 で default を撤廃し、全構築箇所で明示必須にすることで解消（下記）。
+
+### Finding 4（blocking, 検証可能性）
+
+初回 tasks.md は、#282 と同形の受け入れ条件1・2を hand-built double（`ConfigurableAuditLlmInvoker`）だけで満たせる書き方だった。実際に `DefaultLlmOutputParser` → `LlmInvoker` → `LlmInvocationAuditor` という production の配線を経由して #282 相当のケースが正しく扱われることを証明するテストが必須化されていなかった。→ D4 で `ShellLlmInvoker`（実装、`outputParser = DefaultLlmOutputParser()` 既定）に fake `ProcessRunner` を組み合わせた production-wiring テストを必須化することで解消（下記）。
+
+### Non-blocking
+
+`authEvidenceObserved = true` で raw output を非公開にしても、primary category が `AUTHENTICATION` でなければ `authFailureSuspected`（運用ログ通知のトリガー）は false のままになる。仕様が「非公開」だけを要求する範囲では blocking ではないが、独立追跡の運用上の終端（人間への通知）が欠けている。本 change のスコープでは対応せず、follow-up として報告する。
 
 ## Goals / Non-Goals
 
@@ -14,7 +40,8 @@ issue #295 は、issue #282 の実際の production 障害（`OUTPUT_CONTRACT`/`
 
 - primary category の先勝ち解決とは独立に、「認証関連 evidence を出力中（stdout/stderr のいずれか）に一度でも観測したか」を追跡する
 - その追跡結果が false の場合に限り、`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` の raw output を安全に監査記録へ残せるようにする
-- #282 と同形の `OUTPUT_CONTRACT`/`SCHEMA_DRIFT` 障害（起動失敗・非 JSON stdout）で raw output が記録されることを回帰テストで証明する
+- #282 と同形の `OUTPUT_CONTRACT`/`SCHEMA_DRIFT` 障害（起動失敗・非 JSON stdout）で raw output が記録されることを、production の配線を経由したテストで証明する
+- evidence 追跡の否定結果（`authEvidenceObserved == false`）を fail-closed な形（default なし、明示必須）で扱う
 
 **Non-Goals:**
 
@@ -22,33 +49,39 @@ issue #295 は、issue #282 の実際の production 障害（`OUTPUT_CONTRACT`/`
 - `AUTHENTICATION` カテゴリの raw output 非保持方針の変更（引き続き最も保守的に扱う）
 - `SecretRedactor` を出力解析型に作り替えること
 - Claude provider の audit 挙動の変更
-- 新しい認証失敗文言パターンの追加・強化（`CODEX_STDERR_AUTH_FAILURES` の内容自体は変更しない）
+- 新しい認証失敗文言パターンの追加・強化（既知文言の集合は Finding 1 で拡張した範囲に留める）
+- 「既知文言に一致しない任意テキストに未知の secret が含まれていないこと」の完全な保証（Finding 2 参照。有限の文字列一致では原理的に不可能であり、issue #295 のスコープでは対応しない）
 
 ## Decisions
 
 ### D1: evidence 追跡フィールドは `LlmProviderFailure` ではなく `ParsedLlmOutput`/`LlmInvocationResult` に置く
 
-**帰属**: agent 仮決め（issue #295 本文は `LlmProviderFailure` モデルへの追加を候補として挙げていたが、コード調査の結果この形は成立しないため変更した）
+**帰属**: agent 仮決め（issue #295 本文は `LlmProviderFailure` モデルへの追加を候補として挙げていたが、コード調査の結果この形は成立しないため変更した。falsifier のレビューでもこの配置自体は妥当と確認された）
 
 issue #295 の「やること」は `DefaultLlmOutputParser`（または `LlmProviderFailure` モデル）の拡張を候補として挙げているが、実装を検証した結果 `LlmProviderFailure` への追加は機能しない。理由: `isSafeCodexLifecycleFailure()` の既存条件1（lifecycle category）は `cliErrorReported == false`、つまり **adapter が failure を一切検出していない**ケースに限定される。このとき `DefaultLlmOutputParser.parseCodex()` は `ParsedLlmOutput.providerFailure = null` を返し、`LlmInvocationResult.providerFailure` も null になる。`LlmProviderFailure` インスタンス自体が存在しないため、そこに evidence フラグを載せても lifecycle 経路（条件1）には運べない。
 
 `LlmInvocationAuditor.primaryProviderFailure()` は lifecycle category を検出すると `lifecycleFailure(category)` で auditor 側から新規に `LlmProviderFailure` を合成するが、これは parser 由来ではないため、parser が計算した evidence フラグを引き継げない。
 
-よって `ParsedLlmOutput`（parser の戻り値）と `LlmInvocationResult`（invoker の戻り値）に `authEvidenceObserved: Boolean = false` を追加し、`providerFailure` の有無に関わらず常に運ばれるようにした。`LlmPhaseAuditSignals` はこれを `invocationResult?.authEvidenceObserved ?: false` として読む。
+よって `ParsedLlmOutput`（parser の戻り値）と `LlmInvocationResult`（invoker の戻り値）に `authEvidenceObserved: Boolean` を追加し、`providerFailure` の有無に関わらず常に運ばれるようにした。`LlmPhaseAuditSignals` はこれを `invocationResult?.authEvidenceObserved ?: false` として読む（`invocationResult` 自体が null になるのは起動失敗など invocation が完了しなかったケースのみで、その場合 `isSafeCodexLifecycleFailure()` に到達する前に別経路で failure 処理される）。
 
-**代替案として検討したもの**:
-- `LlmProviderFailure` へ追加 → 上記の理由で lifecycle 経路（既存条件3 の置き換え）に対応できないため却下
-- 新しい別クラス（`LlmCodexAuditEvidence` 等）を新設して `ParsedLlmOutput` に持たせる → フィールド1個のためだけに型を増やすのは過剰。`Boolean` で十分
-
-### D2: evidence の判定範囲は「turn.failed/error イベントの message」＋「stdout/stderr 全文の既知文言 contains 検査」
-
-**帰属**: agent 仮決め
+### D2: evidence の判定範囲は「turn.failed/error イベントの message」＋「stdout/stderr 全文の既知文言 contains 検査」（Finding 1 で拡張）
 
 `parseCodex()` のイベントループ内で `turn.failed`/`error` の message を `knownCompatibilityFailureCategory()` で判定し、結果が `AUTHENTICATION` であれば first-win で他カテゴリが確定済みでも `authEvidenceObserved = true` にする。
 
-加えて、イベントループ終了後に `CODEX_STDERR_AUTH_FAILURES` の各文言を **stdout と stderr の両方**に対して `.contains()`（部分一致）で検査する。#296 の既存 condition 3 は stderr のみを対象にしていたが、issue #282 が示す「起動失敗で stdout が空・非 JSON になるケース」では、認証失敗の平文メッセージが JSON でラップされずそのまま stdout に出る可能性を排除できない。issue #295 の文言「出力中に一度でも観測したか」は stdout/stderr のどちらかに限定していないため、両方を検査範囲に含めるのが安全側の解釈と判断した。
+加えて、イベントループ終了後に次の **`CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`**（`CODEX_STDERR_AUTH_FAILURES` の2文言 ∪ `knownCompatibilityFailureCategory()` が `AUTHENTICATION` に分類する2文言 "Not logged in"/"Invalid authentication credentials"）を **stdout と stderr の両方**に対して `.contains()`（部分一致）で検査する。
+
+```kotlin
+internal val CODEX_KNOWN_AUTH_EVIDENCE_TEXTS = CODEX_STDERR_AUTH_FAILURES + setOf(
+    "Not logged in",
+    "Invalid authentication credentials",
+)
+```
+
+`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED` に分類される文言（"Session limit reached" 等）は意図的にこの集合へ含めない。これらは新設の output-interpreted 経路そのものが公開対象とするカテゴリであり、その分類文言自体を「evidence として公開をブロックする文言」に含めると、当該カテゴリが常に自己矛盾でブロックされてしまうため。
 
 `.contains()`（部分一致）を採用したのは #296 の condition 3 と同じ安全側判定を踏襲するため（parser 内部の `stderrAuthFailure`＝主 category 決定用の判定は `trimEnd().. in set` の完全一致だが、これは「認証失敗と断定する」ための厳格な判定であり、evidence 追跡（「疑わしきは記録しない」）とは目的が異なるため意図的に区別する）。
+
+**残る限界（Finding 2、Risks 参照）**: `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` は固定の既知文言集合であり、これに一致しない任意テキスト（未知の secret、OAuth device code、rotation 後の token 等）を検出できない。この限界はユーザー確認済みの残存リスクとして受容する。
 
 ### D3: `isSafeCodexLifecycleFailure()` を2経路の disjunction に再構成する
 
@@ -69,29 +102,40 @@ private fun isSafeCodexLifecycleFailure(
 ```
 
 - lifecycle 経路（条件1）は既存の `cliErrorReported == false` 要件をそのまま維持する（#296 の condition 2 が守っていた「adapter-derived failure が lifecycle category に上書きされる複合ケース」への防御は evidence 追跡だけでは代替できないため）
-- output-interpreted 経路（新設）は `OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` に対して `cliErrorReported` を要求しない。これらのカテゴリは定義上すべて adapter 由来（`cliErrorReported` は必然的に true）であり、意味のある追加条件にならないため
+- output-interpreted 経路（新設、`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE`）は `cliErrorReported` を要求しない。これらのカテゴリは定義上すべて adapter 由来（`cliErrorReported` は必然的に true）であり、意味のある追加条件にならないため
 - `authEvidenceObserved` チェックを関数冒頭でどちらの経路よりも先に評価することで、「lifecycle category にせよ output-interpreted category にせよ、認証 evidence が独立に観測されていれば無条件で記録しない」という最優先の否定条件を明示する
-- 旧 condition 3（stderr 直接 inspect）は `authEvidenceObserved` に統合されるため、この関数は `processResult: ProcessRunResult` を引数に取らなくなる（呼び出し元の1箇所を更新）
+- 旧 condition 3（stderr 直接 inspect）は `authEvidenceObserved` に統合されるため、この関数は `processResult: ProcessRunResult` を引数に取らなくなる（呼び出し元1箇所を更新）
 
-### D4: 既存テストの `ConfigurableAuditLlmInvoker` は `authEvidenceObserved` を明示指定できるようにする
+### D4: 既存テストの更新 ＋ production-wiring テストの必須化（Finding 4 で追加）
+
+`LlmInvocationAuditorTest.kt` の `ConfigurableAuditLlmInvoker` は実際の `DefaultLlmOutputParser` を通さず `LlmInvocationResult` を直接組み立てるテスト double であり、`authEvidenceObserved` を明示パラメータとして受け取れるよう拡張する。既存テスト `invokeAndAudit_omitsRawOutputWhenStderrCarriesKnownAuthSignatureAlongsideProcessExit` はこの double に `authEvidenceObserved = true` を明示的に渡す形へ更新する。
+
+これに加えて、#282 の受け入れ条件（AC1・AC2）は **production の配線を経由したテスト**で証明する。`ShellLlmInvoker` は `outputParser: LlmOutputParser = DefaultLlmOutputParser()` を既定値に持つため、`processRunner` だけを固定 `ProcessRunResult` を返す fake に差し替えれば、実際の `DefaultLlmOutputParser.parseCodex()` を経由した `LlmInvocationResult` を得られる（`ShellLlmInvokerTest.kt` の既存パターンと同じ手法）。この `ShellLlmInvoker` インスタンスをそのまま `LlmInvocationAuditor.invokeAndAudit()` の `llmInvoker` 引数に渡すことで、parser → invoker → auditor の一続きを実コードで検証する。
+
+- #282 同形 fixture（非 JSON stdout、既知認証文言なし）→ production 配線経由で raw output が記録されることを証明
+- 同じ fixture 形状で stdout に既知認証文言を埋め込んだケース → production 配線経由で raw output が記録されないことを証明
+
+`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` については、parser 単体テスト（`DefaultLlmOutputParserTest.kt`、実 parser を直接呼ぶため既に production の parsing ロジックを証明している）と `ConfigurableAuditLlmInvoker` 経由の auditor テストの組み合わせで十分と判断し、production-wiring テストは #282 が直接対応する `OUTPUT_CONTRACT` に限定する（issue の受け入れ条件1が名指しするのがこのカテゴリのため）。
+
+### D5: `authEvidenceObserved` は default なしのフィールドとする（Finding 3 で追加）
 
 **帰属**: agent 仮決め
 
-`LlmInvocationAuditorTest.kt` の `ConfigurableAuditLlmInvoker` は実際の `DefaultLlmOutputParser` を通さず `LlmInvocationResult` を直接組み立てるテスト double であり、`authEvidenceObserved` のデフォルト値（false）のままでは既存テスト `invokeAndAudit_omitsRawOutputWhenStderrCarriesKnownAuthSignatureAlongsideProcessExit`（stderr に既知認証文言があるケース）が意図した状態を再現できなくなる。この double に `authEvidenceObserved: Boolean = false` パラメータを追加し、該当テストで明示的に `true` を渡す形に更新する。
+`ParsedLlmOutput.authEvidenceObserved` と `LlmInvocationResult.authEvidenceObserved` はどちらも default 値を持たない `Boolean` とする。これにより全ての構築箇所（`parseClaude()`、`contractFailure()`、`parseCodex()`、`LlmInvoker.kt` の `LlmInvocationResult` 構築、既存テストの `ParsedLlmOutput`/`LlmInvocationResult` 直接構築箇所）がコンパイル時にこの field の明示を強制される。
 
-加えて、`DefaultLlmOutputParser.parseCodex()` が実際にこの複合ケース（成功 event stream + stderr 既知認証文言）で `authEvidenceObserved = true` を返すことを証明する end-to-end テストを `LlmInvocationAuditorTest.kt` 側に別途追加する（production call path の証明として、hand-built fixture だけでなく実際の parser 配線を通す）。
+**代替案として検討したもの**: falsifier は `NOT_SCANNED`/`ABSENT`/`PRESENT` の tri-state enum を提案した。表現力は tri-state の方が高い（「scan を試みたが未実施」という中間状態を型で表現できる）が、本 change の実装範囲では `authEvidenceObserved` を計算する経路（Codex）と計算しない経路（Claude、明示的に `false`）の2択で全ケースを尽くせるため、Boolean + default なしで十分と判断した。将来 Codex 以外の provider で類似の evidence 追跡が必要になった場合は、その時点で tri-state 化を再検討する。
 
 ## Risks / Trade-offs
 
-- [Risk] stdout/stderr の contains 検査を広げたことで、既知認証文言が業務データ（会話内容や market data）に偶然含まれ、false positive で `OUTPUT_CONTRACT`/`UNKNOWN_PROVIDER_FAILURE` の raw output が不必要に非公開になるケースがありうる → Mitigation: false positive は「本来見えるはずの診断情報が見えない」という運用上の不便に留まり、secret 漏洩方向の安全性は損なわない。安全側に倒す設計として許容する
-- [Risk] `CODEX_STDERR_AUTH_FAILURES` の文言は Codex CLI のバージョンに依存する固定文字列であり、CLI 側の文言変更で evidence 追跡が漏れる可能性は #296 から変わらず残る → Mitigation: 既存の残存リスクと同一であり、本 change のスコープでは対処しない（`adapterSchemaVersion` によるバージョンピン止めで検知する既存の仕組みに委ねる）
-- [Trade-off] `isSafeCodexLifecycleFailure()` のシグネチャ変更（`processResult` 引数の削除）は呼び出し元1箇所の更新を伴う。影響範囲は限定的だが、既存の3条件ゲートを丸ごと書き換えるため、レビューでは新旧の等価性（lifecycle 経路が #296 と同じ結果を返すこと）を重点確認する必要がある
+- [Risk・ユーザー確認済み] `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` は固定の既知文言集合であり、これに一致しない未知の secret（token rotation 後の値、OAuth device code、ファイルパス等）が `OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` の raw output に含まれていた場合、evidence 追跡はそれを検出できず監査記録に残る。特に `UNKNOWN_PROVIDER_FAILURE` と `OUTPUT_CONTRACT`（非 JSON raw garbage のケース）はカテゴリの性質上、既知パターンに一致しない任意内容を含みうる度合いが他の2カテゴリより高い。この risk は #296 の対象範囲（lifecycle 3カテゴリ）には存在しなかった新規リスクであり、独立反証（Finding 2）で指摘された。issue #295 の明示スコープどおり4カテゴリ全部を対象とする方針をユーザーに確認した上で受容する
+- [Risk] `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` の文言は Codex CLI のバージョンに依存する固定文字列であり、CLI 側の文言変更で evidence 追跡が漏れる可能性が残る → Mitigation: `adapterSchemaVersion` によるバージョンピン止めで検知する既存の仕組みに委ねる（#296 から変わらず残る限定的なリスク）
+- [Trade-off] `isSafeCodexLifecycleFailure()` のシグネチャ変更（`processResult` 引数の削除）と `authEvidenceObserved` の default 撤廃は、呼び出し元・テスト double の複数箇所を更新する必要がある。影響範囲は限定的だが、レビューでは新旧の等価性（lifecycle 経路が #296 と同じ結果を返すこと）を重点確認する必要がある
 
 ## Migration Plan
 
-- schema 変更なし。`authEvidenceObserved` はデフォルト `false` の追加フィールドであり、既存の呼び出し箇所（Claude path、lifecycleFailure 合成箇所）は影響を受けない
+- schema 変更なし。`authEvidenceObserved` は新規フィールドだが default を持たないため、既存の呼び出し箇所は全てこの change の diff 内でコンパイルが通る形に更新する（別 PR での段階移行は不要）
 - ロールバック: 本 change の commit を revert すれば #296 の3条件ゲートに戻る。DB マイグレーションやランタイム設定の変更は伴わない
 
 ## Open Questions
 
-（なし。issue #295 の受け入れ条件は本設計で全て充足する）
+（なし。issue #295 の受け入れ条件と falsification round 1 の指摘は本設計で全て充足・解消する）

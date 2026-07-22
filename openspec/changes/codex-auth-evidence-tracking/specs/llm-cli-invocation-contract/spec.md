@@ -6,7 +6,9 @@ Issue #189 typed-failure DoD: The runtime MUST classify authentication, rate/ses
 
 Issue #291: Codex invocations retain redacted stdout/stderr when the resolved category is `PROCESS_EXIT`, `PROCESS_TIMEOUT`, or `CLEANUP` (a purely process-lifecycle fact) and the adapter itself reported no provider failure at all (`invocationResult.providerFailure == null`, i.e. `cliErrorReported == false`). `primaryProviderFailure()` prioritizes this lifecycle category over an adapter-derived `UNKNOWN_PROVIDER_FAILURE` whenever the process also exited non-zero, timed out, or hit a cleanup failure, so a lifecycle category can coexist with output-text-derived adapter evidence that was never surfaced as the primary category; the `cliErrorReported == false` condition closes this gap.
 
-Issue #295: Codex invocations additionally retain redacted stdout/stderr when the resolved category is `OUTPUT_CONTRACT`, `RATE_OR_SESSION_LIMIT`, `QUOTA_EXHAUSTED`, or `UNKNOWN_PROVIDER_FAILURE` (categories derived by interpreting Codex's own output text), provided that no authentication evidence was independently observed anywhere in the invocation's output. This independent tracking (`authEvidenceObserved`) is computed by `DefaultLlmOutputParser.parseCodex()` separately from its first-match primary-category resolution: it is set whenever a `turn.failed` or `error` event's message maps to the `AUTHENTICATION` compatibility category (regardless of whether that category was superseded by an earlier first-match result), or whenever the raw stdout or stderr text contains one of the known Codex authentication-failure strings (`CODEX_STDERR_AUTH_FAILURES`), checked unconditionally rather than only when no terminal event was parsed. When `authEvidenceObserved` is true, raw output is withheld regardless of which category — lifecycle or output-interpreted — the invocation resolved to. `AUTHENTICATION` itself continues to retain no raw output under any condition, because it is Codex's own most direct signal that credentials are in play.
+Issue #295: Codex invocations additionally retain redacted stdout/stderr when the resolved category is `OUTPUT_CONTRACT`, `RATE_OR_SESSION_LIMIT`, `QUOTA_EXHAUSTED`, or `UNKNOWN_PROVIDER_FAILURE` (categories derived by interpreting Codex's own output text), provided that no authentication evidence was independently observed anywhere in the invocation's output. This independent tracking (`authEvidenceObserved`) is computed by `DefaultLlmOutputParser.parseCodex()` separately from its first-match primary-category resolution: it is set whenever a `turn.failed` or `error` event's message maps to the `AUTHENTICATION` compatibility category (regardless of whether that category was superseded by an earlier first-match result), or whenever the raw stdout or stderr text contains one of the known Codex authentication-evidence strings (`CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`, the union of `CODEX_STDERR_AUTH_FAILURES` and the two `AUTHENTICATION`-mapped compatibility strings "Not logged in"/"Invalid authentication credentials"), checked unconditionally against both stdout and stderr rather than only against stderr when no terminal event was parsed. When `authEvidenceObserved` is true, raw output is withheld regardless of which category — lifecycle or output-interpreted — the invocation resolved to. `AUTHENTICATION` itself continues to retain no raw output under any condition, because it is Codex's own most direct signal that credentials are in play. `authEvidenceObserved` has no default value at any construction site, so every code path that produces a `ParsedLlmOutput` or `LlmInvocationResult` must set it explicitly; there is no implicit "unscanned" state that resolves to safe.
+
+This known-text matching is necessarily incomplete: content that does not match `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` (an unrotated or newly issued secret, an OAuth device code, a file path) is not detected, and `OUTPUT_CONTRACT` (when caused by non-JSON raw output) and `UNKNOWN_PROVIDER_FAILURE` (when caused by an unrecognized message) are the two categories most likely to carry such undetected content, since by definition their raw text did not match any known structure. This residual risk is accepted for all four newly-safe categories as a deliberate, user-confirmed scope decision.
 
 #### Scenario: Claude reports a session limit
 
@@ -20,17 +22,17 @@ Issue #295: Codex invocations additionally retain redacted stdout/stderr when th
 
 #### Scenario: Codex output cannot be validated against the pinned schema and no authentication evidence is present anywhere in output
 
-- **WHEN** Codex's stdout cannot be validated against the pinned schema (genuine schema drift, including a launch failure that produces empty or non-JSON stdout), and neither stdout nor stderr contains a known Codex authentication-failure string, and no parsed `turn.failed`/`error` event message mapped to `AUTHENTICATION`
+- **WHEN** Codex's stdout cannot be validated against the pinned schema (genuine schema drift, including a launch failure that produces empty or non-JSON stdout), and neither stdout nor stderr contains a known Codex authentication-evidence string, and no parsed `turn.failed`/`error` event message mapped to `AUTHENTICATION`
 - **THEN** audit records `OUTPUT_CONTRACT` and retains the completed process's stdout and stderr after `redactor.redactAndTruncate`, without a `rawOutputOmitted` marker
 
 #### Scenario: Codex output cannot be validated against the pinned schema and authentication evidence is present
 
-- **WHEN** Codex's stdout cannot be validated against the pinned schema — whether from schema drift where stdout or stderr independently contains a known Codex authentication-failure string, or from a terminal payload that also carries authentication-failure evidence which the parser's first-match priority logic resolved to a different category than `AUTHENTICATION`
+- **WHEN** Codex's stdout cannot be validated against the pinned schema — whether from schema drift where stdout or stderr independently contains a known Codex authentication-evidence string, or from a terminal payload that also carries authentication-failure evidence which the parser's first-match priority logic resolved to a different category than `AUTHENTICATION`
 - **THEN** audit records `OUTPUT_CONTRACT` without persisting raw output, token, path, or prompt
 
 #### Scenario: Codex reports a rate/session limit or quota category with no authentication evidence present
 
-- **WHEN** Codex's output contains a `RATE_OR_SESSION_LIMIT` or `QUOTA_EXHAUSTED` match, and neither stdout nor stderr contains a known Codex authentication-failure string, and no parsed event message mapped to `AUTHENTICATION`
+- **WHEN** Codex's output contains a `RATE_OR_SESSION_LIMIT` or `QUOTA_EXHAUSTED` match, and neither stdout nor stderr contains a known Codex authentication-evidence string, and no parsed event message mapped to `AUTHENTICATION`
 - **THEN** audit records that category and retains the completed process's stdout and stderr after `redactor.redactAndTruncate`, without a `rawOutputOmitted` marker
 
 #### Scenario: Codex reports a rate/session limit or quota category ahead of a later authentication signal
@@ -40,7 +42,7 @@ Issue #295: Codex invocations additionally retain redacted stdout/stderr when th
 
 #### Scenario: Unknown provider failure occurs with no authentication evidence present
 
-- **WHEN** output cannot be mapped to a supported typed category, and neither stdout nor stderr contains a known Codex authentication-failure string, and no parsed event message mapped to `AUTHENTICATION`
+- **WHEN** output cannot be mapped to a supported typed category, and neither stdout nor stderr contains a known Codex authentication-evidence string, and no parsed event message mapped to `AUTHENTICATION`
 - **THEN** audit records `UNKNOWN_PROVIDER_FAILURE` and retains the completed process's stdout and stderr after `redactor.redactAndTruncate`, remaining fail-closed
 
 #### Scenario: Codex's output text does not map to a known compatibility failure and authentication evidence is present
@@ -60,5 +62,5 @@ Issue #295: Codex invocations additionally retain redacted stdout/stderr when th
 
 #### Scenario: A complete successful event stream coexists with a known authentication signature in stderr
 
-- **WHEN** Codex's stdout contains a complete, successful event stream (`thread.started`/`item.completed`/`turn.completed`, exactly one terminal), so the adapter reports no provider failure at all, but the process's stderr independently contains one of the known Codex authentication-failure strings, and the process also resolves to `PROCESS_TIMEOUT`, `PROCESS_EXIT`, or `CLEANUP`
+- **WHEN** Codex's stdout contains a complete, successful event stream (`thread.started`/`item.completed`/`turn.completed`, exactly one terminal), so the adapter reports no provider failure at all, but the process's stderr independently contains one of the known Codex authentication-evidence strings, and the process also resolves to `PROCESS_TIMEOUT`, `PROCESS_EXIT`, or `CLEANUP`
 - **THEN** audit does not record raw stdout or stderr for this invocation, because the independent authentication-evidence tracking scans stderr unconditionally (not only when no terminal event was parsed) and withholds raw output whenever it finds a match
