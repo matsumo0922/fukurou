@@ -16,6 +16,9 @@ import java.time.Instant
  *
  * @param responseText semantic response 本文
  * @param usage invocation 単位の structured usage
+ * @param authEvidenceObserved primary category の先勝ち解決とは独立に、既知の認証 evidence 文言
+ * （`CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`）を出力中に観測したか。default を持たないため、
+ * 全ての構築箇所で明示が必須（fail-closed）。Codex 以外の provider では常に false
  * @param configuredModelIdentity renderer が確定した model identity
  * @param observedModelIdentity provider output が報告した model identity
  * @param providerFailure schema または provider が報告した typed failure
@@ -24,6 +27,7 @@ import java.time.Instant
 data class ParsedLlmOutput(
     val responseText: String,
     val usage: LlmUsageDetails?,
+    val authEvidenceObserved: Boolean,
     val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,
     val observedModelIdentity: LlmObservedModelIdentity? = null,
     val providerFailure: LlmProviderFailure? = null,
@@ -86,6 +90,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
         return ParsedLlmOutput(
             responseText = responseText.orEmpty(),
             usage = usage,
+            authEvidenceObserved = false,
             configuredModelIdentity = command.configuredModelIdentity,
             observedModelIdentity = observedModel?.let { model ->
                 LlmObservedModelIdentity(model, CLAUDE_OUTPUT_MODEL_SOURCE)
@@ -104,6 +109,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
         var terminalCount = 0
         var providerCategory: LlmProviderFailureCategory? = null
         var schemaDrift = false
+        var authEvidenceObserved = false
 
         processResult.stdout.lineSequence().filter(String::isNotBlank).forEach { line ->
             val event = runCatching { OutputJson.parseToJsonElement(line) as? JsonObject }.getOrNull()
@@ -133,17 +139,28 @@ class DefaultLlmOutputParser : LlmOutputParser {
                     terminalCount++
                     terminalSucceeded = terminalSucceeded ?: false
                     val message = event.objectOrNull("error")?.stringOrNull("message")
-                    providerCategory = providerCategory ?: message?.knownCompatibilityFailureCategory()
+                    val messageCategory = message?.knownCompatibilityFailureCategory()
+                    if (messageCategory == LlmProviderFailureCategory.AUTHENTICATION) authEvidenceObserved = true
+                    providerCategory = providerCategory ?: messageCategory
                         ?: LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE
                     if (message == null) schemaDrift = true
                 }
                 "error" -> {
                     val message = event.stringOrNull("message")
-                    providerCategory = providerCategory ?: message?.knownCompatibilityFailureCategory()
+                    val messageCategory = message?.knownCompatibilityFailureCategory()
+                    if (messageCategory == LlmProviderFailureCategory.AUTHENTICATION) authEvidenceObserved = true
+                    providerCategory = providerCategory ?: messageCategory
                         ?: LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE
                     if (message == null) schemaDrift = true
                 }
             }
+        }
+
+        if (CODEX_KNOWN_AUTH_EVIDENCE_TEXTS.any { knownText ->
+                processResult.stdout.contains(knownText) || processResult.stderr.contains(knownText)
+            }
+        ) {
+            authEvidenceObserved = true
         }
 
         val hasExactlyOneTerminal = terminalCount == 1
@@ -179,6 +196,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
         return ParsedLlmOutput(
             responseText = responseText.orEmpty(),
             usage = usageDetails,
+            authEvidenceObserved = authEvidenceObserved,
             configuredModelIdentity = command.configuredModelIdentity,
             observedModelIdentity = null,
             providerFailure = providerFailure,
@@ -190,6 +208,7 @@ class DefaultLlmOutputParser : LlmOutputParser {
         return ParsedLlmOutput(
             responseText = "",
             usage = null,
+            authEvidenceObserved = false,
             configuredModelIdentity = command.configuredModelIdentity,
             observedModelIdentity = null,
             providerFailure = outputContractFailure(adapterVersion),
@@ -276,12 +295,32 @@ private const val CODEX_AGENT_MESSAGE_ITEM = "agent_message"
 /**
  * Codex が認証失敗時に stderr へ出す既知の固定文言。
  *
- * [LlmInvocationAuditor] も、成功 terminal と併存する認証 evidence を
- * 監査 payload に残さないための追加チェックでこの集合を参照する。
+ * `parseCodex()` の主 category 判定（`stderrAuthFailure`）が `trimEnd()` した stderr 全体との
+ * 完全一致で使う集合。[CODEX_KNOWN_AUTH_EVIDENCE_TEXTS] の一部としても使われる。
  */
 internal val CODEX_STDERR_AUTH_FAILURES = setOf(
     "API key login is required, but ChatGPT is currently being used. Logging out.",
     "ChatGPT login is required, but an API key is currently being used. Logging out.",
+)
+
+/**
+ * 認証 evidence の独立追跡（`authEvidenceObserved`）が stdout/stderr 全文に対して
+ * `.contains()`（部分一致）で検査する既知文言の集合。
+ *
+ * [CODEX_STDERR_AUTH_FAILURES] の2文言に加え、[knownCompatibilityFailureCategory] が
+ * `AUTHENTICATION` に分類する2文言（"Not logged in"/"Invalid authentication credentials"）を含む。
+ * `RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED` に分類される文言は意図的に含まない
+ * （それらは新設の output-interpreted 経路自身が公開対象とするカテゴリであり、
+ * 分類文言自体を evidence 扱いすると自己矛盾でブロックされ続けるため）。
+ *
+ * この検査は「疑わしきは記録しない」という evidence 追跡が目的であり、主 category を
+ * 確定させるための厳格な完全一致判定（[CODEX_STDERR_AUTH_FAILURES] 単体の用途）とは
+ * 意図的に区別する。既知文言との一致判定に過ぎず、未知の secret や token の
+ * 不存在を証明するものではない。
+ */
+internal val CODEX_KNOWN_AUTH_EVIDENCE_TEXTS = CODEX_STDERR_AUTH_FAILURES + setOf(
+    "Not logged in",
+    "Invalid authentication credentials",
 )
 private val SAFE_PROVIDER_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
 
