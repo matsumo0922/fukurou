@@ -1,25 +1,45 @@
 ## 1. SecretRedactor のパターン確認
 
-- [ ] 1.1 `SecretRedactor.kt` の `SENSITIVE_ENV_KEY_PATTERNS` / `SENSITIVE_JSON_KEY_PATTERNS` が Codex CLI / MCP launcher の実際のエラーメッセージ形式（DB password、API key、token 系）を拾えるか確認する
-- [ ] 1.2 不足パターンがあれば `SecretRedactor.kt` に追加する（なければ何もしない）
+- [ ] 1.1 既知 secret source（環境変数キーパターン `SENSITIVE_ENV_KEY_PATTERNS`、auth JSON キーパターン `SENSITIVE_JSON_KEY_PATTERNS`）の収集範囲と、それらの値が Codex/MCP 出力に現れたときに完全一致置換で masking されることを確認する。この確認は「出力メッセージの書式を正規表現で解析する」ものではなく、「起動時に収集した既知 secret 値を後から置換する」方式であることを前提にする
+- [ ] 1.2 不足パターンがあれば `SecretRedactor.kt` に追加する（なければ何もしない）。出力解析型への作り替えは行わない（design.md Decision 5 / Non-Goals 参照）
 
 ## 2. LlmInvocationAuditor の Codex 経路修正
 
-- [ ] 2.1 `phaseDetails()` 内、`auditSignals.providerFailure != null` の分岐（L362-363 付近）を provider ごとに分割する: Codex かつ `failure.category != AUTHENTICATION` の場合は `redactor.redactAndTruncate(processResult.stdout)` / `redactor.redactAndTruncate(processResult.stderr)` を記録し、それ以外（Claude、または Codex の `AUTHENTICATION`）は現状の省略を維持する
-- [ ] 2.2 `providerFailure == null` の Codex 分岐（L371-375 付近）を、Claude と同じ `redactor.redactAndTruncate(stdout)` / `redactor.redactAndTruncate(stderr)` 記録に変更する
-- [ ] 2.3 `rawOutputOmitted` フィールドの書き込みロジックをコードベースから完全に削除する（`AUTHENTICATION` の場合は `stdout`/`stderr` キー自体を出さない）
+- [ ] 2.1 `DefaultLlmOutputParser.kt` の private 定数 `CODEX_STDERR_AUTH_FAILURES`（L275 付近）を `internal` に変更し、`LlmInvocationAuditor.kt` から参照できるようにする
+- [ ] 2.2 `phaseDetails()` 内、`auditSignals.providerFailure != null` の分岐（L362-363 付近）を書き換える: Codex かつ次の3条件をすべて満たす場合のみ `redactor.redactAndTruncate(processResult.stdout)` / `redactor.redactAndTruncate(processResult.stderr)` を記録する
+  1. `failure.category` が `PROCESS_EXIT` / `PROCESS_TIMEOUT` / `CLEANUP` のいずれか
+  2. `auditSignals.cliErrorReported == false`（= `invocationResult?.providerFailure == null`。adapter が一切何も検出しなかった）
+  3. `processResult.stderr` が `CODEX_STDERR_AUTH_FAILURES` のいずれの文言も含まない（部分文字列一致で判定。parser 自身の完全一致判定より保守的にする）
+
+  それ以外（Claude の任意カテゴリ、または Codex の `AUTHENTICATION`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`OUTPUT_CONTRACT`/`UNKNOWN_PROVIDER_FAILURE`、または上記3条件のいずれか1つでも欠ける複合ケース）は現状の省略を維持する
+- [ ] 2.3 Codex の成功時分岐（`providerFailure == null`、L371-375 付近）は変更しない（既存どおり `stdout`/`stderr` キーを出さない）
+- [ ] 2.4 `rawOutputOmitted` フィールドの書き込みロジックをコードベースから完全に削除する（記録しない場合は `stdout`/`stderr` キー自体を出さない）
 
 ## 3. テスト更新・追加
 
 - [ ] 3.1 `LlmInvocationAuditorTest.kt` の `invokeAndAudit_preservesPartialCodexUsageWhileFailingClosed`（L154-199、`rawOutputOmitted` assertion を含む）を更新する。このテストは `authFailureSuspected=true` の認証失敗ケースなので、`AUTHENTICATION` は raw output 非保持のまま（`stdout`/`stderr` キーが存在しないことを確認する assertion は維持）
-- [ ] 3.2 Codex が `AUTHENTICATION` 以外の失敗カテゴリ（例: `PROCESS_EXIT` または `UNKNOWN_PROVIDER_FAILURE`）で終了したとき、redact 済み stdout/stderr が監査記録に残ることを確認する新規テストを追加する
-- [ ] 3.3 Codex が成功したとき、redact 済み stdout/stderr が監査記録に残ることを確認する新規テストを追加する（Claude の既存成功テストと対称の内容）
-- [ ] 3.4 Codex の stdout/stderr に既知 secret 値（環境変数由来）を含めたとき、監査記録では `[REDACTED]` に置換されることを確認する回帰テストを追加する
-- [ ] 3.5 `OneShotLlmRunnerTest.kt` の L2362 付近（`rawOutputOmitted` assertion）を、新しい期待値に更新する
-- [ ] 3.6 `rawOutputOmitted` という文字列がテストコード・実装コードのどちらにも残っていないことを `grep` で確認する
+- [ ] 3.2 Codex が `PROCESS_EXIT` で終了したとき、redact 済み stdout/stderr が監査記録に残ることを確認する新規テストを追加する
+- [ ] 3.3 Codex が `PROCESS_TIMEOUT` または `CLEANUP` で終了したとき、redact 済み stdout/stderr が監査記録に残ることを確認する新規テストを追加する
+- [ ] 3.4 Codex が `RATE_OR_SESSION_LIMIT` / `QUOTA_EXHAUSTED` / `OUTPUT_CONTRACT` / `UNKNOWN_PROVIDER_FAILURE` で終了したとき、`stdout`/`stderr` キーが一切出ないことを確認する新規テストを追加する
+- [ ] 3.5 複合失敗ケースの回帰テストを追加する: `DefaultLlmOutputParser` が認証失敗 evidence を含みつつ、先勝ち方式で `RATE_OR_SESSION_LIMIT` / `QUOTA_EXHAUSTED` / `OUTPUT_CONTRACT` / `UNKNOWN_PROVIDER_FAILURE` に分類するケース（`DefaultLlmOutputParserTest.kt` の既存テストを参考にする）で、`LlmInvocationAuditor` がこれらのカテゴリとして stdout/stderr を一切記録しないことを確認する
+- [ ] 3.6 **lifecycle category と adapter failure が複合するケースの回帰テストを追加する**（4回目の falsify で判明した反例）: adapter が出力テキストから `UNKNOWN_PROVIDER_FAILURE` を導出しつつ、同時に (a) process が非ゼロ終了する (b) timeout する (c) cleanup 例外が起きる、の3パターンそれぞれで、`primaryProviderFailure()` が `PROCESS_EXIT`/`PROCESS_TIMEOUT`/`CLEANUP` を primary category として返しても、`LlmInvocationAuditor` が `stdout`/`stderr` キーを一切出さないことを確認する
+- [ ] 3.7 **完全な成功 event stream + stderr の既知認証文言が複合するケースの回帰テストを追加する**（5回目の falsify で判明した反例）: stdout に完全な成功 event stream（`thread.started`/`item.completed`/`turn.completed`、`terminalCount == 1`）があり adapter が `providerFailure == null` を返す状態で、stderr に `CODEX_STDERR_AUTH_FAILURES` のいずれかの文言が含まれ、かつ process が (a) 非ゼロ終了する (b) timeout する (c) cleanup 例外が起きる、の3パターンそれぞれで、`LlmInvocationAuditor` が `stdout`/`stderr` キーを一切出さないことを確認する
+- [ ] 3.8 Codex の `PROCESS_EXIT`/`PROCESS_TIMEOUT`/`CLEANUP` 失敗時（かつ adapter failure なし、かつ stderr に既知認証文言なし）の stdout/stderr に既知 secret 値（環境変数由来）を含めたとき、監査記録では `[REDACTED]` に置換されることを確認する回帰テストを追加する
+- [ ] 3.9 Codex の成功時テスト（既存があれば）が、引き続き `stdout`/`stderr` キーを含まないことを確認する。既存の成功時テストが存在しない場合は追加する
+- [ ] 3.10 `OneShotLlmRunnerTest.kt` の L2362 付近（`rawOutputOmitted` assertion）を、新しい期待値に更新する
+- [ ] 3.11 `OpsRouteTest.kt` の `opsRoutes_auditDoesNotExposeCodexRawOutputAndKeepsStructuredUsage`（成功時の非公開保証テスト、L1573-1618 付近）を実行し、今回の変更後も引き続き pass することを確認する（このテストの fixture は成功時・exitCode 0 であり、今回の変更は process lifecycle 系失敗時のみを対象にするため、このテストの前提・期待値は変更しない）
+- [ ] 3.12 `rawOutputOmitted` という文字列がテストコード・実装コードのどちらにも残っていないことを `grep` で確認する
 
-## 4. 検証
+## 4. ドキュメント更新
 
-- [ ] 4.1 `make test` を実行する
-- [ ] 4.2 `make detekt` を実行する
-- [ ] 4.3 `make build` を実行する
+- [ ] 4.1 `docs/design.md` L1309（「Codex は raw JSONL / stderr と起動境界の例外 message / path を永続化せず...」の文）を現在の仕様に合わせて更新する: Codex は process lifecycle カテゴリ（`PROCESS_EXIT`/`PROCESS_TIMEOUT`/`CLEANUP`）の失敗時に redactor 経由の stdout/stderr を `command_event_log` に記録すること、成功時および `AUTHENTICATION`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`OUTPUT_CONTRACT`/`UNKNOWN_PROVIDER_FAILURE` は引き続き raw output・例外 message・path を永続化しないこと
+
+## 5. Follow-up issue の起票
+
+- [ ] 5.1 PR 作成時に、issue #282 と同形の `OUTPUT_CONTRACT`/`SCHEMA_DRIFT` 障害を安全に診断可能にするための follow-up issue を起票する（design.md の Follow-up 参照: parser が primary category と独立に認証 evidence の有無を追跡する設計が必要）
+
+## 6. 検証
+
+- [ ] 6.1 `make test` を実行する
+- [ ] 6.2 `make detekt` を実行する
+- [ ] 6.3 `make build` を実行する
