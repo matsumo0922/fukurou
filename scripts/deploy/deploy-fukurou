@@ -414,7 +414,10 @@ start_new_pause() {
   install_kind="$(jq -er '.installKind' <<<"${snapshot}")"
   [[ "${install_kind}" == "FOUNDATION_V1" ]] || fail "DEPLOY_FOUNDATION_REQUIRED_BEFORE_SIMPLE_EXECUTOR"
   current_generation="$(jq -er '.maintenance.generation' <<<"${snapshot}")"
-  current_enabled="$(jq -er '.maintenance.enabled' <<<"${snapshot}")"
+  # jq -e は最後に出力した値が false/null だと exit 1 を返す値ベースの終了コード仕様のため、
+  # 正常時の期待値である false を保護なし代入で受けると set -e でスクリプトごと即死する
+  # （直後の明示チェックにすら到達しない）。-e を落として明示チェックだけに検証を委ねる。
+  current_enabled="$(jq -r '.maintenance.enabled' <<<"${snapshot}")"
   current_deployment="$(jq -er '.maintenance.deploymentId' <<<"${snapshot}")"
   [[ "${current_enabled}" == "false" ]] || fail "UNTRACKED_LAUNCH_MAINTENANCE_ENABLED"
   [[ "${current_generation}" -lt 9223372036854775807 ]] || fail "MAINTENANCE_GENERATION_OVERFLOW"
@@ -533,7 +536,10 @@ restore_paused_maintenance_after_enable_failure() {
 resume_launches_idempotently() {
   local snapshot enabled generation deployment
   snapshot="$(runtime_snapshot)"
-  enabled="$(jq -er '.maintenance.enabled' <<<"${snapshot}")"
+  # start_new_pause() と同じ理由で -e を落とす。enabled は true/false どちらも
+  # 正常系（下の if/elif が両方を明示的に扱う）であり、false のときに jq -e が
+  # 保護なし代入をset -eで即死させてしまう。
+  enabled="$(jq -r '.maintenance.enabled' <<<"${snapshot}")"
   generation="$(jq -er '.maintenance.generation' <<<"${snapshot}")"
   deployment="$(jq -er '.maintenance.deploymentId' <<<"${snapshot}")"
   [[ "${generation}" == "${MARKER_MAINTENANCE_GENERATION}" ]] || fail "RESUME_MAINTENANCE_GENERATION_MISMATCH"
