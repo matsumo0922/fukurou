@@ -272,7 +272,14 @@ private const val CODEX_THREAD_STARTED_EVENT = "thread.started"
 private const val CODEX_ITEM_COMPLETED_EVENT = "item.completed"
 private const val CODEX_TURN_COMPLETED_EVENT = "turn.completed"
 private const val CODEX_AGENT_MESSAGE_ITEM = "agent_message"
-private val CODEX_STDERR_AUTH_FAILURES = setOf(
+
+/**
+ * Codex が認証失敗時に stderr へ出す既知の固定文言。
+ *
+ * [LlmInvocationAuditor] も、成功 terminal と併存する認証 evidence を
+ * 監査 payload に残さないための追加チェックでこの集合を参照する。
+ */
+internal val CODEX_STDERR_AUTH_FAILURES = setOf(
     "API key login is required, but ChatGPT is currently being used. Logging out.",
     "ChatGPT login is required, but an API key is currently being used. Logging out.",
 )
