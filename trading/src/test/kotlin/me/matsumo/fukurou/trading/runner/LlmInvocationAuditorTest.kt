@@ -1011,6 +1011,7 @@ class LlmInvocationAuditorTest {
         assertEquals("SCHEMA_DRIFT", details["providerCode"]?.jsonPrimitive?.content)
         assertEquals(processResult.stdout, details["stdout"]?.jsonPrimitive?.content)
         assertEquals(processResult.stderr, details["stderr"]?.jsonPrimitive?.content)
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
     }
 
     /**
@@ -1050,6 +1051,7 @@ class LlmInvocationAuditorTest {
         assertEquals("OUTPUT_CONTRACT", details["failureCategory"]?.jsonPrimitive?.content)
         assertFalse(details.containsKey("stdout"))
         assertFalse(details.containsKey("stderr"))
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
     }
 
     private fun manifestAuditor(
