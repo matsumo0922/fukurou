@@ -2204,6 +2204,25 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun codexProposerMcpConfigForwardsInvocationIdToSubprocess() = runBlocking {
+        val fixture = runnerFixture { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        fixture.runOneShot(
+            defaultRequest().copy(
+                proposerProvider = LlmProvider.CODEX,
+            ),
+        ).getOrThrow()
+
+        val proposerCommand = fixture.processRunner.launches.single()
+        val configContent = proposerCommand.codexConfigContent()
+
+        assertTrue(configContent.contains("env_vars = [\"FUKUROU_INVOCATION_ID\"]"))
+    }
+
+    @Test
     fun cliConfigRejectsNonCanonicalFalsifierAllowlist() {
         val readOnlyFalsifierTools = defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME)
             .filterNot { toolName -> toolName.endsWith("__submit_falsification") }

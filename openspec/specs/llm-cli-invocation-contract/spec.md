@@ -3,9 +3,7 @@
 ## Purpose
 
 Claude と Codex の CLI invocation における認証、tool policy、出力 contract、failure classification、model attribution の要件を定義する。
-
 ## Requirements
-
 ### Requirement: Pre-filter activation remains code-gated
 Issue #189 non-regression invariant: The daemon MUST evaluate a code-owned release barrier before starting a pre-filter process, regardless of runtime configuration. The barrier MUST remain closed throughout Issue #189 and SHALL be opened only by the separate Issue #154 activation change.
 
@@ -79,3 +77,11 @@ Issue #189 session-retention and cost-attribution prerequisites: Every invocatio
 #### Scenario: Provider output omits model identity
 - **WHEN** model identity is absent from otherwise valid provider output
 - **THEN** audit retains the effective configured name or explicit `CLI_DEFAULT` source, marks observed identity unavailable, and does not scan session files
+
+### Requirement: OneShotLlmRunner's Codex MCP invocation forwards the decision run invocation id
+Issue #287 proposer-restoration invariant: The `LlmMcpServerConfig` that `OneShotLlmRunner` builds for a decision run's Codex-provider invocation MUST forward `FUKUROU_INVOCATION_ID` to the MCP subprocess via the rendered config's `env_vars`, so the MCP launcher's required-environment check does not fail closed. This requirement scopes to `OneShotLlmRunner.mcpServerConfig()` only; other Codex MCP config builders (e.g. CLI acceptance canary, MCP isolation canary) are out of scope for this change.
+
+#### Scenario: Production MCP config is rendered for a Codex invocation
+- **WHEN** `OneShotLlmRunner` builds an `LlmMcpServerConfig` for a decision run's Codex-provider invocation
+- **THEN** the rendered Codex config TOML's `env_vars` array contains `FUKUROU_INVOCATION_ID`, and the decision run's invocation id is present in the invocation's process environment
+
