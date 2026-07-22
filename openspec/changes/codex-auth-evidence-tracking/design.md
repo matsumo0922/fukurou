@@ -20,7 +20,18 @@ issue #295 は、issue #282 の実際の production 障害（`OUTPUT_CONTRACT`/`
 
 `UNKNOWN_PROVIDER_FAILURE` は定義上「既知パターンに一切マッチしなかった」任意テキストであり、有限の既知文言リストでは「認証 evidence が不存在であること」を証明できない。この不完全性は `OUTPUT_CONTRACT` カテゴリ（非 JSON の raw garbage である #282 のケースを含む）にも構造的に存在する。#296 では `OUTPUT_CONTRACT`/`UNKNOWN_PROVIDER_FAILURE` の raw output は一切公開しない設計だったため、この残存リスクは #296 には存在しなかった新規リスクである（design.md 初版の「#296 から変わらない」という記述は誤りだった）。
 
-**処置**: ユーザーに確認し、issue #295 の明示スコープどおり4カテゴリ全部（`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE`）を対象とすることで確定した（**帰属: ユーザー確認済み**）。この残存リスクは「Risks / Trade-offs」に明記する。
+**処置**: main（propose 担当）がこの run 内でユーザーに直接 `AskUserQuestion` を投げ、確認を得た（**帰属: ユーザー確認済み**）。監査可能性のため、質問と回答をそのまま以下に転記する。
+
+> **質問**: 「既知文言リストでは『認証 evidence 不存在』を完全には証明できないという残存リスクを、どの範囲で受容する？」
+>
+> 選択肢:
+> 1. `OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED` のみ、`UNKNOWN_PROVIDER_FAILURE` は除外（推奨として提示）
+> 2. issue の明示スコープどおり4カテゴリ全部
+> 3. 全面後退：構造化イベント経由の `RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED` のみ（`OUTPUT_CONTRACT` も除外し、#282 の受け入れ条件1を満たさなくなる案）
+>
+> **回答**: 「issue の明示スコープどおり4カテゴリ全部」
+
+この回答により、`CODEX_SAFE_OUTPUT_INTERPRETED_FAILURE_CATEGORIES` は `OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` の4カテゴリ全部を含む方針で確定した。この残存リスクは「Risks / Trade-offs」に明記する。
 
 ### Finding 3（blocking, 設計修正で解消）
 
@@ -34,12 +45,28 @@ issue #295 は、issue #282 の実際の production 障害（`OUTPUT_CONTRACT`/`
 
 `authEvidenceObserved = true` で raw output を非公開にしても、primary category が `AUTHENTICATION` でなければ `authFailureSuspected`（運用ログ通知のトリガー）は false のままになる。仕様が「非公開」だけを要求する範囲では blocking ではないが、独立追跡の運用上の終端（人間への通知）が欠けている。本 change のスコープでは対応せず、follow-up として報告する。
 
+## Falsification Round 2（同一 falsifier による round 1 修正の再反証）
+
+round 1 の4件の修正を適用した版を同じ falsifier に再反証させた結果、Finding 1・3（`ParsedLlmOutput`/`LlmInvocationResult` の範囲）・4 は解消と確認された。新たに2件の blocking が見つかった。
+
+### Blocking A（blocking, spec correctness/security。設計修正で解消）
+
+delta spec のシナリオ title・THEN 節が「no authentication evidence is present anywhere」「remaining fail-closed」といった、実装（既知の固定文言との一致判定）が実際に保証する範囲より強い表現になっており、本文中の残存リスク記述（Finding 2 の帰結）と矛盾して読める。→ 該当する4箇所のシナリオ title を「no known authentication-evidence text is observed」系の表現に統一し、`UNKNOWN_PROVIDER_FAILURE` シナリオの THEN 節から「fail-closed」を raw output 保持と並置しない形（trading-decision の fail-closed と audit exposure の条件を別々に記述）へ書き換えて解消した。本 design.md の Goals も同様に「安全に」という無限定の表現を「既知 evidence 文言の不在という条件の範囲内で」に修正した。
+
+### Blocking B（blocking, fail-open upgrade path。設計修正で解消）
+
+`LlmPhaseAuditSignals.authEvidenceObserved: Boolean = false`（tasks 3.1 の当初案）が default を持っていたため、`ParsedLlmOutput`/`LlmInvocationResult` で確立した fail-closed 不変条件が、security gate 直前のこの集約構造体で再び崩れうるという指摘。`LlmPhaseAuditSignals` は `private data class` で構築箇所は現状1箇所のみだが、将来の変更でその1箇所が `authEvidenceObserved` の明示を省略してもコンパイルが通ってしまう。→ D5 を拡張し、`LlmPhaseAuditSignals.authEvidenceObserved` からも default を撤廃することで解消した（他のフィールドは対象外、理由は D5 参照）。
+
+### Finding 2 の監査可能性
+
+falsifier から、「ユーザー確認済み」という帰属を teammate 経由の伝言としてではなく、質問と回答そのものを読める形で示してほしいという指摘があった。→ Finding 2 のセクションに `AskUserQuestion` の質問文・選択肢・実際の回答をそのまま転記した。
+
 ## Goals / Non-Goals
 
 **Goals:**
 
-- primary category の先勝ち解決とは独立に、「認証関連 evidence を出力中（stdout/stderr のいずれか）に一度でも観測したか」を追跡する
-- その追跡結果が false の場合に限り、`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` の raw output を安全に監査記録へ残せるようにする
+- primary category の先勝ち解決とは独立に、「既知の認証関連 evidence 文言（`CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`）を出力中（stdout/stderr のいずれか）に一度でも観測したか」を追跡する（既知文言との一致判定であり、任意の未知 secret の不存在を証明するものではない。Risks 参照）
+- その追跡結果が false の場合に限り、`OUTPUT_CONTRACT`/`RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` の raw output を、既知 evidence 文言の不在という条件の範囲内で監査記録へ残せるようにする
 - #282 と同形の `OUTPUT_CONTRACT`/`SCHEMA_DRIFT` 障害（起動失敗・非 JSON stdout）で raw output が記録されることを、production の配線を経由したテストで証明する
 - evidence 追跡の否定結果（`authEvidenceObserved == false`）を fail-closed な形（default なし、明示必須）で扱う
 
@@ -117,11 +144,13 @@ private fun isSafeCodexLifecycleFailure(
 
 `RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED`/`UNKNOWN_PROVIDER_FAILURE` については、parser 単体テスト（`DefaultLlmOutputParserTest.kt`、実 parser を直接呼ぶため既に production の parsing ロジックを証明している）と `ConfigurableAuditLlmInvoker` 経由の auditor テストの組み合わせで十分と判断し、production-wiring テストは #282 が直接対応する `OUTPUT_CONTRACT` に限定する（issue の受け入れ条件1が名指しするのがこのカテゴリのため）。
 
-### D5: `authEvidenceObserved` は default なしのフィールドとする（Finding 3 で追加）
+### D5: `authEvidenceObserved` は default なしのフィールドとする（Finding 3 で追加、Finding 3 再反証の Blocking B で `LlmPhaseAuditSignals` にも適用範囲を拡張）
 
 **帰属**: agent 仮決め
 
 `ParsedLlmOutput.authEvidenceObserved` と `LlmInvocationResult.authEvidenceObserved` はどちらも default 値を持たない `Boolean` とする。これにより全ての構築箇所（`parseClaude()`、`contractFailure()`、`parseCodex()`、`LlmInvoker.kt` の `LlmInvocationResult` 構築、既存テストの `ParsedLlmOutput`/`LlmInvocationResult` 直接構築箇所）がコンパイル時にこの field の明示を強制される。
+
+再反証（round 2）で、`LlmInvocationAuditor.kt` 内部の集約構造体 `LlmPhaseAuditSignals.authEvidenceObserved` に `= false` の default が残っていることが blocking として指摘された。`LlmPhaseAuditSignals` は `private data class` で現時点の構築箇所は `invokeAndAudit()` 内の1箇所のみだが、default を残す限り、将来この構造体を構築する箇所が追加・変更されたときに `authEvidenceObserved` の明示を省略してもコンパイルが通ってしまい、`ParsedLlmOutput`/`LlmInvocationResult` 側で確立した fail-closed 不変条件が security gate 直前の1箇所で再び崩れうる。この指摘を受け、`LlmPhaseAuditSignals.authEvidenceObserved` も default を撤廃する（他のフィールド `authFailureSuspected`/`cliErrorReported`/`cleanupFailed`/`providerFailure` は security gate の否定証拠として直接使われないため default を維持する。`authEvidenceObserved` だけを対象にした最小の修正とする）。
 
 **代替案として検討したもの**: falsifier は `NOT_SCANNED`/`ABSENT`/`PRESENT` の tri-state enum を提案した。表現力は tri-state の方が高い（「scan を試みたが未実施」という中間状態を型で表現できる）が、本 change の実装範囲では `authEvidenceObserved` を計算する経路（Codex）と計算しない経路（Claude、明示的に `false`）の2択で全ケースを尽くせるため、Boolean + default なしで十分と判断した。将来 Codex 以外の provider で類似の evidence 追跡が必要になった場合は、その時点で tri-state 化を再検討する。
 
