@@ -92,6 +92,7 @@ COPY --from=db-helper-manifest --chown=root:root --chmod=0444 /db-helper-manifes
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-canary-client.mjs /usr/local/libexec/fukurou-mcp-canary-client.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-cli-canary-mcp.mjs /usr/local/libexec/fukurou-cli-canary-mcp.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/validate-llm-launcher-probe.mjs /usr/local/libexec/validate-llm-launcher-probe.mjs
+COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-run /usr/local/libexec/fukurou-mcp-run
 
 # Ktor fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
 COPY --from=build /src/fukurou/build/libs/*-all.jar app.jar

@@ -2123,6 +2123,30 @@ class McpLaunchBootstrapPolicyTest {
     }
 
     @Test
+    fun readFromArgs_readsManifestFromDirectoryAndPasswordFromEnvironmentWithoutFileDescriptors() {
+        val clock = fixedClock()
+        val manifest = bootstrapManifest(LlmInvocationPhase.PROPOSER, clock)
+        val directory = Files.createTempDirectory("fukurou-mcp-manifest-dir")
+        Files.writeString(
+            directory.resolve("${manifest.invocationId}.json"),
+            kotlinx.serialization.json.Json.encodeToString(manifest),
+        )
+
+        val bootstrap = McpLaunchBootstrap.readFromArgs(
+            manifestId = manifest.invocationId,
+            environment = mapOf(
+                "FUKUROU_MCP_MANIFEST_DIRECTORY" to directory.toString(),
+                "DB_PASSWORD" to MCP_TEST_PASSWORD,
+            ),
+            clock = clock,
+        )
+
+        assertEquals(manifest.decisionRunId, bootstrap.decisionRunContext.decisionRunId)
+        assertEquals(manifest.submissionSocketPath, bootstrap.submissionGatewayBinding.submissionSocketPath)
+        assertFalse(bootstrap.toString().contains(MCP_TEST_PASSWORD))
+    }
+
+    @Test
     fun bootstrapProjectsEnabledTerminalEvidenceFromManifest() {
         val clock = fixedClock()
         val bootstrap = decodeBootstrap(
@@ -2494,6 +2518,7 @@ private fun startMcpDecisionGateway(repository: InMemoryDecisionRepository, invo
             phase = phase,
             phaseManifestId = "$invocationId:${phase.name}",
             effectiveInvocationHash = MCP_DECISION_GATEWAY_HASH,
+            submissionSocketPath = path.toString(),
         ),
     )
 
@@ -2545,6 +2570,7 @@ private fun startTypedErrorGateway(invocationId: String, errorCode: String): Typ
             phase = phase,
             phaseManifestId = "$invocationId:${phase.name}",
             effectiveInvocationHash = MCP_DECISION_GATEWAY_HASH,
+            submissionSocketPath = path.toString(),
         ),
     )
 

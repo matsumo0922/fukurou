@@ -2,22 +2,22 @@
 
 ## 1. Stage 1 / 新起動 primitive の additive 追加（本番未配線）
 
-- [ ] 1.1 `LlmDecisionSubmissionGatewayClient.kt` に `fromSocketPath(binding)` を新設する。`SocketChannel.open(UNIX)` → `connect(UnixDomainSocketAddress.of(binding.submissionSocketPath))`（reflection を使わない）
-- [ ] 1.2 `McpSubmissionGatewayBinding` に `submissionSocketPath: String` を追加する
-- [ ] 1.3 `McpLaunchBootstrap.kt` の `submissionGatewayBinding` へ `manifest.submissionSocketPath` を載せる。`decode()` の検証内容は変えない
-- [ ] 1.4 `LlmMcpServerConfig`（`LlmInvocationModels.kt`）に `literalEnvironmentVariables: Map<String, String> = emptyMap()` を追加する
-- [ ] 1.5 `DefaultLlmCommandRenderer.toCodexConfigToml()` に `[mcp_servers.<name>.env]` 出力を追加する。**この経路には forbidden 名 pattern 検閲（`isForbiddenMcpEnvironmentVariable`）を適用しない**
-- [ ] 1.6 `DefaultLlmCommandRenderer.toClaudeMcpConfigJson()` に per-server `env` object 出力を追加する（同じく forbidden 検閲を適用しない）
-- [ ] 1.7 `McpLaunchBootstrap` に `readFromArgs(manifestId, environment)` を新設する。manifest を `FUKUROU_MCP_MANIFEST_DIRECTORY/<manifestId>.json` から、password を env（`DB_PASSWORD`）から読み、**既存の `decode(manifestBytes, passwordBytes, clock)` を再利用**する
-- [ ] 1.8 `scripts/runtime/fukurou-mcp-run` shell wrapper を新設し、Dockerfile に非 setuid 0555 で COPY する（dormant。この stage では配線しない）
-- [ ] 1.9 production `main()` / gateway 配線 / renderer default command / compose は変更しない
+- [x] 1.1 `LlmDecisionSubmissionGatewayClient.kt` に `fromSocketPath(binding)` を新設する。`SocketChannel.open(UNIX)` → `connect(UnixDomainSocketAddress.of(binding.submissionSocketPath))`（reflection を使わない）
+- [x] 1.2 `McpSubmissionGatewayBinding` に `submissionSocketPath: String` を追加する
+- [x] 1.3 `McpLaunchBootstrap.kt` の `submissionGatewayBinding` へ `manifest.submissionSocketPath` を載せる。`decode()` の検証内容は変えない
+- [x] 1.4 `LlmMcpServerConfig`（`LlmInvocationModels.kt`）に `literalEnvironmentVariables: Map<String, String> = emptyMap()` を追加する
+- [x] 1.5 `DefaultLlmCommandRenderer.toCodexConfigToml()` に `[mcp_servers.<name>.env]` 出力を追加する。**この経路には forbidden 名 pattern 検閲（`isForbiddenMcpEnvironmentVariable`）を適用しない**
+- [x] 1.6 `DefaultLlmCommandRenderer.toClaudeMcpConfigJson()` に per-server `env` object 出力を追加する（同じく forbidden 検閲を適用しない）
+- [x] 1.7 `McpLaunchBootstrap` に `readFromArgs(manifestId, environment)` を新設する。manifest を `FUKUROU_MCP_MANIFEST_DIRECTORY/<manifestId>.json` から、password を env（`DB_PASSWORD`）から読み、**既存の `decode(manifestBytes, passwordBytes, clock)` を再利用**する
+- [x] 1.8 `scripts/runtime/fukurou-mcp-run` shell wrapper を新設し、Dockerfile に非 setuid 0555 で COPY する（dormant。この stage では配線しない）
+- [x] 1.9 production `main()` / gateway 配線 / renderer default command / compose は変更しない
 
 ## 2. Stage 1 / 回帰テスト
 
-- [ ] 2.1 `fromSocketPath` が実際に bind した Unix socket へ connect し、submit → 永続化が成立することのテスト
-- [ ] 2.2 renderer が Codex `[mcp_servers.<name>.env]` と Claude per-server `env` の両方に `DB_PASSWORD` を出力し、**CLI 本体プロセスの env（`RenderedLlmCommand.environment`）には `DB_PASSWORD` が載らない**ことのテスト（literal env が MCP subprocess 専用であることの検証）
-- [ ] 2.3 `readFromArgs` が directory+argv id で manifest を、env で password を読み、`decode()` の検証を通ることのテスト。fd を前提にしないこと
-- [ ] 2.4 `make test` / `make detekt` を実行する
+- [x] 2.1 `fromSocketPath` が実際に bind した Unix socket へ connect し、submit → 永続化が成立することのテスト
+- [x] 2.2 renderer が Codex `[mcp_servers.<name>.env]` と Claude per-server `env` の両方に `DB_PASSWORD` を出力し、**CLI 本体プロセスの env（`RenderedLlmCommand.environment`）には `DB_PASSWORD` が載らない**ことのテスト（literal env が MCP subprocess 専用であることの検証）
+- [x] 2.3 `readFromArgs` が directory+argv id で manifest を、env で password を読み、`decode()` の検証を通ることのテスト。fd を前提にしないこと
+- [x] 2.4 `make test` / `make detekt` を実行する
 
 ## 3. Stage 2 / maintenance admission gate の additive 追加（本番未配線相当）
 

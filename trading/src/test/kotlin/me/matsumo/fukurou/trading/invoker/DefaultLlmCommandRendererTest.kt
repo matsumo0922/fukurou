@@ -431,6 +431,28 @@ class DefaultLlmCommandRendererTest {
     }
 
     @Test
+    fun renderCodex_writesLiteralEnvironmentToMcpEnvTableOnlyNotCliBodyEnvironment() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            literalEnvironmentVariables = mapOf("DB_PASSWORD" to "literal-db-password-fixture"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val codexHome = Path.of(assertNotNull(command.environment[CODEX_HOME_ENV]))
+        val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
+
+        assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\".env]"))
+        assertTrue(configContent.contains("\"DB_PASSWORD\" = \"literal-db-password-fixture\""))
+        assertFalse(command.environment.containsKey("DB_PASSWORD"))
+        assertFalse(command.environment.values.any { value -> value.contains("literal-db-password-fixture") })
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
     fun renderCodex_createsUniquePerRunHomeAndCopiesOnlyAuthJson() {
         val authSourceHome = Files.createTempDirectory("fukurou-codex-auth-source")
         val authFile = authSourceHome.resolve(CODEX_AUTH_FILE_NAME)
@@ -489,6 +511,27 @@ class DefaultLlmCommandRendererTest {
         assertFalse(command.environment.any { (key, value) -> key.contains(secretValue) || value.contains(secretValue) })
         assertFalse(configContent.contains(secretValue))
         assertTrue(Files.exists(configPath))
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderClaude_writesLiteralEnvironmentToMcpConfigOnlyNotCliBodyEnvironment() {
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.PROPOSER,
+            mcpServerName = "custom-mcp",
+            literalEnvironmentVariables = mapOf("DB_PASSWORD" to "literal-db-password-fixture"),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+        val configPath = Path.of(command.args[command.args.indexOf("--mcp-config") + 1])
+        val configContent = Files.readString(configPath)
+
+        assertTrue(configContent.contains(""""env":{"DB_PASSWORD":"literal-db-password-fixture"}"""))
+        assertFalse(command.environment.containsKey("DB_PASSWORD"))
+        assertFalse(command.environment.values.any { value -> value.contains("literal-db-password-fixture") })
 
         command.deleteCleanupPaths()
     }
@@ -741,6 +784,7 @@ class DefaultLlmCommandRendererTest {
         environment: Map<String, String> = emptyMap(),
         autoApprovedTools: List<String> = emptyList(),
         forwardedEnvironmentVariables: List<String> = emptyList(),
+        literalEnvironmentVariables: Map<String, String> = emptyMap(),
     ): LlmInvocationRequest {
         val enabledTools = if (mcpServerName == null) {
             allowedTools
@@ -780,6 +824,7 @@ class DefaultLlmCommandRendererTest {
                     manifestPath = Files.createTempFile("fukurou-test-manifest-", ".json"),
                     autoApprovedTools = autoApprovedTools,
                     forwardedEnvironmentVariables = forwardedEnvironmentVariables,
+                    literalEnvironmentVariables = literalEnvironmentVariables,
                 )
             },
             environment = effectiveEnvironment,

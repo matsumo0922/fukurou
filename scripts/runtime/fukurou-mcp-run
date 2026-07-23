@@ -1,0 +1,8 @@
+#!/bin/sh
+# fukurou MCP subprocess の起動 wrapper。
+#
+# Codex/Claude の MCP config `command` は単一の実行ファイルパスとして扱われ、
+# 複数トークン（例: "java -jar ...") をそのまま渡すことができない。この wrapper が
+# その1トークン制約を吸収し、実体は固定 jar への直接 exec だけを行う。
+# setuid ではなく、argv/env をそのまま子プロセスへ引き継ぐ。
+exec java -jar /app/fukurou-mcp-all.jar "$@"

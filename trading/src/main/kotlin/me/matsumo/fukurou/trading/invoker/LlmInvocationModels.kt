@@ -92,6 +92,7 @@ data class ToolPolicy(
  * @param autoApprovedTools codex の MCP 承認ゲートを approve で通す tool 名。
  * write tool を phase 単位で最小限指定する
  * @param forwardedEnvironmentVariables Codex が MCP subprocess へ明示的に転送する非secret環境変数名
+ * @param literalEnvironmentVariables MCP subprocess にだけ値をインラインで渡す環境変数。CLI 本体プロセスの env には載らない
  */
 data class LlmMcpServerConfig(
     val name: String,
@@ -101,6 +102,7 @@ data class LlmMcpServerConfig(
     val terminalEvidenceCaptureEnabled: Boolean = false,
     val autoApprovedTools: List<String> = emptyList(),
     val forwardedEnvironmentVariables: List<String> = emptyList(),
+    val literalEnvironmentVariables: Map<String, String> = emptyMap(),
 )
 
 /**

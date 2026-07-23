@@ -97,6 +97,14 @@ class LlmDecisionSubmissionGatewayClient private constructor(
             return LlmDecisionSubmissionGatewayClient(openConnectedDescriptor(SUBMISSION_GATEWAY_FD), binding)
         }
 
+        /** manifest の `submissionSocketPath` へ直接 connect する。app と同一 UID で動く前提。 */
+        fun fromSocketPath(binding: McpSubmissionGatewayBinding): LlmDecisionSubmissionGatewayClient {
+            val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
+            channel.connect(UnixDomainSocketAddress.of(binding.submissionSocketPath))
+
+            return LlmDecisionSubmissionGatewayClient(channel, binding)
+        }
+
         internal fun fromChannel(
             channel: SocketChannel,
             binding: McpSubmissionGatewayBinding,
@@ -124,12 +132,13 @@ class LlmDecisionSubmissionGatewayClient private constructor(
     }
 }
 
-/** manifest と FD 5 の相互 binding。 */
+/** manifest と submission gateway の相互 binding。 */
 data class McpSubmissionGatewayBinding(
     val invocationId: String,
     val phase: LlmInvocationPhase,
     val phaseManifestId: String,
     val effectiveInvocationHash: String,
+    val submissionSocketPath: String,
 )
 
 private const val SUBMISSION_GATEWAY_FD = 5
