@@ -9,6 +9,7 @@ services:
     image: ${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}
     container_name: fukurou-ktor
     restart: unless-stopped
+    init: true
     read_only: true
     pids_limit: 512
     cap_drop:

@@ -143,6 +143,11 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(compose.contains("image: \${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}"))
         assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
         assertTrue(dockerfile.contains("ENTRYPOINT [\"java\", \"-jar\", \"/app/app.jar\"]"))
+        assertTrue(
+            compose.contains("init: true"),
+            "ktor service must run under an init process (tini) so PID 1 reaps orphaned descendants " +
+                "now that the C runtime supervisor no longer performs that reaping",
+        )
         assertEquals(
             "github-runner ALL=(root) NOPASSWD: /usr/local/sbin/deploy-fukurou",
             sudoers.lineSequence().first { it.startsWith("github-runner ") },
