@@ -39,7 +39,7 @@
 - [ ] 5.2 `main` の gateway 生成を `fromSocketPath` へ差し替える
 - [ ] 5.3 `OneShotLlmRunner.mcpServerConfig()` が `parentEnvironment["DB_PASSWORD"]` を読み `literalEnvironmentVariables` に設定する
 - [ ] 5.4 `OneShotLlmRunner.kt:2231` の `DEFAULT_RUNNER_MCP_SERVER_COMMAND` を wrapper path（`/usr/local/libexec/fukurou-mcp-run` 相当）へ変える
-- [ ] 5.5 `ShellProcessRunner` の `supervisorAcknowledgementRequired` と `SUPERVISOR_CLEANUP_ACK_EXIT_STATUS` 依存を撤去し、app 側 process-group proof（`check(processExited && !isLinuxProcessGroupRunning(pgid))`）で `PROVEN_EXITED` とする（D9）
+- [ ] 5.5 `ShellProcessRunner` の `supervisorAcknowledgementRequired` と `SUPERVISOR_CLEANUP_ACK_EXIT_STATUS` 依存を撤去する。natural exit は `check(processExited && !isLinuxProcessGroupRunning(pgid))` 成立で `PROVEN_EXITED`、forced termination（timeout/cancel）は ack 相当の証明が無いため `UNCERTAIN` のままとする（D9、実装時に当初案を訂正）
 - [ ] 5.6 `ShellProcessRunner` の `deleteProductionPerRunHome()` と `PRODUCTION_LLM_LAUNCHER` / `CLEANUP_MODE` を撤去し、cleanup を current-user 削除へ一本化する（UID 統合の帰結）
 - [ ] 5.7 fd 経路を削除する。`McpLaunchBootstrap.read()`（fd 3/4/5）、`LlmDecisionSubmissionGatewayClient.fromConnectedDescriptor` と `openConnectedDescriptor`、fd 定数（`MANIFEST_FD`/`PASSWORD_FD`/`SUBMISSION_GATEWAY_FD`）
 - [ ] 5.8 `LaunchFenceDatabaseProbeMain.kt`（supervisor 専用 probe）を削除する（maintenance enforcement は Stage 2 の admission gate が担う）

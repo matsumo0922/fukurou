@@ -444,7 +444,7 @@ class LlmExecutionRecoveryServiceTest {
             executable = "/bin/sh",
             args = listOf(
                 "-c",
-                "trap 'wait; exit $SUPERVISOR_CLEANUP_ACK_EXIT_STATUS' TERM; " +
+                "trap 'wait; exit $CHILD_WAIT_EXIT_STATUS' TERM; " +
                     "(/bin/sleep 30) & echo $! > '$childPidFile'; wait",
             ),
             environment = emptyMap(),
@@ -461,7 +461,7 @@ class LlmExecutionRecoveryServiceTest {
 
         val terminated = processResult.await()
         assertEquals(ProcessRunStatus.TIMED_OUT, terminated.status)
-        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, terminated.processTreeTerminationProof)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, terminated.processTreeTerminationProof)
         LlmExecutionTerminationFenceRegistry.markProcessTreeExited(
             invocationId = "live-child-outage",
             claimantToken = CLAIM_TOKEN,
@@ -959,7 +959,7 @@ private fun String.toPidDiagnosticContent(): String {
 }
 
 /** test supervisor が cleanup 完了を通知する exit status。 */
-private const val SUPERVISOR_CLEANUP_ACK_EXIT_STATUS = 124
+private const val CHILD_WAIT_EXIT_STATUS = 0
 
 /** live child fixture の実行上限。 */
 private val LIVE_CHILD_PROCESS_TIMEOUT: Duration = Duration.ofSeconds(5)

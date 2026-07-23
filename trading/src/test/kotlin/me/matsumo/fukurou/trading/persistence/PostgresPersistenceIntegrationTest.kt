@@ -12176,6 +12176,7 @@ private fun PostgresTestContext.postgresOneShotFixture(
         parentEnvironment = mapOf(
             "DB_URL" to tradingDatabaseConfig().url,
             "FUKUROU_MCP_DB_USER" to "fukurou_mcp",
+            "DB_PASSWORD" to tradingDatabaseConfig().password,
         ),
         clock = clock,
         logger = {},

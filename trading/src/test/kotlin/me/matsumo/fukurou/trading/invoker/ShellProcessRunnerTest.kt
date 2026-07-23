@@ -313,7 +313,7 @@ class ShellProcessRunnerTest {
     }
 
     @Test
-    fun run_supervisorAcknowledgementAndEmptyProxyGroupProveTimeoutTermination() = runBlocking {
+    fun run_forcedTimeoutTerminationStaysUncertainEvenWhenChildExitsWithLegacyAckCode() = runBlocking {
         if (!Files.isExecutable(Path.of("/usr/bin/setsid"))) return@runBlocking
         val tempDirectory = Files.createTempDirectory("fukurou-process-runner-ack-test")
         val command = RenderedLlmCommand(
@@ -328,7 +328,7 @@ class ShellProcessRunnerTest {
         val result = ShellProcessRunner(Duration.ofMillis(200)).run(command).getOrThrow()
 
         assertEquals(ProcessRunStatus.TIMED_OUT, result.status)
-        assertEquals(ProcessTreeTerminationProof.PROVEN_EXITED, result.processTreeTerminationProof)
+        assertEquals(ProcessTreeTerminationProof.UNCERTAIN, result.processTreeTerminationProof)
     }
 
     @Test

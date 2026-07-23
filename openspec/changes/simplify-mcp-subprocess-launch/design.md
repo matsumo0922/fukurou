@@ -106,10 +106,17 @@ maintenance の正本は既に DB テーブル `llm_launch_maintenance`（`DB_HE
 
 **スコープ拡大の明示**: この依存は issue #288 本文の撤去 inventory に無かった（supervisor binary を共有する deploy 側の別機構）。owner が「設計修正・falsify ループを続ける」と回答済みのため、本 change のスコープに取り込む。
 
-### D9. timeout/cancel 終了証明を app 側 process-group proof に一本化（supervisor-124 ack 撤去）
-`ShellProcessRunner` は既に app 自身が Linux process group を setsid で作り、`kill -TERM/-KILL -<pgid>` と `/proc` 走査で終了を確認している（Context 参照）。supervisor の exit 124 ack はこの上に乗る冗長な確認層に過ぎない。supervisor 撤去に伴い、`supervisorAcknowledgementRequired` と `SUPERVISOR_CLEANUP_ACK_EXIT_STATUS`（`:393`）への依存を撤去し、`check(processExited && !isLinuxProcessGroupRunning(pgid))`（`:213`）が成立した時点で `PROVEN_EXITED` とする。`OneShotLlmRunner` の recovery blocker 登録（`:608-618`）は app 側 proof をそのまま使う。
+### D9. timeout/cancel 終了証明は forced-kill か natural exit かで区別を維持する（supervisor-124 ack 撤去、実装時に訂正）
+`ShellProcessRunner` は既に app 自身が Linux process group を setsid で作り、`kill -TERM/-KILL -<pgid>` と `/proc` 走査で終了を確認している（Context 参照）。`supervisorAcknowledgementRequired` / `SUPERVISOR_CLEANUP_ACK_EXIT_STATUS`（exit code 124）への依存は撤去する。
 
-理由: 実際の終了処理（process group kill + /proc 確認）は既に app 側で完結しており、削るのは supervisor 由来の ack だけ。epic #286 の「保守側の理解を超える隔離機構は撤去」に整合し、DoD の「資金/paper truth を壊さない」も、掃引の実体が変わらないため維持される。
+**設計時点の記述からの訂正**: 当初案は「`check(processExited && !isLinuxProcessGroupRunning(pgid))` が成立すれば forced-kill でも常に `PROVEN_EXITED` とする」としていたが、Stage 3 実装時に既存テスト（`ShellProcessRunnerTest.run_linuxProcessGroupKillsDescendantForkedAfterTermSignal` 等）と突き合わせたところ誤りと判明した。exit 124 ack は実際には PID1 supervisor ではなく、削除対象の `fukurou-llm-agent-launcher.c`（root process 自身）が「TERM 転送後に子孫の完全な reap を待ってから明示的に exit 124 する」という、`/proc` の time-of-check スキャンより後に発生する fork を含めて保証する、独立した強い証明だった。launcher 削除後はこの ack を生成できる process が存在しないため、forced-kill（timeout/cancel）経路は `/proc` scan 一回だけでは「scan 後に fork した子孫」の race を排除できない。よって:
+
+- **natural exit**（`ShellProcessRunner.kt` の通常 exit 経路）: 従来通り `check(...)` が成立すれば `PROVEN_EXITED`（forced ではないため late-fork race の対象外）
+- **forced termination**（timeout / cancellation）: `check(...)` が成立しても `UNCERTAIN` のままとする（ack 相当の証明が無いため）。`OneShotLlmRunner` の recovery blocker 登録は現状通り機能し続ける（forced-kill 後は recovery blocker 経由の確認を必須のままにする）。
+
+これは「ack は冗長」という当初の理解を修正するものであり、動作は launcher 削除後の実態（ack を生成する process が存在しない）に合わせて安全側（保守的）に倒す。既存の `ShellProcessRunnerTest` / `LlmExecutionRecoveryServiceTest` の forced-kill 系アサーションは `UNCERTAIN` へ更新し、natural exit 系アサーションは変更しない。
+
+理由: 実際の終了処理（process group kill + /proc 確認）は既に app 側で完結しているが、forced-kill 直後の late-fork race に対する保証は launcher の ack が担っていた。ack を機械的に「常時 true 扱い」にする（＝当初案）と証明されていない安全主張を作ってしまうため、ack 撤去後は「常時 false 扱い」（forced-kill は常に UNCERTAIN）が唯一の正しい単純化である。epic #286 の「保守側の理解を超える隔離機構は撤去」には整合しつつ、DoD の「資金/paper truth を壊さない」を、recovery blocker 経路を保守側に倒すことで維持する。
 
 ## Risks / Trade-offs
 

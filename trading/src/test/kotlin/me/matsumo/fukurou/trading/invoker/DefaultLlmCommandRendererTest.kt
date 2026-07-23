@@ -112,7 +112,7 @@ class DefaultLlmCommandRendererTest {
         assertTrue(userArgIndex < sandboxArgIndex)
         assertFalse(joinedArgs.contains("mcp_servers.fukurou-mcp.command"))
         assertTrue(configContent.contains("[mcp_servers.\"custom-mcp\"]"))
-        assertTrue(configContent.contains("command = \"/usr/local/libexec/fukurou-mcp-launcher\""))
+        assertTrue(configContent.contains("command = \"/usr/local/libexec/fukurou-mcp-run\""))
 
         command.deleteCleanupPaths()
     }
@@ -355,7 +355,7 @@ class DefaultLlmCommandRendererTest {
         val configContent = Files.readString(codexHome.resolve(CODEX_CONFIG_FILE_NAME))
         val expectedConfigContent = """
             |[mcp_servers."custom-mcp"]
-            |command = "/usr/local/libexec/fukurou-mcp-launcher"
+            |command = "/usr/local/libexec/fukurou-mcp-run"
             |args = ["0123456789abcdef0123456789abcdef0123456789abcdef"]
             |required = true
             |
@@ -819,7 +819,7 @@ class DefaultLlmCommandRendererTest {
             mcpServer = mcpServerName?.let { serverName ->
                 LlmMcpServerConfig(
                     name = serverName,
-                    command = "/usr/local/libexec/fukurou-mcp-launcher",
+                    command = "/usr/local/libexec/fukurou-mcp-run",
                     manifestId = "0123456789abcdef0123456789abcdef0123456789abcdef",
                     manifestPath = Files.createTempFile("fukurou-test-manifest-", ".json"),
                     autoApprovedTools = autoApprovedTools,

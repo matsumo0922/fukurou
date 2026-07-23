@@ -410,14 +410,18 @@ private data class LimitedToolContext(
 
 /**
  * fukurou MCP stdio server のエントリポイント。
+ *
+ * @param args argv[0] に manifest id を渡す。manifest directory は
+ *   `FUKUROU_MCP_MANIFEST_DIRECTORY`、DB password は `DB_PASSWORD` から読む。
  */
-fun main() {
+fun main(args: Array<String>) {
     redirectProcessStdoutToStderrForMcpStdio()
     if (useTestInMemoryRuntime()) {
         FukurouMcpServer(clientRole = GmoPublicClientRole.UNSPECIFIED).run()
         return
     }
-    val bootstrap = McpLaunchBootstrap.read()
+    val manifestId = requireNotNull(args.firstOrNull()) { "MCP manifest id argument is required." }
+    val bootstrap = McpLaunchBootstrap.readFromArgs(manifestId, System.getenv())
     val tradingConfig = bootstrap.tradingConfig.copy(
         gmoPublicClient = bootstrap.gmoPublicClientConfig,
         runner = bootstrap.tradingConfig.runner.copy(
@@ -447,7 +451,7 @@ fun main() {
         allowedToolNames = bootstrap.allowedTools,
         expiresAt = bootstrap.expiresAt,
         invocationPhase = bootstrap.phase,
-        submissionGatewayClient = LlmDecisionSubmissionGatewayClient.fromConnectedDescriptor(
+        submissionGatewayClient = LlmDecisionSubmissionGatewayClient.fromSocketPath(
             bootstrap.submissionGatewayBinding,
         ),
         terminalEvidenceCaptureEnabled = bootstrap.terminalEvidenceCaptureEnabled,

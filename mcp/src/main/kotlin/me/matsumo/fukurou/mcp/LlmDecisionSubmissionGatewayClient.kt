@@ -13,13 +13,11 @@ import me.matsumo.fukurou.trading.runner.LlmSubmissionGatewayCodec
 import me.matsumo.fukurou.trading.runner.OPERATION_SUBMIT_DECISION
 import me.matsumo.fukurou.trading.runner.OPERATION_SUBMIT_FALSIFICATION
 import me.matsumo.fukurou.trading.runner.gatewayFrameFits
-import java.io.FileDescriptor
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.channels.SocketChannel
-import java.nio.channels.spi.SelectorProvider
 
-/** launcher が接続済み FD 5 として渡す app-owned submission gateway client。 */
+/** manifest の submission gateway socket path へ connect する app-owned client。 */
 class LlmDecisionSubmissionGatewayClient private constructor(
     private val channel: SocketChannel,
     private val binding: McpSubmissionGatewayBinding,
@@ -93,10 +91,6 @@ class LlmDecisionSubmissionGatewayClient private constructor(
     }
 
     companion object {
-        fun fromConnectedDescriptor(binding: McpSubmissionGatewayBinding): LlmDecisionSubmissionGatewayClient {
-            return LlmDecisionSubmissionGatewayClient(openConnectedDescriptor(SUBMISSION_GATEWAY_FD), binding)
-        }
-
         /** manifest の `submissionSocketPath` へ直接 connect する。app と同一 UID で動く前提。 */
         fun fromSocketPath(binding: McpSubmissionGatewayBinding): LlmDecisionSubmissionGatewayClient {
             val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
@@ -109,26 +103,6 @@ class LlmDecisionSubmissionGatewayClient private constructor(
             channel: SocketChannel,
             binding: McpSubmissionGatewayBinding,
         ): LlmDecisionSubmissionGatewayClient = LlmDecisionSubmissionGatewayClient(channel, binding)
-
-        private fun openConnectedDescriptor(descriptor: Int): SocketChannel {
-            val fileDescriptorConstructor = FileDescriptor::class.java.getDeclaredConstructor(Int::class.javaPrimitiveType)
-                .also { constructor -> constructor.isAccessible = true }
-            val fileDescriptor = fileDescriptorConstructor.newInstance(descriptor)
-            val implementation = Class.forName("sun.nio.ch.SocketChannelImpl")
-            val constructor = implementation.getDeclaredConstructor(
-                SelectorProvider::class.java,
-                java.net.ProtocolFamily::class.java,
-                FileDescriptor::class.java,
-                java.net.SocketAddress::class.java,
-            ).also { value -> value.isAccessible = true }
-
-            return constructor.newInstance(
-                SelectorProvider.provider(),
-                StandardProtocolFamily.UNIX,
-                fileDescriptor,
-                UnixDomainSocketAddress.of("/run/fukurou/connected-submission-gateway"),
-            ) as SocketChannel
-        }
     }
 }
 
@@ -140,5 +114,3 @@ data class McpSubmissionGatewayBinding(
     val effectiveInvocationHash: String,
     val submissionSocketPath: String,
 )
-
-private const val SUBMISSION_GATEWAY_FD = 5

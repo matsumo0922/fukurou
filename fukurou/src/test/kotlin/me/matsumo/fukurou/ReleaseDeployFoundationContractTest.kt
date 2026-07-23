@@ -49,7 +49,7 @@ class ReleaseDeployFoundationContractTest {
         val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
         val main = executor.substringAfter("main() {")
         val deployCompose = executor.substringAfter("deploy_compose() {").substringBefore("\n}\n\nmain()")
-        val composeCutover = executor.substringAfter("compose_cutover() {").substringBefore("\n}\n\nrestore_paused_maintenance")
+        val composeCutover = executor.substringAfter("compose_cutover() {").substringBefore("\n}\n\nresume_launches_idempotently")
 
         assertFalse(executor.contains("--bundle"))
         assertFalse(executor.contains("--signature"))
@@ -76,8 +76,8 @@ class ReleaseDeployFoundationContractTest {
     fun `paused state preserves one maintenance incident until gap close`() {
         val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
         val startPause = executor.substringAfter("start_new_pause() {").substringBefore("\n}\n\nadopt_acknowledged_pause")
-        val adoptPause = executor.substringAfter("adopt_acknowledged_pause() {").substringBefore("\n}\nperform_migration")
-        val completeClose = executor.substringAfter("complete_pending_close() {").substringBefore("\n}\nrecover_healthy_pending_close")
+        val adoptPause = executor.substringAfter("adopt_acknowledged_pause() {").substringBefore("\n}\n\nperform_migration")
+        val completeClose = executor.substringAfter("complete_pending_close() {").substringBefore("\n}\n\nrecover_healthy_pending_close")
 
         listOf(
             "PAUSED_BEFORE_MIGRATION",
@@ -91,10 +91,11 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(executor.contains("MARKER_GAP_ID"))
         assertTrue(executor.contains("MARKER_MAINTENANCE_GENERATION"))
 
-        assertTrue(startPause.indexOf("persist_paused_state") < startPause.indexOf("request_supervisor DISABLE"))
+        assertTrue(startPause.indexOf("persist_paused_state") < startPause.indexOf("maintenance-cas"))
+        assertTrue(startPause.indexOf("maintenance-cas") < startPause.indexOf("drain_launches"))
         assertTrue(startPause.indexOf("drain_launches") < startPause.indexOf("append_gap_event OPEN"))
         assertFalse(adoptPause.contains("drain_launches"))
-        assertFalse(adoptPause.contains("request_supervisor DISABLE"))
+        assertFalse(adoptPause.contains("maintenance-cas"))
         assertTrue(completeClose.indexOf("resume_launches_idempotently") < completeClose.indexOf("close_gap_idempotently"))
         assertTrue(completeClose.indexOf("close_gap_idempotently") < completeClose.indexOf("clear_paused_state"))
         assertTrue(executor.contains("running_digest_matches_marker && health_is_currently_ready"))
@@ -141,7 +142,7 @@ class ReleaseDeployFoundationContractTest {
 
         assertTrue(compose.contains("image: \${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}"))
         assertFalse(compose.contains("FUKUROU_IMAGE_TAG"))
-        assertTrue(dockerfile.contains("ENTRYPOINT [\"/usr/local/libexec/fukurou-runtime-supervisor\"]"))
+        assertTrue(dockerfile.contains("ENTRYPOINT [\"java\", \"-jar\", \"/app/app.jar\"]"))
         assertEquals(
             "github-runner ALL=(root) NOPASSWD: /usr/local/sbin/deploy-fukurou",
             sudoers.lineSequence().first { it.startsWith("github-runner ") },
@@ -165,7 +166,18 @@ class ReleaseDeployFoundationContractTest {
             "scripts/deploy/deploy-contract-v1.json",
             "scripts/deploy/deploy-public-key.pem",
             "scripts/deploy/deploy-schema-sensitive-paths-v1.txt",
+            "scripts/runtime/fukurou-llm-agent-launcher.c",
+            "scripts/runtime/fukurou-mcp-launcher.c",
+            "scripts/runtime/fukurou-runtime-supervisor.c",
+            "scripts/runtime/fukurou-runtime-proxy.h",
+            "scripts/runtime/fukurou-runtime-protocol.h",
+            "scripts/runtime/fukurou-mcp-canary-client.mjs",
+            "scripts/runtime/validate-llm-launcher-probe.mjs",
+            "scripts/mcp-credential-isolation-check",
+            "scripts/mcp-credential-isolation-check-selftest",
+            "fukurou/src/main/kotlin/me/matsumo/fukurou/LaunchFenceDatabaseProbeMain.kt",
         ).forEach { path -> assertFalse(Files.exists(root.resolve(path)), path) }
+        assertTrue(Files.exists(root.resolve("scripts/runtime/fukurou-cli-canary-mcp.mjs")))
     }
 }
 

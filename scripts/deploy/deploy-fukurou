@@ -9,7 +9,6 @@ readonly PAUSED_STATE_FILE="${FUKUROU_PAUSED_STATE_FILE:-${SIMPLE_STATE_ROOT}/pa
 readonly LEGACY_DRAIN_SENTINEL="${FUKUROU_LEGACY_DRAIN_SENTINEL:-${SIMPLE_STATE_ROOT}/.legacy-drain-confirmed}"
 readonly LEGACY_STATE_ROOT="${FUKUROU_LEGACY_DEPLOY_STATE_ROOT:-${DEPLOY_ROOT}/deploy-state}"
 readonly LEGACY_ROLLBACK_STATE_ROOT="${FUKUROU_LEGACY_ROLLBACK_STATE_ROOT:-${DEPLOY_ROOT}/rollback-state}"
-readonly FENCE_ROOT="${DEPLOY_ROOT}/runtime/launch-fence"
 readonly LOCK_FILE="${FUKUROU_DEPLOY_LOCK:-/var/lock/fukurou-deploy.lock}"
 readonly COMPOSE_FILE="${REPO_DIR}/docker-compose.prod.yml"
 readonly MAIN_REF="${FUKUROU_MAIN_REF:-origin/main}"
@@ -21,7 +20,6 @@ readonly MCP_ROLE_SQL="${FUKUROU_MCP_ROLE_SQL:-/usr/local/share/fukurou/mcp-role
 readonly DB_HELPER_MARKER="${FUKUROU_DB_HELPER_MARKER:-/usr/local/share/fukurou/db-helper-manifest.sha256}"
 readonly CANDIDATE_DB_HELPER_MARKER="/usr/local/share/fukurou/db-helper-manifest.sha256"
 readonly BACKUP_HELPER="${FUKUROU_BACKUP_HELPER:-/usr/local/libexec/fukurou/backup-fukurou}"
-readonly SUPERVISOR_BINARY="/usr/local/libexec/fukurou-runtime-supervisor"
 readonly IMAGE_RETENTION_COUNT="${FUKUROU_IMAGE_RETENTION_COUNT:-10}"
 readonly APPLICATION_HEALTH_TIMEOUT="${FUKUROU_DEPLOY_HEALTH_TIMEOUT:-120}"
 
@@ -306,21 +304,6 @@ bind_image_reference() {
   export FUKUROU_IMAGE_REFERENCE="${IMAGE_REPOSITORY}@${MARKER_EXPECTED_DIGEST}"
 }
 
-request_supervisor() {
-  local operation="$1" generation="$2"
-  timeout 30 docker exec --user 0 fukurou-ktor "${SUPERVISOR_BINARY}" --control "${operation}" "${generation}" |
-    grep -Fx "ACK ${operation} ${generation}"
-}
-
-write_fence_fallback() {
-  bind_image_reference
-  timeout 30 docker run --rm --network none --read-only --cap-drop ALL \
-    --security-opt no-new-privileges=true \
-    --mount "type=bind,src=${FENCE_ROOT},dst=/var/lib/fukurou/launch-fence" \
-    --entrypoint "${SUPERVISOR_BINARY}" \
-    "${FUKUROU_IMAGE_REFERENCE}" --fence-write "$1" "$2"
-}
-
 assert_application_pid_zero() {
   local inspection existing_names running pid
   if inspection="$(timeout 10 docker inspect --format '{{.State.Running}}|{{.State.Pid}}' fukurou-ktor 2>/dev/null)"; then
@@ -333,27 +316,15 @@ assert_application_pid_zero() {
   ! grep -Fxq "fukurou-ktor" <<<"${existing_names}" || fail "APPLICATION_CONTAINER_INSPECTION_FAILED"
 }
 
-observe_runtime_children() {
-  local process_table
-  if process_table="$(timeout 10 docker top fukurou-ktor -eo pid,uid 2>/dev/null)"; then
-    awk 'NR > 1 && ($2 == "10002" || $2 == "10003") { count++ } END { print count + 0 }' <<<"${process_table}"
-    return
-  fi
-  if assert_application_pid_zero; then
-    printf '0\n'
-    return
-  fi
-  fail "RUNTIME_PROCESS_OBSERVATION_FAILED"
-}
-
 drain_launches() {
+  # container 内 process の UID では launch child を区別できない（appuser 1 UID に統合済み）ため、
+  # DB の active-launch-count だけを drain 完了の判定に使う。
   local natural_deadline=$(( $(date +%s) + 30 ))
   local absolute_deadline=$(( $(date +%s) + 120 ))
   while (( $(date +%s) < natural_deadline )); do
-    local child_count reservation_count
-    child_count="$(observe_runtime_children)"
+    local reservation_count
     reservation_count="$(timeout 10 "${DB_HELPER}" active-launch-count)" || fail "ACTIVE_LAUNCH_OBSERVATION_FAILED"
-    [[ "${child_count}" == "0" && "${reservation_count}" == "0" ]] && return 0
+    [[ "${reservation_count}" == "0" ]] && return 0
     sleep 5
   done
 
@@ -435,16 +406,9 @@ start_new_pause() {
   MARKER_PHASE="PAUSED_BEFORE_MIGRATION"
   persist_paused_state
 
-  if ! request_supervisor DISABLE "${MARKER_MAINTENANCE_GENERATION}"; then
-    timeout 45 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor
-    assert_application_pid_zero
-    write_fence_fallback DISABLED_PENDING_DB "${MARKER_MAINTENANCE_GENERATION}"
-  fi
   timeout 30 "${DB_HELPER}" maintenance-cas \
     "${current_generation}" false "${current_deployment}" \
     "${MARKER_MAINTENANCE_GENERATION}" true "${MARKER_INCIDENT_DEPLOYMENT_ID}"
-  request_supervisor COMMIT "${MARKER_MAINTENANCE_GENERATION}" >/dev/null ||
-    write_fence_fallback DISABLED_COMMITTED "${MARKER_MAINTENANCE_GENERATION}"
 
   drain_launches
   MARKER_GAP_OPENED_AT="$(timeout 10 "${DB_HELPER}" timestamp)"
@@ -525,14 +489,6 @@ compose_cutover() {
   verify_running_digest
 }
 
-restore_paused_maintenance_after_enable_failure() {
-  timeout 30 "${DB_HELPER}" maintenance-cas \
-    "${MARKER_MAINTENANCE_GENERATION}" false "${MARKER_INCIDENT_DEPLOYMENT_ID}" \
-    "${MARKER_MAINTENANCE_GENERATION}" true "${MARKER_INCIDENT_DEPLOYMENT_ID}" || return 1
-  request_supervisor COMMIT "${MARKER_MAINTENANCE_GENERATION}" >/dev/null ||
-    write_fence_fallback DISABLED_COMMITTED "${MARKER_MAINTENANCE_GENERATION}"
-}
-
 resume_launches_idempotently() {
   local snapshot enabled generation deployment
   snapshot="$(runtime_snapshot)"
@@ -551,11 +507,6 @@ resume_launches_idempotently() {
       "${MARKER_MAINTENANCE_GENERATION}" false "${MARKER_INCIDENT_DEPLOYMENT_ID}"
   elif [[ "${enabled}" != "false" ]]; then
     fail "RESUME_MAINTENANCE_STATE_INVALID"
-  fi
-
-  if ! request_supervisor ENABLE "${MARKER_MAINTENANCE_GENERATION}"; then
-    restore_paused_maintenance_after_enable_failure || fail "ENABLE_ACK_AND_MAINTENANCE_RESTORE_FAILED"
-    fail "ENABLE_ACK_FAILED"
   fi
 }
 

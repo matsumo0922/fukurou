@@ -23,7 +23,6 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,mode=1777
       - /run/fukurou/llm-homes:rw,noexec,nosuid,nodev,mode=2750,uid=10001,gid=10004
       - /run/fukurou/mcp-manifests:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10004
-      - /run/fukurou/control:rw,noexec,nosuid,nodev,mode=0711,uid=0,gid=0
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       DB_USER: ${POSTGRES_USER}
@@ -38,12 +37,12 @@ services:
       FUKUROU_MCP_DB_USER: ${FUKUROU_MCP_DB_USER:-fukurou_mcp}
       FUKUROU_MCP_MANIFEST_DIRECTORY: /run/fukurou/mcp-manifests
       FUKUROU_MCP_SERVER_NAME: ${FUKUROU_MCP_SERVER_NAME:-fukurou-mcp}
-      FUKUROU_MCP_SERVER_COMMAND: /usr/local/libexec/fukurou-mcp-launcher
+      FUKUROU_MCP_SERVER_COMMAND: /usr/local/libexec/fukurou-mcp-run
       FUKUROU_REPOSITORY_ROOT: ${FUKUROU_REPOSITORY_ROOT:-/app}
       FUKUROU_LLM_WORKING_DIRECTORY: ${FUKUROU_LLM_WORKING_DIRECTORY:-/tmp/fukurou-llm}
       FUKUROU_LLM_IMAGE_DIGEST: ${FUKUROU_IMAGE_REFERENCE:?FUKUROU_IMAGE_REFERENCE must be an immutable digest}
-      FUKUROU_CLAUDE_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher claude
-      FUKUROU_CODEX_COMMAND_TEMPLATE: /usr/local/libexec/fukurou-llm-agent-launcher codex
+      FUKUROU_CLAUDE_COMMAND_TEMPLATE: claude
+      FUKUROU_CODEX_COMMAND_TEMPLATE: codex
       FUKUROU_CLAUDE_COMMON_ARGS: ${FUKUROU_CLAUDE_COMMON_ARGS:-}
       FUKUROU_CODEX_COMMON_ARGS: ${FUKUROU_CODEX_COMMON_ARGS:-}
       FUKUROU_CODEX_FALSIFIER_ARGS: ${FUKUROU_CODEX_FALSIFIER_ARGS:-}
@@ -51,15 +50,8 @@ services:
     volumes:
       - llm-auth:/tmp/fukurou-cli-home
       - type: bind
-        source: ${FUKUROU_MCP_DB_PASSWORD_FILE:?FUKUROU_MCP_DB_PASSWORD_FILE is required}
-        target: /run/secrets/fukurou_mcp_db_password
-        read_only: true
-      - type: bind
         source: ${FUKUROU_OBSIDIAN_VAULT_PATH_HOST:-/srv/fukurou/obsidian-vault}
         target: /vault
-      - type: bind
-        source: ${FUKUROU_LAUNCH_FENCE_ROOT_HOST:-/srv/fukurou/runtime/launch-fence}
-        target: /var/lib/fukurou/launch-fence
       - type: bind
         source: /srv/fukurou/monitoring-public
         target: /var/lib/fukurou/monitoring-public

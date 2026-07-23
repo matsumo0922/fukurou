@@ -31,15 +31,6 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY web ./
 RUN npm run build
 
-FROM debian:bookworm-slim AS launcher-build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY scripts/runtime/*.c ./
-COPY scripts/runtime/*.h ./
-RUN gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-llm-agent-launcher fukurou-llm-agent-launcher.c \
-    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-mcp-launcher fukurou-mcp-launcher.c \
-    && gcc -std=c17 -O2 -Wall -Wextra -Werror -o fukurou-runtime-supervisor fukurou-runtime-supervisor.c -lcrypto
-
 FROM debian:bookworm-slim AS db-helper-manifest
 WORKDIR /src
 COPY scripts/deploy/fukurou-deploy-db scripts/deploy/fukurou-deploy-db
@@ -67,31 +58,21 @@ RUN { \
 FROM eclipse-temurin:21-jre AS runtime
 WORKDIR /app
 
-# 非 root 実行ユーザを用意する。
+# 非 root 実行ユーザを用意する。appuser 1 UID に統合し（CLI 本体・MCP・app を同一 UID で動かす）、
+# setuid launcher/supervisor が担っていた UID drop は行わない。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git libcap2-bin nodejs npm util-linux \
+    && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm util-linux \
     && npm install -g @anthropic-ai/claude-code@2.1.199 @openai/codex@0.142.5 \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
     && groupadd --system --gid 10004 llm-runtime \
     && useradd --system --uid 10001 --gid 10004 appuser \
-    && useradd --system --uid 10002 --gid 10004 llm-agent \
-    && groupadd --system --gid 10003 mcp-runtime \
-    && useradd --system --uid 10003 --gid 10003 mcp-runtime \
     && install -d -o appuser -g llm-runtime -m 2750 /run/fukurou/llm-homes \
-    && install -d -o appuser -g llm-runtime -m 0700 /run/fukurou/mcp-manifests \
-    && install -d -o root -g root -m 0711 /run/fukurou/control \
-    && install -d -o root -g root -m 0700 /var/lib/fukurou/launch-fence \
-    && install -d -o root -g root -m 0700 /run/secrets
+    && install -d -o appuser -g llm-runtime -m 0700 /run/fukurou/mcp-manifests
 
-COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-llm-agent-launcher /usr/local/libexec/fukurou-llm-agent-launcher
-COPY --from=launcher-build --chown=root:root --chmod=4755 /src/fukurou-mcp-launcher /usr/local/libexec/fukurou-mcp-launcher
-COPY --from=launcher-build --chown=root:root --chmod=0555 /src/fukurou-runtime-supervisor /usr/local/libexec/fukurou-runtime-supervisor
 COPY --from=db-helper-manifest --chown=root:root --chmod=0444 /db-helper-manifest.sha256 /usr/local/share/fukurou/db-helper-manifest.sha256
-COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-canary-client.mjs /usr/local/libexec/fukurou-mcp-canary-client.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-cli-canary-mcp.mjs /usr/local/libexec/fukurou-cli-canary-mcp.mjs
-COPY --chown=root:root --chmod=0555 scripts/runtime/validate-llm-launcher-probe.mjs /usr/local/libexec/validate-llm-launcher-probe.mjs
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-mcp-run /usr/local/libexec/fukurou-mcp-run
 
 # Ktor fat JAR は fukurou/build/libs/<name>-all.jar に出力される。
@@ -113,4 +94,5 @@ ENV FUKUROU_REVISION=$FUKUROU_REVISION
 ENV FUKUROU_WEB_ROOT=/app/web
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=/run/fukurou/llm-homes -Dfukurou.llm.cleanupQuarantinePath=/run/fukurou/llm-homes/.cleanup-quarantine"
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/libexec/fukurou-runtime-supervisor"]
+USER appuser
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
