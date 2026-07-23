@@ -31,6 +31,23 @@ object McpLaunchBootstrap {
         return decode(manifestBytes, passwordBytes, clock)
     }
 
+    /** argv の manifest id + manifest directory + env の password だけから MCP runtime の launch context を構築する。 */
+    fun readFromArgs(
+        manifestId: String,
+        environment: Map<String, String>,
+        clock: Clock = Clock.systemUTC(),
+    ): McpBootstrapConfig {
+        val manifestDirectory = requireNotNull(environment[MANIFEST_DIRECTORY_ENV]) {
+            "MCP manifest directory environment variable is required."
+        }
+        val manifestBytes = Files.readAllBytes(Path.of(manifestDirectory, "$manifestId.json"))
+        val password = requireNotNull(environment[DB_PASSWORD_ENV]) {
+            "MCP database password environment variable is required."
+        }
+
+        return decode(manifestBytes, password.toByteArray(), clock)
+    }
+
     @Suppress("LongMethod")
     internal fun decode(
         manifestBytes: ByteArray,
@@ -107,6 +124,7 @@ object McpLaunchBootstrap {
                 phase = phase,
                 phaseManifestId = manifest.phaseManifestId,
                 effectiveInvocationHash = manifest.effectiveInvocationHash,
+                submissionSocketPath = manifest.submissionSocketPath,
             ),
             terminalEvidenceCaptureEnabled = manifest.terminalEvidenceCaptureEnabled,
         )
@@ -154,6 +172,8 @@ private const val PASSWORD_FD = 4
 private const val SUBMISSION_GATEWAY_FD = 5
 private const val MAX_MANIFEST_BYTES = 64 * 1024
 private const val MAX_PASSWORD_BYTES = 4096
+private const val MANIFEST_DIRECTORY_ENV = "FUKUROU_MCP_MANIFEST_DIRECTORY"
+private const val DB_PASSWORD_ENV = "DB_PASSWORD"
 private val MANIFEST_JSON = Json {
     ignoreUnknownKeys = false
     isLenient = false

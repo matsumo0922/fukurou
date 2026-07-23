@@ -373,6 +373,11 @@ private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
                 putJsonArray("args") {
                     add(manifestId)
                 }
+                if (literalEnvironmentVariables.isNotEmpty()) {
+                    putJsonObject("env") {
+                        literalEnvironmentVariables.forEach { (key, value) -> put(key, value) }
+                    }
+                }
             }
         }
     }.toString()
@@ -425,6 +430,19 @@ private fun LlmMcpServerConfig?.toCodexConfigToml(effort: LlmEffort, environment
             append("env_vars = ")
             append(forwardedEnvironmentVariables.toTomlArray())
             append("\n")
+        }
+
+        val literalEnvironmentVariables = mcpServer.literalEnvironmentVariables
+        if (literalEnvironmentVariables.isNotEmpty()) {
+            append("[mcp_servers.")
+            append(mcpServer.name.tomlKey())
+            append(".env]\n")
+            literalEnvironmentVariables.forEach { (key, value) ->
+                append(key.tomlKey())
+                append(" = ")
+                append(value.tomlQuoted())
+                append("\n")
+            }
         }
 
         mcpServer.autoApprovedTools.forEach { toolName ->

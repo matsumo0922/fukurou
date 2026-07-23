@@ -80,6 +80,7 @@ class LlmDecisionSubmissionGatewayClientTest {
                 phase = LlmInvocationPhase.PROPOSER,
                 phaseManifestId = PHASE_MANIFEST_ID,
                 effectiveInvocationHash = EFFECTIVE_HASH,
+                submissionSocketPath = path.toString(),
             ),
         )
         val responseJson = "{\"value\":\"${"x".repeat(90_000)}\"}"
@@ -136,6 +137,37 @@ class LlmDecisionSubmissionGatewayClientTest {
                 phase = LlmInvocationPhase.PROPOSER,
                 phaseManifestId = PHASE_MANIFEST_ID,
                 effectiveInvocationHash = EFFECTIVE_HASH,
+                submissionSocketPath = path.toString(),
+            ),
+        )
+
+        val response = client.submitDecision(noTradeDecision())
+
+        assertEquals("true", response.getValue("accepted").toString())
+        assertEquals(DecisionAction.NO_TRADE, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action)
+        client.close()
+        gateway.close()
+    }
+
+    @Test
+    fun `fromSocketPath connects to the manifest socket path and persists through the gateway`() = runBlocking {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-mcp-client-socketpath-${System.nanoTime()}.sock")
+        val gateway = LlmDecisionSubmissionGateway.start(
+            socketPath = path,
+            repository = repository,
+            invocationId = INVOCATION_ID,
+            phase = LlmInvocationPhase.PROPOSER,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+        )
+        val client = LlmDecisionSubmissionGatewayClient.fromSocketPath(
+            McpSubmissionGatewayBinding(
+                invocationId = INVOCATION_ID,
+                phase = LlmInvocationPhase.PROPOSER,
+                phaseManifestId = PHASE_MANIFEST_ID,
+                effectiveInvocationHash = EFFECTIVE_HASH,
+                submissionSocketPath = path.toString(),
             ),
         )
 
@@ -246,7 +278,7 @@ class LlmDecisionSubmissionGatewayClientTest {
 
         return LlmDecisionSubmissionGatewayClient.fromChannel(
             channel,
-            McpSubmissionGatewayBinding(INVOCATION_ID, phase, PHASE_MANIFEST_ID, EFFECTIVE_HASH),
+            McpSubmissionGatewayBinding(INVOCATION_ID, phase, PHASE_MANIFEST_ID, EFFECTIVE_HASH, path.toString()),
         )
     }
 
