@@ -40,6 +40,6 @@ Issue #189 sandbox/tool-inventory DoD: Every LLM invocation request MUST carry a
 - **WHEN** a phase requires a tool that is not enabled by its policy
 - **THEN** rendering fails before credentials, MCP runtime, or provider process are exposed
 
-#### Scenario: Risk-reduction policy reaches the phase-bounded MCP bootstrap
+#### Scenario: Risk-reduction policy reaches the fixed launcher
 - **WHEN** Claude runs the canonical `RISK_REDUCTION_ONLY` phase after standard material capture fails
 - **THEN** the MCP subprocess bootstrap accepts exactly that phase's canonical tool allowlist from the manifest without accepting an arbitrary tool set
