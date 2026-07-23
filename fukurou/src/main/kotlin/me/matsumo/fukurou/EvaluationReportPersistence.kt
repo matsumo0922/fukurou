@@ -481,6 +481,7 @@ private fun retryAfterSeconds(reason: LlmLaunchReservationRejectionReason): Long
     LlmLaunchReservationRejectionReason.INSUFFICIENT_EVALUATION_DAILY_HEADROOM,
     -> Duration.ofDays(1).seconds
     LlmLaunchReservationRejectionReason.HARD_HALT -> 60
+    LlmLaunchReservationRejectionReason.MAINTENANCE_ACTIVE -> 60
 }
 
 private val PersistenceJson = Json {

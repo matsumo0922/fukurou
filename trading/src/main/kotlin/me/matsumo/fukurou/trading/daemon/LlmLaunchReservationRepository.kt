@@ -336,6 +336,9 @@ enum class LlmLaunchReservationRejectionReason {
     /** STOP_PROXIMITY の未使用 24 時間 reserve を保護した。 */
     STOP_PROXIMITY_DAILY_RESERVE,
 
+    /** deploy migration 中の maintenance window でブロックされた。 */
+    MAINTENANCE_ACTIVE,
+
     /**
      * reflection 用に残すべき 1 時間 headroom を下回っていた。
      */

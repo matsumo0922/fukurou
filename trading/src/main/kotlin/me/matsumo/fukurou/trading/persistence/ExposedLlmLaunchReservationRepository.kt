@@ -759,6 +759,10 @@ fun JdbcTransaction.tryReserveLlmLaunchInTransaction(
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.HARD_HALT)
     }
 
+    if (isLaunchMaintenanceActive()) {
+        return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAINTENANCE_ACTIVE)
+    }
+
     if (request.singleAttemptKey != null && singleAttemptExists(request.singleAttemptKey)) {
         return LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED)
     }
