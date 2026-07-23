@@ -21,17 +21,17 @@
 
 ## 3. Stage 2 / maintenance admission gate の additive 追加（本番未配線相当）
 
-- [ ] 3.1 `LlmLaunchReservationRejectionReason` に `MAINTENANCE_ACTIVE` を追加し、`toDaemonSkipReason()` へマップする（scheduler・manual 共通の変換なので両経路に効く）
-- [ ] 3.2 `tryReserveLlmLaunchInTransaction`（`ExposedLlmLaunchReservationRepository.kt:752-790`）に、`selectRiskState(forUpdate = true)` の後で `llm_launch_maintenance` singleton 行を `FOR UPDATE` で読む `selectLaunchMaintenance` を追加する。**`enabled == true`（= maintenance 中 = launch 禁止）なら `Rejected(MAINTENANCE_ACTIVE)` を返す**（polarity: false=平常で許可、true=停止で拒否）
-- [ ] 3.3 lock order を risk_state → maintenance に固定する（`maintenance-cas` は maintenance 行しか触らないため deadlock は生じない）。`maintenance-cas` DB helper と `llm_launch_maintenance` テーブル構造は変更しない
-- [ ] 3.4 admission が maintenance 行を読むため `LaunchFenceDatabaseProbeMain.kt` 相当の別 gate を新設しない（scheduler 専用 gate を作らない）。supervisor がまだ存在する状態で二重 enforce が結論一致し無害であることを確認する
+- [x] 3.1 `LlmLaunchReservationRejectionReason` に `MAINTENANCE_ACTIVE` を追加し、`toDaemonSkipReason()` へマップする（scheduler・manual 共通の変換なので両経路に効く）
+- [x] 3.2 `tryReserveLlmLaunchInTransaction`（`ExposedLlmLaunchReservationRepository.kt:752-790`）に、`selectRiskState(forUpdate = true)` の後で `llm_launch_maintenance` singleton 行を `FOR UPDATE` で読む `selectLaunchMaintenance` を追加する。**`enabled == true`（= maintenance 中 = launch 禁止）なら `Rejected(MAINTENANCE_ACTIVE)` を返す**（polarity: false=平常で許可、true=停止で拒否）
+- [x] 3.3 lock order を risk_state → maintenance に固定する（`maintenance-cas` は maintenance 行しか触らないため deadlock は生じない）。`maintenance-cas` DB helper と `llm_launch_maintenance` テーブル構造は変更しない
+- [x] 3.4 admission が maintenance 行を読むため `LaunchFenceDatabaseProbeMain.kt` 相当の別 gate を新設しない（scheduler 専用 gate を作らない）。supervisor がまだ存在する状態で二重 enforce が結論一致し無害であることを確認する
 
 ## 4. Stage 2 / 回帰テスト
 
-- [ ] 4.1 `llm_launch_maintenance.enabled = true` のとき、**scheduler 経由・manual（`ManualLlmLaunchService`）経由の両方**で予約が `MAINTENANCE_ACTIVE` で拒否され decision run が起動しないことのテスト
-- [ ] 4.2 `enabled = false` のとき従来どおり予約・起動できることのテスト（polarity 検証）
-- [ ] 4.3 admission と `maintenance-cas` の race 不在の回帰: maintenance を true に CAS した後に admission が走ると必ず拒否されること（同一 transaction・行ロックで serialize されること）
-- [ ] 4.4 `make test` / `make detekt` を実行する
+- [x] 4.1 `llm_launch_maintenance.enabled = true` のとき、**scheduler 経由・manual（`ManualLlmLaunchService`）経由の両方**で予約が `MAINTENANCE_ACTIVE` で拒否され decision run が起動しないことのテスト
+- [x] 4.2 `enabled = false` のとき従来どおり予約・起動できることのテスト（polarity 検証）
+- [x] 4.3 admission と `maintenance-cas` の race 不在の回帰: maintenance を true に CAS した後に admission が走ると必ず拒否されること（同一 transaction・行ロックで serialize されること）
+- [x] 4.4 `make test` / `make detekt` を実行する
 
 ## 5. Stage 3 / 本番配線の atomic cutover（Kotlin）
 

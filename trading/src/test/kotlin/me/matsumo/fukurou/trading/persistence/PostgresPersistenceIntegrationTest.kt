@@ -4380,6 +4380,92 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun llm_launch_reservation_allowsReservationWhenMaintenanceIsNotActive() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+
+        val outcome = repository.tryReserve(
+            llmLaunchReservationRequest("maintenance-inactive", LlmRunnerConfig()),
+        ).getOrThrow()
+
+        assertIs<LlmLaunchReservationOutcome.Reserved>(outcome)
+    }
+
+    @Test
+    fun llm_launch_reservation_rejectsSchedulerAndManualTriggersWhenMaintenanceIsActive() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        exposedTransaction(database) {
+            executeUpdate("UPDATE llm_launch_maintenance SET enabled = TRUE WHERE singleton = TRUE")
+        }
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig()
+
+        val schedulerOutcome = repository.tryReserve(
+            llmLaunchReservationRequest(
+                "maintenance-scheduler",
+                config,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+            ),
+        ).getOrThrow()
+        val manualOutcome = repository.tryReserve(
+            llmLaunchReservationRequest("maintenance-manual", config, triggerKind = LlmDaemonTriggerKind.MANUAL),
+        ).getOrThrow()
+
+        listOf(schedulerOutcome, manualOutcome).forEach { outcome ->
+            val rejected = assertIs<LlmLaunchReservationOutcome.Rejected>(outcome)
+            assertEquals(LlmLaunchReservationRejectionReason.MAINTENANCE_ACTIVE, rejected.reason)
+        }
+    }
+
+    @Test
+    fun llm_launch_reservation_serializesAdmissionWithConcurrentMaintenanceActivation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val config = LlmRunnerConfig()
+
+        val maintenanceLockConnection = dataSource.connection
+        maintenanceLockConnection.autoCommit = false
+        maintenanceLockConnection.prepareStatement(
+            "SELECT enabled FROM llm_launch_maintenance WHERE singleton = TRUE FOR UPDATE",
+        ).use { statement ->
+            statement.executeQuery().use { resultSet -> assertTrue(resultSet.next()) }
+        }
+
+        try {
+            val outcomes = coroutineScope {
+                val contenders = (1..2).map { index ->
+                    async(Dispatchers.IO) {
+                        repository.tryReserve(
+                            llmLaunchReservationRequest(
+                                invocationId = "maintenance-race-$index",
+                                config = config,
+                                reservedAt = fixedInstant().plusSeconds(index.toLong()),
+                            ),
+                        ).getOrThrow()
+                    }
+                }
+                try {
+                    awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+                } finally {
+                    maintenanceLockConnection.prepareStatement(
+                        "UPDATE llm_launch_maintenance SET enabled = TRUE WHERE singleton = TRUE",
+                    ).use { statement -> statement.executeUpdate() }
+                    maintenanceLockConnection.commit()
+                    maintenanceLockConnection.close()
+                }
+                contenders.map { contender -> contender.await() }
+            }
+
+            outcomes.forEach { outcome ->
+                val rejected = assertIs<LlmLaunchReservationOutcome.Rejected>(outcome)
+                assertEquals(LlmLaunchReservationRejectionReason.MAINTENANCE_ACTIVE, rejected.reason)
+            }
+        } finally {
+            if (!maintenanceLockConnection.isClosed) maintenanceLockConnection.close()
+        }
+    }
+
+    @Test
     fun llmLaunchQuotaSaturationBarrierAllowsExactlyOneFinalHourlySlot() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val repository = ExposedLlmLaunchReservationRepository(database)
@@ -5664,9 +5750,9 @@ class PostgresPersistenceIntegrationTest {
             repository.tryReserve(llmLaunchReservationRequest("statement-budget", LlmRunnerConfig(), now)).getOrThrow(),
         )
         assertEquals(
-            5,
+            6,
             statementCount.get(),
-            "risk/active/usage reads and reservation/PID registration inserts",
+            "risk/maintenance/active/usage reads and reservation/PID registration inserts",
         )
 
         val lockConnection = dataSource.connection
@@ -5690,7 +5776,7 @@ class PostgresPersistenceIntegrationTest {
             Duration.ofNanos(System.nanoTime() - startedAt)
         }
         assertTrue(lockElapsed >= Duration.ofMillis(250), "risk row lock elapsed=$lockElapsed")
-        assertEquals(2, statementCount.get())
+        assertEquals(3, statementCount.get())
 
         repository.finish(
             LlmLaunchReservationFinish(

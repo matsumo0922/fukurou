@@ -19,6 +19,7 @@ internal fun LlmLaunchReservationRejectionReason.toDaemonSkipReason(): String {
         LlmLaunchReservationRejectionReason.TRIGGER_ALREADY_ATTEMPTED -> "trigger_already_attempted"
         LlmLaunchReservationRejectionReason.HARD_HALT -> LLM_DAEMON_SKIP_HARD_HALT
         LlmLaunchReservationRejectionReason.CONCURRENT_INVOCATION -> "concurrent_invocation"
+        LlmLaunchReservationRejectionReason.MAINTENANCE_ACTIVE -> "maintenance_active"
         LlmLaunchReservationRejectionReason.REPORT_RATE_LIMIT -> "report_rate_limit"
         LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR -> "max_invocations_per_hour_exceeded"
         LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY -> "max_invocations_per_day_exceeded"
