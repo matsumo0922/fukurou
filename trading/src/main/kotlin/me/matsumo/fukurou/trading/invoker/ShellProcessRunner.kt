@@ -68,7 +68,7 @@ class ShellProcessRunner(
                 if (exitCode == null) {
                     val terminationProof = destroyProcessTreeNonCancellable(
                         process = startedProcess,
-                        supervisorAcknowledgementRequired = true,
+                        forcedTermination = true,
                     ).getOrThrow()
 
                     return@coroutineScope ProcessRunResult(
@@ -82,7 +82,7 @@ class ShellProcessRunner(
 
                 val terminationProof = destroyProcessTreeNonCancellable(
                     process = startedProcess,
-                    supervisorAcknowledgementRequired = false,
+                    forcedTermination = false,
                 ).getOrThrow()
 
                 ProcessRunResult(
@@ -95,7 +95,7 @@ class ShellProcessRunner(
             } catch (throwable: CancellationException) {
                 val destroyResult = destroyProcessTreeNonCancellable(
                     process = startedProcess,
-                    supervisorAcknowledgementRequired = true,
+                    forcedTermination = true,
                 )
                 destroyResult.exceptionOrNull()?.let { destroyFailure -> throwable.addSuppressed(destroyFailure) }
 
@@ -132,7 +132,7 @@ class ShellProcessRunner(
 
     private suspend fun destroyProcessTree(
         startedProcess: StartedProcess,
-        supervisorAcknowledgementRequired: Boolean,
+        forcedTermination: Boolean,
     ): ProcessTreeTerminationProof {
         return withContext(Dispatchers.IO) {
             val process = startedProcess.process
@@ -141,7 +141,7 @@ class ShellProcessRunner(
                 return@withContext terminateLinuxProcessGroup(
                     process = process,
                     processGroupId = processGroupId,
-                    supervisorAcknowledgementRequired = supervisorAcknowledgementRequired,
+                    forcedTermination = forcedTermination,
                 )
             }
 
@@ -186,11 +186,11 @@ class ShellProcessRunner(
 
     private suspend fun destroyProcessTreeNonCancellable(
         process: StartedProcess,
-        supervisorAcknowledgementRequired: Boolean,
+        forcedTermination: Boolean,
     ): Result<ProcessTreeTerminationProof> {
         return withContext(NonCancellable) {
             runCatching {
-                destroyProcessTree(process, supervisorAcknowledgementRequired)
+                destroyProcessTree(process, forcedTermination)
             }
         }
     }
@@ -198,7 +198,7 @@ class ShellProcessRunner(
     private fun terminateLinuxProcessGroup(
         process: Process,
         processGroupId: Long,
-        supervisorAcknowledgementRequired: Boolean,
+        forcedTermination: Boolean,
     ): ProcessTreeTerminationProof {
         if (process.isAlive || isLinuxProcessGroupRunning(processGroupId)) {
             signalProcessGroup(processGroupId, "TERM")
@@ -214,13 +214,9 @@ class ShellProcessRunner(
             "LLM Linux process group did not exit after TERM/KILL sequence."
         }
 
-        val supervisorAcknowledged = runCatching { process.exitValue() == SUPERVISOR_CLEANUP_ACK_EXIT_STATUS }
-            .getOrDefault(false)
-        return if (!supervisorAcknowledgementRequired || supervisorAcknowledged) {
-            ProcessTreeTerminationProof.PROVEN_EXITED
-        } else {
-            ProcessTreeTerminationProof.UNCERTAIN
-        }
+        // forced termination（timeout/cancel）は、TERM/KILL 後の遅延 fork がこの時点の /proc scan を
+        // すり抜ける race を排除できないため PROVEN_EXITED を主張しない（UNCERTAIN のまま recovery blocker へ）。
+        return if (forcedTermination) ProcessTreeTerminationProof.UNCERTAIN else ProcessTreeTerminationProof.PROVEN_EXITED
     }
 
     private fun signalProcessGroup(processGroupId: Long, signal: String) {
@@ -284,16 +280,6 @@ class ShellProcessRunner(
     }
 
     private fun deleteCleanupPath(path: Path) {
-        runCatching { deleteCleanupPathAsCurrentUser(path) }
-            .recoverCatching { failure ->
-                if (!path.isProductionPerRunHome()) throw failure
-
-                deleteProductionPerRunHome(path)
-            }
-            .getOrThrow()
-    }
-
-    private fun deleteCleanupPathAsCurrentUser(path: Path) {
         if (Files.isDirectory(path)) {
             Files.walk(path).use { paths ->
                 paths
@@ -302,20 +288,6 @@ class ShellProcessRunner(
             }
         } else {
             Files.deleteIfExists(path)
-        }
-    }
-
-    private fun deleteProductionPerRunHome(path: Path) {
-        val builder = ProcessBuilder(PRODUCTION_LLM_LAUNCHER, CLEANUP_MODE, path.toString())
-            .redirectInput(ProcessBuilder.Redirect.PIPE)
-        builder.environment().clear()
-        val process = builder.start()
-        process.outputStream.close()
-        val stderr = process.errorStream.bufferedReader().use { reader -> reader.readText() }
-        val exitCode = process.waitFor()
-
-        check(exitCode == 0) {
-            "Production LLM per-run home cleanup failed: ${stderr.trim()}"
         }
     }
 }
@@ -368,15 +340,6 @@ private fun ProcessHandle.pidSafely(): Long? {
     return runCatching { pid() }.getOrNull()
 }
 
-private fun Path.isProductionPerRunHome(): Boolean {
-    val normalized = toAbsolutePath().normalize()
-    val parent = normalized.parent ?: return false
-    val name = normalized.fileName.toString()
-
-    return parent == PRODUCTION_LLM_HOME_ROOT &&
-        (name.startsWith(CODEX_HOME_PREFIX) || name.startsWith(CLAUDE_HOME_PREFIX))
-}
-
 private fun ProcessHandle.awaitExitQuietly() {
     runCatching {
         onExit().get(PROCESS_TREE_KILL_WAIT_SECONDS, TimeUnit.SECONDS)
@@ -390,12 +353,6 @@ private const val PROCESS_TREE_KILL_WAIT_SECONDS = 2L
 private const val PROCESS_TREE_ENUMERATION_ATTEMPTS = 20
 private const val PROCESS_TREE_EXIT_POLL_MILLIS = 10L
 private const val PROCESS_GROUP_SIGNAL_WAIT_SECONDS = 2L
-private const val SUPERVISOR_CLEANUP_ACK_EXIT_STATUS = 124
 private const val LINUX_SETSID_PATH = "/usr/bin/setsid"
 private const val LINUX_KILL_PATH = "/bin/kill"
 private const val LINUX_PROC_ROOT = "/proc"
-private const val PRODUCTION_LLM_LAUNCHER = "/usr/local/libexec/fukurou-llm-agent-launcher"
-private const val CLEANUP_MODE = "cleanup"
-private const val CODEX_HOME_PREFIX = "fukurou-codex-home-"
-private const val CLAUDE_HOME_PREFIX = "fukurou-llm-config-"
-private val PRODUCTION_LLM_HOME_ROOT = Path.of("/run/fukurou/llm-homes")

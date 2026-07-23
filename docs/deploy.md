@@ -75,7 +75,6 @@ deploy root を root 所有で作成する。
 sudo install -d -m 0755 /srv/fukurou
 sudo install -d -o root -g root -m 0700 /srv/fukurou/deploy
 sudo install -d -o root -g root -m 0700 /srv/fukurou/deploy-state
-sudo install -d -o root -g root -m 0700 /srv/fukurou/runtime/launch-fence
 sudo install -d -o root -g root -m 0700 /srv/fukurou/secrets
 ```
 
@@ -495,58 +494,13 @@ scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
 scripts/prod-curl /ops/runtime-config
 ```
 
-## MCP credential isolation の移行
+## MCP DB role
 
-この移行は旧imageを止めるPhase 0と、新imageのglobal gateを確認してからcredentialを移行するPhase 1に分ける。merge/deploy前にproduction credentialを変更しない。
+`fukurou_mcp` role は least-privilege で、MCP subprocess は既存 app env の `DB_PASSWORD` をそのまま使って接続する（`OneShotLlmRunner` が literal env として MCP subprocess の config にだけ埋め込み、CLI 本体には渡さない。`docs/mcp-runtime.md` 参照）。role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
 
-### Phase 0: 旧imageをquiescentにする
+**移行時の注意**: `fukurou_mcp` role のパスワードが `POSTGRES_PASSWORD`（＝ `DB_PASSWORD`）と異なる値で provision 済みの場合、この変更を deploy すると MCP subprocess の DB 接続が認証失敗する。deploy 前に `ALTER ROLE fukurou_mcp WITH PASSWORD '<POSTGRES_PASSWORD と同じ値>';` を実行し、role のパスワードを揃えておく。
 
-1. WebUI `/app/config` で `daemon.enabled=false` のdraftを作成し、validateしてactive化する。Ktorを再起動し、`/ops/runtime-config`でeffective valueがfalseであることと、再起動後にscheduler workerが作成されず新しい`DAEMON_STARTED` auditが記録されないことを確認する。旧imageは`llm.launchEnabled`を認識しないため、この段階でglobal gateを設定しようとしない。
-2. Phase 0開始後は`POST /ops/trigger`を呼ばず、`OneShotRunnerMain`も直接実行しない。scheduler worker不在と運用上のlaunch禁止を維持したまま、`pgrep -fa OneShotRunnerMain`が空であることを確認する。
-3. maintenance connectionで `SELECT count(*) FROM llm_launch_reservations WHERE status='RUNNING';` と `SELECT count(*) FROM llm_runs WHERE status='RUNNING';` がどちらも0であることを確認する。0になるまでdeploy、role provision、credential rotationへ進まない。
-
-### Phase 1: 新imageのglobal gate配下で移行する
-
-4. root:root 0400 の `/srv/fukurou/secrets/fukurou_mcp_db_password` を dummy ではない新規値で作成し、値を shell history、log、PR に出さない。provision時のpsql変数解釈を単純に保つため、十分な長さの英数字だけで生成する。
-5. 対象 SHA の新imageを、この文書の digest 固定 `deploy-fukurou --event workflow_dispatch --image-digest ... --deployment-id ... <commit-sha>` でdeployする。欠落している`llm.launchEnabled`はbootstrapによってfalseでactive snapshotへ追加される。Ktor startupの`TradingPersistenceBootstrap`がMCP evaluation viewを作成するまでrole provisioningを実行しない。
-6. `sudo docker run --rm --network fukurou_edge curlimages/curl -fsS http://ktor:8080/health/ready` を実行し、maintenance connectionでrequired viewの存在を確認する。`/ops/runtime-config`で`daemon.enabled`と`llm.launchEnabled`のactive valueとeffective valueがすべてfalseであることを確認する。`daemon.enabled=false`なのでscheduler workerは作成されず、新しい`DAEMON_STARTED` auditも記録されない。
-7. `POST /ops/trigger`が`LLM_LAUNCH_DISABLED`の409を返すこと、direct `OneShotRunnerMain`がchild processやMCP credentialを使う前にnon-zeroで終了することを確認する。scheduler workerは不在なので`LLM_LAUNCH_DISABLED`のscheduler skip auditを期待しない。その後、手順3のRUNNING 0 queryと`pgrep`を再実行する。
-8. `scripts/deploy/provision-fukurou-mcp-role '<maintenance-database-url>' "$POSTGRES_DB" "$POSTGRES_USER" "$FUKUROU_MCP_DB_PASSWORD_FILE"` を実行し、`fukurou_mcp` roleをprovisionする。scriptはMCPのopportunity token、INSERT、close UPDATEがすべてfalseで、app roleのtokenだけがtrueというpostconditionも検証する。preflight、権限不足、postcondition不一致では失敗するため、gateをOFFのまま維持する。
-9. deploy済みimageを再利用する場合は`scripts/mcp-credential-isolation-check --reuse-image <exact-image>`を実行し、paper smoke、knowledge toolsを含むrequired MCP call matrixを確認する。local buildを検査する場合は`--reuse-image`を外す。role flag、membership、ownership、effective grantも確認する。
-10. canary scan 完了後、旧 shared `config.toml` と session artifact を auth source から分離して削除する。
-11. running Ktor containerの`/run/fukurou/llm-homes`がtmpfsであることを`docker inspect`で確認する。旧`fukurou_llm-runs` volumeが残っている場合は、一時containerへread-only mountして残存per-run auth copy、session、quarantine artifactを監査し、必要な証跡を保存してから`fukurou_llm-runs`だけを削除する。永続auth sourceの`fukurou_llm-auth`とDBの`fukurou_pgdata`は削除しない。
-12. app の旧 credential を PostgreSQL と NAS `.env` で同時に rotateし、Ktor containerを再起動して新しい値を反映する。旧 credentialで接続できないことを確認する。
-13. credential rotation後にも手順3のRUNNING 0 queryと`pgrep`を実行する。証跡を保存してから、次のように`llm.launchEnabled=true`と`daemon.enabled=true`を同一draftで作成し、validateしてactive化する。この2キーはどちらも`NEXT_RESTART`なので、別々のactive化や途中の再起動を行わない。
-
-    ```sh
-    draft_id="$(scripts/prod-curl \
-      /ops/runtime-config/drafts \
-      --json '{
-        "baseVersionId": null,
-        "values": {
-          "llm.launchEnabled": "true",
-          "daemon.enabled": "true"
-        },
-        "note": "resume LLM launch surfaces after MCP credential isolation"
-      }' | jq -r '.version.id')"
-
-    scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/validate" \
-      --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
-    scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
-      --json '{"reason":"resume LLM launch surfaces after MCP credential isolation"}'
-    ```
-
-14. Ktorを1回だけ再起動し、`/ops/runtime-config`で両キーのactive valueとeffective valueがすべてtrueであること、新しい`DAEMON_STARTED` auditと通常cycleによってscheduler workerの再開を確認する。production smokeはreservationを共有する`POST /ops/trigger`に限定し、`LLM_LAUNCH_DISABLED`では拒否されず、reservation、起動上限、SafetyFloorなど通常の安全guardを通ることを確認する。direct `OneShotRunnerMain`のgate ONは自動テストを正本とし、通常のmigration完了経路では実行しない。productionでdirect canaryが必要な場合だけ、`docs/mcp-runtime.md`のdirect runner maintenance境界に従ってschedulerと隔離する。
-
-role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
-
-merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix と、`scripts/mcp-credential-isolation-check` の tool audit export・DB data-only dump・encoding scan を含む。scan coverage や dump が欠けた run は無効とし、再実行する。real provider model output probe は operator auth を必要とする別の human check として記録し、自動 check 成功へ読み替えない。
-
-providerがper-run home内へshared groupから通常削除できないmodeのnested artifactを作成した場合、cleanupはfixed LLM launcherのpath限定cleanup modeへ委譲する。対象は`/run/fukurou/llm-homes`直下にappuserが作成したcanonical per-run homeだけで、validated rootから開いたdirectory FDを基準にsymlinkを追跡せずtreeを削除する。helperは同じreal directory inodeのowner traversal/write権限だけを回復し、regular fileのread mode、symlink target、scope外inodeを変更しない。helperを含むcleanup failureでは`/run/fukurou/llm-homes/.cleanup-quarantine`が残り、manual/daemonの次runはcurrent container process内でfail closedになる。markerとper-run artifactは同じtmpfsにあり、container restartでは両方が同時に破棄される。operatorはdaemonを無効のまま残存per-run homeとmanifestを監査し、filesystem原因を解消してからmarkerを削除するか、監査後にcontainerを再起動する。markerだけを先に消したり、strategy NO_TRADEとして成績へ混ぜたりしない。
-
-rotation 後は旧 image で LLM phase を再有効化しない。障害時は daemon disabled のまま現 image を維持するか、修正版へ roll-forward する。
-
-この境界はfixed setuid helper 2個とdeployごとのprivilege inventory gateに依存する。merge前にfinal imageでsetuid/setgid、file capability、runtime/root control socket、LLM/MCP process属性のexact checkが通ることを確認する。imageまたはCLIを更新してNode内部FD配置が変わった場合は、差分を監査してから`validate-llm-launcher-probe.mjs`の`liveFds` exact inventoryを更新し、同じfinal imageでcanaryを再実行する。
+merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix を含む。
 
 ## PostgreSQL backup / restore
 

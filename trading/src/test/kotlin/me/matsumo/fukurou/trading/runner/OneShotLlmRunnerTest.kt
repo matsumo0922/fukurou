@@ -1984,7 +1984,9 @@ class OneShotLlmRunnerTest {
         assertNotNull(decision.submission.promptHash)
         assertNotNull(decision.submission.marketSnapshotId)
         assertEquals(decision.submission.invocationId, auditEvent.decisionRunContext.decisionRunId)
-        assertFalse(mcpConfigContent.contains("DB_PASSWORD"))
+        // DB_PASSWORD は per-server env としてのみ config に現れる（D2）。CLI 本体 env には載らない。
+        assertTrue(mcpConfigContent.contains(""""DB_PASSWORD":"test-password""""))
+        assertFalse(proposerCommand.environment.containsKey("DB_PASSWORD"))
         assertTrue(manifestContent.contains(decision.submission.invocationId))
         assertTrue(manifestContent.contains(decision.submission.promptHash))
         assertTrue(manifestContent.contains(decision.submission.marketSnapshotId))
@@ -2223,6 +2225,49 @@ class OneShotLlmRunnerTest {
     }
 
     @Test
+    fun codexProposerMcpConfigUsesWrapperCommandAndCarriesDbPasswordAsLiteralEnvOnly() = runBlocking {
+        val fixture = runnerFixture { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        fixture.runOneShot(
+            defaultRequest().copy(
+                proposerProvider = LlmProvider.CODEX,
+            ),
+        ).getOrThrow()
+
+        val proposerCommand = fixture.processRunner.launches.single()
+        val configContent = proposerCommand.codexConfigContent()
+
+        assertTrue(configContent.contains("command = \"$DEFAULT_RUNNER_MCP_SERVER_COMMAND\""))
+        assertTrue(configContent.contains("[mcp_servers.\"${DEFAULT_RUNNER_MCP_SERVER_NAME}\".env]"))
+        assertTrue(configContent.contains("\"DB_PASSWORD\" = \"test-password\""))
+        assertFalse(proposerCommand.environment.containsKey("DB_PASSWORD"))
+    }
+
+    @Test
+    fun claudeProposerMcpConfigUsesWrapperCommandAndCarriesDbPasswordAsLiteralEnvOnly() = runBlocking {
+        val fixture = runnerFixture { command ->
+            submitDecision(fixtureRepository, command, DecisionAction.NO_TRADE).getOrThrow()
+            cleanExit()
+        }
+
+        fixture.runOneShot(
+            defaultRequest().copy(
+                proposerProvider = LlmProvider.CLAUDE,
+            ),
+        ).getOrThrow()
+
+        val proposerCommand = fixture.processRunner.launches.single()
+        val configContent = proposerCommand.claudeMcpConfigContent()
+
+        assertTrue(configContent.contains(""""command":"$DEFAULT_RUNNER_MCP_SERVER_COMMAND""""))
+        assertTrue(configContent.contains(""""DB_PASSWORD":"test-password""""))
+        assertFalse(proposerCommand.environment.containsKey("DB_PASSWORD"))
+    }
+
+    @Test
     fun cliConfigRejectsNonCanonicalFalsifierAllowlist() {
         val readOnlyFalsifierTools = defaultFalsifierAllowedTools(DEFAULT_RUNNER_MCP_SERVER_NAME)
             .filterNot { toolName -> toolName.endsWith("__submit_falsification") }
@@ -2328,7 +2373,8 @@ class OneShotLlmRunnerTest {
         assertFalse(joinedArgs.contains("DB_PASSWORD"))
         assertFalse(codexConfigContent.contains("DB_URL"))
         assertFalse(codexConfigContent.contains("DB_USER"))
-        assertFalse(codexConfigContent.contains("DB_PASSWORD"))
+        // DB_PASSWORD は mcp_servers.<name>.env の literal env としてのみ config に現れる（D2）。
+        assertTrue(codexConfigContent.contains("[mcp_servers.\"$DEFAULT_RUNNER_MCP_SERVER_NAME\".env]"))
         assertNotNull(falsifierCommand.environment[FUKUROU_FALSIFIER_INTENT_ID_ENV])
         assertTrue(proposerCommand.mcpManifestContent().contains("\"phase\":\"PROPOSER\""))
         assertTrue(falsifierCommand.mcpManifestContent().contains("\"phase\":\"FALSIFIER\""))

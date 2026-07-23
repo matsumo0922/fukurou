@@ -34,9 +34,9 @@ FUKUROU_OBSIDIAN_VAULT_PATH_HOST=/srv/fukurou/obsidian-vault
 
 ## WebUI CLI login
 
-deploy 後、`llm-auth` volume が root owner で作られている場合、auth copy を作れずに失敗することがある。必要ならauth sourceだけ一度ownerを直す。per-run artifactはcomposeがapp UID/shared groupで作る`/run/fukurou/llm-homes` tmpfsに置き、provider所有のnested treeもfixed cleanup helperが回収するため、運用手順でchownしない。
+deploy 後、`llm-auth` volume が root owner で作られている場合、auth copy を作れずに失敗することがある。必要ならauth sourceだけ一度ownerを直す。per-run artifactはcomposeがapp UIDで作る`/run/fukurou/llm-homes` tmpfsに置き、current-user 権限のcleanupで回収するため、運用手順でchownしない。
 
-timeout / cancel 後は `RUNNER_PHASE_COMPLETED.details.terminal` の `semanticCommit`、`processExit`、`cleanup` を別々に確認する。`processExit=UNCONFIRMED` は supervisor cleanup acknowledgement が欠けた状態であり、process が見えないことだけで安全と判断しない。operator が UID 10002 / 10003 の process inventory を確認して再起動するまで新しい LLM launch は fail closed になる。`cleanup=FAILED` では `/run/fukurou/llm-homes/.cleanup-quarantine` と残存 artifact を一緒に監査し、削除するか container restart で tmpfs 全体を破棄する。永続 `llm-auth` source は cleanup 対象に含めない。
+timeout / cancel 後は `RUNNER_PHASE_COMPLETED.details.terminal` の `semanticCommit`、`processExit`、`cleanup` を別々に確認する。`processExit=UNCONFIRMED` は forced kill（timeout/cancel）で `/proc` 走査後の遅延 fork を排除できない状態であり、process が見えないことだけで安全と判断しない。operator が recovery scan による解決（次 tick の periodic recovery、または対象 process の生死を手動確認しての container 再起動）を待つ必要がある。`cleanup=FAILED` では `/run/fukurou/llm-homes/.cleanup-quarantine` と残存 artifact を一緒に監査し、削除するか container restart で tmpfs 全体を破棄する。永続 `llm-auth` source は cleanup 対象に含めない。
 
 ```sh
 ssh dxp4800plus \
@@ -92,7 +92,7 @@ docker exec fukurou-ktor sh -lc "
 '
 ```
 
-Claude auth sourceの実対応fileをread-onlyに確認する。provider invocationのsmokeはfixed launcherを通すproduction canaryで行う。
+Claude auth sourceの実対応fileをread-onlyに確認する。provider invocationのsmokeはproduction canary（`CliAcceptanceCanaryMain`）で行う。
 
 ```sh
 ssh dxp4800plus \
@@ -150,9 +150,9 @@ Reflection Runner の loop は `reflection.minInterval` と `obsidian.writeInter
 
 LLM daemon を有効化する前に、少なくとも次を満たすこと。
 
-- exact imageのfixed launcher canaryでClaude/Codexのprovider invocation経路が成功している。
+- exact imageの `CliAcceptanceCanaryMain` canaryでClaude/Codexのprovider invocation経路が成功している。
 - `codex login status` と `codex exec ...` の smoke test が成功している。
-- fixed MCP launcher、manifest directory、root-only password fileがrunning containerに反映されている。
+- MCP server command（wrapper `fukurou-mcp-run`）、manifest directory、`DB_PASSWORD` envがrunning containerに反映されている。
 - `FUKUROU_TRADING_MODE=PAPER` のままになっている。
 - WebUI `/app/config` で `runner.maxInvocationsPerHour` / `runner.maxInvocationsPerDay`、`ENTRY_FILL` / `STOP_PROXIMITY` の hour/day reserve、process termination grace、terminal persistence timeoutが意図した値になっている。
 - Codex の model / cost 方針を確認している。

@@ -2581,8 +2581,8 @@ private fun gatewayFixture(
     repository: me.matsumo.fukurou.trading.decision.DecisionRepository,
     bootstrap: McpBootstrapConfig,
 ): GatewayFixture {
-    val path = java.nio.file.Path.of("/tmp/fukurou-role-${System.nanoTime()}.sock")
     val binding = bootstrap.submissionGatewayBinding
+    val path = java.nio.file.Path.of(binding.submissionSocketPath)
     val gateway = me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway.start(
         socketPath = path,
         repository = repository,
@@ -2591,12 +2591,9 @@ private fun gatewayFixture(
         phaseManifestId = binding.phaseManifestId,
         effectiveInvocationHash = binding.effectiveInvocationHash,
     )
-    val channel = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX).apply {
-        connect(java.net.UnixDomainSocketAddress.of(path))
-    }
 
     return GatewayFixture(
-        client = LlmDecisionSubmissionGatewayClient.fromChannel(channel, binding),
+        client = LlmDecisionSubmissionGatewayClient.fromSocketPath(binding),
         gateway = gateway,
     )
 }

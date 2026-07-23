@@ -2109,6 +2109,11 @@ private class OneShotLlmRequestFactory(
                 terminalEvidenceCaptureEnabled = capability.terminalEvidenceCaptureEnabled,
                 autoApprovedTools = productionAutoApprovedTools(provider, allowedTools),
                 forwardedEnvironmentVariables = listOf(FUKUROU_INVOCATION_ID_ENV),
+                literalEnvironmentVariables = mapOf(
+                    "DB_PASSWORD" to requireNotNull(parentEnvironment["DB_PASSWORD"]) {
+                        "DB_PASSWORD is required for the MCP subprocess literal env."
+                    },
+                ),
             )
         } catch (throwable: Throwable) {
             runCatching { Files.deleteIfExists(capability.path) }
@@ -2228,7 +2233,7 @@ const val DEFAULT_RUNNER_MCP_SERVER_NAME = "fukurou-mcp"
 /**
  * runner が既定で使う MCP server 起動 command。
  */
-const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "/usr/local/libexec/fukurou-mcp-launcher"
+const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "/usr/local/libexec/fukurou-mcp-run"
 
 /**
  * MCP jar path placeholder。

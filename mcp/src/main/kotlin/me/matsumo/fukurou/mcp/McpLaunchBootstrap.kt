@@ -18,19 +18,8 @@ import java.nio.file.Path
 import java.time.Clock
 import java.time.Instant
 
-/** launcher が渡した descriptor だけから MCP runtime の launch context を構築する。 */
+/** argv + env だけから MCP runtime の launch context を構築する。 */
 object McpLaunchBootstrap {
-    fun read(clock: Clock = Clock.systemUTC()): McpBootstrapConfig {
-        val manifestBytes = readBoundedDescriptor(MANIFEST_FD, MAX_MANIFEST_BYTES)
-        val passwordBytes = readBoundedDescriptor(PASSWORD_FD, MAX_PASSWORD_BYTES)
-
-        require(Files.exists(Path.of("/proc/self/fd/$SUBMISSION_GATEWAY_FD"))) {
-            "MCP submission gateway descriptor is unavailable."
-        }
-
-        return decode(manifestBytes, passwordBytes, clock)
-    }
-
     /** argv の manifest id + manifest directory + env の password だけから MCP runtime の launch context を構築する。 */
     fun readFromArgs(
         manifestId: String,
@@ -129,13 +118,6 @@ object McpLaunchBootstrap {
             terminalEvidenceCaptureEnabled = manifest.terminalEvidenceCaptureEnabled,
         )
     }
-
-    private fun readBoundedDescriptor(fd: Int, maximumBytes: Int): ByteArray {
-        val bytes = Files.readAllBytes(Path.of("/proc/self/fd/$fd"))
-        require(bytes.isNotEmpty() && bytes.size <= maximumBytes) { "MCP bootstrap descriptor size rejected." }
-
-        return bytes
-    }
 }
 
 /** validated MCP bootstrap values。password を log/serialization 対象へ渡さない。 */
@@ -167,9 +149,6 @@ data class McpBootstrapConfig(
         ")"
 }
 
-private const val MANIFEST_FD = 3
-private const val PASSWORD_FD = 4
-private const val SUBMISSION_GATEWAY_FD = 5
 private const val MAX_MANIFEST_BYTES = 64 * 1024
 private const val MAX_PASSWORD_BYTES = 4096
 private const val MANIFEST_DIRECTORY_ENV = "FUKUROU_MCP_MANIFEST_DIRECTORY"
