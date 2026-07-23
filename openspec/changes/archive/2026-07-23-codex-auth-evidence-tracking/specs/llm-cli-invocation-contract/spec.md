@@ -25,7 +25,7 @@ This known-text matching is necessarily incomplete: content that does not match 
 - **WHEN** Codex's stdout cannot be validated against the pinned schema (genuine schema drift, including a launch failure that produces empty or non-JSON stdout), and neither stdout nor stderr contains a known Codex authentication-evidence string, and no parsed `turn.failed`/`error` event message mapped to `AUTHENTICATION`
 - **THEN** audit records `OUTPUT_CONTRACT` and retains the completed process's stdout and stderr after `redactor.redactAndTruncate`, without a `rawOutputOmitted` marker
 
-#### Scenario: Codex output cannot be validated against the pinned schema and authentication evidence is present
+#### Scenario: Codex output cannot be validated against the pinned schema
 
 - **WHEN** Codex's stdout cannot be validated against the pinned schema — whether from schema drift where stdout or stderr independently contains a known Codex authentication-evidence string, or from a terminal payload that also carries authentication-failure evidence which the parser's first-match priority logic resolved to a different category than `AUTHENTICATION`
 - **THEN** audit records `OUTPUT_CONTRACT` without persisting raw output, token, path, or prompt
@@ -40,17 +40,17 @@ This known-text matching is necessarily incomplete: content that does not match 
 - **WHEN** Codex's output contains a `RATE_OR_SESSION_LIMIT` or `QUOTA_EXHAUSTED` match earlier in the stream than a later, otherwise-exact authentication failure signal, so the parser's first-match resolution assigns `RATE_OR_SESSION_LIMIT` or `QUOTA_EXHAUSTED` as the category, but the later authentication signal is independently tracked
 - **THEN** audit records that category without persisting raw output, token, path, or prompt, because the independently tracked authentication evidence withholds raw output regardless of the resolved category
 
-#### Scenario: Unknown provider failure occurs with no known authentication-evidence text observed
+#### Scenario: Unknown provider failure occurs
 
 - **WHEN** output cannot be mapped to a supported typed category, and neither stdout nor stderr contains a known Codex authentication-evidence string, and no parsed event message mapped to `AUTHENTICATION`
 - **THEN** audit records `UNKNOWN_PROVIDER_FAILURE`, the invocation remains fail-closed for trading-decision purposes (cannot authorize `ENTER` or `ADD_LONG`), and — because no known authentication-evidence text was observed — retains the completed process's stdout and stderr after `redactor.redactAndTruncate`
 
-#### Scenario: Codex's output text does not map to a known compatibility failure and authentication evidence is present
+#### Scenario: Codex's output text does not map to a known compatibility failure
 
 - **WHEN** Codex emits an error or turn-failure message that the parser cannot map to a known compatibility failure category, including when an earlier unrecognized message supersedes a later, otherwise-exact authentication failure signal under first-match resolution, and that later signal is independently tracked as authentication evidence
 - **THEN** audit records `UNKNOWN_PROVIDER_FAILURE` without persisting raw output, token, path, or prompt
 
-#### Scenario: Codex fails with a pure process-lifecycle category, no adapter failure, and no known authentication-evidence text observed
+#### Scenario: Codex fails with a pure process-lifecycle category, no adapter failure, and no known authentication signature in stderr
 
 - **WHEN** Codex's invocation resolves to `PROCESS_TIMEOUT` (from `processResult.status`), `PROCESS_EXIT` (from a non-zero `exitCode`), or `CLEANUP` (from a raised cleanup exception), the adapter reported no provider failure at all for this invocation, and no known authentication-evidence text was independently observed in stdout or stderr
 - **THEN** audit records the failure category and retains the completed process's stdout and stderr after `redactor.redactAndTruncate`, without a `rawOutputOmitted` marker
