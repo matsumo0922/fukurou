@@ -14,6 +14,10 @@ export RESTIC_REPOSITORY="${SELFTEST_ROOT}/repo/repository"
 export RESTIC_PASSWORD_FILE="${SELFTEST_ROOT}/restic-password"
 export FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST=1
 export FUKUROU_SERVICE_BOOT_ID_FILE="${SELFTEST_ROOT}/boot-id"
+# backup-common の BACKUP_SHARE_DIRECTORY はインストール先(/usr/local/share/fukurou)を
+# デフォルトにしたため、repo checkout から直接動かすこの selftest では明示的に
+# repo 内の scripts/backup を指す必要がある（他の selftest と同じパターン）。
+export FUKUROU_BACKUP_SHARE_DIRECTORY="${SELFTEST_DIRECTORY}"
 # shellcheck source=backup-fukurou
 source "${SELFTEST_DIRECTORY}/backup-fukurou"
 
