@@ -127,6 +127,17 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(databaseHelper.contains("sync -f \"\${marker_directory}\""))
         assertTrue(dockerfile.contains("FROM debian:bookworm-slim AS db-helper-manifest"))
         assertTrue(dockerfile.contains("/usr/local/share/fukurou/db-helper-manifest.sha256"))
+        val installMarkerDirectory = "install -d -o root -g root -m 0755 /usr/local/share/fukurou"
+        assertTrue(
+            dockerfile.contains(installMarkerDirectory),
+            "the marker directory must be created with a traversable mode before the marker COPY runs, otherwise " +
+                "COPY --chmod=0444 also restricts the auto-created parent directory and a non-root docker run " +
+                "(deploy-fukurou's read_candidate_db_helper_manifest) cannot read the marker file",
+        )
+        assertTrue(
+            dockerfile.indexOf(installMarkerDirectory) <
+                dockerfile.indexOf("/usr/local/share/fukurou/db-helper-manifest.sha256"),
+        )
 
         assertTrue(executor.contains("\"\${BACKUP_HELPER}\" --invoked-by-deploy"))
         assertTrue(backup.contains("if [[ \"\${1:-}\" == \"--invoked-by-deploy\" ]]"))

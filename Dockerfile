@@ -69,7 +69,8 @@ RUN apt-get update \
     && groupadd --system --gid 10004 llm-runtime \
     && useradd --system --uid 10001 --gid 10004 appuser \
     && install -d -o appuser -g llm-runtime -m 2750 /run/fukurou/llm-homes \
-    && install -d -o appuser -g llm-runtime -m 0700 /run/fukurou/mcp-manifests
+    && install -d -o appuser -g llm-runtime -m 0700 /run/fukurou/mcp-manifests \
+    && install -d -o root -g root -m 0755 /usr/local/share/fukurou
 
 COPY --from=db-helper-manifest --chown=root:root --chmod=0444 /db-helper-manifest.sha256 /usr/local/share/fukurou/db-helper-manifest.sha256
 COPY --chown=root:root --chmod=0555 scripts/runtime/fukurou-cli-canary-mcp.mjs /usr/local/libexec/fukurou-cli-canary-mcp.mjs
