@@ -290,6 +290,9 @@ data class ProcessRunResult(
  *
  * @param request 元の起動要求
  * @param responseText provider output から抽出した最終応答本文
+ * @param authEvidenceObserved primary category の先勝ち解決とは独立に、既知の認証 evidence 文言
+ * （`CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`）を出力中に観測したか。default を持たないため、
+ * 全ての構築箇所で明示が必須（fail-closed）。Codex 以外の provider では常に false
  * @param usage provider output から抽出した structured usage
  * @param processResult process 実行結果
  * @param cleanupFailure process output の解析後に一時 artifact を削除できなかった failure
@@ -301,6 +304,7 @@ data class LlmInvocationResult(
     val request: LlmInvocationRequest,
     val processResult: ProcessRunResult,
     val responseText: String,
+    val authEvidenceObserved: Boolean,
     val usage: LlmUsageDetails? = null,
     val cleanupFailure: Throwable? = null,
     val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,

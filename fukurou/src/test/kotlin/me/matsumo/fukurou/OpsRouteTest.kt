@@ -1893,6 +1893,7 @@ private fun codexAuditInvocationResult(request: LlmInvocationRequest): LlmInvoca
             stderr = "diagnostic path=/private/session/path",
         ),
         responseText = "semantic response",
+        authEvidenceObserved = false,
         usage = usage,
     )
 }

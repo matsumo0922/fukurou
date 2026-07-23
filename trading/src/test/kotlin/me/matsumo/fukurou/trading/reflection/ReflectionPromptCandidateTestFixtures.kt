@@ -55,6 +55,7 @@ internal class RecordingReflectionLlmInvoker(
                 request = request,
                 processResult = processResult,
                 responseText = responseText ?: processResult.stdout,
+                authEvidenceObserved = false,
             )
         }
     }

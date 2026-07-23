@@ -248,6 +248,7 @@ private class StaticPreFilterLlmInvoker(
                     stderr = "",
                 ),
                 responseText = responseText,
+                authEvidenceObserved = false,
             ),
         )
     }

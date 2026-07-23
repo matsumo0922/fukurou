@@ -251,6 +251,7 @@ private fun successfulResult(request: LlmInvocationRequest): LlmInvocationResult
         request = request,
         processResult = process(ProcessRunStatus.EXITED, 0),
         responseText = "FUKUROU_CLI_CANARY_OK",
+        authEvidenceObserved = false,
         configuredModelIdentity = LlmConfiguredModelIdentity(model, LlmConfiguredModelSource.REQUEST),
         observedModelIdentity = if (request.provider == LlmProvider.CLAUDE) {
             LlmObservedModelIdentity(model, "CLAUDE_RESULT")

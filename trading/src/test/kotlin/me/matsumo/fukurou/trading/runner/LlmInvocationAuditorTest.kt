@@ -21,6 +21,7 @@ import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.CODEX_OUTPUT_ADAPTER_VERSION
 import me.matsumo.fukurou.trading.invoker.CODEX_STDERR_AUTH_FAILURES
+import me.matsumo.fukurou.trading.invoker.DefaultLlmOutputParser
 import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
 import me.matsumo.fukurou.trading.invoker.LlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
@@ -361,15 +362,18 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
-    fun invokeAndAudit_omitsRawOutputForCodexStructuredFailureCategories() = runBlocking {
-        val structuredFailures = listOf(
+    fun invokeAndAudit_retainsRawOutputForOutputInterpretedCategoriesWithoutEvidence() = runBlocking {
+        // issue #295: OUTPUT_CONTRACT/RATE_OR_SESSION_LIMIT/QUOTA_EXHAUSTED/UNKNOWN_PROVIDER_FAILURE は
+        // authEvidenceObserved == false（既知の認証 evidence 文言が独立に観測されなかった場合）に限り、
+        // 新設の output-interpreted 経路で raw output を記録できるようになった
+        val outputInterpretedFailures = listOf(
             LlmProviderFailure(LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT, "RATE_LIMIT", CODEX_OUTPUT_ADAPTER_VERSION),
             LlmProviderFailure(LlmProviderFailureCategory.QUOTA_EXHAUSTED, "QUOTA", CODEX_OUTPUT_ADAPTER_VERSION),
             LlmProviderFailure(LlmProviderFailureCategory.OUTPUT_CONTRACT, "SCHEMA_DRIFT", CODEX_OUTPUT_ADAPTER_VERSION),
             LlmProviderFailure(LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE, null, CODEX_OUTPUT_ADAPTER_VERSION),
         )
 
-        structuredFailures.forEach { failure ->
+        outputInterpretedFailures.forEach { failure ->
             val commandEventLog = InMemoryCommandEventLog()
             val auditor = LlmInvocationAuditor(
                 commandEventLog = commandEventLog,
@@ -387,6 +391,51 @@ class LlmInvocationAuditorTest {
                     stderr = "structured failure stderr",
                 ),
                 providerFailure = failure,
+                authEvidenceObserved = false,
+            )
+
+            auditor.invokeAndAudit(
+                phaseName = "falsifier",
+                context = request.decisionRunContext,
+                request = request,
+                llmInvoker = invoker,
+            )
+
+            val details = auditedDetails(commandEventLog)
+            val expectedMessage = "${failure.category} should expose"
+
+            assertEquals(failure.category.name, details["failureCategory"]?.jsonPrimitive?.content)
+            assertEquals("structured failure output", details["stdout"]?.jsonPrimitive?.content, "$expectedMessage stdout")
+            assertEquals("structured failure stderr", details["stderr"]?.jsonPrimitive?.content, "$expectedMessage stderr")
+        }
+    }
+
+    @Test
+    fun invokeAndAudit_omitsRawOutputForOutputInterpretedCategoriesWithEvidence() = runBlocking {
+        val outputInterpretedFailures = listOf(
+            LlmProviderFailure(LlmProviderFailureCategory.RATE_OR_SESSION_LIMIT, "RATE_LIMIT", CODEX_OUTPUT_ADAPTER_VERSION),
+            LlmProviderFailure(LlmProviderFailureCategory.QUOTA_EXHAUSTED, "QUOTA", CODEX_OUTPUT_ADAPTER_VERSION),
+            LlmProviderFailure(LlmProviderFailureCategory.OUTPUT_CONTRACT, "SCHEMA_DRIFT", CODEX_OUTPUT_ADAPTER_VERSION),
+            LlmProviderFailure(LlmProviderFailureCategory.UNKNOWN_PROVIDER_FAILURE, null, CODEX_OUTPUT_ADAPTER_VERSION),
+        )
+
+        outputInterpretedFailures.forEach { failure ->
+            val commandEventLog = InMemoryCommandEventLog()
+            val auditor = LlmInvocationAuditor(
+                commandEventLog = commandEventLog,
+                redactor = SecretRedactor(emptySet()),
+                clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            )
+            val request = auditRequest(LlmProvider.CODEX)
+            val invoker = ConfigurableAuditLlmInvoker(
+                processResult = ProcessRunResult(
+                    status = ProcessRunStatus.EXITED,
+                    exitCode = 0,
+                    stdout = "structured failure output",
+                    stderr = "structured failure stderr",
+                ),
+                providerFailure = failure,
+                authEvidenceObserved = true,
             )
 
             auditor.invokeAndAudit(
@@ -456,6 +505,9 @@ class LlmInvocationAuditorTest {
             clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
         )
         val request = auditRequest(LlmProvider.CODEX)
+        // #296 の condition 3（auditor 側の stderr 直接 inspect）は authEvidenceObserved に統合された。
+        // このテストの意図（成功 event stream と既知認証文言 stderr の併存を排除する）は、
+        // parser が独立に観測した authEvidenceObserved=true をこの double が明示することで再現する
         val invoker = ConfigurableAuditLlmInvoker(
             processResult = ProcessRunResult(
                 status = ProcessRunStatus.EXITED,
@@ -463,6 +515,7 @@ class LlmInvocationAuditorTest {
                 stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
                 stderr = CODEX_STDERR_AUTH_FAILURES.first(),
             ),
+            authEvidenceObserved = true,
         )
 
         auditor.invokeAndAudit(
@@ -822,6 +875,7 @@ class LlmInvocationAuditorTest {
                         request = request,
                         processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", ""),
                         responseText = "",
+                        authEvidenceObserved = false,
                         cleanupFailure = cleanupFailure,
                     ),
                 )
@@ -919,6 +973,88 @@ class LlmInvocationAuditorTest {
         }
     }
 
+    /**
+     * issue #282 と同形の production 障害（`OUTPUT_CONTRACT`/`SCHEMA_DRIFT`、MCP handshake 失敗を模した
+     * 非 JSON stdout）を、hand-built double ではなく実際の `DefaultLlmOutputParser` -> `ShellLlmInvoker` ->
+     * `LlmInvocationAuditor` の配線を経由して証明する（Finding 4、double での代替不可）。
+     */
+    @Test
+    fun invokeAndAudit_recordsRedactedOutputForCodexOutputContractThroughProductionWiring() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val processResult = ProcessRunResult(
+            status = ProcessRunStatus.EXITED,
+            exitCode = 1,
+            stdout = "mcp handshake failed: unexpected token at position 0",
+            stderr = "codex: failed to initialize MCP server",
+        )
+        val shellInvoker = ShellLlmInvoker(
+            commandRenderer = StaticAuditCommandRenderer,
+            processRunner = FixedProcessRunner(processResult),
+            outputParser = DefaultLlmOutputParser(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = shellInvoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("OUTPUT_CONTRACT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals("SCHEMA_DRIFT", details["providerCode"]?.jsonPrimitive?.content)
+        assertEquals(processResult.stdout, details["stdout"]?.jsonPrimitive?.content)
+        assertEquals(processResult.stderr, details["stderr"]?.jsonPrimitive?.content)
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
+    /**
+     * 同じ配線・同じ非 JSON stdout 形状で、stdout に既知の認証 evidence 文言（"Not logged in"）が
+     * 埋め込まれている場合は raw output が記録されないことを証明する（受け入れ条件2）。
+     */
+    @Test
+    fun invokeAndAudit_omitsRawOutputForOutputContractProductionWiringWithEvidence() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val processResult = ProcessRunResult(
+            status = ProcessRunStatus.EXITED,
+            exitCode = 1,
+            stdout = "Not logged in\nmcp handshake failed: unexpected token at position 0",
+            stderr = "codex: failed to initialize MCP server",
+        )
+        val shellInvoker = ShellLlmInvoker(
+            commandRenderer = StaticAuditCommandRenderer,
+            processRunner = FixedProcessRunner(processResult),
+            outputParser = DefaultLlmOutputParser(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = shellInvoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("OUTPUT_CONTRACT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertFalse(details.containsKey("stdout"))
+        assertFalse(details.containsKey("stderr"))
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
     private fun manifestAuditor(
         repository: LlmInputManifestRepository,
         clock: Clock,
@@ -1008,6 +1144,18 @@ private object StaticAuditCommandRenderer : LlmCommandRenderer {
     }
 }
 
+/**
+ * production-wiring テスト用の、固定 [ProcessRunResult] を返すだけの fake `ProcessRunner`。
+ * `ShellLlmInvokerTest.kt` の `RecordingProcessRunner` と同様、実際の parser を経由させるために使う。
+ */
+private class FixedProcessRunner(
+    private val processResult: ProcessRunResult,
+) : ProcessRunner {
+    override suspend fun run(command: RenderedLlmCommand): Result<ProcessRunResult> {
+        return Result.success(processResult)
+    }
+}
+
 private class FailingStartAwareProcessRunner(
     private val callbackInvoked: Boolean,
     private val failure: Throwable,
@@ -1030,6 +1178,7 @@ private class StaticAuditUsageInvoker(private val usage: LlmUsageDetails) : LlmI
                 request = request,
                 processResult = ProcessRunResult(ProcessRunStatus.EXITED, 0, "", ""),
                 responseText = "",
+                authEvidenceObserved = false,
                 usage = usage,
             ),
         )
@@ -1048,6 +1197,7 @@ private class ConfigurableAuditLlmInvoker(
     private val processResult: ProcessRunResult,
     private val providerFailure: LlmProviderFailure? = null,
     private val cleanupFailure: Throwable? = null,
+    private val authEvidenceObserved: Boolean = false,
 ) : LlmInvoker {
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
         return Result.success(
@@ -1055,6 +1205,7 @@ private class ConfigurableAuditLlmInvoker(
                 request = request,
                 processResult = processResult,
                 responseText = "response",
+                authEvidenceObserved = authEvidenceObserved,
                 usage = null,
                 providerFailure = providerFailure,
                 cleanupFailure = cleanupFailure,
@@ -1106,6 +1257,7 @@ private class StaticStructuredAuditLlmInvoker(
                     stderr = "401 unauthorized at /private/session/path",
                 ),
                 responseText = "partial response",
+                authEvidenceObserved = false,
                 usage = usage,
                 providerFailure = me.matsumo.fukurou.trading.invoker.LlmProviderFailure(
                     me.matsumo.fukurou.trading.invoker.LlmProviderFailureCategory.AUTHENTICATION,
@@ -1132,6 +1284,7 @@ private class CleanupFailingAuditLlmInvoker(
                     stderr = "",
                 ),
                 responseText = "semantic response",
+                authEvidenceObserved = false,
                 usage = usage,
                 cleanupFailure = cleanupFailure,
             ),
@@ -1165,6 +1318,7 @@ private class StaticAuditLlmInvoker(
                     stderr = "",
                 ),
                 responseText = stdout,
+                authEvidenceObserved = false,
                 usage = LlmUsageParser.parseClaudeStdout(stdout),
             ),
         )
