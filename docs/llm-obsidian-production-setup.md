@@ -64,18 +64,23 @@ ssh -t dxp4800plus 'docker exec -it -e HOME=/tmp/fukurou-cli-home fukurou-ktor c
 
 Claude prompt が出たら `/login` を実行し、表示された URL を手元の browser で承認して code を貼り付ける。SSH 越しの paste がうまくいかない場合だけ、SSH port forward を一時的な fallback として使う。
 
-Codex CLI は device auth でログインする。
-
-```sh
-ssh -t dxp4800plus 'docker exec -it fukurou-ktor codex login --device-auth'
-```
-
-表示された URL / code を手元の browser で承認する。ログイン後、Codex の login state を確認する。
+Codex CLI は appuser（UID 10001）として device auth でログインする。現行 image の既定 user も appuser だが、fallback 手順は image default に依存しないよう `--user 10001` を明示する。ログイン前に auth source の mtime を記録する。auth file がまだない場合は `AUTH_JSON_MISSING` になる。
 
 ```sh
 ssh dxp4800plus \
-  'docker exec fukurou-ktor sh -lc "codex login status"'
+  'docker exec --user 10001 fukurou-ktor sh -lc "if test -f /tmp/fukurou-cli-home/.codex/auth.json; then stat -c %Y /tmp/fukurou-cli-home/.codex/auth.json; else echo AUTH_JSON_MISSING; fi"'
+
+ssh -t dxp4800plus 'docker exec -it --user 10001 fukurou-ktor codex login --device-auth'
 ```
+
+表示された URL / code を手元の browser で承認する。`Successfully logged in` の表示だけでは credential の保存成功とみなさない。ログイン後に同じ appuser と auth source で mtime と login state を確認し、mtime がログイン前から更新されたこと、または `AUTH_JSON_MISSING` から timestamp に変わったことを確認する。
+
+```sh
+ssh dxp4800plus \
+  'docker exec --user 10001 fukurou-ktor sh -lc "stat -c %Y /tmp/fukurou-cli-home/.codex/auth.json && CODEX_HOME=/tmp/fukurou-cli-home/.codex codex login status"'
+```
+
+UID 0（`--user 0` / root）では Codex login を実行しない。root 実行は成功と表示されても appuser 所有の auth source に credential を保存できず、外部側の既存 session だけを revoke して認証状態を悪化させることがある。
 
 ## Container smoke test
 
@@ -106,7 +111,7 @@ acceptance が検証するのは Codex の configured `-m gpt-5.5` と CLI/image
 
 ```sh
 ssh dxp4800plus \
-  'docker exec fukurou-ktor sh -lc "CODEX_HOME=/tmp/fukurou-cli-home/.codex codex login status"'
+  'docker exec --user 10001 fukurou-ktor sh -lc "CODEX_HOME=/tmp/fukurou-cli-home/.codex codex login status"'
 ```
 
 2026-07-04 時点の確認では、ChatGPT account の Codex CLI で `gpt-5-mini` は受け付けられず、未指定時は `gpt-5.5` が使われた。短い smoke test でも CLI の system prompt / session overhead により token 表示は小さくならないため、daemon 有効化前に model / cost 方針を決める。

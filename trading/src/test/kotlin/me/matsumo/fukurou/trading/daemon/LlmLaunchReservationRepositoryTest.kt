@@ -311,6 +311,18 @@ class LlmLaunchReservationRepositoryTest {
     }
 
     @Test
+    fun manualReservation_bypassesHourlyAndDailyCriticalReserves() = runBlocking {
+        assertManualBypassesHourlyCriticalReserves()
+        assertManualBypassesDailyCriticalReserves()
+    }
+
+    @Test
+    fun manualReservation_respectsHourlyAndDailyHardCaps() = runBlocking {
+        assertManualRespectsHourlyHardCap()
+        assertManualRespectsDailyHardCap()
+    }
+
+    @Test
     fun criticalHourlyOverGuaranteeCannotConsumeTheOtherCriticalReserve() = runBlocking {
         listOf(
             LlmDaemonTriggerKind.ENTRY_FILL to LlmLaunchReservationRejectionReason.STOP_PROXIMITY_HOURLY_RESERVE,
@@ -533,6 +545,162 @@ class LlmLaunchReservationRepositoryTest {
         assertEquals("active", assertNotNull(blocker).invocationId)
         assertEquals(true, active)
     }
+}
+
+private suspend fun assertManualBypassesHourlyCriticalReserves() {
+    val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+    val config = LlmRunnerConfig()
+    val now = launchBudgetFixedInstant()
+    repeat(5) { index ->
+        reserveAndFinishLaunchBudget(
+            repository = repository,
+            invocationId = "manual-hour-normal-$index",
+            config = config,
+            reservedAt = now.plusSeconds(index.toLong()),
+        )
+    }
+
+    val heartbeat = repository.tryReserve(
+        launchBudgetRequest("manual-hour-heartbeat", config, now.plusSeconds(5)),
+    ).getOrThrow()
+    val manual = repository.tryReserve(
+        launchBudgetRequest(
+            invocationId = "manual-hour-reserved",
+            config = config,
+            reservedAt = now.plusSeconds(6),
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        ),
+    ).getOrThrow()
+
+    assertEquals(
+        LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.ENTRY_FILL_HOURLY_RESERVE),
+        heartbeat,
+    )
+    assertIs<LlmLaunchReservationOutcome.Reserved>(manual)
+}
+
+private suspend fun assertManualBypassesDailyCriticalReserves() {
+    val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+    val config = LlmRunnerConfig(
+        maxInvocationsPerDay = 10,
+        entryFillReservePerDay = 1,
+        stopProximityReservePerDay = 1,
+    )
+    val now = launchBudgetFixedInstant()
+    repeat(8) { index ->
+        reserveAndFinishLaunchBudget(
+            repository = repository,
+            invocationId = "manual-day-normal-$index",
+            config = config,
+            reservedAt = now.plus(Duration.ofHours(index.toLong())),
+        )
+    }
+
+    val heartbeat = repository.tryReserve(
+        launchBudgetRequest("manual-day-heartbeat", config, now.plus(Duration.ofHours(8))),
+    ).getOrThrow()
+    val manual = repository.tryReserve(
+        launchBudgetRequest(
+            invocationId = "manual-day-reserved",
+            config = config,
+            reservedAt = now.plus(Duration.ofHours(8)).plusSeconds(1),
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        ),
+    ).getOrThrow()
+
+    assertEquals(
+        LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.ENTRY_FILL_DAILY_RESERVE),
+        heartbeat,
+    )
+    assertIs<LlmLaunchReservationOutcome.Reserved>(manual)
+}
+
+private suspend fun assertManualRespectsHourlyHardCap() {
+    val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+    val config = LlmRunnerConfig()
+    val now = launchBudgetFixedInstant()
+    repeat(5) { index ->
+        reserveAndFinishLaunchBudget(
+            repository = repository,
+            invocationId = "manual-hour-cap-normal-$index",
+            config = config,
+            reservedAt = now.plusSeconds(index.toLong()),
+        )
+    }
+    reserveAndFinishLaunchBudget(
+        repository = repository,
+        invocationId = "manual-hour-cap-entry",
+        config = config,
+        reservedAt = now.plusSeconds(5),
+        triggerKind = LlmDaemonTriggerKind.ENTRY_FILL,
+    )
+    reserveAndFinishLaunchBudget(
+        repository = repository,
+        invocationId = "manual-hour-cap-stop",
+        config = config,
+        reservedAt = now.plusSeconds(6),
+        triggerKind = LlmDaemonTriggerKind.STOP_PROXIMITY,
+    )
+
+    val manual = repository.tryReserve(
+        launchBudgetRequest(
+            invocationId = "manual-hour-cap-rejected",
+            config = config,
+            reservedAt = now.plusSeconds(7),
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        ),
+    ).getOrThrow()
+
+    assertEquals(
+        LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_HOUR),
+        manual,
+    )
+}
+
+private suspend fun assertManualRespectsDailyHardCap() {
+    val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+    val config = LlmRunnerConfig(
+        maxInvocationsPerDay = 5,
+        entryFillReservePerDay = 1,
+        stopProximityReservePerDay = 1,
+    )
+    val now = launchBudgetFixedInstant()
+    repeat(3) { index ->
+        reserveAndFinishLaunchBudget(
+            repository = repository,
+            invocationId = "manual-day-cap-normal-$index",
+            config = config,
+            reservedAt = now.plus(Duration.ofHours(index.toLong())),
+        )
+    }
+    reserveAndFinishLaunchBudget(
+        repository = repository,
+        invocationId = "manual-day-cap-entry",
+        config = config,
+        reservedAt = now.plus(Duration.ofHours(3)),
+        triggerKind = LlmDaemonTriggerKind.ENTRY_FILL,
+    )
+    reserveAndFinishLaunchBudget(
+        repository = repository,
+        invocationId = "manual-day-cap-stop",
+        config = config,
+        reservedAt = now.plus(Duration.ofHours(4)),
+        triggerKind = LlmDaemonTriggerKind.STOP_PROXIMITY,
+    )
+
+    val manual = repository.tryReserve(
+        launchBudgetRequest(
+            invocationId = "manual-day-cap-rejected",
+            config = config,
+            reservedAt = now.plus(Duration.ofHours(5)),
+            triggerKind = LlmDaemonTriggerKind.MANUAL,
+        ),
+    ).getOrThrow()
+
+    assertEquals(
+        LlmLaunchReservationOutcome.Rejected(LlmLaunchReservationRejectionReason.MAX_INVOCATIONS_PER_DAY),
+        manual,
+    )
 }
 
 private suspend fun assertOnlyUnusedHourlyReserve(

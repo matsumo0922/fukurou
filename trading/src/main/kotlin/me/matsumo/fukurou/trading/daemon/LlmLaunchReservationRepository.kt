@@ -984,6 +984,7 @@ private fun reserveRejection(
     hourly: Boolean,
 ): LlmLaunchReservationRejectionReason? {
     val config = request.runnerConfig
+    val manualRequest = request.triggerKind == LlmDaemonTriggerKind.MANUAL
     val hardCap = (if (hourly) config.maxInvocationsPerHour else config.maxInvocationsPerDay).toLong()
     val entryReserve = (if (hourly) config.entryFillReservePerHour else config.entryFillReservePerDay).toLong()
     val stopReserve = (if (hourly) config.stopProximityReservePerHour else config.stopProximityReservePerDay).toLong()
@@ -994,9 +995,11 @@ private fun reserveRejection(
     val stopLimit = hardCap - unusedStop - if (request.triggerKind == LlmDaemonTriggerKind.ENTRY_FILL) 0L else unusedEntry
     val protectedEntry = unusedEntry > 0L &&
         request.triggerKind != LlmDaemonTriggerKind.ENTRY_FILL &&
+        !manualRequest &&
         totalUsage >= entryLimit
     val protectedStop = unusedStop > 0L &&
         request.triggerKind != LlmDaemonTriggerKind.STOP_PROXIMITY &&
+        !manualRequest &&
         totalUsage >= stopLimit
 
     return when {
