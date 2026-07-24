@@ -205,26 +205,23 @@ class ReleaseDeployFoundationContractTest {
     }
 }
 
-private fun shellManifestPaths(source: String): Set<String> =
-    source
-        .substringAfter("db_helper_manifest_entries() {")
-        .substringBefore("\n}\n")
-        .lineSequence()
-        .mapNotNull { line -> Regex("\"(scripts/deploy/[^\"]+)\"").find(line)?.groupValues?.get(1) }
-        .map(::normalizeRepositoryPath)
-        .toSortedSet()
+private fun shellManifestPaths(source: String): Set<String> = source
+    .substringAfter("db_helper_manifest_entries() {")
+    .substringBefore("\n}\n")
+    .lineSequence()
+    .mapNotNull { line -> Regex("\"(scripts/deploy/[^\"]+)\"").find(line)?.groupValues?.get(1) }
+    .map(::normalizeRepositoryPath)
+    .toSortedSet()
 
-private fun dockerManifestPaths(source: String): Set<String> =
-    source
-        .substringAfter("FROM debian:bookworm-slim AS db-helper-manifest")
-        .substringBefore("# ---- runtime stage")
-        .lineSequence()
-        .mapNotNull { line -> Regex("printf '%s\\\\n' (scripts/deploy/[^;]+);").find(line)?.groupValues?.get(1) }
-        .map(::normalizeRepositoryPath)
-        .toSortedSet()
+private fun dockerManifestPaths(source: String): Set<String> = source
+    .substringAfter("FROM debian:bookworm-slim AS db-helper-manifest")
+    .substringBefore("# ---- runtime stage")
+    .lineSequence()
+    .mapNotNull { line -> Regex("printf '%s\\\\n' (scripts/deploy/[^;]+);").find(line)?.groupValues?.get(1) }
+    .map(::normalizeRepositoryPath)
+    .toSortedSet()
 
-private fun normalizeRepositoryPath(path: String): String =
-    Path.of(path).normalize().toString().replace('\\', '/')
+private fun normalizeRepositoryPath(path: String): String = Path.of(path).normalize().toString().replace('\\', '/')
 
 private fun repositoryRoot(): Path {
     var candidate = Path.of(System.getProperty("user.dir")).toAbsolutePath()
