@@ -45,17 +45,26 @@ MCP subprocess が application role を使っても、`submit_decision` の prod
 
 専用 role による DB ACL を残して defense-in-depth とする案は、Epic #286 で single-owner paper 環境に対する保守コストが便益を上回ると判断済みのため採用しない。
 
-### D4. 残存 production role は dependency cleanup を含む owner 手順で削除する（agent 仮決め）
+### D4. 残存 production role は cluster preflight と単一 transaction を通した owner 手順で削除する（agent 仮決め）
 
-image deploy と application 起動は、旧 `fukurou_mcp` role が DB に残っていても成立する。一方、現行 provision は database CONNECT、schema USAGE、table SELECT / INSERT、catalog function EXECUTE を付与するため、`DROP ROLE fukurou_mcp;` 単独では dependent privilege が残って失敗する。
+image deploy と application 起動は、旧 `fukurou_mcp` role が DB に残っていても成立する。一方、現行 provision は database CONNECT、schema USAGE、table SELECT / INSERT、catalog function EXECUTE を付与するため、`DROP ROLE fukurou_mcp;` 単独では dependent privilege が残って失敗する。また `REASSIGN OWNED` / `DROP OWNED` / `DROP ROLE` を autocommit で順に実行すると、最後の `DROP ROLE` が他 database の dependency で失敗した時点で application DB だけが変更済みになる。
 
-PR 2 description には、application database に `POSTGRES_USER` で接続して次の1行を実行する owner migration note を記載する。
+PR 2 description の owner migration note は次の順序を要求する。
+
+1. `pg_shdepend` と `pg_database` を application `POSTGRES_USER` で照合し、`fukurou_mcp` の dependency が application DB と shared database privilege 以外に存在しないこと、active session がないことを cluster-wide preflight する。別 database の table/function/default-ACL dependency が見つかった場合は変更を実行せず停止する。
+2. application DB で最終手順と同じ transaction を `ROLLBACK` 終端で dry-run する。`DROP ROLE` は cluster 全体の dependency を検査するため、preflight が漏らした dependency があっても transaction 全体が rollback され、中間状態を残さない。
 
 ```sql
-REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP ROLE fukurou_mcp;
+BEGIN; REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP ROLE fukurou_mcp; ROLLBACK;
 ```
 
-`REASSIGN OWNED` は想定外に残った所有 object を application role へ保全し、`DROP OWNED` は current database 内で role に付与された ACL dependency を除去する。その後に role を削除する。production で実行する前に disposable PostgreSQL で現行 provision 相当の ownership / privilege を持つ fixture に対してこの1行が成功し、application-owned object が残ることを検証する。production で role が他 database にも権限または所有物を持つ場合は、各 database で `REASSIGN OWNED` と `DROP OWNED` を実行してから最後の `DROP ROLE` を行う。
+3. dry-run 成功後、同じ1行を `COMMIT` 終端で実行する。
+
+```sql
+BEGIN; REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP ROLE fukurou_mcp; COMMIT;
+```
+
+`REASSIGN OWNED` は想定外に残った所有 object を application role へ保全し、`DROP OWNED` は application DB と shared object に付与された ACL dependency を除去する。明示 transaction により `DROP ROLE` が失敗した場合も ownership / ACL 変更を残さない。disposable PostgreSQL では application DB と別 database の両方に dependency を作り、preflight が別 database dependency を検出すること、dry-run failure が application DB を変更しないこと、別 database dependency 除去後の final transaction が role を削除して application-owned object を保持することを検証する。
 
 適用時期は owner が PR 2 deploy の安定を確認して決める。deploy script、Flyway migration、startup hook からは実行しない。自動削除は rollback 時に旧 image が専用 role を必要とする可能性を奪い、DB 権限変更を application deploy に暗黙に混ぜるため採用しない。
 
@@ -70,6 +79,14 @@ PR 1 後に既存 dedicated-role test を残すため、現行 production contra
 
 単一 PR は変更の原子性だけを見ると可能だが、約700行のテスト再編と deploy hidden dependency を含むため採用しない。3 PR 以上への細分化は runtime と deploy cleanup の不整合を招くため行わない。
 
+### D6. PR 2 から旧 image へ戻すときは rollback SHA の DB helper artifact set を先に復元する（agent 仮決め）
+
+PR 2 では DB helper marker の入力が4ファイルから3ファイルへ変わる。root-installed helper/marker が3-file contractのまま旧 imageを candidateにすると、旧 imageの4-file markerと一致せず `CANDIDATE_DB_HELPER_MARKER_MISMATCH` でcompose mutation前に停止する。roleを再provisionするだけでは rollback できない。
+
+rollback は旧 imageを起動する前に、rollback SHAから `deploy-fukurou`、`fukurou-deploy-db`、`deploy-foundation-v1.sql`、`deploy-foundation-v1-indexes.sql`、`mcp-role.sql` をexactにroot配置し、そのrevisionの `fukurou-deploy-db write-install-marker` で4-file markerを再生成する。その後に旧 image digestを `workflow_dispatch` でdeployする。owner migration noteを実行済みの場合は、同じrollback SHAの provision script / SQLで `fukurou_mcp` roleを再作成してから旧 imageを起動する。
+
+逆方向（4-file installed set → PR 2の3-file candidate）と rollback方向（3-file installed set →旧4-file candidate）の両方について、exact artifact setとmarkerを再配置すればcandidate verificationが通り、混在setではfail-closedになることをdeploy contract/self-testで検証する。rollback artifactの配置はroot operator作業であり自動化しない。
+
 ## Risks / Trade-offs
 
 - [Risk] `DB_USER` と `POSTGRES_USER` が異なる環境では意図しない role を manifest に書く → Mitigation: application runtime の正本である `DB_USER` を使用し、production compose と回帰テストで `POSTGRES_USER` から同じ値が注入されることを確認する
@@ -77,8 +94,9 @@ PR 1 後に既存 dedicated-role test を残すため、現行 production contra
 - [Risk] role provision script を削除しても Dockerfile・root deploy executor・DB helper の同期 payload manifest、foundation SQL、contract/self-test、docs に stale な参照が残る → Mitigation: 3箇所の固定 payload list を同一 cutover で更新し、`ReleaseDeployFoundationContractTest` と self-test で残存3-file contractを検証したうえで、対象識別子を active source/docs 全体から検索する
 - [Risk] 約700行の role integration test を削除する際に MCP tool matrix または gateway persistence coverage まで失う → Mitigation: PR 1 で application-role regression を先行追加し、PR 2 ではその scenario が残ることを確認してから role-boundary fixture/assertion を削除する
 - [Risk] PR 1 と PR 2 の間で application-role test と dedicated-role test が併存しテスト時間が増える → Mitigation: 併存期間を stacked 2 PR のレビュー期間に限定し、PR 2 で旧 role test を除去する
-- [Risk] `DROP ROLE` 単独では既存 ACL dependency により失敗し、`DROP OWNED` 単独では想定外の role-owned object を削除し得る → Mitigation: `REASSIGN OWNED` で ownership を application role へ移してから `DROP OWNED` と `DROP ROLE` を行い、同じ1行を disposable PostgreSQL で検証する
-- [Risk] role を先に手動削除すると旧 image への rollback が失敗する → Mitigation: role cleanup を自動化せず、new image の安定確認後に owner が実施する migration note とする
+- [Risk] 他 database dependency を見落としてautocommit cleanupを始めると、`DROP ROLE` failure後にapplication DBだけ変更済みになる → Mitigation: `pg_shdepend` のcluster preflightと、`BEGIN`内で`REASSIGN OWNED`・`DROP OWNED`・`DROP ROLE`をまとめたdry-run/final transactionを使い、複数database fixtureでrollback atomicityを検証する
+- [Risk] PR 2の3-file helper/markerのまま旧4-file imageへ戻すとcandidate verificationでrollbackが停止する → Mitigation: rollback SHAのexecutor/helper/SQL artifact setをexact installしてmarkerを再生成してから旧imageを起動する手順と双方向self-testを持つ
+- [Risk] role を先に手動削除すると旧 image への rollback が失敗する → Mitigation: role cleanup を自動化せず、new image の安定確認後にownerが実施し、実施後のrollbackは旧artifact set復元に加えて旧provisionを再実行する
 - [Trade-off] app role 統合後は DB ACL 単体で MCP の直接 write を禁止できない → submission gateway という application-level invariant を正本とし、single-owner paper 環境では重複 ACL を維持しない
 
 ## Migration Plan
@@ -86,9 +104,9 @@ PR 1 後に既存 dedicated-role test を残すため、現行 production contra
 1. PR 1 で application role を使う MCP tool matrix / submission gateway 回帰テストを additive に追加する。本番配線と dedicated-role test は維持する。
 2. PR 2 で application role 配線、canary・compose、Dockerfile・root deploy executor・DB helper の同期 payload manifest、foundation SQL、contract/self-test、旧 role-boundary test、docs を一括で切り替える。DB schema migration はない。
 3. PR 2 を通常の production deploy で起動し、MCP 起動と既存 tool call が application role で成立することを既存監査・health 経路で確認する。
-4. disposable PostgreSQL で `REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP ROLE fukurou_mcp;` が現行 ACL dependency を除去し、application-owned object を保持することを確認する。
-5. 安定確認後、owner が PR 2 description の migration note に従って production application DB の ownership / ACL dependency を cleanup し、`fukurou_mcp` role を削除する。
-6. role 削除前の rollback は旧 image へ戻す。role 削除後に旧 image へ戻す必要が生じた場合は、旧 provision 手順を当該 revision から一時的に再実行してから rollback する。
+4. disposable PostgreSQL の複数database fixtureで、cluster dependency preflight、transaction dry-runのrollback atomicity、final transactionのrole削除とownership保全を確認する。
+5. 安定確認後、owner が PR 2 description のmigration noteに従い、cluster preflight → dry-run transaction → final transactionの順でproduction roleを削除する。
+6. role削除前にrollbackする場合も、旧image起動前にrollback SHAのexecutor/helper/foundation/index/`mcp-role.sql`をexact配置し、旧helperで4-file markerを再生成する。role削除後はさらに旧provisionを同じSHAから再実行する。混在artifact setのままdeployしない。
 7. PR 1 では OpenSpec change を archive せず、PR 2 完了後に一度だけ archive する。
 
 ## Open Questions

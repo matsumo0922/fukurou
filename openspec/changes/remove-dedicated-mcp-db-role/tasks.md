@@ -28,13 +28,15 @@
 - [ ] 4.1 `docs/deploy.md` から MCP role provision、権限マトリクス、rollout / DR の専用 role 手順を削除または application role 構成の現在形へ書き直す
 - [ ] 4.2 `docs/mcp-runtime.md` の DB role 分離説明と test 説明を application role + submission gateway 境界へ書き直し、`docs/design.md` の stale な `fukurou_mcp` 前提を除去する
 - [ ] 4.3 README と docs を `FUKUROU_MCP_DB_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql` で検索し、専用 role の残存記述を除去する
-- [ ] 4.4 PR 2 description に「ドキュメント影響: あり（対象ファイル）」と、owner migration note `REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP ROLE fukurou_mcp;`、application DB で実行する前提、自動実行しない理由、適用タイミングを記載する
+- [ ] 4.4 PR 2 description に「ドキュメント影響: あり（対象ファイル）」と、`pg_shdepend` / active session のcluster preflight、`BEGIN; REASSIGN OWNED ...; DROP OWNED ...; DROP ROLE ...; ROLLBACK;` dry-run、同transactionの`COMMIT`版、別database dependency検出時は変更せず停止する条件、自動実行しない理由、適用タイミングを記載する
+- [ ] 4.5 `docs/deploy.md` に、rollback SHAの`deploy-fukurou`・`fukurou-deploy-db`・foundation/index/`mcp-role.sql`をexact配置して旧markerを再生成してから旧imageを起動し、role cleanup後は旧provisionも再実行するrollback手順を記載する
 
 ## 5. PR 2 — Verification and archive
 
 - [ ] 5.1 MCP manifest / runner / isolation canary / application-role tool matrix の関連テストを実行し、application role での起動と gateway 経由 tool call を確認する
 - [ ] 5.2 `ReleaseDeployFoundationContractTest`、`deploy-db-selftest`、`deploy-postgres-selftest` を実行し、Dockerfile・root deploy executor・DB helper の残存3-file manifest と foundation install を確認する
-- [ ] 5.3 disposable PostgreSQL に現行 provision 相当の role ownership / ACL dependency を作り、owner migration note の `REASSIGN OWNED` → `DROP OWNED` → `DROP ROLE` が成功して application-owned object を保持することを検証する
-- [ ] 5.4 `make test`、`make detekt`、`make build` を実行する
-- [ ] 5.5 active source/docs 全体を `FUKUROU_MCP_DB_USER`、`DEFAULT_MCP_DATABASE_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql`、`mcp_role` で検索し、archived OpenSpec と意図した PR migration note 以外の残存を確認する
-- [ ] 5.6 PR 2 完了後に OpenSpec change を一度だけ archive する
+- [ ] 5.3 disposable PostgreSQL のapplication DBと別databaseにrole ownership / ACL dependencyを作り、cluster preflightが別database dependencyを検出すること、dry-run transactionの`DROP ROLE` failureがapplication DBを変更しないこと、別database cleanup後のfinal transactionがroleを削除してownershipを保持することを検証する
+- [ ] 5.4 4-file旧artifact set→3-file新candidateと、3-file新artifact set→4-file旧candidateの両方向について、exact set + marker再生成なら検証が通り、混在setではfail-closedになるrollback manifest self-testを追加・実行する
+- [ ] 5.5 `make test`、`make detekt`、`make build` を実行する
+- [ ] 5.6 active source/docs 全体を `FUKUROU_MCP_DB_USER`、`DEFAULT_MCP_DATABASE_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql`、`mcp_role` で検索し、archived OpenSpec と意図した PR migration note 以外の残存を確認する
+- [ ] 5.7 PR 2 完了後に OpenSpec change を一度だけ archive する

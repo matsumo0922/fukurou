@@ -10,7 +10,8 @@ MCP subprocess 専用の PostgreSQL role `fukurou_mcp` は single-owner の pape
 - MCP isolation canary の manifest 生成を application user に追従させる。
 - dedicated-role integration test を、application role で既存 MCP tool matrix と submission gateway 経路が成立する回帰テストへ置き換える。
 - `fukurou_mcp` role を前提とする runtime・deploy・design の記述と `.env.example` を現在の構成へ更新する。
-- production DB に残る `fukurou_mcp` role は自動削除せず、既存 ownership を application role へ移し、ACL dependency を除去してから role を削除する owner 手順を最終 cutover PR の migration note として提示する。
+- production DB に残る `fukurou_mcp` role は自動削除せず、cluster dependency preflight と単一 transaction の dry-run / commit により ownership移管・ACL除去・role削除をatomicに行うowner手順を最終cutover PRのmigration noteとして提示する。
+- 旧imageへのrollbackは、rollback SHAのexecutor・DB helper・SQL artifact setとmarkerをexact復元してから行い、role cleanup後は旧provisionも再実行する。
 - `submit_decision` は引き続き submission gateway 経由とし、MCP tool の永続化経路と paper truth の意味を変更しない。
 
 ## Capabilities
