@@ -2113,6 +2113,7 @@ private class OneShotLlmRequestFactory(
                     "DB_PASSWORD" to requireNotNull(parentEnvironment["DB_PASSWORD"]) {
                         "DB_PASSWORD is required for the MCP subprocess literal env."
                     },
+                    FUKUROU_MCP_MANIFEST_DIRECTORY_ENV to manifestDirectory.toString(),
                 ),
             )
         } catch (throwable: Throwable) {

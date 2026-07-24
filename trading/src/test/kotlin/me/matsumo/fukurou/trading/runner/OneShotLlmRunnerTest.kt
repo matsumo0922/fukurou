@@ -2243,6 +2243,12 @@ class OneShotLlmRunnerTest {
         assertTrue(configContent.contains("command = \"$DEFAULT_RUNNER_MCP_SERVER_COMMAND\""))
         assertTrue(configContent.contains("[mcp_servers.\"${DEFAULT_RUNNER_MCP_SERVER_NAME}\".env]"))
         assertTrue(configContent.contains("\"DB_PASSWORD\" = \"test-password\""))
+        assertTrue(
+            configContent.contains("\"FUKUROU_MCP_MANIFEST_DIRECTORY\" ="),
+            "Codex reconstructs the MCP subprocess environment from scratch and does not forward " +
+                "arbitrary parent env, so the manifest directory must be a literal MCP-server env value " +
+                "(verified against a real codex binary during the incident that motivated this test)",
+        )
         assertFalse(proposerCommand.environment.containsKey("DB_PASSWORD"))
     }
 
@@ -2264,6 +2270,12 @@ class OneShotLlmRunnerTest {
 
         assertTrue(configContent.contains(""""command":"$DEFAULT_RUNNER_MCP_SERVER_COMMAND""""))
         assertTrue(configContent.contains(""""DB_PASSWORD":"test-password""""))
+        assertTrue(
+            configContent.contains(""""FUKUROU_MCP_MANIFEST_DIRECTORY":"""),
+            "the MCP subprocess only ever sees ShellProcessRunner's replaced (filtered) environment, " +
+                "never the parent env directly, so the manifest directory must be a literal MCP-server " +
+                "env value for Claude too, not just Codex",
+        )
         assertFalse(proposerCommand.environment.containsKey("DB_PASSWORD"))
     }
 
