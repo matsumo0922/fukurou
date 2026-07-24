@@ -37,6 +37,6 @@
 - [x] 5.2 `ReleaseDeployFoundationContractTest`、`deploy-db-selftest`、`deploy-postgres-selftest` を実行し、Dockerfile・root deploy executor・DB helper の残存3-file manifest と foundation install を確認する
 - [x] 5.3 disposable PostgreSQL のapplication DBと別databaseにrole ownership / ACL dependencyを作り、cluster preflightが別database dependencyを検出すること、dry-run transactionの`DROP ROLE` failureがapplication DBを変更しないこと、別database cleanup後のfinal transactionがroleを削除してownershipを保持することを検証する
 - [x] 5.4 4-file旧artifact set→3-file新candidateと、3-file新artifact set→4-file旧candidateの両方向について、exact set + marker再生成なら検証が通り、混在setではfail-closedになるrollback manifest self-testを追加・実行する
-- [ ] 5.5 `make test`、`make detekt`、`make build` を実行する
+- [x] 5.5 `make test`、`make detekt`、`make build` を実行する
 - [x] 5.6 active source/docs 全体を `FUKUROU_MCP_DB_USER`、`DEFAULT_MCP_DATABASE_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql`、`mcp_role` で検索し、archived OpenSpec と意図した PR migration note 以外の残存を確認する
 - [ ] 5.7 PR 2 merge 後、次回runまたは手動操作で OpenSpec change を一度だけ archive する（このPRでは実行しない）
