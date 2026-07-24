@@ -28,7 +28,7 @@
 - [x] 4.1 `docs/deploy.md` から MCP role provision、権限マトリクス、rollout / DR の専用 role 手順を削除または application role 構成の現在形へ書き直す
 - [x] 4.2 `docs/mcp-runtime.md` の DB role 分離説明と test 説明を application role + submission gateway 境界へ書き直し、`docs/design.md` の stale な `fukurou_mcp` 前提を除去する
 - [x] 4.3 README と docs を `FUKUROU_MCP_DB_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql` で検索し、専用 role の残存記述を除去する
-- [ ] 4.4 PR 2 description に「ドキュメント影響: あり（対象ファイル）」と、`pg_shdepend` / active session のcluster preflight、`BEGIN; REASSIGN OWNED ...; DROP OWNED ...; DROP ROLE ...; ROLLBACK;` dry-run、同transactionの`COMMIT`版、別database dependency検出時は変更せず停止する条件、自動実行しない理由、適用タイミングを記載する
+- [x] 4.4 PR 2 description に「ドキュメント影響: あり（対象ファイル）」と、`pg_shdepend` / active session のcluster preflight、`BEGIN; REASSIGN OWNED ...; DROP OWNED ...; DROP ROLE ...; ROLLBACK;` dry-run、同transactionの`COMMIT`版、別database dependency検出時は変更せず停止する条件、自動実行しない理由、適用タイミングを記載する
 - [x] 4.5 `docs/deploy.md` に、rollback SHAの`deploy-fukurou`・`fukurou-deploy-db`・foundation/index/`mcp-role.sql`をexact配置して旧markerを再生成してから旧imageを起動し、role cleanup後は旧provisionも再実行するrollback手順を記載する
 
 ## 5. PR 2 — Verification and archive
