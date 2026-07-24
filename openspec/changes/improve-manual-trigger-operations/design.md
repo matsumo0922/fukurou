@@ -35,16 +35,16 @@ Codex の永続 auth source は compose-managed `llm-auth` volume の `/tmp/fuku
 
 hard cap は `reserveRejection()` より前に `hourlyRemaining <= 0` / `dailyRemaining <= 0` で判定される。順序を変更しないことで、reserve 例外が hard cap 免除へ拡大しないことを構造的に維持する。
 
-### D2. repository 境界の2テストで reserve 例外と hard cap を固定する
+### D2. repository 境界の2テストで hourly / daily の reserve 例外と hard cap を固定する
 
-**帰属:** agent 仮決め（Issue #307 の受け入れ条件を最小の repository 回帰へ具体化）
+**帰属:** agent 仮決め（Issue #307 の受け入れ条件を最小の repository 回帰へ具体化、独立反証 F-01 を反映）
 
 `LlmLaunchReservationRepositoryTest` に次の回帰を追加する。
 
-1. default config で5件の `FLAT_HEARTBEAT` を予約・完了し、critical reserve だけが残る状態を作る。同じ usage で次の `FLAT_HEARTBEAT` が reserve reason で拒否されることを確認した後、拒否が usage を消費していない同じ repository で `MANUAL` が予約されることを確認する。
-2. default config で5件の通常 trigger と `ENTRY_FILL`・`STOP_PROXIMITY` を予約・完了して hourly hard cap 7件へ到達させ、その後の `MANUAL` が `MAX_INVOCATIONS_PER_HOUR` で拒否されることを確認する。
+1. reserve 例外テストでは、hourly と daily の各 subcase で non-reserved headroom を `FLAT_HEARTBEAT` により消費する。同じ usage で次の `FLAT_HEARTBEAT` が対応する reserve reason で拒否されることを確認した後、拒否が usage を消費していない同じ repository で `MANUAL` が予約されることを確認する。
+2. hard cap テストでは、hourly と daily の各 subcase で通常 trigger と `ENTRY_FILL`・`STOP_PROXIMITY` を使って対応する hard cap へ到達させ、その後の `MANUAL` が `MAX_INVOCATIONS_PER_HOUR` または `MAX_INVOCATIONS_PER_DAY` で拒否されることを確認する。
 
-純粋関数 `launchBudgetRejection()` の直接テストではなく repository の `tryReserve()` を使い、rolling usage の集計、rejection、reservation insert まで既存の実経路で検証する。daily 例外は同じ `reserveRejection(..., hourly = false)` の条件変更で適用され、既存 daily reserve 回帰を維持する。Issue の DoD にない追加の exhaustive/property test は作らない。
+純粋関数 `launchBudgetRejection()` の直接テストではなく repository の `tryReserve()` を使い、rolling usage の集計、rejection、reservation insert まで既存の実経路で検証する。2 test の中で hourly / daily を subcase 化し、delta spec の4 Scenario を直接証明する。Issue の DoD にない exhaustive/property test は作らない。
 
 ### D3. fallback login は明示 UID と auth source mtime の前後比較を正本にする
 

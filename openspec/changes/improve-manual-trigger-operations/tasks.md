@@ -5,8 +5,8 @@
 
 ## 2. Reservation regression tests
 
-- [ ] 2.1 default hourly usage が critical reserve 保護域へ達した状態で、`FLAT_HEARTBEAT` は reserve reason で拒否され、同じ usage の `MANUAL` は予約される repository test を追加する
-- [ ] 2.2 default hourly hard cap へ到達した状態で、`MANUAL` が `MAX_INVOCATIONS_PER_HOUR` で拒否される repository test を追加する
+- [ ] 2.1 hourly / daily の各 reserve 保護域で `FLAT_HEARTBEAT` は対応する reserve reason で拒否され、同じ usage の `MANUAL` は予約される repository test を追加する
+- [ ] 2.2 hourly / daily の各 hard cap へ到達した状態で、`MANUAL` が対応する `MAX_INVOCATIONS_PER_*` reason で拒否される repository test を追加する
 - [ ] 2.3 `LlmLaunchReservationRepositoryTest` の対象テストを実行し、既存 hourly / daily reserve 回帰も通ることを確認する
 
 ## 3. Production operations documentation
