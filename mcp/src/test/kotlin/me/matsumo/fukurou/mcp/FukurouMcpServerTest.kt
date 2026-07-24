@@ -132,9 +132,7 @@ import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
 import org.testcontainers.DockerClientFactory
-import org.testcontainers.containers.Container
 import org.testcontainers.containers.PostgreSQLContainer
-import org.testcontainers.utility.MountableFile
 import java.math.BigDecimal
 import java.net.InetSocketAddress
 import java.net.StandardProtocolFamily
@@ -144,7 +142,6 @@ import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.DriverManager
-import java.sql.SQLException
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -2228,7 +2225,7 @@ private fun bootstrapManifest(phase: LlmInvocationPhase, clock: Clock): McpLaunc
         systemPromptVersion = "fixture-system-prompt-v1",
         marketSnapshotId = "fixture-snapshot",
         dbUrl = "jdbc:postgresql://fixture/fukurou",
-        dbUser = MCP_TEST_ROLE,
+        dbUser = MCP_TEST_DATABASE_USER,
         gmoPublicBaseUrl = "http://127.0.0.1:1",
         runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig()),
         totalToolCallLimit = 48,
@@ -2246,47 +2243,8 @@ private fun terminalEvidenceResult(response: JsonObject): CallToolResult = CallT
     structuredContent = response,
 )
 
-/** least-privilege PostgreSQL role と production bootstrap/server path の integration。 */
-class McpDatabaseRoleIntegrationTest {
-    @Test
-    fun leastPrivilegeRole_supportsRequiredMatrixAndRejectsForbiddenWrites() = runBlocking {
-        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
-
-        val container = McpPostgresContainer()
-        container.start()
-        val marketFixture = GmoRequiredMatrixFixture.start()
-        try {
-            val clock = fixedClock()
-            val database = ExposedDatabase.connect(container.jdbcUrl, driver = "org.postgresql.Driver", user = container.username, password = container.password)
-            assertMcpRoleProvisionRequiresBootstrap(container)
-            TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
-            seedRequiredMatrixRun(container, clock)
-
-            provisionMcpRole(container)
-            assertRoleBoundary(container)
-
-            seedDirtyMcpPrivileges(container)
-            provisionMcpRole(container)
-            assertRoleBoundary(container)
-
-            provisionMcpRole(container)
-            createFuturePrivilegeBoundaryObjects(container)
-            assertRoleBoundary(container, includeFutureBoundary = true)
-
-            assertRequiredMatrixThroughProductionPath(
-                container = container,
-                clock = clock,
-                marketFixture = marketFixture,
-                mcpDatabaseConfig = TradingDatabaseConfig(container.jdbcUrl, MCP_TEST_ROLE, MCP_TEST_PASSWORD),
-            )
-            assertForbiddenDml(container)
-            assertNoFallback(container, clock)
-        } finally {
-            marketFixture.close()
-            container.stop()
-        }
-    }
-
+/** application PostgreSQL role と production bootstrap/server path の integration。 */
+class McpApplicationDatabaseRoleIntegrationTest {
     @Test
     fun applicationRole_supportsRequiredMatrixAndPersistsGatewaySubmissions() = runBlocking {
         if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
@@ -2748,58 +2706,6 @@ private fun assertIdentityDualWrite(container: PostgreSQLContainer<*>) {
     }
 }
 
-private fun seedDirtyMcpPrivileges(container: PostgreSQLContainer<*>) {
-    val sql = """
-        ALTER ROLE $MCP_TEST_ROLE WITH LOGIN PASSWORD '$MCP_TEST_PASSWORD' SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS INHERIT;
-        CREATE ROLE mcp_dirty_parent;
-        CREATE ROLE mcp_dirty_child;
-        CREATE ROLE mcp_dirty_grantor;
-        GRANT mcp_dirty_parent TO $MCP_TEST_ROLE;
-        GRANT $MCP_TEST_ROLE TO mcp_dirty_child;
-        CREATE TABLE mcp_dirty_owned(id bigint generated always as identity, value text);
-        ALTER TABLE mcp_dirty_owned OWNER TO $MCP_TEST_ROLE;
-        CREATE FUNCTION mcp_dirty_function() RETURNS integer LANGUAGE sql AS 'SELECT 1';
-        ALTER FUNCTION mcp_dirty_function() OWNER TO $MCP_TEST_ROLE;
-        GRANT ALL ON ALL TABLES IN SCHEMA public TO $MCP_TEST_ROLE;
-        REVOKE UPDATE ON orders FROM $MCP_TEST_ROLE;
-        GRANT UPDATE (status) ON orders TO $MCP_TEST_ROLE;
-        GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $MCP_TEST_ROLE;
-        GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO $MCP_TEST_ROLE;
-        GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
-        REVOKE UPDATE ON orders FROM PUBLIC;
-        GRANT UPDATE (status) ON orders TO PUBLIC;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO PUBLIC;
-        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT ALL ON TABLES TO $MCP_TEST_ROLE;
-        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT ALL ON SEQUENCES TO $MCP_TEST_ROLE;
-        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT ALL ON FUNCTIONS TO $MCP_TEST_ROLE;
-        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
-        ALTER DEFAULT PRIVILEGES FOR ROLE ${container.username} IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
-        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor IN SCHEMA public GRANT SELECT ON TABLES TO $MCP_TEST_ROLE;
-        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
-        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT SELECT ON TABLES TO $MCP_TEST_ROLE;
-        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT SELECT ON TABLES TO PUBLIC;
-        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT EXECUTE ON FUNCTIONS TO $MCP_TEST_ROLE;
-        ALTER DEFAULT PRIVILEGES FOR ROLE mcp_dirty_grantor GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
-    """.trimIndent()
-    val result = container.execInContainer(
-        "psql", "-U", container.username, "-d", container.databaseName,
-        "-v", "ON_ERROR_STOP=1", "-c", sql,
-    )
-    check(result.exitCode == 0) { "dirty MCP fixture failed: ${result.stderr}" }
-}
-
-private fun createFuturePrivilegeBoundaryObjects(container: PostgreSQLContainer<*>) {
-    val sql = """
-        CREATE TABLE mcp_future_boundary(id bigint);
-        CREATE FUNCTION mcp_future_boundary_function() RETURNS integer LANGUAGE sql AS 'SELECT 1';
-    """.trimIndent()
-    val result = container.execInContainer(
-        "psql", "-U", container.username, "-d", container.databaseName,
-        "-v", "ON_ERROR_STOP=1", "-c", sql,
-    )
-    check(result.exitCode == 0) { "future privilege boundary fixture failed: ${result.stderr}" }
-}
-
 private suspend fun seedRequiredMatrixRun(container: PostgreSQLContainer<*>, clock: Clock) {
     val runtime = TradingRuntimeFactory.postgres(
         TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
@@ -2846,147 +2752,6 @@ private suspend fun seedRequiredMatrixRun(container: PostgreSQLContainer<*>, clo
     }
 }
 
-private fun provisionMcpRole(container: PostgreSQLContainer<*>) {
-    val result = runMcpRoleProvision(container)
-    check(result.exitCode == 0) { "MCP role SQL failed: ${result.stderr}" }
-    check(MCP_TEST_PASSWORD !in result.stdout && MCP_TEST_PASSWORD !in result.stderr) {
-        "MCP role wrapper disclosed its password."
-    }
-    val roleCheck = container.execInContainer(
-        "psql", "-U", container.username, "-d", container.databaseName,
-        "-Atc", "SELECT rolname FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'",
-    )
-    check(roleCheck.stdout.trim() == MCP_TEST_ROLE) { "MCP role was not created; SQL output=${result.stdout}" }
-}
-
-private fun assertMcpRoleProvisionRequiresBootstrap(container: PostgreSQLContainer<*>) {
-    val result = runMcpRoleProvision(container)
-
-    assertTrue(result.exitCode != 0)
-    assertTrue(result.stderr.contains("deploy the application schema/bootstrap"))
-    val roleCheck = container.execInContainer(
-        "psql", "-U", container.username, "-d", container.databaseName,
-        "-Atc", "SELECT count(*) FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'",
-    )
-    assertEquals("0", roleCheck.stdout.trim())
-}
-
-private fun runMcpRoleProvision(container: PostgreSQLContainer<*>): Container.ExecResult {
-    val repositoryRoot = generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { path ->
-        path.parent
-    }.first { path -> Files.isRegularFile(path.resolve("scripts/deploy/provision-fukurou-mcp-role")) }
-    val wrapperPath = repositoryRoot.resolve("scripts/deploy/provision-fukurou-mcp-role")
-    val sqlPath = repositoryRoot.resolve("scripts/deploy/sql/mcp-role.sql")
-    val passwordPath = Files.createTempFile("fukurou-mcp-password", ".txt")
-
-    return try {
-        Files.writeString(passwordPath, "$MCP_TEST_PASSWORD\n")
-        container.copyFileToContainer(MountableFile.forHostPath(wrapperPath, 493), "/tmp/deploy/provision-fukurou-mcp-role")
-        container.copyFileToContainer(MountableFile.forHostPath(sqlPath), "/tmp/deploy/sql/mcp-role.sql")
-        container.copyFileToContainer(MountableFile.forHostPath(passwordPath), "/tmp/mcp-password")
-
-        container.execInContainer(
-            "/tmp/deploy/provision-fukurou-mcp-role",
-            "postgresql://${container.username}:${container.password}@127.0.0.1:5432/${container.databaseName}",
-            container.databaseName,
-            container.username,
-            "/tmp/mcp-password",
-        )
-    } finally {
-        Files.deleteIfExists(passwordPath)
-    }
-}
-
-@Suppress("NestedBlockDepth")
-private fun assertRoleBoundary(container: PostgreSQLContainer<*>, includeFutureBoundary: Boolean = false) {
-    DriverManager.getConnection(container.jdbcUrl, container.username, container.password).use { connection ->
-        connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'").use { rows ->
-                assertTrue(rows.next())
-                (1..6).forEach { column -> assertEquals(false, rows.getBoolean(column)) }
-            }
-            assertSqlCount(statement, "SELECT count(*) FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
-            assertSqlCount(statement, "SELECT count(*) FROM pg_auth_members WHERE roleid=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
-            assertSqlCount(statement, "SELECT count(*) FROM pg_class WHERE relowner=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
-            assertSqlCount(statement, "SELECT count(*) FROM pg_proc WHERE proowner=(SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE')", 0)
-            statement.executeQuery("SELECT has_database_privilege('public', current_database(), 'CREATE'), has_database_privilege('public', current_database(), 'TEMP'), has_schema_privilege('public', 'public', 'CREATE')").use { rows ->
-                assertTrue(rows.next())
-                (1..3).forEach { column -> assertEquals(false, rows.getBoolean(column)) }
-            }
-            assertSqlCount(statement, "SELECT count(*) FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema='public'", 0)
-            statement.executeQuery(
-                "SELECT has_function_privilege('public', 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE')",
-            ).use { rows ->
-                assertTrue(rows.next())
-                assertFalse(rows.getBoolean(1))
-            }
-            if (includeFutureBoundary) {
-                statement.executeQuery(
-                    "SELECT " +
-                        "has_table_privilege('public', 'mcp_future_boundary', 'SELECT'), " +
-                        "has_table_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary', 'SELECT'), " +
-                        "has_function_privilege('public', 'mcp_future_boundary_function()', 'EXECUTE'), " +
-                        "has_function_privilege('$MCP_TEST_ROLE', 'mcp_future_boundary_function()', 'EXECUTE')",
-                ).use { rows ->
-                    assertTrue(rows.next())
-                    (1..4).forEach { column -> assertFalse(rows.getBoolean(column)) }
-                }
-            }
-            assertTerminalEvidenceTablePrivileges(statement)
-            assertSqlCount(
-                statement,
-                "SELECT count(*) FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(COALESCE(d.defaclacl, acldefault(d.defaclobjtype, d.defaclrole))) a " +
-                    "WHERE d.defaclnamespace IN (0, 'public'::regnamespace) " +
-                    "AND a.grantee IN (0, (SELECT oid FROM pg_roles WHERE rolname='$MCP_TEST_ROLE'))",
-                0,
-            )
-            assertSqlCount(
-                statement,
-                "SELECT count(*) FROM information_schema.role_usage_grants WHERE grantee='$MCP_TEST_ROLE' AND object_schema='public'",
-                0,
-            )
-        }
-    }
-    mcpTestConnection(container).use { connection ->
-        connection.createStatement().use { statement ->
-            statement.executeQuery("SELECT has_table_privilege(current_user, 'command_event_log', 'SELECT,INSERT'), has_column_privilege(current_user, 'orders', 'status', 'SELECT'), has_table_privilege(current_user, 'orders', 'UPDATE'), has_function_privilege(current_user, 'pg_catalog.pg_try_advisory_lock(bigint)', 'EXECUTE'), has_function_privilege(current_user, 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE'), has_database_privilege(current_user, current_database(), 'TEMP'), has_column_privilege(current_user, 'opportunity_episodes', 'closed_at', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'close_reason', 'UPDATE'), has_column_privilege(current_user, 'opportunity_episodes', 'id', 'INSERT')").use { rows ->
-                assertTrue(rows.next())
-                assertEquals(true, rows.getBoolean(1))
-                assertEquals(true, rows.getBoolean(2))
-                assertEquals(false, rows.getBoolean(3))
-                assertEquals(true, rows.getBoolean(4))
-                assertEquals(true, rows.getBoolean(5))
-                assertEquals(false, rows.getBoolean(6))
-                assertEquals(false, rows.getBoolean(7))
-                assertEquals(false, rows.getBoolean(8))
-                assertEquals(false, rows.getBoolean(9))
-            }
-        }
-    }
-}
-
-private val TERMINAL_EVIDENCE_TABLES = listOf(
-    "llm_tool_evidence_activation_boundaries",
-    "llm_tool_evidence",
-    "llm_terminal_evidence_links",
-    "llm_decision_phase_evidence_coverage",
-)
-
-private fun assertTerminalEvidenceTablePrivileges(statement: java.sql.Statement) {
-    TERMINAL_EVIDENCE_TABLES.forEach { table ->
-        statement.executeQuery(
-            "SELECT " +
-                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'INSERT'), " +
-                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'UPDATE'), " +
-                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'DELETE'), " +
-                "has_table_privilege('$MCP_TEST_ROLE', '$table', 'TRUNCATE')",
-        ).use { rows ->
-            assertTrue(rows.next())
-            (1..4).forEach { column -> assertFalse(rows.getBoolean(column), "$table privilege $column") }
-        }
-    }
-}
-
 private fun requiredMatrixBootstrap(
     databaseConfig: TradingDatabaseConfig,
     clock: Clock,
@@ -3019,69 +2784,9 @@ private fun requiredMatrixBootstrap(
     return McpLaunchBootstrap.decode(manifestBytes, databaseConfig.password.encodeToByteArray(), clock)
 }
 
-private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
-    mcpTestConnection(container).use { connection ->
-        listOf(
-            "UPDATE orders SET status=status",
-            "DELETE FROM executions",
-            "TRUNCATE positions",
-            "INSERT INTO orders DEFAULT VALUES",
-            "INSERT INTO decisions DEFAULT VALUES",
-            "INSERT INTO trade_plans DEFAULT VALUES",
-            "INSERT INTO trade_intents DEFAULT VALUES",
-            "INSERT INTO falsifications DEFAULT VALUES",
-            "INSERT INTO opportunity_episodes (id,symbol,thesis_id,price_move_threshold_ratio,opened_at,closed_at,close_reason) " +
-                "VALUES (gen_random_uuid(),'BTC','forbidden-thesis',0.01,0,NULL,NULL)",
-            "INSERT INTO dedupe_shadow_observations DEFAULT VALUES",
-            "INSERT INTO decision_identity_generation_failures DEFAULT VALUES",
-            "INSERT INTO llm_tool_evidence DEFAULT VALUES",
-            "INSERT INTO llm_terminal_evidence_links DEFAULT VALUES",
-            "INSERT INTO llm_decision_phase_evidence_coverage DEFAULT VALUES",
-            "INSERT INTO llm_tool_evidence_activation_boundaries DEFAULT VALUES",
-            "UPDATE opportunity_episodes SET closed_at=closed_at,close_reason=close_reason",
-            "UPDATE mcp_current_evaluation_scope SET account_initial_cash_jpy=account_initial_cash_jpy",
-            "UPDATE mcp_evaluation_epochs SET initial_cash_jpy=initial_cash_jpy",
-            "SELECT config_value FROM runtime_config_values LIMIT 1",
-            "SELECT runtime_config_hash FROM paper_account_epochs LIMIT 1",
-        ).forEach { sql ->
-            assertNotNull(runCatching { connection.createStatement().use { it.execute(sql) } }.exceptionOrNull())
-        }
-    }
-}
-
-private fun assertNoFallback(container: PostgreSQLContainer<*>, clock: Clock) {
-    val jdbcUrl = container.jdbcUrl.withJdbcQueryParameters(
-        mapOf(
-            TEST_POSTGRES_CONNECT_TIMEOUT_KEY to MCP_WRONG_PASSWORD_TIMEOUT_SECONDS.toString(),
-            TEST_POSTGRES_SOCKET_TIMEOUT_KEY to MCP_WRONG_PASSWORD_TIMEOUT_SECONDS.toString(),
-        ),
-    )
-    val failure = runCatching {
-        TradingRuntimeFactory.postgresForMcp(
-            TradingDatabaseConfig(jdbcUrl, MCP_TEST_ROLE, "wrong-dummy-password"),
-            clock = clock,
-        )
-    }.exceptionOrNull()
-
-    assertEquals(POSTGRES_INVALID_PASSWORD_SQL_STATE, failure?.firstSqlState())
-}
-
-private fun Throwable.firstSqlState(): String? {
-    return generateSequence(this) { throwable -> throwable.cause }
-        .filterIsInstance<SQLException>()
-        .mapNotNull(SQLException::getSQLState)
-        .firstOrNull()
-}
-
 /** MCP integration test 用 PostgreSQL container。 */
 private class McpPostgresContainer :
     BoundedTestPostgresContainer<McpPostgresContainer>("postgres:16-alpine")
-
-private fun mcpTestConnection(container: PostgreSQLContainer<*>) =
-    DriverManager.getConnection(container.jdbcUrl, MCP_TEST_ROLE, MCP_TEST_PASSWORD)
-
-private const val MCP_WRONG_PASSWORD_TIMEOUT_SECONDS = 2
-private const val POSTGRES_INVALID_PASSWORD_SQL_STATE = "28P01"
 
 private fun assertSqlCount(
     statement: java.sql.Statement,
@@ -3129,7 +2834,7 @@ private fun HttpExchange.respondRequiredMatrixFixture() {
     responseBody.use { output -> output.write(body) }
 }
 
-private const val MCP_TEST_ROLE = "fukurou_mcp"
+private const val MCP_TEST_DATABASE_USER = "fukurou"
 private const val MCP_TEST_PASSWORD = "FUKUROU_CANARY_DB_ROLE_DUMMY_ONLY"
 private const val MCP_MATRIX_RUN_ID = "mcp-required-matrix-run"
 private const val MCP_REQUIRED_CALL_COUNT = 16

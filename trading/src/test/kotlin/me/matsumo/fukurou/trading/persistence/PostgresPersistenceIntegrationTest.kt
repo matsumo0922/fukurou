@@ -12175,7 +12175,7 @@ private fun PostgresTestContext.postgresOneShotFixture(
         llmInvoker = invoker,
         parentEnvironment = mapOf(
             "DB_URL" to tradingDatabaseConfig().url,
-            "FUKUROU_MCP_DB_USER" to "fukurou_mcp",
+            "DB_USER" to tradingDatabaseConfig().user,
             "DB_PASSWORD" to tradingDatabaseConfig().password,
         ),
         clock = clock,

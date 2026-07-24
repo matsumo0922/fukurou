@@ -1990,6 +1990,7 @@ class OneShotLlmRunnerTest {
         assertTrue(manifestContent.contains(decision.submission.invocationId))
         assertTrue(manifestContent.contains(decision.submission.promptHash))
         assertTrue(manifestContent.contains(decision.submission.marketSnapshotId))
+        assertTrue(manifestContent.contains("\"dbUser\":\"fukurou\""))
     }
 
     @Test
