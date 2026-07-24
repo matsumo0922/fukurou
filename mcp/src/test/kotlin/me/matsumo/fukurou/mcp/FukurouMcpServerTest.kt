@@ -106,6 +106,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
 import me.matsumo.fukurou.trading.invoker.MCP_MANIFEST_VERSION
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
 import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
@@ -2413,6 +2414,7 @@ private suspend fun assertRequiredMatrixThroughProductionPath(
         )
         val decision = callTool(server, "submit_decision", enterDecisionArguments(invocationId = MCP_MATRIX_RUN_ID))
         results["submit_decision"] = decision
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, proposerGateway.semanticSubmissionState())
         val intentId = assertNotNull(decision.structuredContent).getValue("intent_id").jsonPrimitive.contentOrNull
         results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
         assertIdentityDualWrite(container)
@@ -2465,6 +2467,7 @@ private suspend fun assertRequiredMatrixThroughProductionPath(
                 put("reason_ja", "fixture data の反証を完了しました。")
             },
         )
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, falsifierGateway.semanticSubmissionState())
         results["preview_order"] = callTool(server, "preview_order", placeOrderArguments(intentId))
 
         assertFalsificationPersistedThroughGateway(appRuntime.decisionRepository, intentId)
@@ -2542,6 +2545,8 @@ private class GatewayFixture(
     val client: LlmDecisionSubmissionGatewayClient,
     private val gateway: me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway,
 ) : AutoCloseable {
+    fun semanticSubmissionState(): LlmSemanticSubmissionState = gateway.semanticSubmissionState()
+
     override fun close() {
         client.close()
         gateway.close()
