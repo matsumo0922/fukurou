@@ -27,25 +27,25 @@ Issue #288 により MCP subprocess の起動は app と同じ service user、ar
 
 ## Decisions
 
-### D1. Manifest の DB identity は application runtime の `DB_USER` を正本とする
+### D1. Manifest の DB identity は application runtime の `DB_USER` を正本とする（agent 仮決め）
 
 `OneShotLlmRunner.mcpServerConfig()` は独立した `FUKUROU_MCP_DB_USER` を解決せず、Ktor application と同じ database username を launch manifest の `dbUser` に設定する。production compose では `DB_USER` が `POSTGRES_USER` から注入されるため、production path と `McpIsolationCanaryArtifacts` は `DB_USER` を使用し、compose と `.env.example` から `FUKUROU_MCP_DB_USER` を削除する。manifest の `dbUser` フィールドは bootstrap と監査上の接続情報として残す。
 
 代替案として `FUKUROU_MCP_DB_USER` の default だけを app user に変える方法は、不要な二重設定と将来の不一致余地を残すため採用しない。`POSTGRES_USER` を subprocess 設定から直接読む方法も、application が利用する runtime 名は `DB_USER` であるため採用しない。
 
-### D2. 専用 role の provision 資産と deploy GRANT 追従は cutover で一括削除する
+### D2. 専用 role の provision 資産と deploy GRANT 追従は cutover で一括削除する（agent 仮決め）
 
 cutover では `scripts/deploy/provision-fukurou-mcp-role` と `scripts/deploy/sql/mcp-role.sql` に加え、`fukurou-deploy-db` の role env/default・payload manifest entry・`--set=mcp_role`、`deploy-foundation-v1.sql` の role GRANT、`deploy-db-selftest` と `deploy-postgres-selftest` の専用 role fixture/assertion を同時に削除する。runtime が app role を使う一方で deploy helper が削除済み SQL を検証したり、foundation migration が stale な role へ GRANT したりする中間状態を作らない。
 
 代替案として runtime 切替と deploy cleanup を別 PR に分ける方法は、それぞれ単体で設定と運用契約を不整合にするため採用しない。PR を分ける場合も、本番挙動を変えない regression coverage の追加だけを先行させ、runtime・deploy・docs の cutover は一括で行う。
 
-### D3. 書き込み境界は PostgreSQL role ではなく submission gateway で維持する
+### D3. 書き込み境界は PostgreSQL role ではなく submission gateway で維持する（ユーザー確認済み）
 
 MCP subprocess が application role を使っても、`submit_decision` の production path は manifest の `submissionSocketPath` を通じて app-owned gateway に接続し、gateway が validation と永続化を担う。MCP tool の実装を直接 INSERT へ変更せず、既存回帰テストで gateway 経由を確認する。
 
 専用 role による DB ACL を残して defense-in-depth とする案は、Epic #286 で single-owner paper 環境に対する保守コストが便益を上回ると判断済みのため採用しない。
 
-### D4. 残存 production role は dependency cleanup を含む owner 手順で削除する
+### D4. 残存 production role は dependency cleanup を含む owner 手順で削除する（agent 仮決め）
 
 image deploy と application 起動は、旧 `fukurou_mcp` role が DB に残っていても成立する。一方、現行 provision は database CONNECT、schema USAGE、table SELECT / INSERT、catalog function EXECUTE を付与するため、`DROP ROLE fukurou_mcp;` 単独では dependent privilege が残って失敗する。
 
@@ -59,7 +59,7 @@ REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP R
 
 適用時期は owner が PR 2 deploy の安定を確認して決める。deploy script、Flyway migration、startup hook からは実行しない。自動削除は rollback 時に旧 image が専用 role を必要とする可能性を奪い、DB 権限変更を application deploy に暗黙に混ぜるため採用しない。
 
-### D5. 2 PR に分け、application-role coverage を先行して cutover を一括レビューする
+### D5. 2 PR に分け、application-role coverage を先行して cutover を一括レビューする（ユーザー確認済み）
 
 専用 role を固定する `McpDatabaseRoleIntegrationTest` は約700行あり、provision、dirty privilege repair、future object boundary、禁止 write assertion と、16 tool の required matrix coverage が同じクラスに混在する。これを単一 PR で runtime・deploy・docs の変更と同時に大幅削除すると、human-authored diff 1,000 行目安を超えやすく、「消した role 境界」と「残す tool/gateway 回帰」のレビューが埋もれる。そのため次の2 PRに分ける。
 
