@@ -4017,7 +4017,7 @@ maxDD = min((equity - equityPeak) / equityPeak)
 - receipt の欠落は接続 session 内 source sequence の連続性で判定する。`admission_ordinal` の欠番は永続 sequence 由来の正当な穴を含むため欠落と解釈しない。receipt は対象 order が跨ぐ `(session_id, source_sequence)` 範囲で indexed に読み、全期間 time scan を発行しない。
 - 対象期間を必須引数とし、対象件数上限と statement timeout を設ける。超過は打ち切らず run 全体を失敗させる。run 全体の失敗と対象ごとの `UNKNOWN` を区別する。
 - 出力は JSON Lines（1 行 1 対象 + cohort ごとの集計行 + run summary）。summary で eligible / 理由別 `UNKNOWN` / 入力欠如 / `NON_TTL_TERMINAL` / `OPEN_AT_SNAPSHOT` を開示し、終端状態を黙って落とさない。
-- read-only credential 前提: replay の実行には receipt を含む read set への SELECT 権を持ち write 権を持たない専用 read-only credential を要する。既存 `fukurou_mcp` role は receipt SELECT を持たず要件を満たさないため、必要な read-only 権限の付与はオーナー承認の運用作業とする（role 定義の変更は replay コードに含めない）。
+- read-only credential 前提: replay の実行には receipt を含む read set への SELECT 権を持ち write 権を持たない専用 read-only credential を要する。MCP subprocess と Ktor service が共有する application role は write 権を持つため要件を満たさず、必要な read-only role の作成と権限付与はオーナー承認の運用作業とする（role 定義の変更は replay コードに含めない）。
 
 #### `EXACT` の定義
 
