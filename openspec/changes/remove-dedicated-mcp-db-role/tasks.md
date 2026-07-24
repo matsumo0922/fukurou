@@ -2,7 +2,7 @@
 
 - [x] 1.1 `McpDatabaseRoleIntegrationTest` の fixture/helper を整理し、専用 role の既存 assertion を変更せずに application role で production bootstrap/server path を起動できる additive scenario を作る
 - [x] 1.2 application role の scenario で既存 MCP required tool matrix が成立し、`submit_decision` / `submit_falsification` が submission gateway 経由で永続化されることを検証する
-- [ ] 1.3 PR 1 の関連 MCP integration test、`make test`、`make detekt` を実行し、本番配線を変更していないことを確認する
+- [x] 1.3 PR 1 の関連 MCP integration test、`make test`、`make detekt` を実行し、本番配線を変更していないことを確認する
 - [ ] 1.4 PR 1 description に「ドキュメント影響: なし」と、OpenSpec change は最終 cutover PR 完了まで archive しないことを記載する
 
 ## 2. PR 2 — MCP database identity cutover
