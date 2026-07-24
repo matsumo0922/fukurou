@@ -22,4 +22,4 @@
 - [x] 4.1 IntelliJ MCP は sibling worktree を project 外として拒否したため、変更 Kotlin ファイルの error / warning を `make detekt` と関連テストで代替確認する
 - [x] 4.2 `make test` と `make detekt` を実行する
 - [x] 4.3 `openspec validate improve-manual-trigger-operations --strict` を実行し、proposal・design・specs・tasks の整合を確認する
-- [ ] 4.4 code・tests・docs・OpenSpec を単一 PR にまとめ、PR description に `ドキュメント影響: あり（docs/llm-obsidian-production-setup.md, docs/mcp-runtime.md）` と hard cap 非変更を明記する
+- [x] 4.4 code・tests・docs・OpenSpec を単一 PR にまとめ、PR description に `ドキュメント影響: あり（docs/llm-obsidian-production-setup.md, docs/mcp-runtime.md）` と hard cap 非変更を明記する
