@@ -7,7 +7,7 @@
 
 - [x] 2.1 hourly / daily の各 reserve 保護域で `FLAT_HEARTBEAT` は対応する reserve reason で拒否され、同じ usage の `MANUAL` は予約される repository test を追加する
 - [x] 2.2 hourly / daily の各 hard cap へ到達した状態で、`MANUAL` が対応する `MAX_INVOCATIONS_PER_*` reason で拒否される repository test を追加する
-- [ ] 2.3 `LlmLaunchReservationRepositoryTest` の対象テストを実行し、既存 hourly / daily reserve 回帰も通ることを確認する
+- [x] 2.3 `LlmLaunchReservationRepositoryTest` の対象テストを実行し、既存 hourly / daily reserve 回帰も通ることを確認する
 
 ## 3. Production operations documentation
 
@@ -19,7 +19,7 @@
 
 ## 4. Validation and delivery
 
-- [ ] 4.1 IntelliJ MCP の `get_file_problems` で変更した Kotlin ファイルの error / warning を確認する
-- [ ] 4.2 `make test` と `make detekt` を実行する
-- [ ] 4.3 `openspec validate improve-manual-trigger-operations --strict` を実行し、proposal・design・specs・tasks の整合を確認する
+- [x] 4.1 IntelliJ MCP は sibling worktree を project 外として拒否したため、変更 Kotlin ファイルの error / warning を `make detekt` と関連テストで代替確認する
+- [x] 4.2 `make test` と `make detekt` を実行する
+- [x] 4.3 `openspec validate improve-manual-trigger-operations --strict` を実行し、proposal・design・specs・tasks の整合を確認する
 - [ ] 4.4 code・tests・docs・OpenSpec を単一 PR にまとめ、PR description に `ドキュメント影響: あり（docs/llm-obsidian-production-setup.md, docs/mcp-runtime.md）` と hard cap 非変更を明記する
