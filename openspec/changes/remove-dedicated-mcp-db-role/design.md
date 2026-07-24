@@ -35,7 +35,7 @@ Issue #288 により MCP subprocess の起動は app と同じ service user、ar
 
 ### D2. 専用 role の provision 資産と deploy GRANT 追従は cutover で一括削除する（agent 仮決め）
 
-cutover では `scripts/deploy/provision-fukurou-mcp-role` と `scripts/deploy/sql/mcp-role.sql` に加え、`fukurou-deploy-db` の role env/default・payload manifest entry・`--set=mcp_role`、`deploy-foundation-v1.sql` の role GRANT、`deploy-db-selftest` と `deploy-postgres-selftest` の専用 role fixture/assertion を同時に削除する。runtime が app role を使う一方で deploy helper が削除済み SQL を検証したり、foundation migration が stale な role へ GRANT したりする中間状態を作らない。
+cutover では `scripts/deploy/provision-fukurou-mcp-role` と `scripts/deploy/sql/mcp-role.sql` に加え、固定 payload list を共有する3箇所を同時に更新する。`Dockerfile` の `COPY` / hash list、`scripts/deploy/deploy-fukurou` の `MCP_ROLE_SQL` / installed manifest entry、`scripts/deploy/fukurou-deploy-db` の role env/default・payload manifest entry・`--set=mcp_role` が対象である。さらに `deploy-foundation-v1.sql` の role GRANT、`ReleaseDeployFoundationContractTest`、deploy executor / DB helper self-test の専用 role fixture/assertion を同時に削除または残存3-file contractへ更新する。runtime が app role を使う一方で image build が削除済み SQLを `COPY` したり、root deploy executor / DB helper が削除済み payload を検証したり、foundation migration が stale な role へ GRANT したりする中間状態を作らない。
 
 代替案として runtime 切替と deploy cleanup を別 PR に分ける方法は、それぞれ単体で設定と運用契約を不整合にするため採用しない。PR を分ける場合も、本番挙動を変えない regression coverage の追加だけを先行させ、runtime・deploy・docs の cutover は一括で行う。
 
@@ -64,7 +64,7 @@ REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP R
 専用 role を固定する `McpDatabaseRoleIntegrationTest` は約700行あり、provision、dirty privilege repair、future object boundary、禁止 write assertion と、16 tool の required matrix coverage が同じクラスに混在する。これを単一 PR で runtime・deploy・docs の変更と同時に大幅削除すると、human-authored diff 1,000 行目安を超えやすく、「消した role 境界」と「残す tool/gateway 回帰」のレビューが埋もれる。そのため次の2 PRに分ける。
 
 - **PR 1 — additive application-role regression coverage**: production 配線、専用 role provision、既存 role-boundary test は変更せず、application role で production bootstrap/server path の MCP tool matrix と submission gateway 永続化が成立する回帰シナリオを追加する。可能な限り既存 fixture/helper を共有し、専用の新 harness は作らない。この PR は本番挙動を変えず、cutover 後に残す coverage を先に確立する。
-- **PR 2 — atomic runtime/deploy/docs cutover**: `OneShotLlmRunner` と canary を `DB_USER` へ切り替え、compose / `.env.example` の env を削除する。同じ PR で provision script / SQL、DB helper payload entry、foundation GRANT、deploy self-test の role fixture、旧 role-boundary assertion を削除し、PR 1 で追加した application-role matrix を正本として残す。docs と owner migration note もここで更新する。
+- **PR 2 — atomic runtime/deploy/docs cutover**: `OneShotLlmRunner` と canary を `DB_USER` へ切り替え、compose / `.env.example` の env を削除する。同じ PR で provision script / SQL、Dockerfile・root deploy executor・DB helper の同期 payload entry、foundation GRANT、deploy contract/self-test の role fixture、旧 role-boundary assertion を削除し、PR 1 で追加した application-role matrix を正本として残す。docs と owner migration note もここで更新する。
 
 PR 1 後に既存 dedicated-role test を残すため、現行 production contract の coverage は弱まらない。PR 2 は本番 identity と deploy contract を一括で切り替えるため、stale な中間状態を作らない。OpenSpec change は PR 1 では archive せず、PR 2 完了後に一度だけ archive する。PR 2 を PR 1 branch に対する stacked PR とする場合は、PR 1 merge 後かつ base branch 削除前に PR 2 の base を `main` へ明示的に retarget する。
 
@@ -74,7 +74,7 @@ PR 1 後に既存 dedicated-role test を残すため、現行 production contra
 
 - [Risk] `DB_USER` と `POSTGRES_USER` が異なる環境では意図しない role を manifest に書く → Mitigation: application runtime の正本である `DB_USER` を使用し、production compose と回帰テストで `POSTGRES_USER` から同じ値が注入されることを確認する
 - [Risk] app role に統合すると MCP subprocess が従来より広い DB 権限を持つ → Mitigation: Epic #286 の owner 判断として受容し、production write path が gateway 経由であることを回帰テストと spec で維持する
-- [Risk] role provision script を削除しても DB helper payload manifest、foundation SQL、self-test、docs に stale な参照が残る → Mitigation: `FUKUROU_MCP_DB_USER`、`DEFAULT_MCP_DATABASE_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql`、`mcp_role` を active source/docs 全体で検索し、archived OpenSpec と意図した migration note 以外の残存を確認する
+- [Risk] role provision script を削除しても Dockerfile・root deploy executor・DB helper の同期 payload manifest、foundation SQL、contract/self-test、docs に stale な参照が残る → Mitigation: 3箇所の固定 payload list を同一 cutover で更新し、`ReleaseDeployFoundationContractTest` と self-test で残存3-file contractを検証したうえで、対象識別子を active source/docs 全体から検索する
 - [Risk] 約700行の role integration test を削除する際に MCP tool matrix または gateway persistence coverage まで失う → Mitigation: PR 1 で application-role regression を先行追加し、PR 2 ではその scenario が残ることを確認してから role-boundary fixture/assertion を削除する
 - [Risk] PR 1 と PR 2 の間で application-role test と dedicated-role test が併存しテスト時間が増える → Mitigation: 併存期間を stacked 2 PR のレビュー期間に限定し、PR 2 で旧 role test を除去する
 - [Risk] `DROP ROLE` 単独では既存 ACL dependency により失敗し、`DROP OWNED` 単独では想定外の role-owned object を削除し得る → Mitigation: `REASSIGN OWNED` で ownership を application role へ移してから `DROP OWNED` と `DROP ROLE` を行い、同じ1行を disposable PostgreSQL で検証する
@@ -84,7 +84,7 @@ PR 1 後に既存 dedicated-role test を残すため、現行 production contra
 ## Migration Plan
 
 1. PR 1 で application role を使う MCP tool matrix / submission gateway 回帰テストを additive に追加する。本番配線と dedicated-role test は維持する。
-2. PR 2 で application role 配線、canary・compose・deploy helper・foundation SQL・self-test・旧 role-boundary test・docs を一括で切り替える。DB schema migration はない。
+2. PR 2 で application role 配線、canary・compose、Dockerfile・root deploy executor・DB helper の同期 payload manifest、foundation SQL、contract/self-test、旧 role-boundary test、docs を一括で切り替える。DB schema migration はない。
 3. PR 2 を通常の production deploy で起動し、MCP 起動と既存 tool call が application role で成立することを既存監査・health 経路で確認する。
 4. disposable PostgreSQL で `REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp; DROP ROLE fukurou_mcp;` が現行 ACL dependency を除去し、application-owned object を保持することを確認する。
 5. 安定確認後、owner が PR 2 description の migration note に従って production application DB の ownership / ACL dependency を cleanup し、`fukurou_mcp` role を削除する。

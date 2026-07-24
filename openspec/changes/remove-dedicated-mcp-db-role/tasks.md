@@ -15,11 +15,13 @@
 ## 3. PR 2 — Dedicated role provisioning removal
 
 - [ ] 3.1 `scripts/deploy/provision-fukurou-mcp-role` と `scripts/deploy/sql/mcp-role.sql` を削除する
-- [ ] 3.2 `scripts/deploy/fukurou-deploy-db` から MCP role env/default、`mcp-role.sql` payload manifest entry、foundation SQL の `--set=mcp_role` 引数を削除する
-- [ ] 3.3 `scripts/deploy/sql/deploy-foundation-v1.sql` から MCP role への GRANT 追従を削除する
-- [ ] 3.4 `deploy-db-selftest` と `deploy-postgres-selftest` から MCP role SQL fixture、env、CREATE ROLE、GRANT argument assertion を削除し、DB helper manifest と foundation install の残存 contract を更新する
-- [ ] 3.5 `McpDatabaseRoleIntegrationTest` から provision / privilege repair / future object / forbidden-write role-boundary fixture と assertion を削除し、PR 1 で追加した application-role tool matrix / gateway regression を正本として残す
-- [ ] 3.6 `McpPersistenceSchemaVerifier` と readiness test に専用 role / ACL 前提がないことを確認し、該当がない場合は変更しない
+- [ ] 3.2 `Dockerfile` の db-helper-manifest stage から `mcp-role.sql` の `COPY` と hash list entry を削除する
+- [ ] 3.3 `scripts/deploy/deploy-fukurou` から `MCP_ROLE_SQL` と installed DB helper manifest の `mcp-role.sql` entry を削除する
+- [ ] 3.4 `scripts/deploy/fukurou-deploy-db` から MCP role env/default、`mcp-role.sql` payload manifest entry、foundation SQL の `--set=mcp_role` 引数を削除する
+- [ ] 3.5 `scripts/deploy/sql/deploy-foundation-v1.sql` から MCP role への GRANT 追従を削除する
+- [ ] 3.6 `ReleaseDeployFoundationContractTest`、deploy executor self-test、`deploy-db-selftest`、`deploy-postgres-selftest` から MCP role payload / SQL fixture / env / CREATE ROLE / GRANT argument assertion を削除し、Dockerfile・root deploy executor・DB helper に共通する残存3-file manifest contract を検証する
+- [ ] 3.7 `McpDatabaseRoleIntegrationTest` から provision / privilege repair / future object / forbidden-write role-boundary fixture と assertion を削除し、PR 1 で追加した application-role tool matrix / gateway regression を正本として残す
+- [ ] 3.8 `McpPersistenceSchemaVerifier` と readiness test に専用 role / ACL 前提がないことを確認し、該当がない場合は変更しない
 
 ## 4. PR 2 — Documentation and migration note
 
@@ -31,8 +33,8 @@
 ## 5. PR 2 — Verification and archive
 
 - [ ] 5.1 MCP manifest / runner / isolation canary / application-role tool matrix の関連テストを実行し、application role での起動と gateway 経由 tool call を確認する
-- [ ] 5.2 `deploy-db-selftest` と `deploy-postgres-selftest` を実行し、専用 role 資産を含まない DB helper manifest と foundation install を確認する
+- [ ] 5.2 `ReleaseDeployFoundationContractTest`、`deploy-db-selftest`、`deploy-postgres-selftest` を実行し、Dockerfile・root deploy executor・DB helper の残存3-file manifest と foundation install を確認する
 - [ ] 5.3 disposable PostgreSQL に現行 provision 相当の role ownership / ACL dependency を作り、owner migration note の `REASSIGN OWNED` → `DROP OWNED` → `DROP ROLE` が成功して application-owned object を保持することを検証する
-- [ ] 5.4 `make test` と `make detekt` を実行する
+- [ ] 5.4 `make test`、`make detekt`、`make build` を実行する
 - [ ] 5.5 active source/docs 全体を `FUKUROU_MCP_DB_USER`、`DEFAULT_MCP_DATABASE_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql`、`mcp_role` で検索し、archived OpenSpec と意図した PR migration note 以外の残存を確認する
 - [ ] 5.6 PR 2 完了後に OpenSpec change を一度だけ archive する

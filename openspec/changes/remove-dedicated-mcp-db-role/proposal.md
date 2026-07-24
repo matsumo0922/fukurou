@@ -6,7 +6,7 @@ MCP subprocess 専用の PostgreSQL role `fukurou_mcp` は single-owner の pape
 
 - MCP launch manifest の `dbUser` に application user（`DB_USER` / `POSTGRES_USER` と同じ値）を書き、専用 MCP role への依存を撤去する。
 - `FUKUROU_MCP_DB_USER` と `DEFAULT_MCP_DATABASE_USER` を削除する。
-- `scripts/deploy/provision-fukurou-mcp-role` と `scripts/deploy/sql/mcp-role.sql` を削除し、deploy helper の payload manifest、foundation SQL の `mcp_role` GRANT、関連 self-test から専用 role の追従処理を除去する。
+- `scripts/deploy/provision-fukurou-mcp-role` と `scripts/deploy/sql/mcp-role.sql` を削除し、Docker image・root deploy executor・DB helper の3箇所で同期する payload manifest、foundation SQL の `mcp_role` GRANT、関連 contract/self-test から専用 role の追従処理を除去する。
 - MCP isolation canary の manifest 生成を application user に追従させる。
 - dedicated-role integration test を、application role で既存 MCP tool matrix と submission gateway 経路が成立する回帰テストへ置き換える。
 - `fukurou_mcp` role を前提とする runtime・deploy・design の記述と `.env.example` を現在の構成へ更新する。
@@ -27,7 +27,7 @@ MCP subprocess 専用の PostgreSQL role `fukurou_mcp` は single-owner の pape
 
 - `trading` module の production / canary MCP manifest 生成と関連テスト
 - production compose と `.env.example` の MCP DB user 設定
-- deploy role provision script / SQL、DB helper payload manifest、foundation GRANT、deploy self-test
+- deploy role provision script / SQL、Dockerfile・root deploy executor・DB helper の payload manifest、foundation GRANT、deploy contract/self-test
 - `mcp` module の dedicated-role integration test と MCP tool matrix coverage
 - `docs/deploy.md`、`docs/mcp-runtime.md`、`docs/design.md` および README の関連記述
 - production database の owner 向け手動 migration note
