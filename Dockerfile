@@ -36,7 +36,6 @@ WORKDIR /src
 COPY scripts/deploy/fukurou-deploy-db scripts/deploy/fukurou-deploy-db
 COPY scripts/deploy/sql/deploy-foundation-v1-indexes.sql scripts/deploy/sql/deploy-foundation-v1-indexes.sql
 COPY scripts/deploy/sql/deploy-foundation-v1.sql scripts/deploy/sql/deploy-foundation-v1.sql
-COPY scripts/deploy/sql/mcp-role.sql scripts/deploy/sql/mcp-role.sql
 # このファイル集合は scripts/deploy/deploy-fukurou の db_helper_manifest_entries() と
 # scripts/deploy/fukurou-deploy-db の db_helper_manifest_entries() の一覧に一致させること
 # （NAS root install 側は個別ファイル配置で scripts/deploy/sql/ ディレクトリを持たないため、
@@ -45,7 +44,6 @@ RUN { \
       printf '%s\n' scripts/deploy/fukurou-deploy-db; \
       printf '%s\n' scripts/deploy/sql/deploy-foundation-v1-indexes.sql; \
       printf '%s\n' scripts/deploy/sql/deploy-foundation-v1.sql; \
-      printf '%s\n' scripts/deploy/sql/mcp-role.sql; \
     } \
     | LC_ALL=C sort \
     | while IFS= read -r path; do \

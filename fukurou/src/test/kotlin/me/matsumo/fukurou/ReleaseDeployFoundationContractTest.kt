@@ -114,11 +114,13 @@ class ReleaseDeployFoundationContractTest {
             "scripts/deploy/fukurou-deploy-db",
             "scripts/deploy/sql/deploy-foundation-v1-indexes.sql",
             "scripts/deploy/sql/deploy-foundation-v1.sql",
-            "scripts/deploy/sql/mcp-role.sql",
         ).forEach { path ->
             assertTrue(executor.contains(path))
             assertTrue(databaseHelper.contains(path))
         }
+        assertFalse(executor.contains("mcp-role.sql"))
+        assertFalse(databaseHelper.contains("mcp-role.sql"))
+        assertFalse(dockerfile.contains("mcp-role.sql"))
         assertTrue(executor.contains("LC_ALL=C sort"))
         assertTrue(executor.contains("printf '%s\\0%s\\0'"))
         assertTrue(executor.contains("ROOT_DB_HELPER_INSTALLATION_CHANGED"))
@@ -191,6 +193,8 @@ class ReleaseDeployFoundationContractTest {
             "scripts/runtime/validate-llm-launcher-probe.mjs",
             "scripts/mcp-credential-isolation-check",
             "scripts/mcp-credential-isolation-check-selftest",
+            "scripts/deploy/provision-fukurou-mcp-role",
+            "scripts/deploy/sql/mcp-role.sql",
             "fukurou/src/main/kotlin/me/matsumo/fukurou/LaunchFenceDatabaseProbeMain.kt",
         ).forEach { path -> assertFalse(Files.exists(root.resolve(path)), path) }
         assertTrue(Files.exists(root.resolve("scripts/runtime/fukurou-cli-canary-mcp.mjs")))

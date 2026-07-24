@@ -3,22 +3,68 @@ set -Eeuo pipefail
 
 readonly SELFTEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
-touch "${SELFTEST_ROOT}/foundation.sql" "${SELFTEST_ROOT}/indexes.sql" "${SELFTEST_ROOT}/mcp-role.sql"
+touch "${SELFTEST_ROOT}/foundation.sql" "${SELFTEST_ROOT}/indexes.sql"
 export FUKUROU_FOUNDATION_SQL="${SELFTEST_ROOT}/foundation.sql"
 export FUKUROU_FOUNDATION_INDEX_SQL="${SELFTEST_ROOT}/indexes.sql"
-export FUKUROU_MCP_ROLE_SQL="${SELFTEST_ROOT}/mcp-role.sql"
 export FUKUROU_DEPLOY_DB_HELPER_SOURCE="$(dirname "$0")/fukurou-deploy-db"
-export FUKUROU_MCP_DB_USER=fukurou_mcp_fixture
 
 # shellcheck source=fukurou-deploy-db
 source "$(dirname "$0")/fukurou-deploy-db"
 grep -Fq 'command timeout --foreground --signal=TERM --kill-after=5' < <(declare -f psql_exec_impl)
 
+manifest_digest() {
+  local relative_path installed_path content_hash
+  while IFS=$'\t' read -r relative_path installed_path; do
+    content_hash="$(sha256sum "${installed_path}" | awk '{print $1}')"
+    printf '%s\0%s\0' "${relative_path}" "${content_hash}"
+  done | sha256sum | awk '{print $1}'
+}
+
+manifest_contract_accepts() {
+  local installed_actual="$1" installed_recorded="$2" candidate_expected="$3"
+  [[ "${installed_actual}" == "${installed_recorded}" && "${installed_actual}" == "${candidate_expected}" ]]
+}
+
 initial_manifest="$(calculate_db_helper_manifest)"
 [[ "${initial_manifest}" =~ ^[0-9a-f]{64}$ ]]
 [[ "$(calculate_db_helper_manifest)" == "${initial_manifest}" ]]
-printf 'changed\n' >"${SELFTEST_ROOT}/mcp-role.sql"
+printf 'changed\n' >"${SELFTEST_ROOT}/foundation.sql"
 [[ "$(calculate_db_helper_manifest)" != "${initial_manifest}" ]]
+printf '' >"${SELFTEST_ROOT}/foundation.sql"
+
+legacy_helper="${SELFTEST_ROOT}/legacy-fukurou-deploy-db"
+legacy_foundation="${SELFTEST_ROOT}/legacy-foundation.sql"
+legacy_indexes="${SELFTEST_ROOT}/legacy-indexes.sql"
+legacy_mcp_role="${SELFTEST_ROOT}/legacy-mcp-role.sql"
+printf 'legacy helper\n' >"${legacy_helper}"
+printf 'legacy foundation\n' >"${legacy_foundation}"
+printf 'legacy indexes\n' >"${legacy_indexes}"
+printf 'legacy role\n' >"${legacy_mcp_role}"
+legacy_manifest="$({
+  printf '%s\t%s\n' \
+    scripts/deploy/fukurou-deploy-db "${legacy_helper}" \
+    scripts/deploy/sql/deploy-foundation-v1-indexes.sql "${legacy_indexes}" \
+    scripts/deploy/sql/deploy-foundation-v1.sql "${legacy_foundation}" \
+    scripts/deploy/sql/mcp-role.sql "${legacy_mcp_role}" | LC_ALL=C sort
+} | manifest_digest)"
+
+# 旧4-file installed set から新3-file candidateへは、marker未更新の混在状態を拒否し、
+# 新artifact setのexact配置後に現helper APIでmarkerを再生成した状態だけを受理する。
+! manifest_contract_accepts "${legacy_manifest}" "${legacy_manifest}" "${initial_manifest}"
+manifest_contract_accepts "${initial_manifest}" "${initial_manifest}" "${initial_manifest}"
+# rollback方向も同様に、新3-file installed setのまま旧candidateを拒否し、旧4-file setと
+# 旧markerのexact復元だけを受理する。内容の一部だけ差し替えたmixed setもfail-closedになる。
+! manifest_contract_accepts "${initial_manifest}" "${initial_manifest}" "${legacy_manifest}"
+manifest_contract_accepts "${legacy_manifest}" "${legacy_manifest}" "${legacy_manifest}"
+printf 'mixed foundation\n' >"${legacy_foundation}"
+mixed_manifest="$({
+  printf '%s\t%s\n' \
+    scripts/deploy/fukurou-deploy-db "${legacy_helper}" \
+    scripts/deploy/sql/deploy-foundation-v1-indexes.sql "${legacy_indexes}" \
+    scripts/deploy/sql/deploy-foundation-v1.sql "${legacy_foundation}" \
+    scripts/deploy/sql/mcp-role.sql "${legacy_mcp_role}" | LC_ALL=C sort
+} | manifest_digest)"
+! manifest_contract_accepts "${mixed_manifest}" "${legacy_manifest}" "${legacy_manifest}"
 
 MODE=PRE_FOUNDATION
 LAST_PSQL_ARGS="${SELFTEST_ROOT}/psql-args"
@@ -60,9 +106,8 @@ psql_exec_with_timeout() {
   psql_exec "$@"
 }
 
-[[ -z "$(application_value FUKUROU_MCP_DB_USER)" ]]
 install_foundation >/dev/null
-grep -Fq -- '--set=mcp_role=fukurou_mcp_fixture' "${LAST_PSQL_ARGS}"
+! grep -Fq -- '--set=mcp_role=' "${LAST_PSQL_ARGS}"
 grep -Fxq -- '60' "${LAST_PSQL_TIMEOUT}"
 install_indexes >/dev/null
 grep -Fxq -- '300' "${LAST_PSQL_TIMEOUT}"
@@ -84,4 +129,4 @@ runtime_snapshot="$(snapshot)"
 grep -Fq "c.relkind::text" "${LAST_SNAPSHOT_QUERY}"
 grep -Fxq -- '-Atq' "${LAST_PSQL_ARGS}"
 
-echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact manifest=deterministic-change-sensitive snapshots=pre-foundation,foundation-v1,runtime-config"
+echo "DEPLOY_DB_SELFTEST_OK manifest=three-file-deterministic-change-sensitive transitions=4-to-3,3-to-4,mixed-fail-closed snapshots=pre-foundation,foundation-v1,runtime-config"

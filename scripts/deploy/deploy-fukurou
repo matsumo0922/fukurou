@@ -16,7 +16,6 @@ readonly IMAGE_REPOSITORY="${FUKUROU_IMAGE_REPOSITORY:-ghcr.io/matsumo0922/fukur
 readonly DB_HELPER="${FUKUROU_DEPLOY_DB_HELPER:-/usr/local/libexec/fukurou-deploy-db}"
 readonly FOUNDATION_SQL="${FUKUROU_FOUNDATION_SQL:-/usr/local/share/fukurou/deploy-foundation-v1.sql}"
 readonly FOUNDATION_INDEX_SQL="${FUKUROU_FOUNDATION_INDEX_SQL:-/usr/local/share/fukurou/deploy-foundation-v1-indexes.sql}"
-readonly MCP_ROLE_SQL="${FUKUROU_MCP_ROLE_SQL:-/usr/local/share/fukurou/mcp-role.sql}"
 readonly DB_HELPER_MARKER="${FUKUROU_DB_HELPER_MARKER:-/usr/local/share/fukurou/db-helper-manifest.sha256}"
 readonly CANDIDATE_DB_HELPER_MARKER="/usr/local/share/fukurou/db-helper-manifest.sha256"
 readonly BACKUP_HELPER="${FUKUROU_BACKUP_HELPER:-/usr/local/libexec/fukurou/backup-fukurou}"
@@ -252,8 +251,7 @@ db_helper_manifest_entries() {
   printf '%s\t%s\n' \
     "scripts/deploy/fukurou-deploy-db" "${DB_HELPER}" \
     "scripts/deploy/sql/deploy-foundation-v1-indexes.sql" "${FOUNDATION_INDEX_SQL}" \
-    "scripts/deploy/sql/deploy-foundation-v1.sql" "${FOUNDATION_SQL}" \
-    "scripts/deploy/sql/mcp-role.sql" "${MCP_ROLE_SQL}" |
+    "scripts/deploy/sql/deploy-foundation-v1.sql" "${FOUNDATION_SQL}" |
     LC_ALL=C sort
 }
 
