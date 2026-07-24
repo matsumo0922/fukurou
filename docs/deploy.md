@@ -741,20 +741,102 @@ past-SHA 再デプロイは application image だけを切り替え、database �
 
 ### DB helper artifact set を伴う rollback
 
-DB helper markerの入力ファイル集合が異なるrevisionへ戻す場合は、旧imageをcandidateにする前にrollback SHAのartifact setをexact復元する。rollback SHAから `deploy-fukurou`、`fukurou-deploy-db`、`deploy-foundation-v1.sql`、`deploy-foundation-v1-indexes.sql`、`mcp-role.sql` をroot-owned pathへ連続配置し、そのrevisionの `fukurou-deploy-db write-install-marker` で4-file markerを再生成する。現行3-file helper/markerと旧4-file candidate、または旧helperと現行SQLを混在させるとcandidate verificationはfail closedになる。
+DB helper markerの入力ファイル集合が異なるrevisionへ戻す場合は、rollback imageをcandidateにする前にrollback SHAのartifact setをexact復元する。rollback SHAは40文字のexact commit SHAとして指定し、最新の`origin/main`から到達可能であることを確認する。root-owned repositoryからtemporary detached worktreeへartifactをmaterializeし、worktree HEADと各blobがrollback SHAに一致することを検証してからinstallする。既存の`/srv/fukurou/rollback-artifacts/$sha`を正本として仮定しない。
 
-```sh
-rollback_sha='<origin/main から到達可能な rollback SHA>'
-rollback_root="/srv/fukurou/rollback-artifacts/${rollback_sha}"
-sudo install -m 0755 "${rollback_root}/scripts/deploy/deploy-fukurou" /usr/local/sbin/deploy-fukurou
-sudo install -m 0755 "${rollback_root}/scripts/deploy/fukurou-deploy-db" /usr/local/libexec/fukurou-deploy-db
-sudo install -m 0644 "${rollback_root}/scripts/deploy/sql/deploy-foundation-v1.sql" /usr/local/share/fukurou/deploy-foundation-v1.sql
-sudo install -m 0644 "${rollback_root}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql" /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
-sudo install -m 0444 "${rollback_root}/scripts/deploy/sql/mcp-role.sql" /usr/local/share/fukurou/mcp-role.sql
+risk-increasing executionと新規LLM launchを停止し、in-flight launchをdrainした後、次を同じoperator shellで実行する。`rollback_sha`にはreview済みcommitの完全な40文字SHAを入れる。
+
+```bash
+set -Eeuo pipefail
+rollback_sha='<40文字のreview済みrollback commit SHA>'
+repo=/srv/fukurou/repo
+[[ "${rollback_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo 'rollback SHA must be exactly 40 lowercase hexadecimal characters' >&2
+  exit 1
+}
+
+sudo git -C "${repo}" fetch --prune origin +refs/heads/main:refs/remotes/origin/main
+resolved_sha="$(sudo git -C "${repo}" rev-parse --verify "${rollback_sha}^{commit}")"
+[[ "${resolved_sha}" == "${rollback_sha}" ]]
+sudo git -C "${repo}" merge-base --is-ancestor "${rollback_sha}" refs/remotes/origin/main
+
+rollback_parent="$(sudo mktemp -d /srv/fukurou/rollback-artifacts.XXXXXX)"
+rollback_root="${rollback_parent}/tree"
+cleanup_rollback_tree() {
+  sudo git -C "${repo}" worktree remove --force "${rollback_root}" >/dev/null 2>&1 || true
+  sudo rm -rf "${rollback_parent}"
+}
+trap cleanup_rollback_tree EXIT
+sudo git -C "${repo}" worktree add --detach "${rollback_root}" "${rollback_sha}"
+[[ "$(sudo git -C "${rollback_root}" rev-parse --verify HEAD)" == "${rollback_sha}" ]]
+[[ -z "$(sudo git -C "${rollback_root}" status --porcelain --untracked-files=all)" ]]
+
+rollback_paths=(
+  scripts/deploy/deploy-fukurou
+  scripts/deploy/fukurou-deploy-db
+  scripts/deploy/provision-fukurou-mcp-role
+  scripts/deploy/sql/deploy-foundation-v1.sql
+  scripts/deploy/sql/deploy-foundation-v1-indexes.sql
+  scripts/deploy/sql/mcp-role.sql
+)
+for path in "${rollback_paths[@]}"; do
+  sudo test -f "${rollback_root}/${path}"
+  sudo test ! -L "${rollback_root}/${path}"
+  expected_blob="$(sudo git -C "${repo}" rev-parse "${rollback_sha}:${path}")"
+  actual_blob="$(sudo git -C "${rollback_root}" hash-object "${path}")"
+  [[ "${actual_blob}" == "${expected_blob}" ]]
+done
+
+sudo install -o root -g root -m 0755 "${rollback_root}/scripts/deploy/deploy-fukurou" /usr/local/sbin/deploy-fukurou
+sudo install -o root -g root -m 0755 "${rollback_root}/scripts/deploy/fukurou-deploy-db" /usr/local/libexec/fukurou-deploy-db
+sudo install -o root -g root -m 0644 "${rollback_root}/scripts/deploy/sql/deploy-foundation-v1.sql" /usr/local/share/fukurou/deploy-foundation-v1.sql
+sudo install -o root -g root -m 0644 "${rollback_root}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql" /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
+sudo install -o root -g root -m 0444 "${rollback_root}/scripts/deploy/sql/mcp-role.sql" /usr/local/share/fukurou/mcp-role.sql
 sudo /usr/local/libexec/fukurou-deploy-db write-install-marker
 ```
 
-`残存 dedicated role の owner cleanup` を実行済みなら、同じrollback SHAの `provision-fukurou-mcp-role` と `mcp-role.sql` で `fukurou_mcp` roleを再作成してから旧imageを起動する。role再作成だけではmarker mismatchを解消しないため、artifact set復元とmarker再生成を先に完了する。cleanup前のrollbackでもartifact set復元は必要である。
+`write-install-marker`の成功により、rollback revisionの4-file artifact setとinstall markerの一致を確定する。markerを復元する前にrollback imageをdispatchしない。3-file helper/markerと4-file candidate、または異なるrevisionのhelper/SQLを混在させるとcandidate verificationはfail closedになる。
+
+`残存 dedicated role の owner cleanup` を実行済みなら、marker復元後かつrollback imageのdispatch前に、同じtemporary worktreeの`provision-fukurou-mcp-role`と`mcp-role.sql`で`fukurou_mcp` roleを再作成する。次の手順はPostgreSQL container内の既存superuser接続を使い、role passwordは既存のroot-only file `/srv/fukurou/secrets/fukurou_mcp_db_password`から渡す。password値をargv、log、shell historyへ展開しない。
+
+```bash
+mcp_password_file=/srv/fukurou/secrets/fukurou_mcp_db_password
+sudo test -f "${mcp_password_file}"
+sudo test ! -L "${mcp_password_file}"
+[[ "$(sudo stat -c '%u:%g:%a' "${mcp_password_file}")" == '0:0:400' ]]
+postgres_db="$(sudo awk -F= '$1 == "POSTGRES_DB" { sub(/^[^=]*=/, ""); print; exit }' /srv/fukurou/.env)"
+postgres_user="$(sudo awk -F= '$1 == "POSTGRES_USER" { sub(/^[^=]*=/, ""); print; exit }' /srv/fukurou/.env)"
+[[ -n "${postgres_db}" && -n "${postgres_user}" ]]
+
+role_stage="/tmp/fukurou-role-rollback-${rollback_sha}"
+sudo docker exec fukurou-postgres sh -ceu 'rm -rf "$1"; install -d -m 0700 "$1/sql"' sh "${role_stage}"
+sudo docker cp "${rollback_root}/scripts/deploy/provision-fukurou-mcp-role" "fukurou-postgres:${role_stage}/provision-fukurou-mcp-role"
+sudo docker cp "${rollback_root}/scripts/deploy/sql/mcp-role.sql" "fukurou-postgres:${role_stage}/sql/mcp-role.sql"
+sudo docker cp "${mcp_password_file}" "fukurou-postgres:${role_stage}/fukurou_mcp_db_password"
+sudo docker exec fukurou-postgres sh -ceu '
+  stage=$1
+  shift
+  trap '\''rm -rf "${stage}"'\'' EXIT
+  chmod 0500 "${stage}/provision-fukurou-mcp-role"
+  chmod 0400 "${stage}/fukurou_mcp_db_password"
+  export PGPASSWORD="${POSTGRES_PASSWORD}"
+  "${stage}/provision-fukurou-mcp-role" "$@"
+' sh \
+  "${role_stage}" \
+  "postgresql:///${postgres_db}?user=${postgres_user}" \
+  "${postgres_db}" \
+  "${postgres_user}" \
+  "${role_stage}/fukurou_mcp_db_password"
+```
+
+cleanup前のrollbackではrole再作成を省略するが、artifact setとmarkerのexact復元は省略しない。marker復元と、必要な場合のrole再作成が成功した後にだけ、operator workstationからrollback imageをdispatchする。
+
+```bash
+rollback_sha='<同じ40文字のreview済みrollback commit SHA>'
+[[ "${rollback_sha}" =~ ^[0-9a-f]{40}$ ]]
+gh workflow run deploy.yml --ref main -f image_sha="${rollback_sha}"
+```
+
+workflowがrollback SHAのimmutable image digestをbuild/deployし、health/digest確認とgap closeを完了するまでrisk-increasing executionと新規LLM launchを再開しない。
 
 ### schema migration 事故からの復旧
 
