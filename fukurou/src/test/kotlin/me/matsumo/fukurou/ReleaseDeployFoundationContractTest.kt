@@ -109,15 +109,18 @@ class ReleaseDeployFoundationContractTest {
         val databaseHelper = Files.readString(root.resolve("scripts/deploy/fukurou-deploy-db"))
         val backup = Files.readString(root.resolve("scripts/backup/backup-fukurou"))
         val dockerfile = Files.readString(root.resolve("Dockerfile"))
+        val manifestVerifier = executor
+            .substringAfter("verify_db_helper_manifest() {")
+            .substringBefore("\n}\n")
 
-        listOf(
+        val expectedManifestPaths = sortedSetOf(
             "scripts/deploy/fukurou-deploy-db",
             "scripts/deploy/sql/deploy-foundation-v1-indexes.sql",
             "scripts/deploy/sql/deploy-foundation-v1.sql",
-        ).forEach { path ->
-            assertTrue(executor.contains(path))
-            assertTrue(databaseHelper.contains(path))
-        }
+        )
+        assertEquals(expectedManifestPaths, shellManifestPaths(executor))
+        assertEquals(expectedManifestPaths, shellManifestPaths(databaseHelper))
+        assertEquals(expectedManifestPaths, dockerManifestPaths(dockerfile))
         assertFalse(executor.contains("mcp-role.sql"))
         assertFalse(databaseHelper.contains("mcp-role.sql"))
         assertFalse(dockerfile.contains("mcp-role.sql"))
@@ -125,6 +128,7 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(executor.contains("printf '%s\\0%s\\0'"))
         assertTrue(executor.contains("ROOT_DB_HELPER_INSTALLATION_CHANGED"))
         assertTrue(executor.contains("CANDIDATE_DB_HELPER_MARKER_MISMATCH"))
+        assertTrue(manifestVerifier.contains("verify_db_helper_manifest_digests"))
         assertTrue(databaseHelper.contains("write-install-marker"))
         assertTrue(databaseHelper.contains("sync -f \"\${marker_directory}\""))
         assertTrue(dockerfile.contains("FROM debian:bookworm-slim AS db-helper-manifest"))
@@ -200,6 +204,27 @@ class ReleaseDeployFoundationContractTest {
         assertTrue(Files.exists(root.resolve("scripts/runtime/fukurou-cli-canary-mcp.mjs")))
     }
 }
+
+private fun shellManifestPaths(source: String): Set<String> =
+    source
+        .substringAfter("db_helper_manifest_entries() {")
+        .substringBefore("\n}\n")
+        .lineSequence()
+        .mapNotNull { line -> Regex("\"(scripts/deploy/[^\"]+)\"").find(line)?.groupValues?.get(1) }
+        .map(::normalizeRepositoryPath)
+        .toSortedSet()
+
+private fun dockerManifestPaths(source: String): Set<String> =
+    source
+        .substringAfter("FROM debian:bookworm-slim AS db-helper-manifest")
+        .substringBefore("# ---- runtime stage")
+        .lineSequence()
+        .mapNotNull { line -> Regex("printf '%s\\\\n' (scripts/deploy/[^;]+);").find(line)?.groupValues?.get(1) }
+        .map(::normalizeRepositoryPath)
+        .toSortedSet()
+
+private fun normalizeRepositoryPath(path: String): String =
+    Path.of(path).normalize().toString().replace('\\', '/')
 
 private fun repositoryRoot(): Path {
     var candidate = Path.of(System.getProperty("user.dir")).toAbsolutePath()

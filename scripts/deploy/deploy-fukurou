@@ -277,6 +277,18 @@ read_candidate_db_helper_manifest() {
   printf '%s\n' "${marker}"
 }
 
+verify_db_helper_manifest_digests() {
+  local installed_actual="$1" installed_recorded="$2" candidate_expected="$3"
+  [[ "${installed_actual}" == "${installed_recorded}" ]] || {
+    fail "ROOT_DB_HELPER_INSTALLATION_CHANGED"
+    return 1
+  }
+  [[ "${installed_actual}" == "${candidate_expected}" ]] || {
+    fail "CANDIDATE_DB_HELPER_MARKER_MISMATCH"
+    return 1
+  }
+}
+
 verify_db_helper_manifest() {
   [[ -f "${DB_HELPER_MARKER}" && ! -L "${DB_HELPER_MARKER}" ]] || fail "ROOT_DB_HELPER_MARKER_MISSING"
   [[ "$(stat -c '%u:%g:%a' "${DB_HELPER_MARKER}")" == "0:0:444" ]] || fail "ROOT_DB_HELPER_MARKER_METADATA_INVALID"
@@ -285,8 +297,7 @@ verify_db_helper_manifest() {
   [[ "${installed_recorded}" =~ ^[0-9a-f]{64}$ ]] || fail "ROOT_DB_HELPER_MARKER_INVALID"
   installed_actual="$(calculate_installed_db_helper_manifest)"
   candidate_expected="$(read_candidate_db_helper_manifest "${IMAGE_REFERENCE}")"
-  [[ "${installed_actual}" == "${installed_recorded}" ]] || fail "ROOT_DB_HELPER_INSTALLATION_CHANGED"
-  [[ "${installed_actual}" == "${candidate_expected}" ]] || fail "CANDIDATE_DB_HELPER_MARKER_MISMATCH"
+  verify_db_helper_manifest_digests "${installed_actual}" "${installed_recorded}" "${candidate_expected}"
 }
 
 pull_candidate() {
