@@ -24,7 +24,6 @@ import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -107,6 +106,7 @@ import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicRequestCorrelation
 import me.matsumo.fukurou.trading.exchange.gmo.GmoRetryConfig
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
 import me.matsumo.fukurou.trading.invoker.MCP_MANIFEST_VERSION
 import me.matsumo.fukurou.trading.invoker.McpLaunchManifest
 import me.matsumo.fukurou.trading.invoker.McpToolContractCatalog
@@ -2255,9 +2255,6 @@ class McpDatabaseRoleIntegrationTest {
         val container = McpPostgresContainer()
         container.start()
         val marketFixture = GmoRequiredMatrixFixture.start()
-        var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
-        var appRuntime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
-        var gatewayFixture: GatewayFixture? = null
         try {
             val clock = fixedClock()
             val database = ExposedDatabase.connect(container.jdbcUrl, driver = "org.postgresql.Driver", user = container.username, password = container.password)
@@ -2275,159 +2272,281 @@ class McpDatabaseRoleIntegrationTest {
             provisionMcpRole(container)
             createFuturePrivilegeBoundaryObjects(container)
             assertRoleBoundary(container, includeFutureBoundary = true)
-            appRuntime = TradingRuntimeFactory.postgres(
-                TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
-                clock = clock,
-            )
 
-            val bootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.PROPOSER)
-            val tradingConfig = TradingBotConfig(
-                gmoPublicClient = GmoPublicClientConfig(
-                    baseUrl = marketFixture.baseUrl,
-                    connectTimeout = Duration.ofSeconds(2),
-                    requestTimeout = Duration.ofSeconds(2),
-                    retry = GmoRetryConfig(maxAttempts = 1),
-                ),
-            )
-            val requestAuditSink = DeferredGmoPublicRequestAuditSink()
-            val marketDataSource = GmoPublicMarketDataSource.fromConfig(
-                config = tradingConfig.gmoPublicClient,
-                clientType = me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType.FUKUROU_MCP,
-                requestAuditSink = requestAuditSink,
+            assertRequiredMatrixThroughProductionPath(
+                container = container,
                 clock = clock,
+                marketFixture = marketFixture,
+                mcpDatabaseConfig = TradingDatabaseConfig(container.jdbcUrl, MCP_TEST_ROLE, MCP_TEST_PASSWORD),
             )
-            val fixtureMarketDataSource = RequiredMatrixMarketDataSource(marketDataSource)
-            runtime = TradingRuntimeFactory.postgresForMcp(
-                config = bootstrap.databaseConfig,
-                clock = clock,
-                marketDataSource = fixtureMarketDataSource,
-                tradingConfig = tradingConfig,
-            )
-            gatewayFixture = gatewayFixture(
-                repository = requireNotNull(appRuntime).decisionRepository,
-                bootstrap = bootstrap,
-            )
-            var server = FukurouMcpServer(
-                tradingConfig = tradingConfig,
-                requestAuditSink = requestAuditSink,
-                marketDataSource = fixtureMarketDataSource,
-                clock = clock,
-                tradingRuntime = runtime,
-                decisionRunContext = bootstrap.decisionRunContext,
-                clientRole = bootstrap.phase.toGmoPublicClientRole(),
-                allowedToolNames = bootstrap.allowedTools,
-                expiresAt = bootstrap.expiresAt,
-                invocationPhase = bootstrap.phase,
-                submissionGatewayClient = gatewayFixture.client,
-            ).createServer()
-            val results = linkedMapOf<String, CallToolResult>()
-            results["get_ticker"] = callTool(server, "get_ticker")
-            results["get_candles"] = callTool(
-                server = server,
-                toolName = "get_candles",
-                arguments = buildJsonObject {
-                    put("interval", "1hour")
-                    put("limit", 1)
-                },
-            )
-            results["get_orderbook"] = callTool(server, "get_orderbook")
-            results["get_trades"] = callTool(server, "get_trades")
-            results["get_symbol_rules"] = callTool(server, "get_symbol_rules")
-            results["calc_indicator"] = callTool(
-                server = server,
-                toolName = "calc_indicator",
-                arguments = buildJsonObject {
-                    put("interval", "1hour")
-                    put("indicator", "SMA")
-                    putJsonObject("params") {
-                        put("period", 1)
-                    }
-                },
-            )
-            results["get_balance"] = callTool(server, "get_balance")
-            results["get_positions"] = callTool(server, "get_positions")
-            results["get_open_orders"] = callTool(server, "get_open_orders")
-            results["get_account_status"] = callTool(server, "get_account_status")
-            results["knowledge_get_recent_lessons"] = callTool(server, "knowledge_get_recent_lessons")
-            results["knowledge_search_similar_setups"] = callTool(
-                server = server,
-                toolName = "knowledge_search_similar_setups",
-                arguments = buildJsonObject {
-                    put("signal_summary", "breakout")
-                    put("limit", 3)
-                },
-            )
-            val decision = callTool(server, "submit_decision", enterDecisionArguments(invocationId = MCP_MATRIX_RUN_ID))
-            results["submit_decision"] = decision
-            val intentId = assertNotNull(decision.structuredContent).getValue("intent_id").jsonPrimitive.contentOrNull
-            results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
-            assertIdentityDualWrite(container)
-            gatewayFixture.close()
-            gatewayFixture = null
-            runtime.close()
-            val falsifierBootstrap = requiredMatrixBootstrap(container, clock, LlmInvocationPhase.FALSIFIER)
-            val falsifierRequestAuditSink = DeferredGmoPublicRequestAuditSink()
-            val falsifierMarketDataSource = RequiredMatrixMarketDataSource(
-                GmoPublicMarketDataSource.fromConfig(
-                    config = tradingConfig.gmoPublicClient,
-                    clientType = me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType.FUKUROU_MCP,
-                    requestAuditSink = falsifierRequestAuditSink,
-                    clock = clock,
-                ),
-            )
-            runtime = TradingRuntimeFactory.postgresForMcp(
-                config = falsifierBootstrap.databaseConfig,
-                clock = clock,
-                marketDataSource = falsifierMarketDataSource,
-                tradingConfig = tradingConfig,
-            )
-            gatewayFixture = gatewayFixture(
-                repository = requireNotNull(appRuntime).decisionRepository,
-                bootstrap = falsifierBootstrap,
-            )
-            server = FukurouMcpServer(
-                tradingConfig = tradingConfig,
-                requestAuditSink = falsifierRequestAuditSink,
-                marketDataSource = falsifierMarketDataSource,
-                clock = clock,
-                tradingRuntime = runtime,
-                decisionRunContext = falsifierBootstrap.decisionRunContext,
-                clientRole = falsifierBootstrap.phase.toGmoPublicClientRole(),
-                allowedToolNames = falsifierBootstrap.allowedTools,
-                expiresAt = falsifierBootstrap.expiresAt,
-                invocationPhase = falsifierBootstrap.phase,
-                submissionGatewayClient = gatewayFixture.client,
-            ).createServer()
-            results["submit_falsification"] = callTool(
-                server,
-                "submit_falsification",
-                buildJsonObject {
-                    put("intent_id", intentId)
-                    put("verdict", FalsificationVerdict.APPROVED.name)
-                    put("llm_provider", "codex")
-                    put("reason_ja", "fixture data の反証を完了しました。")
-                },
-            )
-            results["preview_order"] = callTool(server, "preview_order", placeOrderArguments(assertNotNull(intentId)))
-
-            assertEquals(MCP_REQUIRED_CALL_COUNT, results.size)
-            assertTrue(results.none { (_, result) -> result.isError == true }, "Required MCP call failures: ${results.filterValues { it.isError == true }.keys}")
             assertForbiddenDml(container)
             assertNoFallback(container, clock)
         } finally {
-            gatewayFixture?.close()
-            runtime?.close()
-            appRuntime?.close()
+            marketFixture.close()
+            container.stop()
+        }
+    }
+
+    @Test
+    fun applicationRole_supportsRequiredMatrixAndPersistsGatewaySubmissions() = runBlocking {
+        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
+
+        val container = McpPostgresContainer()
+        container.start()
+        val marketFixture = GmoRequiredMatrixFixture.start()
+        try {
+            val clock = fixedClock()
+            val database = ExposedDatabase.connect(
+                container.jdbcUrl,
+                driver = "org.postgresql.Driver",
+                user = container.username,
+                password = container.password,
+            )
+            TradingPersistenceBootstrap(database, clock).ensureSchema().getOrThrow()
+            seedRequiredMatrixRun(container, clock)
+
+            assertRequiredMatrixThroughProductionPath(
+                container = container,
+                clock = clock,
+                marketFixture = marketFixture,
+                mcpDatabaseConfig = TradingDatabaseConfig(
+                    container.jdbcUrl,
+                    container.username,
+                    container.password,
+                ),
+            )
+        } finally {
             marketFixture.close()
             container.stop()
         }
     }
 }
 
+private suspend fun assertRequiredMatrixThroughProductionPath(
+    container: PostgreSQLContainer<*>,
+    clock: Clock,
+    marketFixture: GmoRequiredMatrixFixture,
+    mcpDatabaseConfig: TradingDatabaseConfig,
+) {
+    val appRuntime = TradingRuntimeFactory.postgres(
+        TradingDatabaseConfig(container.jdbcUrl, container.username, container.password),
+        clock = clock,
+    )
+    var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
+    var gatewayFixture: GatewayFixture? = null
+    try {
+        val tradingConfig = TradingBotConfig(
+            gmoPublicClient = GmoPublicClientConfig(
+                baseUrl = marketFixture.baseUrl,
+                connectTimeout = Duration.ofSeconds(2),
+                requestTimeout = Duration.ofSeconds(2),
+                retry = GmoRetryConfig(maxAttempts = 1),
+            ),
+        )
+        val results = linkedMapOf<String, CallToolResult>()
+        val proposerBootstrap = requiredMatrixBootstrap(
+            databaseConfig = mcpDatabaseConfig,
+            clock = clock,
+            phase = LlmInvocationPhase.PROPOSER,
+        )
+        val proposerRequestAuditSink = DeferredGmoPublicRequestAuditSink()
+        val proposerMarketDataSource = requiredMatrixMarketDataSource(
+            tradingConfig = tradingConfig,
+            requestAuditSink = proposerRequestAuditSink,
+            clock = clock,
+        )
+        val proposerRuntime = TradingRuntimeFactory.postgresForMcp(
+            config = proposerBootstrap.databaseConfig,
+            clock = clock,
+            marketDataSource = proposerMarketDataSource,
+            tradingConfig = tradingConfig,
+        )
+        runtime = proposerRuntime
+        val proposerGateway = gatewayFixture(
+            repository = appRuntime.decisionRepository,
+            bootstrap = proposerBootstrap,
+        )
+        gatewayFixture = proposerGateway
+        var server = requiredMatrixServer(
+            bootstrap = proposerBootstrap,
+            tradingConfig = tradingConfig,
+            requestAuditSink = proposerRequestAuditSink,
+            marketDataSource = proposerMarketDataSource,
+            clock = clock,
+            runtime = proposerRuntime,
+            gatewayClient = proposerGateway.client,
+        )
+        results["get_ticker"] = callTool(server, "get_ticker")
+        results["get_candles"] = callTool(
+            server = server,
+            toolName = "get_candles",
+            arguments = buildJsonObject {
+                put("interval", "1hour")
+                put("limit", 1)
+            },
+        )
+        results["get_orderbook"] = callTool(server, "get_orderbook")
+        results["get_trades"] = callTool(server, "get_trades")
+        results["get_symbol_rules"] = callTool(server, "get_symbol_rules")
+        results["calc_indicator"] = callTool(
+            server = server,
+            toolName = "calc_indicator",
+            arguments = buildJsonObject {
+                put("interval", "1hour")
+                put("indicator", "SMA")
+                putJsonObject("params") {
+                    put("period", 1)
+                }
+            },
+        )
+        results["get_balance"] = callTool(server, "get_balance")
+        results["get_positions"] = callTool(server, "get_positions")
+        results["get_open_orders"] = callTool(server, "get_open_orders")
+        results["get_account_status"] = callTool(server, "get_account_status")
+        results["knowledge_get_recent_lessons"] = callTool(server, "knowledge_get_recent_lessons")
+        results["knowledge_search_similar_setups"] = callTool(
+            server = server,
+            toolName = "knowledge_search_similar_setups",
+            arguments = buildJsonObject {
+                put("signal_summary", "breakout")
+                put("limit", 3)
+            },
+        )
+        val decision = callTool(server, "submit_decision", enterDecisionArguments(invocationId = MCP_MATRIX_RUN_ID))
+        results["submit_decision"] = decision
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, proposerGateway.semanticSubmissionState())
+        val intentId = assertNotNull(decision.structuredContent).getValue("intent_id").jsonPrimitive.contentOrNull
+        results["get_trade_intent"] = callTool(server, "get_trade_intent", buildJsonObject { put("intent_id", intentId) })
+        assertIdentityDualWrite(container)
+        assertDecisionPersistedThroughGateway(appRuntime.decisionRepository, assertNotNull(intentId))
+
+        proposerGateway.close()
+        gatewayFixture = null
+        proposerRuntime.close()
+        runtime = null
+
+        val falsifierBootstrap = requiredMatrixBootstrap(
+            databaseConfig = mcpDatabaseConfig,
+            clock = clock,
+            phase = LlmInvocationPhase.FALSIFIER,
+        )
+        val falsifierRequestAuditSink = DeferredGmoPublicRequestAuditSink()
+        val falsifierMarketDataSource = requiredMatrixMarketDataSource(
+            tradingConfig = tradingConfig,
+            requestAuditSink = falsifierRequestAuditSink,
+            clock = clock,
+        )
+        val falsifierRuntime = TradingRuntimeFactory.postgresForMcp(
+            config = falsifierBootstrap.databaseConfig,
+            clock = clock,
+            marketDataSource = falsifierMarketDataSource,
+            tradingConfig = tradingConfig,
+        )
+        runtime = falsifierRuntime
+        val falsifierGateway = gatewayFixture(
+            repository = appRuntime.decisionRepository,
+            bootstrap = falsifierBootstrap,
+        )
+        gatewayFixture = falsifierGateway
+        server = requiredMatrixServer(
+            bootstrap = falsifierBootstrap,
+            tradingConfig = tradingConfig,
+            requestAuditSink = falsifierRequestAuditSink,
+            marketDataSource = falsifierMarketDataSource,
+            clock = clock,
+            runtime = falsifierRuntime,
+            gatewayClient = falsifierGateway.client,
+        )
+        results["submit_falsification"] = callTool(
+            server,
+            "submit_falsification",
+            buildJsonObject {
+                put("intent_id", intentId)
+                put("verdict", FalsificationVerdict.APPROVED.name)
+                put("llm_provider", "codex")
+                put("reason_ja", "fixture data の反証を完了しました。")
+            },
+        )
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, falsifierGateway.semanticSubmissionState())
+        results["preview_order"] = callTool(server, "preview_order", placeOrderArguments(intentId))
+
+        assertFalsificationPersistedThroughGateway(appRuntime.decisionRepository, intentId)
+        assertEquals(MCP_REQUIRED_CALL_COUNT, results.size)
+        assertTrue(
+            results.none { (_, result) -> result.isError == true },
+            "Required MCP call failures: ${results.filterValues { it.isError == true }.keys}",
+        )
+    } finally {
+        gatewayFixture?.close()
+        runtime?.close()
+        appRuntime.close()
+    }
+}
+
+private fun requiredMatrixMarketDataSource(
+    tradingConfig: TradingBotConfig,
+    requestAuditSink: DeferredGmoPublicRequestAuditSink,
+    clock: Clock,
+): RequiredMatrixMarketDataSource {
+    return RequiredMatrixMarketDataSource(
+        GmoPublicMarketDataSource.fromConfig(
+            config = tradingConfig.gmoPublicClient,
+            clientType = me.matsumo.fukurou.trading.exchange.gmo.GmoPublicClientType.FUKUROU_MCP,
+            requestAuditSink = requestAuditSink,
+            clock = clock,
+        ),
+    )
+}
+
+private fun requiredMatrixServer(
+    bootstrap: McpBootstrapConfig,
+    tradingConfig: TradingBotConfig,
+    requestAuditSink: DeferredGmoPublicRequestAuditSink,
+    marketDataSource: RequiredMatrixMarketDataSource,
+    clock: Clock,
+    runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime,
+    gatewayClient: LlmDecisionSubmissionGatewayClient,
+): io.modelcontextprotocol.kotlin.sdk.server.Server {
+    return FukurouMcpServer(
+        tradingConfig = tradingConfig,
+        requestAuditSink = requestAuditSink,
+        marketDataSource = marketDataSource,
+        clock = clock,
+        tradingRuntime = runtime,
+        decisionRunContext = bootstrap.decisionRunContext,
+        clientRole = bootstrap.phase.toGmoPublicClientRole(),
+        allowedToolNames = bootstrap.allowedTools,
+        expiresAt = bootstrap.expiresAt,
+        invocationPhase = bootstrap.phase,
+        submissionGatewayClient = gatewayClient,
+    ).createServer()
+}
+
+private suspend fun assertDecisionPersistedThroughGateway(
+    repository: me.matsumo.fukurou.trading.decision.DecisionRepository,
+    intentId: String,
+) {
+    val persisted = assertNotNull(repository.latestDecisionByInvocationId(MCP_MATRIX_RUN_ID).getOrThrow())
+
+    assertEquals(UUID.fromString(intentId), assertNotNull(persisted.tradeIntent).intentId)
+}
+
+private suspend fun assertFalsificationPersistedThroughGateway(
+    repository: me.matsumo.fukurou.trading.decision.DecisionRepository,
+    intentId: String,
+) {
+    val persisted = assertNotNull(repository.latestFalsification(UUID.fromString(intentId)).getOrThrow())
+
+    assertEquals(FalsificationVerdict.APPROVED, persisted.verdict)
+    assertEquals("codex", persisted.llmProvider)
+}
+
 private class GatewayFixture(
     val client: LlmDecisionSubmissionGatewayClient,
     private val gateway: me.matsumo.fukurou.trading.runner.LlmDecisionSubmissionGateway,
 ) : AutoCloseable {
+    fun semanticSubmissionState(): LlmSemanticSubmissionState = gateway.semanticSubmissionState()
+
     override fun close() {
         client.close()
         gateway.close()
@@ -2869,7 +2988,7 @@ private fun assertTerminalEvidenceTablePrivileges(statement: java.sql.Statement)
 }
 
 private fun requiredMatrixBootstrap(
-    container: PostgreSQLContainer<*>,
+    databaseConfig: TradingDatabaseConfig,
     clock: Clock,
     phase: LlmInvocationPhase,
 ): McpBootstrapConfig {
@@ -2889,15 +3008,15 @@ private fun requiredMatrixBootstrap(
         promptHash = "fixture-hash",
         systemPromptVersion = "fixture-system-prompt-v1",
         marketSnapshotId = "fixture-snapshot",
-        dbUrl = container.jdbcUrl,
-        dbUser = MCP_TEST_ROLE,
+        dbUrl = databaseConfig.url,
+        dbUser = databaseConfig.user,
         gmoPublicBaseUrl = "http://127.0.0.1:1",
         runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(TradingBotConfig()),
         totalToolCallLimit = 48,
         actToolCallLimit = 3,
     )
     val manifestBytes = kotlinx.serialization.json.Json.encodeToString(manifest).encodeToByteArray()
-    return McpLaunchBootstrap.decode(manifestBytes, MCP_TEST_PASSWORD.encodeToByteArray(), clock)
+    return McpLaunchBootstrap.decode(manifestBytes, databaseConfig.password.encodeToByteArray(), clock)
 }
 
 private fun assertForbiddenDml(container: PostgreSQLContainer<*>) {
