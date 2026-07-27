@@ -39,4 +39,4 @@
 - [x] 5.4 4-file旧artifact set→3-file新candidateと、3-file新artifact set→4-file旧candidateの両方向について、exact set + marker再生成なら検証が通り、混在setではfail-closedになるrollback manifest self-testを追加・実行する
 - [x] 5.5 `make test`、`make detekt`、`make build` を実行する
 - [x] 5.6 active source/docs 全体を `FUKUROU_MCP_DB_USER`、`DEFAULT_MCP_DATABASE_USER`、`fukurou_mcp`、`provision-fukurou-mcp-role`、`mcp-role.sql`、`mcp_role` で検索し、archived OpenSpec と意図した PR migration note 以外の残存を確認する
-- [ ] 5.7 PR 2 merge 後、次回runまたは手動操作で OpenSpec change を一度だけ archive する（このPRでは実行しない）
+- [x] 5.7 owner指示に従い、PR 2 の最終コミットで OpenSpec change を一度だけ archive する
