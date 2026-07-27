@@ -16,7 +16,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 
-/** MCP launcher が検証して FD 経由で bootstrap へ渡す非 secret manifest。 */
+/** manifest directory 経由で bootstrap へ渡す非 secret manifest。 */
 @Serializable
 data class McpLaunchManifest(
     val version: Int,
@@ -39,7 +39,6 @@ data class McpLaunchManifest(
     val effectiveInvocationHash: String = me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy.sha256(
         promptHash,
     ),
-    val toolSchemaHash: String = McpToolContractCatalog.canonicalSchemaHash(LlmInvocationPhase.valueOf(phase)),
     val submissionSocketPath: String = "/tmp/fukurou-submission.sock",
     val terminalEvidenceCaptureEnabled: Boolean = false,
 )
@@ -150,7 +149,6 @@ class McpLaunchManifestWriter(
             actToolCallLimit = actToolCallLimit,
             phaseManifestId = phaseManifestId,
             effectiveInvocationHash = effectiveInvocationHash,
-            toolSchemaHash = McpToolContractCatalog.canonicalSchemaHash(phase),
             submissionSocketPath = submissionSocketPath,
             terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
         )
@@ -192,7 +190,7 @@ data class McpLaunchCapability(
 )
 
 const val DEFAULT_MCP_MANIFEST_DIRECTORY = "/run/fukurou/mcp-manifests"
-const val MCP_MANIFEST_VERSION = 2
+const val MCP_MANIFEST_VERSION = 3
 private const val MANIFEST_ID_BYTES = 24
 private val SECURE_RANDOM = SecureRandom()
 private val MANIFEST_JSON = Json { encodeDefaults = true }

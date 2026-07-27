@@ -2155,27 +2155,52 @@ class McpLaunchBootstrapPolicyTest {
     }
 
     @Test
-    fun bothPhasesRejectUnknownTamperedExpiredEmptyAndBudgetExceed() {
+    fun bothPhasesRejectOperationalMistakes() {
         val clock = fixedClock()
         listOf(LlmInvocationPhase.PROPOSER, LlmInvocationPhase.FALSIFIER).forEach { phase ->
             val canonical = bootstrapManifest(phase, clock)
             assertNotNull(decodeBootstrap(canonical, clock))
             listOf(
+                canonical.copy(version = MCP_MANIFEST_VERSION - 1),
                 canonical.copy(phase = "UNKNOWN"),
-                canonical.copy(allowedTools = canonical.allowedTools + "place_order"),
-                canonical.copy(allowedTools = emptyList()),
                 canonical.copy(expiresAt = Instant.now(clock).minusSeconds(1).toString()),
                 canonical.copy(totalToolCallLimit = 49),
                 canonical.copy(actToolCallLimit = 4),
                 canonical.copy(totalToolCallLimit = 1, actToolCallLimit = 2),
                 canonical.copy(runtimeEnvironment = emptyMap()),
                 canonical.copy(runtimeEnvironment = canonical.runtimeEnvironment + ("UNKNOWN_RUNTIME_KEY" to "tampered")),
-                canonical.copy(systemPromptVersion = ""),
-                canonical.copy(decisionRunId = "different-decision-run"),
+                canonical.copy(submissionSocketPath = "relative/path.sock"),
+                canonical.copy(submissionSocketPath = "/tmp/not-a-socket.txt"),
+                canonical.copy(submissionSocketPath = ""),
             ).forEach { rejected ->
                 assertNotNull(runCatching { decodeBootstrap(rejected, clock) }.exceptionOrNull())
             }
         }
+    }
+
+    @Test
+    fun effectiveAllowlistComesFromCatalogNotManifestPayload() {
+        val clock = fixedClock()
+        listOf(LlmInvocationPhase.PROPOSER, LlmInvocationPhase.FALSIFIER).forEach { phase ->
+            val divergent = bootstrapManifest(phase, clock).copy(
+                allowedTools = listOf("place_order", "unknown_tool"),
+            )
+
+            val bootstrap = decodeBootstrap(divergent, clock)
+
+            assertEquals(McpToolContractCatalog.toolsFor(phase), bootstrap.allowedTools)
+        }
+    }
+
+    @Test
+    fun rejectedEmptyPasswordFailsBeforeServerStart() {
+        val clock = fixedClock()
+        val manifest = bootstrapManifest(LlmInvocationPhase.PROPOSER, clock)
+        val bytes = kotlinx.serialization.json.Json.encodeToString(manifest).encodeToByteArray()
+
+        assertNotNull(
+            runCatching { McpLaunchBootstrap.decode(bytes, "\n".encodeToByteArray(), clock) }.exceptionOrNull(),
+        )
     }
 
     @Test
