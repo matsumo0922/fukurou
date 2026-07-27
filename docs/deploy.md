@@ -796,36 +796,28 @@ sudo /usr/local/libexec/fukurou-deploy-db write-install-marker
 
 `write-install-marker`の成功により、rollback revisionの4-file artifact setとinstall markerの一致を確定する。markerを復元する前にrollback imageをdispatchしない。3-file helper/markerと4-file candidate、または異なるrevisionのhelper/SQLを混在させるとcandidate verificationはfail closedになる。
 
-`残存 dedicated role の owner cleanup` を実行済みなら、marker復元後かつrollback imageのdispatch前に、同じtemporary worktreeの`provision-fukurou-mcp-role`と`mcp-role.sql`で`fukurou_mcp` roleを再作成する。次の手順はPostgreSQL container内の既存superuser接続を使い、role passwordは既存のroot-only file `/srv/fukurou/secrets/fukurou_mcp_db_password`から渡す。password値をargv、log、shell historyへ展開しない。
+`残存 dedicated role の owner cleanup` を実行済みなら、marker復元後かつrollback imageのdispatch前に、同じtemporary worktreeの`provision-fukurou-mcp-role`と`mcp-role.sql`で`fukurou_mcp` roleを再作成する。次の手順はexact rollback script / SQLをPostgreSQL container内へstageした後、containerの既存`POSTGRES_PASSWORD`からtemporary password fileをcontainer内に生成し、同じ値をlocal socket接続の`PGPASSWORD`にも使う。production composeはrollback imageの`DB_PASSWORD`にも`POSTGRES_PASSWORD`を渡すため、再作成するrole passwordとrollback imageの接続passwordは一致する。password値をhost、argv、log、shell historyへ展開しない。
 
 ```bash
-mcp_password_file=/srv/fukurou/secrets/fukurou_mcp_db_password
-sudo test -f "${mcp_password_file}"
-sudo test ! -L "${mcp_password_file}"
-[[ "$(sudo stat -c '%u:%g:%a' "${mcp_password_file}")" == '0:0:400' ]]
-postgres_db="$(sudo awk -F= '$1 == "POSTGRES_DB" { sub(/^[^=]*=/, ""); print; exit }' /srv/fukurou/.env)"
-postgres_user="$(sudo awk -F= '$1 == "POSTGRES_USER" { sub(/^[^=]*=/, ""); print; exit }' /srv/fukurou/.env)"
-[[ -n "${postgres_db}" && -n "${postgres_user}" ]]
-
 role_stage="/tmp/fukurou-role-rollback-${rollback_sha}"
 sudo docker exec fukurou-postgres sh -ceu 'rm -rf "$1"; install -d -m 0700 "$1/sql"' sh "${role_stage}"
 sudo docker cp "${rollback_root}/scripts/deploy/provision-fukurou-mcp-role" "fukurou-postgres:${role_stage}/provision-fukurou-mcp-role"
 sudo docker cp "${rollback_root}/scripts/deploy/sql/mcp-role.sql" "fukurou-postgres:${role_stage}/sql/mcp-role.sql"
-sudo docker cp "${mcp_password_file}" "fukurou-postgres:${role_stage}/fukurou_mcp_db_password"
 sudo docker exec fukurou-postgres sh -ceu '
   stage=$1
-  shift
   trap '\''rm -rf "${stage}"'\'' EXIT
   chmod 0500 "${stage}/provision-fukurou-mcp-role"
-  chmod 0400 "${stage}/fukurou_mcp_db_password"
+  password_file="${stage}/role-password"
+  umask 077
+  printf %s "${POSTGRES_PASSWORD}" > "${password_file}"
+  chmod 0400 "${password_file}"
   export PGPASSWORD="${POSTGRES_PASSWORD}"
-  "${stage}/provision-fukurou-mcp-role" "$@"
-' sh \
-  "${role_stage}" \
-  "postgresql:///${postgres_db}?user=${postgres_user}" \
-  "${postgres_db}" \
-  "${postgres_user}" \
-  "${role_stage}/fukurou_mcp_db_password"
+  "${stage}/provision-fukurou-mcp-role" \
+    "postgresql:///${POSTGRES_DB}?user=${POSTGRES_USER}" \
+    "${POSTGRES_DB}" \
+    "${POSTGRES_USER}" \
+    "${password_file}"
+' sh "${role_stage}"
 ```
 
 cleanup前のrollbackではrole再作成を省略するが、artifact setとmarkerのexact復元は省略しない。marker復元と、必要な場合のrole再作成が成功した後にだけ、operator workstationからrollback imageをdispatchする。
