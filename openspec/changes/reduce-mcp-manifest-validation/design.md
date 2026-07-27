@@ -74,6 +74,7 @@ audit 経路の確認結果: `invocationId` / `decisionRunId` は decode 後に 
 - [manifest version 3 への bump を writer / 検証 / canary fixture のどこかで更新し忘れる] → `MCP_MANIFEST_VERSION` 定数は 1 箇所であり writer / decode 双方が参照している。grep で literal `2` のハードコードがないことを確認する。
 - [allowlist の正本を catalog に移した結果、manifest の `allowedTools` と MCP 実効 allowlist が乖離しても検出されない] → 乖離しても実効 allowlist は常に canonical であり、phase 別 tool 制限（LLM 行動制約）は catalog 側で維持される。renderer 側の allowlist は従来どおり `OneShotLlmRunner` が catalog から生成するため、乖離は fixture の手書き manifest でしか起きない。
 - [撤去した検証が実は防いでいた事故を見逃す] → 撤去対象はすべて「writer が生成時に強制している」「gateway が submission 時に照合している」「読み手が存在しない」のいずれかに該当することをこの設計で確認済み。迷う項目が実装中に見つかった場合は撤去せず残し、PR description に列挙する。
+- [phase identity 形式 require の撤去で fail closed のタイミングが後退する]（独立反証 F2）→ `bindPhaseIdentity` のバグで空/不正な phase identity が manifest に入った場合、従来は起動直後に失敗していたが、撤去後は submission 時の gateway 厳密照合（`LlmDecisionSubmissionGateway`）で初めて拒否され、tool call budget を消費してから失敗する。誤受理は起きず fail closed は維持されるため受容する。診断が必要になったら gateway の拒否メッセージが原因を示す。
 
 ## Migration Plan
 
