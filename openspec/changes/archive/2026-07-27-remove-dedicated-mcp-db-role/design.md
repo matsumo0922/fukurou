@@ -75,7 +75,7 @@ BEGIN; REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER; DROP OWNED BY fukurou_mcp;
 - **PR 1 — additive application-role regression coverage**: production 配線、専用 role provision、既存 role-boundary test は変更せず、application role で production bootstrap/server path の MCP tool matrix と submission gateway 永続化が成立する回帰シナリオを追加する。可能な限り既存 fixture/helper を共有し、専用の新 harness は作らない。この PR は本番挙動を変えず、cutover 後に残す coverage を先に確立する。
 - **PR 2 — atomic runtime/deploy/docs cutover**: `OneShotLlmRunner` と canary を `DB_USER` へ切り替え、compose / `.env.example` の env を削除する。同じ PR で provision script / SQL、Dockerfile・root deploy executor・DB helper の同期 payload entry、foundation GRANT、deploy contract/self-test の role fixture、旧 role-boundary assertion を削除し、PR 1 で追加した application-role matrix を正本として残す。docs と owner migration note もここで更新する。
 
-PR 1 後に既存 dedicated-role test を残すため、現行 production contract の coverage は弱まらない。PR 2 は本番 identity と deploy contract を一括で切り替えるため、stale な中間状態を作らない。OpenSpec change は PR 1 では archive せず、PR 2 完了後に一度だけ archive する。PR 2 を PR 1 branch に対する stacked PR とする場合は、PR 1 merge 後かつ base branch 削除前に PR 2 の base を `main` へ明示的に retarget する。
+PR 1 後に既存 dedicated-role test を残すため、現行 production contract の coverage は弱まらない。PR 2 は本番 identity と deploy contract を一括で切り替えるため、stale な中間状態を作らない。OpenSpec change は PR 1 では archiveせず、owner指示に従ってPR 2の最終コミットで一度だけarchiveする。PR 2 を PR 1 branch に対する stacked PR とする場合は、PR 1 merge 後かつ base branch 削除前に PR 2 の base を `main` へ明示的に retarget する。
 
 単一 PR は変更の原子性だけを見ると可能だが、約700行のテスト再編と deploy hidden dependency を含むため採用しない。3 PR 以上への細分化は runtime と deploy cleanup の不整合を招くため行わない。
 
@@ -83,9 +83,9 @@ PR 1 後に既存 dedicated-role test を残すため、現行 production contra
 
 PR 2 では DB helper marker の入力が4ファイルから3ファイルへ変わる。root-installed helper/marker が3-file contractのまま旧 imageを candidateにすると、旧 imageの4-file markerと一致せず `CANDIDATE_DB_HELPER_MARKER_MISMATCH` でcompose mutation前に停止する。roleを再provisionするだけでは rollback できない。
 
-rollback は旧 imageを起動する前に、rollback SHAから `deploy-fukurou`、`fukurou-deploy-db`、`deploy-foundation-v1.sql`、`deploy-foundation-v1-indexes.sql`、`mcp-role.sql` をexactにroot配置し、そのrevisionの `fukurou-deploy-db write-install-marker` で4-file markerを再生成する。その後に旧 image digestを `workflow_dispatch` でdeployする。owner migration noteを実行済みの場合は、同じrollback SHAの provision script / SQLで `fukurou_mcp` roleを再作成してから旧 imageを起動する。
+rollback は旧 imageを起動する前に、rollback SHAから `deploy-fukurou`、`fukurou-deploy-db`、`deploy-foundation-v1.sql`、`deploy-foundation-v1-indexes.sql`、`mcp-role.sql` をexactにroot配置し、そのrevisionの `fukurou-deploy-db write-install-marker` で4-file markerを再生成する。その後に旧 image digestを `workflow_dispatch` でdeployする。owner migration noteを実行済みの場合は、同じrollback SHAの provision script / SQLをPostgreSQL container内へstageし、containerの既存`POSTGRES_PASSWORD`から0400のtemporary role password fileを生成して旧provisionをlocal socketで実行してから旧 imageを起動する。production composeがrollback imageの`DB_PASSWORD`にも同じ`POSTGRES_PASSWORD`を渡すため、再作成するrole passwordとrollback imageの接続passwordは一致する。
 
-逆方向（4-file installed set → PR 2の3-file candidate）と rollback方向（3-file installed set →旧4-file candidate）の両方について、exact artifact setとmarkerを再配置すればcandidate verificationが通り、混在setではfail-closedになることをdeploy contract/self-testで検証する。rollback artifactの配置はroot operator作業であり自動化しない。
+逆方向（4-file installed set → PR 2の3-file candidate）と rollback方向（3-file installed set →旧4-file candidate）の両方について、exact artifact setとmarkerを再配置すればcandidate verificationが通り、混在setではfail-closedになることをdeploy contract/self-testで検証する。rollback contract testはmarker復元、必要なrole再作成、旧image dispatchの順序と、role passwordをhost上の専用fileではなくcontainer `POSTGRES_PASSWORD`から導出することも固定する。rollback artifactの配置はroot operator作業であり自動化しない。
 
 ## Risks / Trade-offs
 
@@ -106,8 +106,8 @@ rollback は旧 imageを起動する前に、rollback SHAから `deploy-fukurou`
 3. PR 2 を通常の production deploy で起動し、MCP 起動と既存 tool call が application role で成立することを既存監査・health 経路で確認する。
 4. disposable PostgreSQL の複数database fixtureで、cluster dependency preflight、transaction dry-runのrollback atomicity、final transactionのrole削除とownership保全を確認する。
 5. 安定確認後、owner が PR 2 description のmigration noteに従い、cluster preflight → dry-run transaction → final transactionの順でproduction roleを削除する。
-6. role削除前にrollbackする場合も、旧image起動前にrollback SHAのexecutor/helper/foundation/index/`mcp-role.sql`をexact配置し、旧helperで4-file markerを再生成する。role削除後はさらに旧provisionを同じSHAから再実行する。混在artifact setのままdeployしない。
-7. PR 1 では OpenSpec change を archive せず、PR 2 完了後に一度だけ archive する。
+6. role削除前にrollbackする場合も、旧image起動前にrollback SHAのexecutor/helper/foundation/index/`mcp-role.sql`をexact配置し、旧helperで4-file markerを再生成する。role削除後はさらに旧provisionを同じSHAから再実行し、role passwordはPostgreSQL containerの`POSTGRES_PASSWORD`から生成してrollback imageの`DB_PASSWORD`と一致させる。混在artifact setのままdeployしない。
+7. PR 1ではOpenSpec changeをarchiveせず、owner指示に従ってPR 2の最終コミットで一度だけarchiveする。
 
 ## Open Questions
 

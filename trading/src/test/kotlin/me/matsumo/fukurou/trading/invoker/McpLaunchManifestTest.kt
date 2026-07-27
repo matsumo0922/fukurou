@@ -77,7 +77,7 @@ class McpLaunchManifestTest {
                 ),
                 allowedTools = listOf("mcp__fukurou-mcp__submit_decision"),
                 databaseUrl = "jdbc:postgresql://postgres/fukurou",
-                databaseUser = "fukurou_mcp",
+                databaseUser = "fukurou",
                 gmoPublicBaseUrl = "http://127.0.0.1:1",
                 runtimeEnvironment = me.matsumo.fukurou.trading.config.RuntimeConfigCatalog.runtimeEnvironment(
                     me.matsumo.fukurou.trading.config.TradingBotConfig(),
@@ -107,7 +107,7 @@ class McpLaunchManifestTest {
             ),
             allowedTools = listOf("mcp__fukurou-mcp__submit_decision", "mcp__fukurou-mcp__get_balance"),
             databaseUrl = "jdbc:postgresql://postgres/fukurou",
-            databaseUser = "fukurou_mcp",
+            databaseUser = "fukurou",
             gmoPublicBaseUrl = "http://127.0.0.1:1",
             runtimeEnvironment = me.matsumo.fukurou.trading.config.RuntimeConfigCatalog.runtimeEnvironment(
                 me.matsumo.fukurou.trading.config.TradingBotConfig(),

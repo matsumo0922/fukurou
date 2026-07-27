@@ -109,20 +109,26 @@ class ReleaseDeployFoundationContractTest {
         val databaseHelper = Files.readString(root.resolve("scripts/deploy/fukurou-deploy-db"))
         val backup = Files.readString(root.resolve("scripts/backup/backup-fukurou"))
         val dockerfile = Files.readString(root.resolve("Dockerfile"))
+        val manifestVerifier = executor
+            .substringAfter("verify_db_helper_manifest() {")
+            .substringBefore("\n}\n")
 
-        listOf(
+        val expectedManifestPaths = sortedSetOf(
             "scripts/deploy/fukurou-deploy-db",
             "scripts/deploy/sql/deploy-foundation-v1-indexes.sql",
             "scripts/deploy/sql/deploy-foundation-v1.sql",
-            "scripts/deploy/sql/mcp-role.sql",
-        ).forEach { path ->
-            assertTrue(executor.contains(path))
-            assertTrue(databaseHelper.contains(path))
-        }
+        )
+        assertEquals(expectedManifestPaths, shellManifestPaths(executor))
+        assertEquals(expectedManifestPaths, shellManifestPaths(databaseHelper))
+        assertEquals(expectedManifestPaths, dockerManifestPaths(dockerfile))
+        assertFalse(executor.contains("mcp-role.sql"))
+        assertFalse(databaseHelper.contains("mcp-role.sql"))
+        assertFalse(dockerfile.contains("mcp-role.sql"))
         assertTrue(executor.contains("LC_ALL=C sort"))
         assertTrue(executor.contains("printf '%s\\0%s\\0'"))
         assertTrue(executor.contains("ROOT_DB_HELPER_INSTALLATION_CHANGED"))
         assertTrue(executor.contains("CANDIDATE_DB_HELPER_MARKER_MISMATCH"))
+        assertTrue(manifestVerifier.contains("verify_db_helper_manifest_digests"))
         assertTrue(databaseHelper.contains("write-install-marker"))
         assertTrue(databaseHelper.contains("sync -f \"\${marker_directory}\""))
         assertTrue(dockerfile.contains("FROM debian:bookworm-slim AS db-helper-manifest"))
@@ -169,6 +175,51 @@ class ReleaseDeployFoundationContractTest {
     }
 
     @Test
+    fun `rollback role reprovision derives the password from container state not a host file`() {
+        val deploy = Files.readString(root.resolve("docs/deploy.md"))
+        val compose = Files.readString(root.resolve("docker-compose.prod.yml"))
+        val rollbackSection = deploy
+            .substringAfter("### DB helper artifact set を伴う rollback")
+            .substringBefore("### schema migration 事故からの復旧")
+        val roleReprovisionBlock = rollbackSection
+            .substringAfter("`残存 dedicated role の owner cleanup` を実行済みなら")
+            .substringBefore("cleanup前のrollbackではrole再作成を省略するが")
+
+        assertFalse(roleReprovisionBlock.contains("/srv/fukurou/secrets/fukurou_mcp_db_password"))
+        assertFalse(roleReprovisionBlock.contains("mcp_password_file"))
+        assertTrue(roleReprovisionBlock.contains("umask 077"))
+        assertTrue(roleReprovisionBlock.contains("printf %s \"\${POSTGRES_PASSWORD}\" > \"\${password_file}\""))
+        assertTrue(roleReprovisionBlock.contains("chmod 0400 \"\${password_file}\""))
+        assertTrue(roleReprovisionBlock.contains("export PGPASSWORD=\"\${POSTGRES_PASSWORD}\""))
+        assertTrue(
+            roleReprovisionBlock.contains(
+                "production composeはrollback imageの`DB_PASSWORD`にも`POSTGRES_PASSWORD`を渡すため、" +
+                    "再作成するrole passwordとrollback imageの接続passwordは一致する。",
+            ),
+        )
+
+        val provisionCallStart = roleReprovisionBlock.indexOf("\"\${stage}/provision-fukurou-mcp-role\" \\")
+        val provisionCallEnd = roleReprovisionBlock.indexOf("' sh \"\${role_stage}\"", provisionCallStart)
+        assertTrue(provisionCallStart >= 0)
+        assertTrue(provisionCallStart < provisionCallEnd)
+        val provisionArgs = roleReprovisionBlock.substring(provisionCallStart, provisionCallEnd)
+        assertTrue(provisionArgs.contains("\"postgresql:///\${POSTGRES_DB}?user=\${POSTGRES_USER}\""))
+        assertTrue(provisionArgs.contains("\"\${POSTGRES_DB}\""))
+        assertTrue(provisionArgs.contains("\"\${POSTGRES_USER}\""))
+        assertTrue(provisionArgs.trimEnd().endsWith("\"\${password_file}\""))
+
+        val markerRestore = rollbackSection.indexOf("sudo /usr/local/libexec/fukurou-deploy-db write-install-marker")
+        val roleReprovisionStart = rollbackSection.indexOf("`残存 dedicated role の owner cleanup` を実行済みなら")
+        val imageDispatch = rollbackSection.indexOf("gh workflow run deploy.yml --ref main -f image_sha=")
+        assertTrue(markerRestore >= 0)
+        assertTrue(markerRestore < roleReprovisionStart)
+        assertTrue(roleReprovisionStart < imageDispatch)
+
+        assertTrue(compose.contains("DB_PASSWORD: \${POSTGRES_PASSWORD}"))
+        assertTrue(compose.contains("POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}"))
+    }
+
+    @Test
     fun `retired deploy artifacts are absent`() {
         listOf(
             "scripts/deploy/deploy-contract-selftest",
@@ -191,11 +242,31 @@ class ReleaseDeployFoundationContractTest {
             "scripts/runtime/validate-llm-launcher-probe.mjs",
             "scripts/mcp-credential-isolation-check",
             "scripts/mcp-credential-isolation-check-selftest",
+            "scripts/deploy/provision-fukurou-mcp-role",
+            "scripts/deploy/sql/mcp-role.sql",
             "fukurou/src/main/kotlin/me/matsumo/fukurou/LaunchFenceDatabaseProbeMain.kt",
         ).forEach { path -> assertFalse(Files.exists(root.resolve(path)), path) }
         assertTrue(Files.exists(root.resolve("scripts/runtime/fukurou-cli-canary-mcp.mjs")))
     }
 }
+
+private fun shellManifestPaths(source: String): Set<String> = source
+    .substringAfter("db_helper_manifest_entries() {")
+    .substringBefore("\n}\n")
+    .lineSequence()
+    .mapNotNull { line -> Regex("\"(scripts/deploy/[^\"]+)\"").find(line)?.groupValues?.get(1) }
+    .map(::normalizeRepositoryPath)
+    .toSortedSet()
+
+private fun dockerManifestPaths(source: String): Set<String> = source
+    .substringAfter("FROM debian:bookworm-slim AS db-helper-manifest")
+    .substringBefore("# ---- runtime stage")
+    .lineSequence()
+    .mapNotNull { line -> Regex("printf '%s\\\\n' (scripts/deploy/[^;]+);").find(line)?.groupValues?.get(1) }
+    .map(::normalizeRepositoryPath)
+    .toSortedSet()
+
+private fun normalizeRepositoryPath(path: String): String = Path.of(path).normalize().toString().replace('\\', '/')
 
 private fun repositoryRoot(): Path {
     var candidate = Path.of(System.getProperty("user.dir")).toAbsolutePath()

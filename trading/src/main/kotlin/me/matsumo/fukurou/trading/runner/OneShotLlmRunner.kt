@@ -2092,7 +2092,7 @@ private class OneShotLlmRequestFactory(
             context = context,
             allowedTools = allowedTools,
             databaseUrl = requireNotNull(parentEnvironment["DB_URL"]) { "DB_URL is required for MCP manifest." },
-            databaseUser = parentEnvironment["FUKUROU_MCP_DB_USER"] ?: DEFAULT_MCP_DATABASE_USER,
+            databaseUser = requireNotNull(parentEnvironment["DB_USER"]) { "DB_USER is required for MCP manifest." },
             gmoPublicBaseUrl = tradingConfig.gmoPublicClient.baseUrl,
             runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(tradingConfig),
             timeout = tradingConfig.runner.perRunTimeout,
@@ -2240,7 +2240,6 @@ const val DEFAULT_RUNNER_MCP_SERVER_COMMAND = "/usr/local/libexec/fukurou-mcp-ru
  * MCP jar path placeholder。
  */
 const val MCP_JAR_PATH_PLACEHOLDER = $$"${mcpJarPath}"
-private const val DEFAULT_MCP_DATABASE_USER = "fukurou_mcp"
 private const val FUKUROU_MCP_MANIFEST_DIRECTORY_ENV = "FUKUROU_MCP_MANIFEST_DIRECTORY"
 
 /**

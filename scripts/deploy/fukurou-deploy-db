@@ -5,10 +5,8 @@ readonly POSTGRES_CONTAINER="${FUKUROU_POSTGRES_CONTAINER:-fukurou-postgres}"
 readonly APPLICATION_CONTAINER="${FUKUROU_APPLICATION_CONTAINER:-fukurou-ktor}"
 readonly FOUNDATION_SQL="${FUKUROU_FOUNDATION_SQL:-/usr/local/share/fukurou/deploy-foundation-v1.sql}"
 readonly FOUNDATION_INDEX_SQL="${FUKUROU_FOUNDATION_INDEX_SQL:-/usr/local/share/fukurou/deploy-foundation-v1-indexes.sql}"
-readonly MCP_ROLE_SQL="${FUKUROU_MCP_ROLE_SQL:-/usr/local/share/fukurou/mcp-role.sql}"
 readonly DB_HELPER_SOURCE="${FUKUROU_DEPLOY_DB_HELPER_SOURCE:-$(readlink -f "${BASH_SOURCE[0]}")}"
 readonly DB_HELPER_MARKER="${FUKUROU_DB_HELPER_MARKER:-/usr/local/share/fukurou/db-helper-manifest.sha256}"
-readonly MCP_DATABASE_ROLE="${FUKUROU_MCP_DB_USER:-fukurou_mcp}"
 
 fail() { echo "fukurou-deploy-db: $*" >&2; exit 1; }
 require_root() { [[ "$(id -u)" == "0" ]] || fail "root is required"; }
@@ -68,8 +66,7 @@ db_helper_manifest_entries() {
   printf '%s\t%s\n' \
     "scripts/deploy/fukurou-deploy-db" "${DB_HELPER_SOURCE}" \
     "scripts/deploy/sql/deploy-foundation-v1-indexes.sql" "${FOUNDATION_INDEX_SQL}" \
-    "scripts/deploy/sql/deploy-foundation-v1.sql" "${FOUNDATION_SQL}" \
-    "scripts/deploy/sql/mcp-role.sql" "${MCP_ROLE_SQL}" |
+    "scripts/deploy/sql/deploy-foundation-v1.sql" "${FOUNDATION_SQL}" |
     LC_ALL=C sort
 }
 
@@ -101,8 +98,7 @@ write_install_marker() {
 
 install_foundation() {
   [[ -f "${FOUNDATION_SQL}" ]] || fail "foundation migration is missing"
-  local mcp_role; mcp_role="$(application_value FUKUROU_MCP_DB_USER)"; [[ -n "${mcp_role}" ]] || mcp_role="${MCP_DATABASE_ROLE}"
-  psql_exec_with_timeout 60 --set=mcp_role="${mcp_role}" < "${FOUNDATION_SQL}"
+  psql_exec_with_timeout 60 < "${FOUNDATION_SQL}"
 }
 install_indexes() {
   [[ -f "${FOUNDATION_INDEX_SQL}" ]] || fail "foundation index migration is missing"

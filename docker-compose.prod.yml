@@ -35,7 +35,6 @@ services:
       FUKUROU_GMO_PUBLIC_WEBSOCKET_URL: ${FUKUROU_GMO_PUBLIC_WEBSOCKET_URL:-wss://api.coin.z.com/ws/public/v1}
       FUKUROU_OBSIDIAN_VAULT_PATH: ${FUKUROU_OBSIDIAN_VAULT_PATH:-/vault}
       FUKUROU_MCP_JAR_PATH: /app/fukurou-mcp-all.jar
-      FUKUROU_MCP_DB_USER: ${FUKUROU_MCP_DB_USER:-fukurou_mcp}
       FUKUROU_MCP_MANIFEST_DIRECTORY: /run/fukurou/mcp-manifests
       FUKUROU_MCP_SERVER_NAME: ${FUKUROU_MCP_SERVER_NAME:-fukurou-mcp}
       FUKUROU_MCP_SERVER_COMMAND: /usr/local/libexec/fukurou-mcp-run

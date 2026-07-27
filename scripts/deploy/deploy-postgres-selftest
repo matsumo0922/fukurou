@@ -6,9 +6,11 @@ readonly CONTAINER="fukurou-deploy-postgres-selftest-$$"
 readonly DATABASE="fukurou"
 readonly USER="fukurou"
 readonly PASSWORD="fixture-password"
+TIMEOUT_SHIM_ROOT=""
 
 cleanup() {
   docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  [[ -z "${TIMEOUT_SHIM_ROOT}" ]] || rm -rf "${TIMEOUT_SHIM_ROOT}"
 }
 trap cleanup EXIT
 
@@ -37,10 +39,38 @@ export FUKUROU_POSTGRES_CONTAINER="${CONTAINER}"
 export FUKUROU_APPLICATION_CONTAINER="${CONTAINER}-absent"
 export FUKUROU_FOUNDATION_SQL="${ROOT}/scripts/deploy/sql/deploy-foundation-v1.sql"
 export FUKUROU_FOUNDATION_INDEX_SQL="${ROOT}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql"
-export FUKUROU_MCP_DB_USER=fukurou_mcp
+
+if ! command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_SHIM_ROOT="$(mktemp -d)"
+  cat >"${TIMEOUT_SHIM_ROOT}/timeout" <<'SH'
+#!/bin/sh
+while [ "${1#--}" != "$1" ]; do shift; done
+shift
+exec "$@"
+SH
+  chmod +x "${TIMEOUT_SHIM_ROOT}/timeout"
+  export PATH="${TIMEOUT_SHIM_ROOT}:${PATH}"
+fi
 
 # shellcheck source=fukurou-deploy-db
 source "${ROOT}/scripts/deploy/fukurou-deploy-db"
+
+psql_database_exec() {
+  local database="$1"
+  shift
+  docker exec -i "${CONTAINER}" psql -X -v ON_ERROR_STOP=1 -U "${USER}" -d "${database}" "$@"
+}
+
+role_dependency_preflight() {
+  psql_exec -At <<'SQL'
+SELECT COALESCE(database.datname, '<shared>') || ':' || dependency.deptype::text
+FROM pg_shdepend dependency
+LEFT JOIN pg_database database ON database.oid = dependency.dbid
+WHERE dependency.refclassid = 'pg_authid'::regclass
+  AND dependency.refobjid = (SELECT oid FROM pg_roles WHERE rolname = 'fukurou_mcp')
+ORDER BY 1;
+SQL
+}
 
 assert_equal() {
   local label="$1" expected="$2" actual="$3"
@@ -57,7 +87,6 @@ pre_foundation_snapshot="$(snapshot)"
 [[ "$(jq -r '.pidRegistrations.total' <<<"${pre_foundation_snapshot}")" == 0 ]]
 
 psql_exec <<'SQL'
-CREATE ROLE fukurou_mcp;
 CREATE TABLE positions (mode text, status text, account_epoch_id uuid, closed_at timestamptz, opened_at timestamptz, id uuid);
 CREATE TABLE orders (created_at timestamptz, updated_at timestamptz, decision_run_id uuid, intent_id uuid, id uuid);
 CREATE TABLE executions (executed_at timestamptz, position_id uuid, order_id uuid, decision_run_id uuid, id uuid);
@@ -159,4 +188,60 @@ runtime_snapshot="$(snapshot)"
 [[ "$(jq -r '.preFilterActive' <<<"${runtime_snapshot}")" == false ]]
 [[ "$(jq -r '.maintenance.enabled' <<<"${runtime_snapshot}")" == true ]]
 
-echo "DEPLOY_POSTGRES_SELFTEST_OK postgres=16 snapshots=pre-foundation,foundation,runtime-config maintenance=false-to-true gap=open-to-close launches=count-interrupt terminal-cleanup=bounded indexes=idempotent"
+psql_exec -c "CREATE ROLE fukurou_mcp LOGIN PASSWORD 'fixture-role-password'"
+psql_exec -c "CREATE DATABASE fukurou_aux"
+psql_exec <<'SQL'
+CREATE TABLE mcp_cleanup_owned (id bigint PRIMARY KEY);
+ALTER TABLE mcp_cleanup_owned OWNER TO fukurou_mcp;
+GRANT CONNECT ON DATABASE fukurou TO fukurou_mcp;
+SQL
+psql_database_exec fukurou_aux <<'SQL'
+CREATE TABLE mcp_cleanup_aux_owned (id bigint PRIMARY KEY);
+ALTER TABLE mcp_cleanup_aux_owned OWNER TO fukurou_mcp;
+GRANT CONNECT ON DATABASE fukurou_aux TO fukurou_mcp;
+SQL
+
+dependency_snapshot="$(role_dependency_preflight)"
+grep -Fq 'fukurou:' <<<"${dependency_snapshot}"
+grep -Fq 'fukurou_aux:' <<<"${dependency_snapshot}"
+assert_equal cleanup-active-session-count 0 \
+  "$(psql_exec -Atc "SELECT COUNT(*) FROM pg_stat_activity WHERE usename='fukurou_mcp'")"
+
+if psql_exec >/dev/null 2>&1 <<'SQL'
+BEGIN;
+REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER;
+DROP OWNED BY fukurou_mcp;
+DROP ROLE fukurou_mcp;
+ROLLBACK;
+SQL
+then
+  echo "deploy-postgres-selftest: cross-database dependency did not fail the dry-run transaction" >&2
+  exit 1
+fi
+assert_equal dry-run-rollback-owner fukurou_mcp \
+  "$(psql_exec -Atc "SELECT tableowner FROM pg_tables WHERE tablename='mcp_cleanup_owned'")"
+assert_equal dry-run-rollback-role 1 \
+  "$(psql_exec -Atc "SELECT COUNT(*) FROM pg_roles WHERE rolname='fukurou_mcp'")"
+
+psql_database_exec fukurou_aux >/dev/null <<'SQL'
+BEGIN;
+REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER;
+DROP OWNED BY fukurou_mcp;
+COMMIT;
+SQL
+! role_dependency_preflight | grep -Fq 'fukurou_aux:'
+psql_exec >/dev/null <<'SQL'
+BEGIN;
+REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER;
+DROP OWNED BY fukurou_mcp;
+DROP ROLE fukurou_mcp;
+COMMIT;
+SQL
+assert_equal final-role-count 0 \
+  "$(psql_exec -Atc "SELECT COUNT(*) FROM pg_roles WHERE rolname='fukurou_mcp'")"
+assert_equal final-application-owner fukurou \
+  "$(psql_exec -Atc "SELECT tableowner FROM pg_tables WHERE tablename='mcp_cleanup_owned'")"
+assert_equal final-auxiliary-owner fukurou \
+  "$(psql_database_exec fukurou_aux -Atc "SELECT tableowner FROM pg_tables WHERE tablename='mcp_cleanup_aux_owned'")"
+
+echo "DEPLOY_POSTGRES_SELFTEST_OK postgres=16 snapshots=pre-foundation,foundation,runtime-config maintenance=false-to-true gap=open-to-close launches=count-interrupt terminal-cleanup=bounded indexes=idempotent role-cleanup=preflight-dry-run-final"

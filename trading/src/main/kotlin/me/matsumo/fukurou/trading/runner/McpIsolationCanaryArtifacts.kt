@@ -200,7 +200,7 @@ private fun generateArtifacts(
         context = context,
         allowedTools = shortTools.toList(),
         databaseUrl = requireNotNull(System.getenv("DB_URL")),
-        databaseUser = requireNotNull(System.getenv("FUKUROU_MCP_DB_USER")),
+        databaseUser = requireNotNull(System.getenv("DB_USER")),
         gmoPublicBaseUrl = requireNotNull(System.getenv("FUKUROU_GMO_PUBLIC_BASE_URL")),
         runtimeEnvironment = RuntimeConfigCatalog.runtimeEnvironment(config),
         timeout = Duration.ofMinutes(5),

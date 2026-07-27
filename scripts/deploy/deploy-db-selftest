@@ -2,23 +2,149 @@
 set -Eeuo pipefail
 
 readonly SELFTEST_ROOT="$(mktemp -d)"
+readonly DEPLOY_EXECUTOR="$(dirname "$0")/deploy-fukurou"
 trap 'rm -rf "${SELFTEST_ROOT}"' EXIT
-touch "${SELFTEST_ROOT}/foundation.sql" "${SELFTEST_ROOT}/indexes.sql" "${SELFTEST_ROOT}/mcp-role.sql"
-export FUKUROU_FOUNDATION_SQL="${SELFTEST_ROOT}/foundation.sql"
-export FUKUROU_FOUNDATION_INDEX_SQL="${SELFTEST_ROOT}/indexes.sql"
-export FUKUROU_MCP_ROLE_SQL="${SELFTEST_ROOT}/mcp-role.sql"
-export FUKUROU_DEPLOY_DB_HELPER_SOURCE="$(dirname "$0")/fukurou-deploy-db"
-export FUKUROU_MCP_DB_USER=fukurou_mcp_fixture
+
+readonly INSTALLED_ROOT="${SELFTEST_ROOT}/installed"
+readonly NEW_SOURCE_ROOT="${SELFTEST_ROOT}/new-source"
+readonly OLD_SOURCE_ROOT="${SELFTEST_ROOT}/old-source"
+mkdir -p "${INSTALLED_ROOT}" "${NEW_SOURCE_ROOT}" "${OLD_SOURCE_ROOT}"
+printf 'new foundation\n' >"${NEW_SOURCE_ROOT}/foundation.sql"
+printf 'new indexes\n' >"${NEW_SOURCE_ROOT}/indexes.sql"
+cp "$(dirname "$0")/fukurou-deploy-db" "${NEW_SOURCE_ROOT}/fukurou-deploy-db"
+printf 'old helper\n' >"${OLD_SOURCE_ROOT}/fukurou-deploy-db"
+printf 'old foundation\n' >"${OLD_SOURCE_ROOT}/foundation.sql"
+printf 'old indexes\n' >"${OLD_SOURCE_ROOT}/indexes.sql"
+printf 'old role\n' >"${OLD_SOURCE_ROOT}/mcp-role.sql"
+
+export FUKUROU_FOUNDATION_SQL="${INSTALLED_ROOT}/foundation.sql"
+export FUKUROU_FOUNDATION_INDEX_SQL="${INSTALLED_ROOT}/indexes.sql"
+export FUKUROU_DEPLOY_DB_HELPER_SOURCE="${INSTALLED_ROOT}/fukurou-deploy-db"
+export FUKUROU_DB_HELPER_MARKER="${SELFTEST_ROOT}/installed-marker.sha256"
+
+install_new_artifact_set() {
+  cp "${NEW_SOURCE_ROOT}/fukurou-deploy-db" "${FUKUROU_DEPLOY_DB_HELPER_SOURCE}"
+  cp "${NEW_SOURCE_ROOT}/foundation.sql" "${FUKUROU_FOUNDATION_SQL}"
+  cp "${NEW_SOURCE_ROOT}/indexes.sql" "${FUKUROU_FOUNDATION_INDEX_SQL}"
+  rm -f "${INSTALLED_ROOT}/mcp-role.sql"
+}
+
+install_old_artifact_set() {
+  cp "${OLD_SOURCE_ROOT}/fukurou-deploy-db" "${FUKUROU_DEPLOY_DB_HELPER_SOURCE}"
+  cp "${OLD_SOURCE_ROOT}/foundation.sql" "${FUKUROU_FOUNDATION_SQL}"
+  cp "${OLD_SOURCE_ROOT}/indexes.sql" "${FUKUROU_FOUNDATION_INDEX_SQL}"
+  cp "${OLD_SOURCE_ROOT}/mcp-role.sql" "${INSTALLED_ROOT}/mcp-role.sql"
+}
+
+manifest_digest() {
+  local relative_path installed_path content_hash
+  while IFS=$'\t' read -r relative_path installed_path; do
+    content_hash="$(sha256sum "${installed_path}" | awk '{print $1}')"
+    printf '%s\0%s\0' "${relative_path}" "${content_hash}"
+  done | sha256sum | awk '{print $1}'
+}
+
+calculate_old_manifest() {
+  printf '%s\t%s\n' \
+    scripts/deploy/fukurou-deploy-db "${FUKUROU_DEPLOY_DB_HELPER_SOURCE}" \
+    scripts/deploy/sql/deploy-foundation-v1-indexes.sql "${FUKUROU_FOUNDATION_INDEX_SQL}" \
+    scripts/deploy/sql/deploy-foundation-v1.sql "${FUKUROU_FOUNDATION_SQL}" \
+    scripts/deploy/sql/mcp-role.sql "${INSTALLED_ROOT}/mcp-role.sql" |
+    LC_ALL=C sort |
+    manifest_digest
+}
+
+write_fixture_marker() {
+  rm -f "$2"
+  printf '%s\n' "$1" >"$2"
+}
+
+production_manifest_verifier_accepts() {
+  local installed_actual="$1" installed_marker="$2" candidate_marker="$3"
+  bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    installed_recorded="$(tr -d "\n" <"$3")"
+    candidate_expected="$(tr -d "\n" <"$4")"
+    verify_db_helper_manifest_digests "$2" "${installed_recorded}" "${candidate_expected}"
+  ' _ "${DEPLOY_EXECUTOR}" "${installed_actual}" "${installed_marker}" "${candidate_marker}"
+}
+
+assert_manifest_accepts() {
+  local label="$1"
+  shift
+  production_manifest_verifier_accepts "$@" || {
+    echo "${label}: production verifier unexpectedly rejected the manifest transition" >&2
+    exit 1
+  }
+}
+
+assert_manifest_rejects() {
+  local label="$1"
+  shift
+  if production_manifest_verifier_accepts "$@" >/dev/null 2>&1; then
+    echo "${label}: production verifier unexpectedly accepted the manifest transition" >&2
+    exit 1
+  fi
+}
+
+install_new_artifact_set
 
 # shellcheck source=fukurou-deploy-db
 source "$(dirname "$0")/fukurou-deploy-db"
 grep -Fq 'command timeout --foreground --signal=TERM --kill-after=5' < <(declare -f psql_exec_impl)
 
-initial_manifest="$(calculate_db_helper_manifest)"
-[[ "${initial_manifest}" =~ ^[0-9a-f]{64}$ ]]
-[[ "$(calculate_db_helper_manifest)" == "${initial_manifest}" ]]
-printf 'changed\n' >"${SELFTEST_ROOT}/mcp-role.sql"
-[[ "$(calculate_db_helper_manifest)" != "${initial_manifest}" ]]
+new_manifest="$(calculate_db_helper_manifest)"
+[[ "${new_manifest}" =~ ^[0-9a-f]{64}$ ]]
+[[ "$(calculate_db_helper_manifest)" == "${new_manifest}" ]]
+printf 'changed\n' >"${FUKUROU_FOUNDATION_SQL}"
+[[ "$(calculate_db_helper_manifest)" != "${new_manifest}" ]]
+cp "${NEW_SOURCE_ROOT}/foundation.sql" "${FUKUROU_FOUNDATION_SQL}"
+write_fixture_marker "${new_manifest}" "${SELFTEST_ROOT}/new-candidate-marker.sha256"
+
+install_old_artifact_set
+old_manifest="$(calculate_old_manifest)"
+write_fixture_marker "${old_manifest}" "${SELFTEST_ROOT}/old-installed-marker.sha256"
+write_fixture_marker "${old_manifest}" "${SELFTEST_ROOT}/old-candidate-marker.sha256"
+assert_manifest_rejects \
+  MK-PRE-4TO3 \
+  "${old_manifest}" \
+  "${SELFTEST_ROOT}/old-installed-marker.sha256" \
+  "${SELFTEST_ROOT}/new-candidate-marker.sha256"
+
+install_new_artifact_set
+chown() { :; }
+chmod() { :; }
+sync() { :; }
+write_install_marker
+unset -f chown chmod sync
+assert_manifest_accepts \
+  MK-EXACT-4TO3 \
+  "$(calculate_db_helper_manifest)" \
+  "${FUKUROU_DB_HELPER_MARKER}" \
+  "${SELFTEST_ROOT}/new-candidate-marker.sha256"
+assert_manifest_rejects \
+  MK-PRE-3TO4 \
+  "$(calculate_db_helper_manifest)" \
+  "${FUKUROU_DB_HELPER_MARKER}" \
+  "${SELFTEST_ROOT}/old-candidate-marker.sha256"
+
+install_old_artifact_set
+old_manifest="$(calculate_old_manifest)"
+write_fixture_marker "${old_manifest}" "${FUKUROU_DB_HELPER_MARKER}"
+assert_manifest_accepts \
+  MK-EXACT-3TO4 \
+  "${old_manifest}" \
+  "${FUKUROU_DB_HELPER_MARKER}" \
+  "${SELFTEST_ROOT}/old-candidate-marker.sha256"
+
+cp "${NEW_SOURCE_ROOT}/foundation.sql" "${FUKUROU_FOUNDATION_SQL}"
+mixed_manifest="$(calculate_old_manifest)"
+assert_manifest_rejects \
+  MK-MIXED \
+  "${mixed_manifest}" \
+  "${FUKUROU_DB_HELPER_MARKER}" \
+  "${SELFTEST_ROOT}/old-candidate-marker.sha256"
 
 MODE=PRE_FOUNDATION
 LAST_PSQL_ARGS="${SELFTEST_ROOT}/psql-args"
@@ -60,9 +186,8 @@ psql_exec_with_timeout() {
   psql_exec "$@"
 }
 
-[[ -z "$(application_value FUKUROU_MCP_DB_USER)" ]]
 install_foundation >/dev/null
-grep -Fq -- '--set=mcp_role=fukurou_mcp_fixture' "${LAST_PSQL_ARGS}"
+! grep -Fq -- '--set=mcp_role=' "${LAST_PSQL_ARGS}"
 grep -Fxq -- '60' "${LAST_PSQL_TIMEOUT}"
 install_indexes >/dev/null
 grep -Fxq -- '300' "${LAST_PSQL_TIMEOUT}"
@@ -84,4 +209,4 @@ runtime_snapshot="$(snapshot)"
 grep -Fq "c.relkind::text" "${LAST_SNAPSHOT_QUERY}"
 grep -Fxq -- '-Atq' "${LAST_PSQL_ARGS}"
 
-echo "DEPLOY_DB_SELFTEST_OK application=absent fallback-role=exact manifest=deterministic-change-sensitive snapshots=pre-foundation,foundation-v1,runtime-config"
+echo "DEPLOY_DB_SELFTEST_OK markers=MK-PRE-4TO3,MK-EXACT-4TO3,MK-PRE-3TO4,MK-EXACT-3TO4,MK-MIXED snapshots=pre-foundation,foundation-v1,runtime-config"

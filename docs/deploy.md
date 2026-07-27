@@ -88,7 +88,7 @@ LLM daemon / Obsidian Writer の有効化、Claude Code / Codex の container lo
 
 `llm_launch_reservations` の execution claim migration は nullable な state / token / claimed / heartbeat の4列と、CLAIMED recovery用・non-CLAIMED active判定用の2つのpartial indexだけをadditiveに追加し、既存rowをbackfillしない。bootstrapのschema verification、旧generation recovery、startup recovery audit、periodic DB scanのいずれかが失敗したcontainerはreadyにならず、daemon / manual / direct admissionからchildを開始しない。CLAIMED bootstrap recoveryはsingle-instanceの旧container/process generation終了を確認したstop/startだけで有効になり、rolling coexistence中には実行しない。rollbackでも列とindexを削除しない。旧binaryへ戻す前にglobal launch gateをOFFにし、evaluation / reflectionをdrainして、RUNNING reservation、RUNNING `llm_runs`、direct runner、未解決claimがすべて0であることを確認する。旧binaryではone-shot claim invariantを有効と扱わない。
 
-terminal evidence captureはcode-owned schema version 1を正本とする。cutover後はactivation boundaryが1 rowだけ存在し、exact-image canaryが完全bundleのevidence / link / coverage graph、phase所属、連続ordinal、MCP roleのwrite拒否を通過することを確認する。旧imageへrollbackする場合はLLM launch gateをOFFにしてactive runをdrainしてから切り替え、post-boundary rowを削除・再尺度化・backfillしない。14日coverageとmaintenance failureの運用観測はstage-out判定の入力であり、必要期間が経過するまでは達成済みとして扱わない。
+terminal evidence captureはcode-owned schema version 1を正本とする。cutover後はactivation boundaryが1 rowだけ存在し、exact-image canaryが完全bundleのevidence / link / coverage graph、phase所属、連続ordinalを通過することを確認する。旧imageへrollbackする場合はLLM launch gateをOFFにしてactive runをdrainしてから切り替え、post-boundary rowを削除・再尺度化・backfillしない。14日coverageとmaintenance failureの運用観測はstage-out判定の入力であり、必要期間が経過するまでは達成済みとして扱わない。
 
 GMO maintenance availability gate は runtime key と schema を追加しない。rollback 対象時刻が土曜日 09:00〜11:00 JST、公式 status が `OPEN` 以外、または status を確認できない場合は、先に `daemon.enabled=false` を active 化して restart し、scheduler worker が停止した状態を維持する。修正版へ戻すか、定期窓外かつ公式 status `OPEN` を確認するまで daemon を再開しない。ProtectionReconciler は別 worker のまま継続する。runtime config 操作の許可がない場合は rollback せず availability gate を維持する。
 
@@ -145,7 +145,7 @@ sudo docker pull ghcr.io/matsumo0922/fukurou:<commit-sha>
 
 ## deploy script と sudoers
 
-`deploy-fukurou`、`fukurou-deploy-db`、migration SQL は同じ reviewed SHA から root-owned path へ同時に配置する。DB helper marker は `fukurou-deploy-db` と `scripts/deploy/sql/**/*.sql` を repository 相対 path で `LC_ALL=C` sort し、各 file の `path + NUL + sha256(content) + NUL` を連結した manifest 全体の SHA-256 である。helper の `write-install-marker` は root-installed 実 file から marker を再計算し、atomic rename で記録する。
+`deploy-fukurou`、`fukurou-deploy-db`、foundation/index SQL は同じ reviewed SHA から root-owned path へ同時に配置する。DB helper marker は `fukurou-deploy-db`、`deploy-foundation-v1.sql`、`deploy-foundation-v1-indexes.sql` の固定3ファイルを repository 相対 path で `LC_ALL=C` sort し、各 file の `path + NUL + sha256(content) + NUL` を連結した manifest 全体の SHA-256 である。helper の `write-install-marker` は root-installed 実 file から marker を再計算し、atomic rename で記録する。
 
 ```sh
 sudo install -d -o root -g root -m 0755 /usr/local/share/fukurou
@@ -153,7 +153,6 @@ sudo install -m 0755 /srv/fukurou/repo/scripts/deploy/deploy-fukurou /usr/local/
 sudo install -m 0755 /srv/fukurou/repo/scripts/deploy/fukurou-deploy-db /usr/local/libexec/fukurou-deploy-db
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1.sql /usr/local/share/fukurou/deploy-foundation-v1.sql
 sudo install -m 0644 /srv/fukurou/repo/scripts/deploy/sql/deploy-foundation-v1-indexes.sql /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
-sudo install -m 0444 /srv/fukurou/repo/scripts/deploy/sql/mcp-role.sql /usr/local/share/fukurou/mcp-role.sql
 sudo /usr/local/libexec/fukurou-deploy-db write-install-marker
 sudo stat -c '%U:%G:%a %n' \
   /usr/local/sbin/deploy-fukurou \
@@ -204,7 +203,7 @@ history の移動は、全 entry が terminal であることを確認した roo
 ### 本 PR merge 後・NAS 配置時チェックリスト
 
 1. merge commit の exact SHA を `/srv/fukurou/repo` へ fetch する。
-2. 同じ SHA から新 executor、DB helper、foundation/index SQL、`mcp-role.sql` を連続して配置する。
+2. 同じ SHA から executor、DB helper、foundation/index SQL を連続して配置する。
 3. `/usr/local/libexec/fukurou-deploy-db write-install-marker` を実行する。
 4. `bash -n /usr/local/sbin/deploy-fukurou` と marker metadata を確認する。
 5. `/srv/fukurou/deploy/.legacy-drain-confirmed` が存在し、legacy active path が空であることを確認する。
@@ -494,13 +493,53 @@ scripts/prod-curl "/ops/runtime-config/drafts/${draft_id}/activate" \
 scripts/prod-curl /ops/runtime-config
 ```
 
-## MCP DB role
+## MCP database identity
 
-`fukurou_mcp` role は least-privilege で、MCP subprocess は既存 app env の `DB_PASSWORD` をそのまま使って接続する（`OneShotLlmRunner` が literal env として MCP subprocess の config にだけ埋め込み、CLI 本体には渡さない。`docs/mcp-runtime.md` 参照）。role の `rolsuper`、`rolcreatedb`、`rolcreaterole`、`rolreplication`、`rolbypassrls` はすべて false、membership と object ownership は 0 であることを確認する。MCP の evaluation scope は `mcp_current_evaluation_scope` と `mcp_evaluation_epochs` view から account epoch、3つのbaseline、epoch kind、作成時刻だけを読み、secretを含み得る `runtime_config_versions` / `runtime_config_values` や `paper_account_epochs` への直接SELECTは許可しない。`llm_launch_reservations`、`equity_snapshots` と ledger の UPDATE/DELETE/TRUNCATE も拒否される。必要 call の permission failure は role SQL と inventory を修正して disposable test からやり直す。
+MCP subprocess は Ktor service と同じ application role（compose の `DB_USER=${POSTGRES_USER}`）で PostgreSQL へ接続する。`OneShotLlmRunner` は manifest の `dbUser` に `DB_USER` を記録し、`DB_PASSWORD` は MCP subprocess の server-local literal env にだけ渡す。CLI process 本体の env/config/session には DB password を渡さない。decision と falsification の production write path は application role の権限ではなく、owner-only Unix socket上の `LlmDecisionSubmissionGateway` が validation とtransactional persistenceを担う境界を正本とする。
 
-**移行時の注意**: `fukurou_mcp` role のパスワードが `POSTGRES_PASSWORD`（＝ `DB_PASSWORD`）と異なる値で provision 済みの場合、この変更を deploy すると MCP subprocess の DB 接続が認証失敗する。deploy 前に `ALTER ROLE fukurou_mcp WITH PASSWORD '<POSTGRES_PASSWORD と同じ値>';` を実行し、role のパスワードを揃えておく。
+`McpApplicationDatabaseRoleIntegrationTest` は disposable PostgreSQL の application role で production bootstrap/server path を起動し、Proposer/Falsifier union の16 required call、gateway の `COMMITTED`、decision/falsification repository persistenceを検証する。
 
-merge 前の自動証跡は `McpDatabaseRoleIntegrationTest` の role/effective privilege/required-call matrix を含む。
+### 残存 dedicated role の owner cleanup
+
+application deploy は残存 `fukurou_mcp` role を自動削除しない。新imageのMCP起動とtool callが安定していることをownerが確認した後に、次のcluster preflight、dry-run、final transactionを手動で実行する。別database dependencyまたはactive sessionが1件でもあれば、DBを変更せず停止して依存元を個別に調査する。
+
+```sql
+SELECT COALESCE(database.datname, '<shared>') AS database_name,
+       dependency.deptype AS dependency_type,
+       dependency.classid::regclass AS catalog,
+       dependency.objid
+FROM pg_shdepend dependency
+LEFT JOIN pg_database database ON database.oid = dependency.dbid
+WHERE dependency.refclassid = 'pg_authid'::regclass
+  AND dependency.refobjid = (SELECT oid FROM pg_roles WHERE rolname = 'fukurou_mcp')
+ORDER BY database_name, dependency_type, catalog::text, dependency.objid;
+
+SELECT pid, datname, application_name, state
+FROM pg_stat_activity
+WHERE usename = 'fukurou_mcp';
+```
+
+`pg_shdepend` の結果がapplication databaseと想定済みshared database privilegeだけで、active sessionが0件であることを確認する。application databaseで最終操作と同じtransactionを `ROLLBACK` 終端で実行し、cluster-wideな `DROP ROLE` 検査を含むdry-runを行う。
+
+```sql
+BEGIN;
+REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER;
+DROP OWNED BY fukurou_mcp;
+DROP ROLE fukurou_mcp;
+ROLLBACK;
+```
+
+成功後、同じ操作を `COMMIT` 終端で実行する。
+
+```sql
+BEGIN;
+REASSIGN OWNED BY fukurou_mcp TO CURRENT_USER;
+DROP OWNED BY fukurou_mcp;
+DROP ROLE fukurou_mcp;
+COMMIT;
+```
+
+`REASSIGN OWNED` は想定外の所有objectをapplication roleへ保全し、`DROP OWNED` はapplication databaseとshared objectのACL dependencyを除去する。単一transactionのため、他database dependencyなどで `DROP ROLE` が失敗してもownership/ACL変更は残らない。このcleanupをdeploy script、Flyway migration、startup hookから実行しない。旧imageへのrollbackに必要なroleを暗黙に失わせず、DB権限変更の適用時期をownerが明示的に決めるためである。
 
 ## PostgreSQL backup / restore
 
@@ -692,7 +731,7 @@ tagのAND predicateはcomma-separatedの単一`--tag`を使う。複数の`--tag
 
 このrepositoryのcommandはproduction databaseを置換しない。corruptionまたはdata lossが疑われる場合はrisk-increasing executionを停止し、exact snapshotをisolated environmentへrestoreして内容と証跡を確認する。production replacementは別途明示承認を必要とする。
 
-replacementを承認した場合もowner/ACLをarchiveから再生しない。application起動前にcode-owned `scripts/deploy/sql/deploy-foundation-v1.sql`、index foundation、`scripts/deploy/sql/mcp-role.sql`を適用し、application role、PUBLIC revoke、MCP role/effective privilegeをbootstrap手順どおり検証する。role/ACL bootstrapが確認できないdatabaseをproductionとして起動しない。
+replacementを承認した場合もowner/ACLをarchiveから再生しない。application起動前にcode-owned `scripts/deploy/sql/deploy-foundation-v1.sql` と index foundationを適用し、application roleとschema contractをbootstrap/readiness手順どおり検証する。application roleまたはschema bootstrapを確認できないdatabaseをproductionとして起動しない。
 
 ## Rollback
 
@@ -700,12 +739,103 @@ application rollback は、過去の known-good commit SHA を `workflow_dispatc
 
 past-SHA 再デプロイは application image だけを切り替え、database を復元しない。後続 revision が非互換な schema migration を適用済みの場合、旧 application は現在の schema と互換でない可能性がある。この場合、past-SHA 再デプロイだけでは復旧にならない。
 
+### DB helper artifact set を伴う rollback
+
+DB helper markerの入力ファイル集合が異なるrevisionへ戻す場合は、rollback imageをcandidateにする前にrollback SHAのartifact setをexact復元する。rollback SHAは40文字のexact commit SHAとして指定し、最新の`origin/main`から到達可能であることを確認する。root-owned repositoryからtemporary detached worktreeへartifactをmaterializeし、worktree HEADと各blobがrollback SHAに一致することを検証してからinstallする。既存の`/srv/fukurou/rollback-artifacts/$sha`を正本として仮定しない。
+
+risk-increasing executionと新規LLM launchを停止し、in-flight launchをdrainした後、次を同じoperator shellで実行する。`rollback_sha`にはreview済みcommitの完全な40文字SHAを入れる。
+
+```bash
+set -Eeuo pipefail
+rollback_sha='<40文字のreview済みrollback commit SHA>'
+repo=/srv/fukurou/repo
+[[ "${rollback_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo 'rollback SHA must be exactly 40 lowercase hexadecimal characters' >&2
+  exit 1
+}
+
+sudo git -C "${repo}" fetch --prune origin +refs/heads/main:refs/remotes/origin/main
+resolved_sha="$(sudo git -C "${repo}" rev-parse --verify "${rollback_sha}^{commit}")"
+[[ "${resolved_sha}" == "${rollback_sha}" ]]
+sudo git -C "${repo}" merge-base --is-ancestor "${rollback_sha}" refs/remotes/origin/main
+
+rollback_parent="$(sudo mktemp -d /srv/fukurou/rollback-artifacts.XXXXXX)"
+rollback_root="${rollback_parent}/tree"
+cleanup_rollback_tree() {
+  sudo git -C "${repo}" worktree remove --force "${rollback_root}" >/dev/null 2>&1 || true
+  sudo rm -rf "${rollback_parent}"
+}
+trap cleanup_rollback_tree EXIT
+sudo git -C "${repo}" worktree add --detach "${rollback_root}" "${rollback_sha}"
+[[ "$(sudo git -C "${rollback_root}" rev-parse --verify HEAD)" == "${rollback_sha}" ]]
+[[ -z "$(sudo git -C "${rollback_root}" status --porcelain --untracked-files=all)" ]]
+
+rollback_paths=(
+  scripts/deploy/deploy-fukurou
+  scripts/deploy/fukurou-deploy-db
+  scripts/deploy/provision-fukurou-mcp-role
+  scripts/deploy/sql/deploy-foundation-v1.sql
+  scripts/deploy/sql/deploy-foundation-v1-indexes.sql
+  scripts/deploy/sql/mcp-role.sql
+)
+for path in "${rollback_paths[@]}"; do
+  sudo test -f "${rollback_root}/${path}"
+  sudo test ! -L "${rollback_root}/${path}"
+  expected_blob="$(sudo git -C "${repo}" rev-parse "${rollback_sha}:${path}")"
+  actual_blob="$(sudo git -C "${rollback_root}" hash-object "${path}")"
+  [[ "${actual_blob}" == "${expected_blob}" ]]
+done
+
+sudo install -o root -g root -m 0755 "${rollback_root}/scripts/deploy/deploy-fukurou" /usr/local/sbin/deploy-fukurou
+sudo install -o root -g root -m 0755 "${rollback_root}/scripts/deploy/fukurou-deploy-db" /usr/local/libexec/fukurou-deploy-db
+sudo install -o root -g root -m 0644 "${rollback_root}/scripts/deploy/sql/deploy-foundation-v1.sql" /usr/local/share/fukurou/deploy-foundation-v1.sql
+sudo install -o root -g root -m 0644 "${rollback_root}/scripts/deploy/sql/deploy-foundation-v1-indexes.sql" /usr/local/share/fukurou/deploy-foundation-v1-indexes.sql
+sudo install -o root -g root -m 0444 "${rollback_root}/scripts/deploy/sql/mcp-role.sql" /usr/local/share/fukurou/mcp-role.sql
+sudo /usr/local/libexec/fukurou-deploy-db write-install-marker
+```
+
+`write-install-marker`の成功により、rollback revisionの4-file artifact setとinstall markerの一致を確定する。markerを復元する前にrollback imageをdispatchしない。3-file helper/markerと4-file candidate、または異なるrevisionのhelper/SQLを混在させるとcandidate verificationはfail closedになる。
+
+`残存 dedicated role の owner cleanup` を実行済みなら、marker復元後かつrollback imageのdispatch前に、同じtemporary worktreeの`provision-fukurou-mcp-role`と`mcp-role.sql`で`fukurou_mcp` roleを再作成する。次の手順はexact rollback script / SQLをPostgreSQL container内へstageした後、containerの既存`POSTGRES_PASSWORD`からtemporary password fileをcontainer内に生成し、同じ値をlocal socket接続の`PGPASSWORD`にも使う。production composeはrollback imageの`DB_PASSWORD`にも`POSTGRES_PASSWORD`を渡すため、再作成するrole passwordとrollback imageの接続passwordは一致する。password値をhost、argv、log、shell historyへ展開しない。
+
+```bash
+role_stage="/tmp/fukurou-role-rollback-${rollback_sha}"
+sudo docker exec fukurou-postgres sh -ceu 'rm -rf "$1"; install -d -m 0700 "$1/sql"' sh "${role_stage}"
+sudo docker cp "${rollback_root}/scripts/deploy/provision-fukurou-mcp-role" "fukurou-postgres:${role_stage}/provision-fukurou-mcp-role"
+sudo docker cp "${rollback_root}/scripts/deploy/sql/mcp-role.sql" "fukurou-postgres:${role_stage}/sql/mcp-role.sql"
+sudo docker exec fukurou-postgres sh -ceu '
+  stage=$1
+  trap '\''rm -rf "${stage}"'\'' EXIT
+  chmod 0500 "${stage}/provision-fukurou-mcp-role"
+  password_file="${stage}/role-password"
+  umask 077
+  printf %s "${POSTGRES_PASSWORD}" > "${password_file}"
+  chmod 0400 "${password_file}"
+  export PGPASSWORD="${POSTGRES_PASSWORD}"
+  "${stage}/provision-fukurou-mcp-role" \
+    "postgresql:///${POSTGRES_DB}?user=${POSTGRES_USER}" \
+    "${POSTGRES_DB}" \
+    "${POSTGRES_USER}" \
+    "${password_file}"
+' sh "${role_stage}"
+```
+
+cleanup前のrollbackではrole再作成を省略するが、artifact setとmarkerのexact復元は省略しない。marker復元と、必要な場合のrole再作成が成功した後にだけ、operator workstationからrollback imageをdispatchする。
+
+```bash
+rollback_sha='<同じ40文字のreview済みrollback commit SHA>'
+[[ "${rollback_sha}" =~ ^[0-9a-f]{40}$ ]]
+gh workflow run deploy.yml --ref main -f image_sha="${rollback_sha}"
+```
+
+workflowがrollback SHAのimmutable image digestをbuild/deployし、health/digest確認とgap closeを完了するまでrisk-increasing executionと新規LLM launchを再開しない。
+
 ### schema migration 事故からの復旧
 
 1. risk-increasing execution と新規 LLM launch を停止し、paused-state marker、maintenance generation、gap ID、running image digest、直前 backup の status を保存する。
 2. database が current application と互換で、修正版 migration を追加できる場合は forward fix を作成し、通常の main merge/deploy で適用する。既存 migration history を書き換えず、破壊的 backfill を行わない。
 3. database を migration 前へ戻す必要がある場合は deploy pipeline を使わない。`PostgreSQL backup / restore` の exact integrity-checked snapshot を isolated PostgreSQL 16 へ restore して内容を検証し、`Production database replacement boundary` に従って owner の明示承認後に手動 replacement を行う。
-4. manual restore 後は code-owned foundation/index/role SQL、application role、MCP role、runtime config、paper account epoch、order/execution/position history を検証し、health と paper truth の整合を確認してから launch を再開する。
+4. manual restore 後は code-owned foundation/index SQL、application role、runtime config、paper account epoch、order/execution/position history を検証し、health と paper truth の整合を確認してから launch を再開する。
 
 restore によって account epoch や paper baseline を暗黙に切り替えず、観測不能期間を strategy outcome に混ぜない。復旧中の gap は元の gap ID のまま CLOSE まで保持する。
 

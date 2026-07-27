@@ -84,6 +84,3 @@ CREATE CONSTRAINT TRIGGER validate_infrastructure_gap_close_v1
 AFTER INSERT ON infrastructure_gap_events
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION validate_infrastructure_gap_close_v1();
-
-SELECT format('GRANT SELECT ON TABLE public.infrastructure_gap_events TO %I', :'mcp_role')
-WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'mcp_role') \gexec
