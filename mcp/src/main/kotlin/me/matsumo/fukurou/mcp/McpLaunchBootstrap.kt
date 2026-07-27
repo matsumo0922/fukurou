@@ -37,37 +37,24 @@ object McpLaunchBootstrap {
         return decode(manifestBytes, password.toByteArray(), clock)
     }
 
-    @Suppress("LongMethod")
     internal fun decode(
         manifestBytes: ByteArray,
         passwordBytes: ByteArray,
         clock: Clock,
     ): McpBootstrapConfig {
-        require(manifestBytes.isNotEmpty() && manifestBytes.size <= MAX_MANIFEST_BYTES) {
-            "MCP manifest descriptor size rejected."
-        }
-        require(passwordBytes.isNotEmpty() && passwordBytes.size <= MAX_PASSWORD_BYTES) {
-            "MCP password descriptor size rejected."
-        }
         val manifest = MANIFEST_JSON.decodeFromString<McpLaunchManifest>(manifestBytes.decodeToString())
         val expiresAt = Instant.parse(manifest.expiresAt)
         val password = passwordBytes.decodeToString().trimEnd('\n', '\r')
 
-        require(manifest.version == MCP_MANIFEST_VERSION) { "Unsupported MCP manifest version." }
-        require(manifest.invocationId == manifest.decisionRunId) {
-            "MCP manifest invocation does not match decision run identity."
+        // 検証は運用ミスの早期検出だけを目的とする。writer 由来の値の再検算は行わない。
+        require(manifest.version == MCP_MANIFEST_VERSION) {
+            "MCP manifest version ${manifest.version} does not match this image ($MCP_MANIFEST_VERSION)."
         }
         val phase = runCatching { LlmInvocationPhase.valueOf(manifest.phase) }
             .getOrElse { throw IllegalArgumentException("Unsupported MCP manifest phase.") }
         val canonicalTools = McpToolContractCatalog.toolsFor(phase)
         require(canonicalTools.isNotEmpty()) { "Unsupported MCP manifest phase." }
-        require(manifest.allowedTools.toSet() == canonicalTools) { "MCP manifest allowlist is not canonical." }
-        require(manifest.toolSchemaHash == McpToolContractCatalog.canonicalSchemaHash(phase)) {
-            "MCP manifest tool schema hash mismatch."
-        }
-        require(manifest.phaseManifestId.isNotBlank() && manifest.effectiveInvocationHash.length == 64) {
-            "MCP manifest effective phase identity is required."
-        }
+        require(expiresAt.isAfter(Instant.now(clock))) { "MCP manifest is expired." }
         require(
             manifest.submissionSocketPath.isNotBlank() &&
                 Path.of(manifest.submissionSocketPath).isAbsolute &&
@@ -75,9 +62,7 @@ object McpLaunchBootstrap {
         ) {
             "MCP manifest submission gateway path is invalid."
         }
-        require(manifest.systemPromptVersion.isNotBlank()) { "MCP manifest system prompt version is required." }
-        require(expiresAt.isAfter(Instant.now(clock))) { "MCP manifest is expired." }
-        require(password.isNotEmpty()) { "MCP password descriptor must not be empty." }
+        require(password.isNotEmpty()) { "MCP database password environment value must not be empty." }
         require(manifest.totalToolCallLimit in 1..DEFAULT_MAX_TOOL_CALLS_PER_RUN) {
             "MCP total tool call budget is outside the canonical limit."
         }
@@ -102,7 +87,8 @@ object McpLaunchBootstrap {
                 systemPromptVersion = manifest.systemPromptVersion,
                 marketSnapshotId = manifest.marketSnapshotId,
             ),
-            allowedTools = manifest.allowedTools.toSet(),
+            // 実効 allowlist の正本は catalog。manifest の allowedTools は renderer 向けで、ここでは読まない。
+            allowedTools = canonicalTools,
             expiresAt = expiresAt,
             totalToolCallLimit = manifest.totalToolCallLimit,
             actToolCallLimit = manifest.actToolCallLimit,
@@ -149,8 +135,6 @@ data class McpBootstrapConfig(
         ")"
 }
 
-private const val MAX_MANIFEST_BYTES = 64 * 1024
-private const val MAX_PASSWORD_BYTES = 4096
 private const val MANIFEST_DIRECTORY_ENV = "FUKUROU_MCP_MANIFEST_DIRECTORY"
 private const val DB_PASSWORD_ENV = "DB_PASSWORD"
 private val MANIFEST_JSON = Json {

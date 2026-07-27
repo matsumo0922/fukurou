@@ -3,7 +3,6 @@ package me.matsumo.fukurou.trading.invoker
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
-import me.matsumo.fukurou.trading.audit.ManifestPersistencePolicy
 
 /** runner、bootstrap、MCP registration が共有する実JSON schema contract catalog。 */
 object McpToolContractCatalog {
@@ -75,9 +74,6 @@ object McpToolContractCatalog {
         phase = phase,
         schemaJsonByTool = SCHEMA_JSON_BY_TOOL,
     )
-
-    fun canonicalSchemaHash(phase: LlmInvocationPhase): String =
-        ManifestPersistencePolicy.sha256(canonicalSchemaBundle(phase))
 
     internal fun canonicalSchemaBundle(phase: LlmInvocationPhase, schemaJsonByTool: Map<String, String>): String =
         toolsFor(phase).sorted().joinToString(prefix = "mcp-tool-catalog-v1\n", separator = "\n") { tool ->
