@@ -10,7 +10,7 @@
 ## 3. Tests
 
 - [x] 3.1 Rework `McpLaunchBootstrapPolicyTest`: delete reject cases for removed validations, keep/extend reject cases for retained validations, and assert that a manifest with a divergent `allowedTools` payload still yields the catalog-canonical effective allowlist.
-- [ ] 3.2 Keep the MCP startup → tool call regression path green and adapt `McpLaunchManifestTest` and any canary/fixture serialization to the version-3 manifest without `toolSchemaHash`.
+- [x] 3.2 Keep the MCP startup → tool call regression path green and adapt `McpLaunchManifestTest` and any canary/fixture serialization to the version-3 manifest without `toolSchemaHash`.
 
 ## 4. Documentation and delivery
 
