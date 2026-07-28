@@ -6,6 +6,8 @@ Issue #306 observability invariant: The audit signal `authFailureSuspected` MUST
 
 `authFailureSuspected` is an operational-notification signal only. It MUST NOT relax the raw-output withholding rules: an invocation whose `authEvidenceObserved` is true continues to withhold raw stdout/stderr under every category, and `authFailureSuspected` itself grants no additional disclosure.
 
+Because `authEvidenceObserved` is independent of the process outcome, `authFailureSuspected` may be true for an invocation that succeeded — for example when a complete Codex event stream carries a known authentication-evidence string in its agent message text. Consequently the `/ops` per-provider authentication-failure count is independent of the failure count, and may exceed it. This is a deliberate trade-off: withholding the signal until the invocation also fails would reintroduce the same class of gap this requirement closes.
+
 The known Codex authentication-evidence strings (`CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`) MUST include the refresh-token failure texts observed in the 2026-07-23 production incident: `Failed to refresh token`, `refresh_token_reused`, and `token_expired`. These strings are added to the substring-matched evidence set only; the exact-match set that resolves the primary category (`CODEX_STDERR_AUTH_FAILURES`) and the compatibility-message classification table are unchanged, so adding them does not reclassify any invocation's primary category.
 
 #### Scenario: Refresh-token failure resolves to a non-authentication category
@@ -17,6 +19,11 @@ The known Codex authentication-evidence strings (`CODEX_KNOWN_AUTH_EVIDENCE_TEXT
 
 - **WHEN** a Codex invocation's resolved primary category is `OUTPUT_CONTRACT` and its stdout or stderr contains one of `Failed to refresh token`, `refresh_token_reused`, or `token_expired`
 - **THEN** the phase audit details contain neither `stdout` nor `stderr`, because the observed authentication evidence withholds raw output regardless of the resolved category
+
+#### Scenario: A successful invocation carries an authentication-evidence string
+
+- **WHEN** a Codex invocation returns a complete, successful event stream so that no provider failure is resolved, but its output text contains a known authentication-evidence string
+- **THEN** the phase audit details record `authFailureSuspected` as true, because the signal follows observed evidence rather than the invocation's outcome
 
 #### Scenario: No authentication evidence is observed
 

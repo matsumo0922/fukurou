@@ -1145,6 +1145,52 @@ class LlmInvocationAuditorTest {
         LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
     }
 
+    /**
+     * 成功した invocation の出力本文に認証 evidence 文言が含まれる場合も `authFailureSuspected` が
+     * 立つことを証明する（design.md D2 で明示的に受容した false positive 経路。意図された挙動と
+     * 回帰を将来の読み手が区別できるようにするため pin する）。
+     */
+    @Test
+    fun invokeAndAudit_suspectsAuthFailureForSuccessfulInvocationCarryingAuthEvidenceText() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val evidenceBearingStdout = """
+            {"type":"thread.started","thread_id":"thread-1"}
+            {"type":"item.completed","item":{"type":"agent_message","text":"the log line says token_expired"}}
+            {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+        """.trimIndent()
+        val shellInvoker = ShellLlmInvoker(
+            commandRenderer = StaticAuditCommandRenderer,
+            processRunner = FixedProcessRunner(
+                ProcessRunResult(
+                    status = ProcessRunStatus.EXITED,
+                    exitCode = 0,
+                    stdout = evidenceBearingStdout,
+                    stderr = "",
+                ),
+            ),
+            outputParser = DefaultLlmOutputParser(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = shellInvoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertFalse(details.containsKey("failureCategory"))
+        assertEquals("true", details["authFailureSuspected"]?.jsonPrimitive?.content)
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
     private fun manifestAuditor(
         repository: LlmInputManifestRepository,
         clock: Clock,

@@ -2371,7 +2371,8 @@ private data class LlmRequestInput(
  *
  * @param decision 保存済み decision
  * @param failure proposer phase の失敗
- * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
+ * @param authFailureSuspected 認証失敗を疑う運用シグナル。primary category が `AUTHENTICATION` に
+ *  解決されたか、既知の認証 evidence 文言を出力中に観測したかのいずれかで立つ
  * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
  */
 private data class ProposerDecisionResult(

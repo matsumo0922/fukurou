@@ -595,7 +595,8 @@ private fun Throwable.asPreLaunchCaptureFailure(
  *
  * @param invocationResult process 実行結果を含む LLM 起動結果
  * @param duration phase 実行時間
- * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
+ * @param authFailureSuspected 認証失敗を疑う運用シグナル。primary category が `AUTHENTICATION` に
+ *  解決されたか、既知の認証 evidence 文言を出力中に観測したかのいずれかで立つ
  * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
  */
 data class LlmPhaseAuditResult(
