@@ -2,6 +2,7 @@
 
 - [x] 1.1 `DefaultLlmOutputParser.kt` の `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` へ `Failed to refresh token` / `refresh_token_reused` / `token_expired` を追加し、KDoc の構成説明を更新する
 - [x] 1.2 `LlmInvocationAuditor.kt` の `authFailureSuspected` 導出へ `authEvidenceObserved` を OR で加え、`LlmPhaseAuditSignals` の KDoc を更新する
+- [x] 1.3 同じ値を運ぶ `LlmPhaseAuditResult` と `ProposerDecisionResult` の `authFailureSuspected` の KDoc も新しいセマンティクスへ揃える
 
 ## 2. テスト
 
@@ -9,6 +10,7 @@
 - [x] 2.2 `LlmInvocationAuditorTest` に、同形の入力で監査 payload に `authFailureSuspected="true"` が載り、`stdout` / `stderr` が載らないことを確認するテストを追加する
 - [x] 2.3 `OneShotLlmRunnerTest` に、production call path（`OneShotLlmRunner` 経由の Codex proposer invocation）で同形の入力から `authFailureSuspected="true"` と runbook ログが出ることを確認するテストを追加する
 - [x] 2.4 既存の #300 / #296 由来テストの前提が変わっていないことを確認する（既存テストの assertion を弱める修正を行わない）
+- [x] 2.5 design.md D2 で受容した false positive 経路（成功 invocation の出力本文に evidence 文言が含まれる場合）を、delta spec の Scenario と `LlmInvocationAuditorTest` のテストで pin する
 
 ## 3. 検証
 
