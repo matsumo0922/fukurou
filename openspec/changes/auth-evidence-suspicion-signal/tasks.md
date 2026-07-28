@@ -12,5 +12,5 @@
 
 ## 3. 検証
 
-- [ ] 3.1 `make detekt` を通す
-- [ ] 3.2 `make test` を通す
+- [x] 3.1 `make detekt` を通す
+- [x] 3.2 `make test` を通す
