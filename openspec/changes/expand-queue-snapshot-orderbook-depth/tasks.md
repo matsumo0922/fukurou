@@ -17,23 +17,23 @@
 
 - [x] 3.1 `docs/mcp-runtime.md` の「板 depth 外」fail-closed 記述を、queue_ahead が返却 bid levels 全体を観測し、その全体の圏外だけ fail-closed になる現在形へ更新する
 - [x] 3.2 `make test` / `make detekt` を実行する
-- [ ] 3.3 PR-A description に次を記載する。「ドキュメント影響: あり（docs/mcp-runtime.md）」／ OpenSpec change は PR-B 完了まで archive しないこと ／ ユーザー確認済みの residual risk として「admission 母集団が変わるが `PAPER_WS_V1` は bump しない」判断と、過去 5 件の救済は板 snapshot 不在で検証不能であること
+- [x] 3.3 PR-A description に次を記載する。「ドキュメント影響: あり（docs/mcp-runtime.md）」／ OpenSpec change は PR-B 完了まで archive しないこと ／ ユーザー確認済みの residual risk として「admission 母集団が変わるが `PAPER_WS_V1` は bump しない」判断と、過去 5 件の救済は板 snapshot 不在で検証不能であること
 
 ## 4. PR-B — `messageOmitted` の撤去と diagnostic allowlist
 
-- [ ] 4.1 queue snapshot の diagnostic 文字列を定数として一箇所に定義し、`PaperBroker` と `ExposedPaperLedgerWriter` の 10 箇所がその定数を参照するようにする。文字列の実体が生成側と audit 側で二重管理にならない構造にする
-- [ ] 4.2 `NoTradeAuditPayload` に、4.1 の定数集合との**完全一致**で判定する allowlist を導入する。prefix / 部分一致は使わない。判定関数の KDoc に「外部由来の例外が prefix を spoof して secret を混入するのを防ぐため完全一致とする」理由を書く
-- [ ] 4.3 `buildNoTradeFailurePayload` から `isCodexProvider` 分岐と `messageOmitted` キーを撤去し、allowlist に完全一致する message だけを `message` キーへ出力する。一致しない場合は `message` キー自体を出力しない
-- [ ] 4.4 `llmProvider` 引数が他の用途で使われていなければ signature から外し、`ToolCallGuard` / `CallerNoTradeGuard` の呼び出し側を追従させる
+- [x] 4.1 queue snapshot の diagnostic 文字列を定数として一箇所に定義し、`PaperBroker` と `ExposedPaperLedgerWriter` の 10 箇所がその定数を参照するようにする。文字列の実体が生成側と audit 側で二重管理にならない構造にする
+- [x] 4.2 `NoTradeAuditPayload` に、4.1 の定数集合との**完全一致**で判定する allowlist を導入する。prefix / 部分一致は使わない。判定関数の KDoc に「外部由来の例外が prefix を spoof して secret を混入するのを防ぐため完全一致とする」理由を書く
+- [x] 4.3 `buildNoTradeFailurePayload` から `isCodexProvider` 分岐と `messageOmitted` キーを撤去し、allowlist に完全一致する message だけを `message` キーへ出力する。一致しない場合は `message` キー自体を出力しない
+- [x] 4.4 `llmProvider` 引数が他の用途で使われていなければ signature から外し、`ToolCallGuard` / `CallerNoTradeGuard` の呼び出し側を追従させる
 
 ## 5. PR-B — テストと検証
 
-- [ ] 5.1 `CallerNoTradeGuardTest` の `messageOmitted` assertion を撤去し、provider によらず (a) allowlist 完全一致 message が記録される (b) 非一致 message では `message` キーが出力されない、の 2 scenario へ置き換える
-- [ ] 5.2 allowlist 文字列で始まるが後続に追加文字列を持つ message（prefix spoof）で `message` キーが出力されないことを検証する
-- [ ] 5.3 Codex provider で allowlist 一致 cause が記録され、任意文字列の cause では message が出ないことを検証する
-- [ ] 5.4 `OneShotLlmRunnerTest` L2556 / L2598 付近の `messageOmitted` assertion を更新する
-- [ ] 5.5 `make test` / `make detekt` を実行する
-- [ ] 5.6 PR-B description に「ドキュメント影響: なし」と、allowlist 外の失敗（`caller_failed` / `tool_call_failed` 等）は引き続き cause 型名だけになるという既知の限界を記載する
+- [x] 5.1 `CallerNoTradeGuardTest` の `messageOmitted` assertion を撤去し、provider によらず (a) allowlist 完全一致 message が記録される (b) 非一致 message では `message` キーが出力されない、の 2 scenario へ置き換える
+- [x] 5.2 allowlist 文字列で始まるが後続に追加文字列を持つ message（prefix spoof）で `message` キーが出力されないことを検証する
+- [x] 5.3 Codex provider で allowlist 一致 cause が記録され、任意文字列の cause では message が出ないことを検証する
+- [x] 5.4 `OneShotLlmRunnerTest` L2556 / L2598 付近の `messageOmitted` assertion を更新する
+- [x] 5.5 `make test` / `make detekt` を実行する
+- [x] 5.6 PR-B description に「ドキュメント影響: なし」と、allowlist 外の失敗（`caller_failed` / `tool_call_failed` 等）は引き続き cause 型名だけになるという既知の限界を記載する
 
 ## 6. Archive
 
