@@ -304,6 +304,14 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
+    fun parseOrderbookResponse_keepsEveryLevelForQueueSnapshotDepth() {
+        val orderbook = parseOrderbookResponse(ORDERBOOK_SUCCESS_RESPONSE, TradingSymbol.BTC, depth = 500)
+
+        assertEquals(2, orderbook.bids.size)
+        assertEquals(2, orderbook.asks.size)
+    }
+
+    @Test
     fun parseTradesResponse_returnsRecentTrades() {
         val trades = parseTradesResponse(TRADES_SUCCESS_RESPONSE, TradingSymbol.BTC)
         val firstTrade = trades.first()

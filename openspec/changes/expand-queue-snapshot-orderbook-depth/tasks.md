@@ -1,22 +1,22 @@
 ## 1. PR-A — Queue snapshot depth の分離と拡大
 
-- [ ] 1.1 `PaperBroker.kt` に queue_ahead 専用の `PAPER_EXECUTION_ORDERBOOK_QUEUE_DEPTH = 500` を新設し、`calculateQueueAhead` の `getOrderbook` 呼び出しだけをこの定数へ差し替える
-- [ ] 1.2 `orderbookFor()` が使う `PAPER_EXECUTION_ORDERBOOK_DEPTH = 50` を据え置き、`FillSimulator` / `SafetyFloor` の板参照が変化しないことを確認する
-- [ ] 1.3 `GmoPublicMarketDataSource.MAX_ORDERBOOK_DEPTH` を 500 へ引き上げ、`mcp-gmo-coin` 側の同名定数は変更しない
+- [x] 1.1 `PaperBroker.kt` に queue_ahead 専用の `PAPER_EXECUTION_ORDERBOOK_QUEUE_DEPTH = 500` を新設し、`calculateQueueAhead` の `getOrderbook` 呼び出しだけをこの定数へ差し替える
+- [x] 1.2 `orderbookFor()` が使う `PAPER_EXECUTION_ORDERBOOK_DEPTH = 50` を据え置き、`FillSimulator` / `SafetyFloor` の板参照が変化しないことを確認する
+- [x] 1.3 `GmoPublicMarketDataSource.MAX_ORDERBOOK_DEPTH` を 500 へ引き上げ、`mcp-gmo-coin` 側の同名定数は変更しない
 
 ## 2. PR-A — 回帰テスト
 
-- [ ] 2.1 `PaperBrokerTest` の fake market data source に、production と同じく `bids.take(depth)` / `asks.take(depth)` で切り詰める実装を用意する。depth を無視する既存 fake のままでは、定数を差し替えなくてもテストが通ってしまい regression を証明できない
-- [ ] 2.2 bid levels 60 段の fake orderbook で 55 段目の価格へ resting BUY LIMIT を置き、注文が受理されて open order が作られる scenario を追加する。旧 depth 50 のままではこの scenario が `QUEUE_SNAPSHOT_UNAVAILABLE` で落ちることを、実装前に一度確認する
-- [ ] 2.3 保存された `queueAheadBtc` は `Order` read model に露出していないため、値の検証は event sequence で行う。同価格の bid 数量 + 自注文 size に満たない SELL 数量では約定せず、到達した event で約定することを確認する
-- [ ] 2.4 同 fake で全 levels より低い指値が `QUEUE_SNAPSHOT_UNAVAILABLE: limit price is outside returned bid depth.` で fail-closed し、open order が作られない scenario を追加する
-- [ ] 2.5 fake が `getOrderbook` に渡された depth を記録し、queue_ahead 経路が queue depth を、`orderbookFor` 経路が execution depth を要求することを検証する
-- [ ] 2.6 `GmoPublicMarketDataSourceTest` に depth 500 が `validateLimit` を通ることの回帰を追加する
+- [x] 2.1 `PaperBrokerTest` の fake market data source に、production と同じく `bids.take(depth)` / `asks.take(depth)` で切り詰める実装を用意する。depth を無視する既存 fake のままでは、定数を差し替えなくてもテストが通ってしまい regression を証明できない
+- [x] 2.2 bid levels 60 段の fake orderbook で 55 段目の価格へ resting BUY LIMIT を置き、注文が受理されて open order が作られる scenario を追加する。旧 depth 50 のままではこの scenario が `QUEUE_SNAPSHOT_UNAVAILABLE` で落ちることを、実装前に一度確認する
+- [x] 2.3 保存された `queueAheadBtc` は `Order` read model に露出していないため、値の検証は event sequence で行う。同価格の bid 数量 + 自注文 size に満たない SELL 数量では約定せず、到達した event で約定することを確認する
+- [x] 2.4 同 fake で全 levels より低い指値が `QUEUE_SNAPSHOT_UNAVAILABLE: limit price is outside returned bid depth.` で fail-closed し、open order が作られない scenario を追加する
+- [x] 2.5 fake が `getOrderbook` に渡された depth を記録し、queue_ahead 経路が queue depth を、`orderbookFor` 経路が execution depth を要求することを検証する
+- [x] 2.6 `GmoPublicMarketDataSourceTest` に depth 500 が `validateLimit` を通ることの回帰を追加する
 
 ## 3. PR-A — ドキュメントと検証
 
-- [ ] 3.1 `docs/mcp-runtime.md` の「板 depth 外」fail-closed 記述を、queue_ahead が返却 bid levels 全体を観測し、その全体の圏外だけ fail-closed になる現在形へ更新する
-- [ ] 3.2 `make test` / `make detekt` を実行する
+- [x] 3.1 `docs/mcp-runtime.md` の「板 depth 外」fail-closed 記述を、queue_ahead が返却 bid levels 全体を観測し、その全体の圏外だけ fail-closed になる現在形へ更新する
+- [x] 3.2 `make test` / `make detekt` を実行する
 - [ ] 3.3 PR-A description に次を記載する。「ドキュメント影響: あり（docs/mcp-runtime.md）」／ OpenSpec change は PR-B 完了まで archive しないこと ／ ユーザー確認済みの residual risk として「admission 母集団が変わるが `PAPER_WS_V1` は bump しない」判断と、過去 5 件の救済は板 snapshot 不在で検証不能であること
 
 ## 4. PR-B — `messageOmitted` の撤去と diagnostic allowlist

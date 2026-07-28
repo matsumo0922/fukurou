@@ -513,7 +513,7 @@ private class PaperBrokerTradeDelegate(
     private suspend fun calculateQueueAhead(command: PlaceOrderCommand): BigDecimal {
         val limitPrice = requireNotNull(command.priceJpy)
         val orderbook = requireNotNull(runtime.market.marketDataSource)
-            .getOrderbook(command.symbol, PAPER_EXECUTION_ORDERBOOK_DEPTH)
+            .getOrderbook(command.symbol, PAPER_EXECUTION_ORDERBOOK_QUEUE_DEPTH)
             .getOrElse { throwable ->
                 if (throwable.isFailClosedGmoRequestFailure()) throw throwable
 
@@ -1873,9 +1873,20 @@ private const val ATR_PERIOD = 14
 private const val ATR_SCALE = 8
 
 /**
- * paper 約定時に取得する orderbook depth。
+ * paper 約定価格の算出時に取得する orderbook depth。
+ *
+ * slippage walk と SafetyFloor の板参照に使う。queue_ahead は別 depth を使う。
  */
 private const val PAPER_EXECUTION_ORDERBOOK_DEPTH = 50
+
+/**
+ * resting BUY LIMIT の queue_ahead 算出時に取得する orderbook depth。
+ *
+ * `getOrderbook` は取引所へ depth を渡さず返却済み levels を client 側で切り詰めるため、
+ * 取引所が 1 response で返しうる levels 数を超える値を指定して切り詰めを無効化する。
+ * queue_ahead は paper 約定の因果的入力であり、観測範囲を狭めると妥当な指値が fail-closed になる。
+ */
+private const val PAPER_EXECUTION_ORDERBOOK_QUEUE_DEPTH = 500
 
 /**
  * paper orderbook fetch fallback log の key。
