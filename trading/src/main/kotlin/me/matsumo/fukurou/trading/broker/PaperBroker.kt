@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.domain.Orderbook
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionStatus
 import me.matsumo.fukurou.trading.domain.ProtectionStatus
+import me.matsumo.fukurou.trading.domain.QueueSnapshotDiagnostics
 import me.matsumo.fukurou.trading.domain.SymbolRules
 import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -469,17 +470,17 @@ private class PaperBrokerTradeDelegate(
 
         val before = runtime.reconcilerStatusProvider.snapshot()
         require(before.marketDataState == MarketDataConnectionState.CONNECTED) {
-            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is not connected."
+            QueueSnapshotDiagnostics.SESSION_NOT_CONNECTED
         }
         val sessionId = requireNotNull(before.marketDataSessionId) {
-            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is unavailable."
+            QueueSnapshotDiagnostics.SESSION_UNAVAILABLE
         }
         val now = Instant.now(runtime.time.clock)
         val lastMarketDataAt = requireNotNull(before.lastTradeAt) {
-            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session has not received an event."
+            QueueSnapshotDiagnostics.SESSION_HAS_NO_EVENT
         }
         require(!lastMarketDataAt.isAfter(now) && Duration.between(lastMarketDataAt, now) <= MARKET_DATA_FRESHNESS_WINDOW) {
-            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is stale."
+            QueueSnapshotDiagnostics.SESSION_STALE
         }
         val queueSnapshotAt = Instant.now(runtime.time.clock)
         val queueAhead = if (command.orderType == OrderType.LIMIT) {
@@ -489,7 +490,7 @@ private class PaperBrokerTradeDelegate(
         }
         val after = runtime.reconcilerStatusProvider.snapshot()
         require(after.marketDataState == MarketDataConnectionState.CONNECTED && after.marketDataSessionId == sessionId) {
-            "QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session changed during order creation."
+            QueueSnapshotDiagnostics.SESSION_CHANGED
         }
         val eligibleFrom = Instant.now(runtime.time.clock)
 
@@ -517,13 +518,13 @@ private class PaperBrokerTradeDelegate(
             .getOrElse { throwable ->
                 if (throwable.isFailClosedGmoRequestFailure()) throw throwable
 
-                throw IllegalStateException("QUEUE_SNAPSHOT_UNAVAILABLE: orderbook request failed.", throwable)
+                throw IllegalStateException(QueueSnapshotDiagnostics.ORDERBOOK_REQUEST_FAILED, throwable)
             }
         val bidPrices = orderbook.bids.mapNotNull { level -> level.price.toBigDecimalOrNull() }
         val minimumCoveredBid = bidPrices.minOrNull()
-            ?: error("QUEUE_SNAPSHOT_UNAVAILABLE: orderbook has no valid bid depth.")
+            ?: error(QueueSnapshotDiagnostics.ORDERBOOK_NO_VALID_BID_DEPTH)
         require(limitPrice >= minimumCoveredBid) {
-            "QUEUE_SNAPSHOT_UNAVAILABLE: limit price is outside returned bid depth."
+            QueueSnapshotDiagnostics.LIMIT_OUTSIDE_BID_DEPTH
         }
         val exchangeQueue = orderbook.bids
             .filter { level -> level.price.toBigDecimalOrNull() == limitPrice }

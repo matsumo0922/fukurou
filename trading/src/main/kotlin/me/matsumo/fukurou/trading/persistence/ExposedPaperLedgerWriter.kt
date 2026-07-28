@@ -62,6 +62,7 @@ import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.PAPER_EXECUTION_SEMANTICS_VERSION
 import me.matsumo.fukurou.trading.domain.PaperExecutionLineage
+import me.matsumo.fukurou.trading.domain.QueueSnapshotDiagnostics
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.Position
 import me.matsumo.fukurou.trading.domain.PositionSide
@@ -2132,10 +2133,10 @@ private fun JdbcTransaction.verifyMarketEligibilitySession(eligibility: RestingO
         statement.setObject(1, eligibility.sessionId)
         statement.executeQuery().use { resultSet ->
             require(resultSet.next()) {
-                "QUEUE_SNAPSHOT_UNAVAILABLE: market-data session is not connected."
+                QueueSnapshotDiagnostics.LEDGER_SESSION_NOT_CONNECTED
             }
             require(resultSet.getLong("last_processed_sequence") == eligibility.eligibleAfterSequence) {
-                "QUEUE_SNAPSHOT_UNAVAILABLE: market-data session advanced during order creation."
+                QueueSnapshotDiagnostics.LEDGER_SESSION_ADVANCED
             }
         }
     }

@@ -2553,7 +2553,7 @@ class OneShotLlmRunnerTest {
         assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
         assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
         assertFalse(noTradeEvent.payload.contains("path-message-marker"))
-        assertTrue(noTradeEvent.payload.contains("\"messageOmitted\":true"))
+        assertFalse(noTradeEvent.payload.contains("\"message\""))
     }
 
     @Test
@@ -2595,7 +2595,7 @@ class OneShotLlmRunnerTest {
         assertEquals("Codex invocation failure details omitted.", record?.errorMessage)
         assertFalse(noTradeEvent.payload.contains("auth-path-marker"))
         assertFalse(noTradeEvent.payload.contains("path-message-marker"))
-        assertTrue(noTradeEvent.payload.contains("\"messageOmitted\":true"))
+        assertFalse(noTradeEvent.payload.contains("\"message\""))
     }
 
     @Test
