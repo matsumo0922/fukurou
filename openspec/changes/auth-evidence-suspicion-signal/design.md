@@ -59,6 +59,6 @@ authFailureSuspected = providerFailure?.category == LlmProviderFailureCategory.A
 ## Risks / Trade-offs
 
 - [追加文言により、認証と無関係だが文言を含む Codex 出力の raw output が失われる] → `token_expired` 等は認証文脈以外で Codex が出す蓋然性が低い。失われるのは診断用の raw output だけで、failure category と typed failure は残る
-- [成功した invocation で `authFailureSuspected` が立ち、`/ops` の authentication-failure カウントが過大になる] → D2 の判断として受容。診断フラグのみで fail-closed 挙動には影響しない。人間確認事項として PR に転記する
-- [`authFailureSuspected=true` は `noDecisionAuditReason()` で `proposer_missing_decision` を返す分岐に入るため、decision 未保存時の no-trade 理由の分布が変わる] → いずれも `proposer_missing_decision` は「判断が保存されなかった」という同じ事実を指し、原因の説明が `proposer_no_tool_calls` より正確になる方向の変化。paper truth の意味は変わらない
+- [成功した invocation で `authFailureSuspected` が立ち、`/ops` の authentication-failure カウントが過大になる] → 具体的には、Codex が完全な成功 event stream を返しつつ agent message 本文に `token_expired` 等の文言を含めた場合、`.contains()` の部分一致で `authEvidenceObserved=true` になり、`MonitoringRepository` が process 成否と独立にこれを authentication failure として集計する。D2 の判断として受容。診断フラグのみで fail-closed 挙動には影響しない。人間確認事項として PR に転記する
+- [`authFailureSuspected=true` は `noDecisionAuditReason()` で `proposer_missing_decision` を返す分岐に入るため、decision 未保存時の no-trade 理由の分布が変わる] → 認証障害が実在する場合は原因の説明が `proposer_no_tool_calls` より正確になる。一方、成功 invocation の本文に evidence 文言がたまたま含まれ、かつ decision 未保存・tool call 0 件だった場合は、より具体的な `proposer_no_tool_calls` を失って汎用の `proposer_missing_decision` になる。いずれの場合も結果は NO_TRADE のままで、decision や trade を許可する経路には入らないため paper truth の意味は変わらない
 - [`authEvidenceObserved` は既知文言の一致判定に過ぎず、未知の認証 evidence を検出しない] → 既存 spec が明記している限界をそのまま引き継ぐ。今回の変更は検出範囲を狭めない

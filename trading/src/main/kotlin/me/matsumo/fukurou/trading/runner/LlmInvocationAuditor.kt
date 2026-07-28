@@ -122,10 +122,12 @@ class LlmInvocationAuditor(
         val startFailure = (invocationThrowable ?: resultFailure).takeIf { processResult == null }
         val usage = invocationResult?.usage
         val providerFailure = primaryProviderFailure(invocationResult, startFailure, cleanupFailures)
+        val authEvidenceObserved = invocationResult?.authEvidenceObserved ?: false
+        val authCategoryResolved = providerFailure?.category == LlmProviderFailureCategory.AUTHENTICATION
         val auditSignals = LlmPhaseAuditSignals(
             cliErrorReported = invocationResult?.providerFailure != null,
-            authEvidenceObserved = invocationResult?.authEvidenceObserved ?: false,
-            authFailureSuspected = providerFailure?.category == LlmProviderFailureCategory.AUTHENTICATION,
+            authEvidenceObserved = authEvidenceObserved,
+            authFailureSuspected = authCategoryResolved || authEvidenceObserved,
             cleanupFailed = cleanupFailures.any { failure -> failure != null },
             providerFailure = providerFailure,
         )
@@ -614,7 +616,10 @@ data class LlmPhaseAuditResult(
  *
  * @param cliErrorReported CLI が error 終了を報告する出力を検出したか
  * @param authEvidenceObserved 既知の認証 evidence 文言を出力中に独立に観測したか
- * @param authFailureSuspected CLI 認証失敗らしい出力を検出したか
+ * @param authFailureSuspected 認証失敗を疑う運用シグナル。primary category が `AUTHENTICATION`
+ *  に解決されたか、`authEvidenceObserved` が true のいずれかで立つ。認証障害が primary category
+ *  の先勝ち解決で別カテゴリへ吸収されても観測できるようにするため（issue #306）。運用通知専用で、
+ *  raw output の公開範囲は一切広げない
  * @param cleanupFailed 一時 artifact の cleanup に失敗したか
  */
 private data class LlmPhaseAuditSignals(

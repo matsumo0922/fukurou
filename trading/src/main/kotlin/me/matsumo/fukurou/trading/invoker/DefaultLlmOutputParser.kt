@@ -307,10 +307,16 @@ internal val CODEX_STDERR_AUTH_FAILURES = setOf(
  * 認証 evidence の独立追跡（`authEvidenceObserved`）が stdout/stderr 全文に対して
  * `.contains()`（部分一致）で検査する既知文言の集合。
  *
- * [CODEX_STDERR_AUTH_FAILURES] の2文言に加え、[knownCompatibilityFailureCategory] が
- * `AUTHENTICATION` に分類する2文言（"Not logged in"/"Invalid authentication credentials"）を含む。
+ * 次の3群を含む。
+ *
+ * 1. [CODEX_STDERR_AUTH_FAILURES] の2文言
+ * 2. [knownCompatibilityFailureCategory] が `AUTHENTICATION` に分類する2文言
+ *    （"Not logged in"/"Invalid authentication credentials"）
+ * 3. refresh token 失効時に Codex が stderr へ出す3文言
+ *    （"Failed to refresh token"/"refresh_token_reused"/"token_expired"）
+ *
  * `RATE_OR_SESSION_LIMIT`/`QUOTA_EXHAUSTED` に分類される文言は意図的に含まない
- * （それらは新設の output-interpreted 経路自身が公開対象とするカテゴリであり、
+ * （それらは output-interpreted 経路自身が公開対象とするカテゴリであり、
  * 分類文言自体を evidence 扱いすると自己矛盾でブロックされ続けるため）。
  *
  * この検査は「疑わしきは記録しない」という evidence 追跡が目的であり、主 category を
@@ -321,6 +327,9 @@ internal val CODEX_STDERR_AUTH_FAILURES = setOf(
 internal val CODEX_KNOWN_AUTH_EVIDENCE_TEXTS = CODEX_STDERR_AUTH_FAILURES + setOf(
     "Not logged in",
     "Invalid authentication credentials",
+    "Failed to refresh token",
+    "refresh_token_reused",
+    "token_expired",
 )
 private val SAFE_PROVIDER_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
 
