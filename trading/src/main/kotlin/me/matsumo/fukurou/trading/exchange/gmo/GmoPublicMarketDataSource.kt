@@ -130,9 +130,12 @@ private const val GMO_KLINES_NOT_FOUND_MESSAGE_CODE = "ERR-5207"
 private const val MAX_TRADES_LIMIT = 100
 
 /**
- * orderbook tool で許可する最大 depth。
+ * orderbook 取得で許可する最大 depth。
+ *
+ * depth は取引所への要求ではなく返却済み levels の client 側切り詰め幅であり、
+ * paper の queue_ahead 算出が切り詰めなしの観測を要求するため取引所の返却上限より大きく取る。
  */
-private const val MAX_ORDERBOOK_DEPTH = 100
+private const val MAX_ORDERBOOK_DEPTH = 500
 
 /**
  * candles tool で許可する最大取得本数。

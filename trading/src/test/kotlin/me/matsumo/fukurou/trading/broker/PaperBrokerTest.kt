@@ -1903,6 +1903,90 @@ class PaperBrokerTest {
     }
 
     @Test
+    fun resting_limit_deeper_than_legacy_depth_is_accepted_with_queue_ahead() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000320")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = TruncatingOrderbookMarketDataSource(deepBidOrderbook())
+        val broker = connectedRestingLimitBroker(repository, decisionRepository, marketDataSource, sessionId)
+
+        val result = broker.placeOrder(
+            approvedCommand(decisionRepository, restingLimitCommand(priceJpy = DEEP_BID_LIMIT_PRICE)),
+        )
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf(OrderType.LIMIT), broker.getOpenOrders().getOrThrow().map { order -> order.orderType })
+        // queue snapshot は全 levels を、約定価格の算出は既存 depth を要求する。
+        assertEquals(listOf(QUEUE_SNAPSHOT_DEPTH), marketDataSource.requestedDepths.filter { it != PAPER_EXECUTION_DEPTH })
+        assertTrue(marketDataSource.requestedDepths.contains(PAPER_EXECUTION_DEPTH))
+    }
+
+    @Test
+    fun resting_limit_deeper_than_legacy_depth_fills_only_after_queue_ahead_is_consumed() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000321")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = TruncatingOrderbookMarketDataSource(deepBidOrderbook())
+        val broker = connectedRestingLimitBroker(repository, decisionRepository, marketDataSource, sessionId)
+        broker.applyMarketEvent(inMemoryPaperTradeEvent(sessionId, 1, OrderSide.SELL, "0.0010")).getOrThrow()
+        broker.placeOrder(
+            approvedCommand(decisionRepository, restingLimitCommand(priceJpy = DEEP_BID_LIMIT_PRICE)),
+        ).getOrThrow()
+
+        // 55 段目の bid 数量 0.0030 + 自注文 0.0050 = 0.0080 が閾値になる。
+        broker.applyMarketEvent(
+            inMemoryPaperTradeEvent(sessionId, 2, OrderSide.SELL, "0.0070", priceJpy = DEEP_BID_LIMIT_PRICE.toString()),
+        ).getOrThrow()
+
+        assertTrue(repository.getExecutions().getOrThrow().isEmpty())
+
+        broker.applyMarketEvent(
+            inMemoryPaperTradeEvent(sessionId, 3, OrderSide.SELL, "0.0010", priceJpy = DEEP_BID_LIMIT_PRICE.toString()),
+        ).getOrThrow()
+
+        assertEquals(1, repository.getExecutions().getOrThrow().size)
+    }
+
+    @Test
+    fun resting_limit_outside_entire_returned_depth_still_fails_closed() = runBlocking {
+        val sessionId = UUID.fromString("00000000-0000-0000-0000-000000000322")
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = TruncatingOrderbookMarketDataSource(deepBidOrderbook())
+        val broker = connectedRestingLimitBroker(repository, decisionRepository, marketDataSource, sessionId)
+
+        // 最深 bid は 60 段目の 9,941,000 円。それより低い指値は全 levels の圏外になる。
+        val result = broker.placeOrder(
+            approvedCommand(decisionRepository, restingLimitCommand(priceJpy = BigDecimal("9940000"))),
+        )
+
+        assertTrue(result.isFailure)
+        assertTrue(
+            result.exceptionOrNull()?.message.orEmpty().contains("limit price is outside returned bid depth"),
+        )
+        assertTrue(broker.getOpenOrders().getOrThrow().isEmpty())
+    }
+
+    @Test
+    fun paper_execution_orderbook_lookup_keeps_the_legacy_depth() = runBlocking {
+        val repository = InMemoryPaperLedgerRepository(clock = fixedClock())
+        val decisionRepository = InMemoryDecisionRepository(fixedClock())
+        val marketDataSource = TruncatingOrderbookMarketDataSource(deepBidOrderbook())
+        val broker = PaperBroker(
+            ledgerRepository = repository,
+            riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+            decisionRepository = decisionRepository,
+            marketDataSource = marketDataSource,
+            clock = fixedClock(),
+        )
+
+        broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
+
+        assertTrue(marketDataSource.requestedDepths.isNotEmpty())
+        assertTrue(marketDataSource.requestedDepths.all { depth -> depth == PAPER_EXECUTION_DEPTH })
+    }
+
+    @Test
     fun periodic_rest_maintenance_does_not_execute_virtual_take_profit_but_market_event_does() = runBlocking {
         val repository = InMemoryPaperLedgerRepository()
         val decisionRepository = InMemoryDecisionRepository(fixedClock())
@@ -2218,6 +2302,81 @@ private fun marketEntryCommand(
     )
 }
 
+/**
+ * paper 約定価格の算出が要求する orderbook depth。
+ */
+private const val PAPER_EXECUTION_DEPTH = 50
+
+/**
+ * queue_ahead 算出が要求する orderbook depth。取引所の返却上限を超え、client 側の切り詰めを無効にする。
+ */
+private const val QUEUE_SNAPSHOT_DEPTH = 500
+
+/**
+ * `deepBidOrderbook` が持つ bid levels 数。
+ */
+private const val DEEP_BID_LEVEL_COUNT = 60
+
+/**
+ * `deepBidOrderbook` の 55 段目の価格。depth 50 の圏外かつ全 levels の圏内になる。
+ */
+private val DEEP_BID_LIMIT_PRICE = BigDecimal("9946000")
+
+/**
+ * 1,000 円刻みで 60 段の bid を持つ板。
+ *
+ * 55 段目は best bid から 54,000 円下にあり、depth 50 で切り詰めると圏外になる。
+ */
+private fun deepBidOrderbook(): Orderbook {
+    val topBidPrice = 10_000_000
+    val bids = (0 until DEEP_BID_LEVEL_COUNT).map { index ->
+        OrderbookLevel(
+            price = (topBidPrice - index * 1_000).toString(),
+            size = if (index == 54) "0.0030" else "0.0100",
+        )
+    }
+
+    return Orderbook(
+        symbol = "BTC",
+        bids = bids,
+        asks = listOf(OrderbookLevel(price = "10001000", size = "1.0000")),
+    )
+}
+
+/**
+ * realtime session が接続済みで resting LIMIT を受理できる broker を作る。
+ */
+private fun connectedRestingLimitBroker(
+    repository: InMemoryPaperLedgerRepository,
+    decisionRepository: InMemoryDecisionRepository,
+    marketDataSource: MarketDataSource,
+    sessionId: UUID,
+): PaperBroker {
+    val reconcilerStatus = MutableReconcilerStatus()
+    reconcilerStatus.updateMarketData(
+        ReconcilerStatus(
+            startupFullReconcileCompleted = true,
+            lastTransportActivityAt = fixedInstant(),
+            lastTradeAt = fixedInstant(),
+            lastMaintenanceAt = fixedInstant(),
+            marketDataState = MarketDataConnectionState.CONNECTED,
+            marketDataSessionId = sessionId,
+            lastProcessedSequence = 1,
+            startupRecoveryCompleted = true,
+        ),
+    )
+
+    return PaperBroker(
+        ledgerRepository = repository,
+        riskStateRepository = InMemoryRiskStateRepository(clock = fixedClock()),
+        decisionRepository = decisionRepository,
+        marketDataSource = marketDataSource,
+        reconcilerStatusProvider = reconcilerStatus,
+        requireRealtimeIntegrityForRestingOrders = true,
+        clock = fixedClock(),
+    )
+}
+
 private fun restingLimitCommand(priceJpy: BigDecimal = BigDecimal("9900000")): PlaceOrderCommand {
     return PlaceOrderCommand(
         commandId = UUID.randomUUID(),
@@ -2460,6 +2619,30 @@ private class MutableOrderbookMarketDataSource(
 ) : MarketDataSource by FakeMarketDataSource {
     override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
         return Result.success(orderbook)
+    }
+}
+
+/**
+ * production と同じく返却済み levels を要求 depth で切り詰める fake market data。
+ *
+ * depth を無視する fake では、client 側 depth を変えても結果が変わらず回帰を証明できない。
+ *
+ * @param orderbook 切り詰め前の板全量
+ */
+private class TruncatingOrderbookMarketDataSource(
+    private val orderbook: Orderbook,
+) : MarketDataSource by FakeMarketDataSource {
+    val requestedDepths: MutableList<Int> = mutableListOf()
+
+    override suspend fun getOrderbook(symbol: TradingSymbol, depth: Int): Result<Orderbook> {
+        requestedDepths += depth
+
+        return Result.success(
+            orderbook.copy(
+                bids = orderbook.bids.take(depth),
+                asks = orderbook.asks.take(depth),
+            ),
+        )
     }
 }
 
