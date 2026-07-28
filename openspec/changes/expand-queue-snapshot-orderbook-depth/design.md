@@ -23,7 +23,7 @@ paper の resting BUY LIMIT は、発注時に取得した orderbook から「�
 
 **Goals:**
 
-- LLM が実際に置く押し目 LIMIT の価格分布に対して、queue_ahead の観測範囲が構造的に不足しない状態にする
+- queue_ahead の観測範囲を client 側の固定切り詰めで狭めず、取引所が返した bid levels 全体にする
 - どの require で fail-closed したかを audit payload から特定できるようにする
 - paper 約定価格の算出規則（slippage walk、fallback 条件）を変えない
 
@@ -66,22 +66,35 @@ depth 500 でも `limitPrice < minimumCoveredBid` になるケース（best bid 
 1. **cause の型集合が閉じていない**。`ToolCallGuard.runLockedTool` と `CallerNoTradeGuard.run` は `Throwable` を丸ごと catch し、`recordNoTradeExit` は任意の `Throwable?` を受ける。tool block・risk state repository・LLM process 境界のどこから来た例外でも通るため、message の内容を静的に列挙できない
 2. **`SecretRedactor` は起動時に収集した既知値の完全一致置換**。対象 key pattern は `API_KEY` / `SECRET` / `TOKEN` / `PASSWORD` / `CREDENTIAL` の 5 つだけで、rotation 後の値、URL や base64 へ変形された credential、pattern 外の key に入った secret は伏字にならない。`DB_URL` に埋め込まれた接続文字列などがこれに当たる
 
-そこで、message の保存は次の allowlist を満たす場合だけに限る。
+そこで、message の保存は **既知の diagnostic 文字列との完全一致** に限る。prefix 一致では不十分である。
 
-- `QUEUE_SNAPSHOT_UNAVAILABLE:` で始まる broker 生成 diagnostic
+prefix 判定を採らない理由: guard が任意の `Throwable` を受ける以上、外部由来の例外が `QUEUE_SNAPSHOT_UNAVAILABLE: token=<secret>` のような message を持てば、fukurou 生成でないのに allowlist を通過してしまう。prefix は「fukurou 自身が生成した」ことの証明にならない。完全一致であれば、外部例外が安全な固定文言を spoof しても、その文言自体に secret を混入できない。
+
+allowlist は `PaperBroker` と `ExposedPaperLedgerWriter` が生成する 10 個の固定文字列とする。いずれも変数展開を持たないリテラルであることを実装時に確認する。
+
+- `QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is not connected.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is unavailable.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session has not received an event.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session is stale.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: realtime market-data session changed during order creation.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: orderbook request failed.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: orderbook has no valid bid depth.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: limit price is outside returned bid depth.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: market-data session is not connected.`
+- `QUEUE_SNAPSHOT_UNAVAILABLE: market-data session advanced during order creation.`
 
 allowlist に一致しない cause は `cause`（例外の simpleName）だけを残し、`message` キーを出力しない。`messageOmitted` のような provider 分岐マーカーは持たず、allowlist 判定の結果として message キーの有無が決まる。
 
-この範囲で issue #320 の目的は達成される。今回診断できなかったのは「どの require で fail-closed したか」であり、それは全て `QUEUE_SNAPSHOT_UNAVAILABLE:` prefix を持つ broker 自身の文字列だからである。任意の provider 例外 message を開示する必要はない。
+この範囲で issue #320 の目的は達成される。今回診断できなかったのは「どの require で fail-closed したか」であり、それは全て上記 10 文字列のいずれかだからである。任意の provider 例外 message を開示する必要はない。
 
-allowlist prefix を今後増やす場合は、その prefix を生成するコードが fukurou 自身のものであり、外部入力を message へ埋め込まないことを確認する。
+allowlist を今後増やす場合は、追加する文字列が変数展開を持たないリテラルであることと、その生成箇所が fukurou 自身のコードであることを確認する。文字列の定義を broker 側と audit 側で共有し、片方だけが変更されて allowlist から外れる drift を防ぐ。
 
-`SecretRedactor` の配線は行わない。allowlist 済み文字列は fukurou 自身が生成した定数で secret を含まないため、redaction は不要であり、guard に redactor を渡す配線も不要になる。
+`SecretRedactor` の配線は行わない。allowlist は固定文字列との完全一致であり、通過する値は fukurou 自身が定義した定数そのものなので、redaction の対象になる可変部分が存在しない。
 
 ### 4. PR 分割
 
 - **PR-A（queue snapshot depth）**: depth 定数の分離・拡大、`MAX_ORDERBOOK_DEPTH` 引き上げ、`PaperBrokerTest` の回帰、`docs/mcp-runtime.md` の更新。レビュー観点は paper 真実性
-- **PR-B（audit message）**: `messageOmitted` 撤去、redactor 配線、guard test の更新。レビュー観点は secret 境界
+- **PR-B（audit message）**: `messageOmitted` 撤去、diagnostic allowlist の導入、guard test の更新。レビュー観点は secret 境界
 
 依存関係はない。PR-A は queue_ahead の観測範囲を広げ、PR-B は診断性の改善として独立に入る。OpenSpec change は PR-B 完了後に 1 回だけ archive する。
 
@@ -91,15 +104,22 @@ issue #320 が挙げた 5 件のうち、当時の指値と市場価格の対応
 
 板 depth は永続化されていない（`docs/design.md` の execution replay の節が同じ制約を記録している）ため、過去の 5 件が depth 500 で受理されたかを事後に検証する手段は存在しない。
 
-したがって本 change の主張は「観測された押し目 LIMIT の分布（現在値の 0.1〜0.3% 下）に対して queue_ahead の観測範囲が構造的に不足している状態を解消する」までとし、「過去 5 件が救済される」とは主張しない。deploy 後は PR-B が可視化する `QUEUE_SNAPSHOT_UNAVAILABLE` の内訳から、同じ reason の再発有無を既存 audit で確認する。
+したがって本 change は、指値の分布や頻度について何も主張しない。確認できる事実だけを根拠とする。
+
+- production で depth 50 圏外を理由とする `place_order_failed` が 5 回発生した
+- うち 1 件は限界価格と 1 分足終値の差が -0.23% だった
+- 別時点（2026-07-27）の板実測では、50 levels が best bid から 0.080%、100 levels が 0.263% しか覆っていない
+- `getOrderbook` の depth は client 側の切り詰め幅にすぎず、取引所の返却内容を変えない
+
+以上から「client 側で 50 に固定して切り詰める実装は、取引所が実際に板を出している価格帯の指値を観測範囲から除外し得る」と言える。本 change はこの client truncation を撤去する。deploy 後は PR-B が可視化する `QUEUE_SNAPSHOT_UNAVAILABLE` の内訳から、同じ reason の再発有無を既存 audit で確認する。
 
 ## Risks / Trade-offs
 
 - **先行注文の取消を反映しない conservative underfill の適用母数が増える**: queue_ahead は発注時点の exact-price 数量を 1 回だけ snapshot する。その後 exchange の先行注文が取り消されても queue は減らないため、実際より約定が遅く見積もられる。これは depth 50 のときから存在する既知の限界（`docs/mcp-runtime.md` に「partial fill と先行 exchange order cancellation は再現しない」と記載）だが、depth 拡大により従来 fail-closed で注文にすらならなかった価格帯へこのモデルが適用されるようになり、適用母数が増える。約定を早く見積もる方向の歪みではないため受容する
 - **深い指値の queue_ahead が大きくなり、約定しにくくなる**: 実際にその価格に厚い板があるなら約定しにくいのが正しい。fail-closed で注文が存在しなかった従来より、paper と live の意味は近づく
-- **admission 母集団の非連続（人間確認事項）**: 本 change 後は従来 fail-closed になっていた指値が order として成立するため、`place_order_failed` の発生率が下がり、resting entry の母数が増える。「depth 50 圏外の指値が注文にならなかった期間」と「注文になる期間」で母集団構成が変わり、cohort 上は両者を区別できない。
+- **admission 母集団の非連続（ユーザー確認済み）**: 本 change 後は従来 fail-closed になっていた指値が order として成立するため、`place_order_failed` の発生率が下がり、resting entry の母数が増える。「depth 50 圏外の指値が注文にならなかった期間」と「注文になる期間」で母集団構成が変わり、cohort 上は両者を区別できない。
 
-  execution semantics version（`PAPER_WS_V1`）は bump しない。約定規則そのもの（queue consumption による fill 判定）が不変であることに加え、このリポジトリでは #209 で version を定義して以降、#239（resting fill invariants の追加 = fill 可否の変更）を含む複数の admission 変更を経ても一度も bump されていない。depth 拡大は fill 判定を変えず観測範囲だけを広げるもので、#239 より影響が小さい。
+  execution semantics version（`PAPER_WS_V1`）は bump しない。この判断はオーナーが確認済みである。約定規則そのもの（queue consumption による fill 判定）が不変であることに加え、このリポジトリでは #209 で version を定義して以降、#239（resting fill invariants の追加）を含む複数の変更を経ても一度も bump されていない。#239 は fill 条件に到達した resting entry へ SafetyFloor を再評価し、違反時に約定させず CANCELED にする変更であり、fill outcome そのものを変えている。depth 拡大は fill 判定を変えず観測範囲だけを広げるもので、#239 より影響が小さい。
 
-  ただしこの判断は評価の連続性に関わるため、PR の人間確認事項として明示する。bump が必要と判断される場合は、deploy 時点で残る V1 open order が deploy 後に fill される mixed lineage、rollback、評価 query の新旧 version 認識を同時に設計する必要があり、本 change のスコープを超える
-- **allowlist 外の失敗は cause 型名だけになる**: `caller_failed` / `tool_call_failed` など LLM process 境界の失敗では、引き続き message が audit に残らない。`QUEUE_SNAPSHOT_UNAVAILABLE` 以外の診断性ギャップは本 change では閉じない。必要になった時点で、その prefix を生成するコードの所有者を確認したうえで allowlist へ追加する
+  この判断は評価の連続性に関わる residual risk として PR へ転記する。bump が必要と後から判断される場合は、deploy 時点で残る V1 open order が deploy 後に fill される mixed lineage、rollback、評価 query の新旧 version 認識を同時に設計する必要があり、本 change のスコープを超える。
+- **allowlist 外の失敗は cause 型名だけになる**: `caller_failed` / `tool_call_failed` など LLM process 境界の失敗では、引き続き message が audit に残らない。`QUEUE_SNAPSHOT_UNAVAILABLE` 以外の診断性ギャップは本 change では閉じない。必要になった時点で、その文字列が変数展開を持たないリテラルであることを確認したうえで allowlist へ追加する

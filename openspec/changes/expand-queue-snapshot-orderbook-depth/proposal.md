@@ -10,7 +10,9 @@ require(limitPrice >= minimumCoveredBid) {
 }
 ```
 
-GMO 公開 API の実測（2026-07-27）では、`getOrderbook` は depth を API へ渡さず全 levels を取得してから `take(depth)` している。この日の bids は 417 levels あり、depth 50 のカバー幅は best bid から 0.080%、depth 100 でも 0.263% に留まる。LLM の押し目 LIMIT は現在値の 0.1〜0.3% 下に置かれることが多く、観測範囲がこの分布に対して構造的に狭い。depth を拡大しても取得する response は同一であり、API コストは増えない。
+`getOrderbook` は depth を API へ渡さず、全 levels を取得してから client 側で `take(depth)` している。depth は取引所への要求ではなく、返却済みデータの切り詰め幅にすぎない。2026-07-27 の実測では bids が 417 levels あり、そのうち depth 50 が覆うのは best bid から 0.080%、depth 100 でも 0.263% だった。報告された 5 件のうち唯一価格が判る run `5b16ff53` は、限界価格と 1 分足終値の差が -0.23% である。
+
+つまり client 側の 50 固定は、取引所が実際に板を出している価格帯の指値を観測範囲から除外し得る。depth を拡大しても取得する response は同一であり、HTTP request 数と response サイズは変わらない。
 
 fail-closed 設計自体は paper 真実性（queue_ahead は paper 約定の因果的入力であり、観測できない場合に注文を作らない）の観点で正しい。修正対象は観測範囲だけに限る。
 
@@ -21,7 +23,7 @@ fail-closed 設計自体は paper 真実性（queue_ahead は paper 約定の因
 - queue_ahead 算出専用の orderbook depth 定数を新設し、GMO が返す全 levels（500）を観測範囲とする。`PaperBroker.calculateQueueAhead` だけがこの定数を使う。
 - `orderbookFor()`（`FillSimulator` の MARKET / LIMIT taker slippage walk、`SafetyFloor` の板参照）が使う既存 `PAPER_EXECUTION_ORDERBOOK_DEPTH = 50` は変更しない。paper 約定価格の算出規則を本 change では変えない。
 - `GmoPublicMarketDataSource.MAX_ORDERBOOK_DEPTH` を 100 から 500 へ引き上げる。LLM 向け MCP tool 側の `MAX_ORDERBOOK_DEPTH = 100`（`mcp-gmo-coin`）は prompt 面の上限であり変更しない。
-- `buildNoTradeFailurePayload` の Codex 分岐と `messageOmitted` キーを撤去し、fukurou 自身が生成した定型 diagnostic（`QUEUE_SNAPSHOT_UNAVAILABLE:` prefix）に一致する message だけを provider によらず記録する。allowlist 外の cause は例外型名だけを残す。
+- `buildNoTradeFailurePayload` の Codex 分岐と `messageOmitted` キーを撤去し、`PaperBroker` / `ExposedPaperLedgerWriter` が生成する 10 個の固定 diagnostic 文字列と**完全一致**する message だけを provider によらず記録する。allowlist 外の cause は例外型名だけを残す。prefix 一致では外部由来の例外が secret を混入した文字列で通過し得るため採らない。
 - 2 PR 構成とする。PR-A: queue snapshot depth の拡大と回帰テスト。PR-B: `messageOmitted` の撤去と diagnostic allowlist の導入。互いに独立で、レビュー観点（paper 真実性 / secret 境界）が異なる。
 
 ## Capabilities
@@ -44,4 +46,5 @@ fail-closed 設計自体は paper 真実性（queue_ahead は paper 約定の因
 - `docs/mcp-runtime.md`: 「板 depth 外」の fail-closed 記述を現在の観測範囲へ更新
 - 破壊的変更: なし。既存 order・execution・評価集計を書き換えない
 - 依存: なし
-- 人間確認事項: depth 拡大により resting entry の admission 母集団が変わるが、execution semantics version（`PAPER_WS_V1`）は bump しない。評価の連続性に関わる判断のため PR で明示する
+- residual risk（ユーザー確認済み）: depth 拡大により resting entry の admission 母集団が変わるが、execution semantics version（`PAPER_WS_V1`）は bump しない。評価の連続性に関わる判断のため PR で明示する
+- 本 change は過去 5 件の retrospective な救済を主張しない。発注時点の板 depth が永続化されていないため事後検証できない
