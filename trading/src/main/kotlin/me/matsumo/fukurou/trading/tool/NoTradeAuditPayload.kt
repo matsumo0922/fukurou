@@ -2,6 +2,7 @@ package me.matsumo.fukurou.trading.tool
 
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.decision.submissionRejectionCodeOrNull
 import me.matsumo.fukurou.trading.domain.QueueSnapshotDiagnostics
 
 /**
@@ -12,11 +13,13 @@ import me.matsumo.fukurou.trading.domain.QueueSnapshotDiagnostics
 internal fun buildNoTradeFailurePayload(reason: String, cause: Throwable?): String {
     val causeName = cause?.javaClass?.simpleName ?: "none"
     val persistableMessage = cause?.message?.takeIf { message -> message.isPersistableDiagnostic() }
+    val rejectionCode = cause?.submissionRejectionCodeOrNull()?.wireValue
 
     return buildJsonObject {
         put("reason", reason)
         put("cause", causeName)
         persistableMessage?.let { message -> put("message", message) }
+        rejectionCode?.let { code -> put("rejectionCode", code) }
         put("noTrade", true)
     }.toString()
 }

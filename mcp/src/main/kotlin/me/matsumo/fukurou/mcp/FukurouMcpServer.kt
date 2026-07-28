@@ -67,11 +67,13 @@ import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
 import me.matsumo.fukurou.trading.decision.TradeIntentReviewSnapshot
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
 import me.matsumo.fukurou.trading.decision.requiresEntryIntent
+import me.matsumo.fukurou.trading.decision.submissionRejectionCodeOrNull
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -371,6 +373,7 @@ private val ToolErrorTypes: List<Pair<KClass<out Throwable>, String>> = listOf(
     GmoRequestAuditException::class to "audit_failed_after_execution",
     DecisionSubmissionConflictException::class to "decision_submission_conflict",
     DecisionSubmissionUnknownException::class to "decision_submission_unknown",
+    SubmissionRejectedException::class to "submission_rejected",
     MarketInvalidRequestException::class to "invalid_request",
     GmoRateLimitException::class to "rate_limited",
     GmoApiStatusException::class to "gmo_status_error",
@@ -2830,8 +2833,15 @@ private fun throwableResult(throwable: Throwable): CallToolResult {
     }
 
     val failureKind = (throwable as? MarketDataException)?.kind?.name?.lowercase()
+    val rejectionCode = throwable.submissionRejectionCodeOrNull()?.wireValue
 
-    return mcpErrorResult(type, throwable.message.orEmpty(), executed, failureKind)
+    return mcpErrorResult(
+        type = type,
+        message = throwable.message.orEmpty(),
+        executed = executed,
+        failureKind = failureKind,
+        rejectionCode = rejectionCode,
+    )
 }
 
 private suspend fun <T> withMcpGmoRequestCorrelation(

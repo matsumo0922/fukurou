@@ -26,9 +26,12 @@ import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
+import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.decision.gatewayRejectionCode
 import me.matsumo.fukurou.trading.decision.submitTerminalDecision
 import me.matsumo.fukurou.trading.decision.submitTerminalFalsification
 import me.matsumo.fukurou.trading.domain.OrderSide
@@ -186,7 +189,10 @@ class LlmDecisionSubmissionGateway private constructor(
                 runCatching {
                     server.accept().use { channel ->
                         val response = runCatching {
-                            val request = LlmSubmissionGatewayCodec.readFrame(channel)
+                            val request = runCatching { LlmSubmissionGatewayCodec.readFrame(channel) }
+                                .getOrElse {
+                                    throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST)
+                                }
                             runBlocking {
                                 handleRequest(
                                     request = request,
@@ -251,33 +257,35 @@ class LlmDecisionSubmissionGateway private constructor(
             terminalEvidenceCaptureEnabled: Boolean,
             submissionState: AtomicReference<LlmSemanticSubmissionState>,
         ): JsonObject {
-            val terminalEvidence = decodeTerminalEvidenceBundle(request, terminalEvidenceCaptureEnabled)
-            require(request.requiredString("invocationId") == invocationId) { "Gateway invocation binding mismatch." }
-            require(request.requiredString("phase") == phase.name) { "Gateway phase binding mismatch." }
-            require(request.requiredString("phaseManifestId") == phaseManifestId) { "Gateway manifest binding mismatch." }
-            require(request.requiredString("effectiveInvocationHash") == effectiveInvocationHash) {
-                "Gateway effective invocation binding mismatch."
-            }
-            val payload = request.getValue("payload").jsonObject
-            val trustedTerminalEvidence = TrustedTerminalToolEvidenceBundle(
+            val trustedTerminalEvidence = request.trustedTerminalEvidence(
                 invocationId = invocationId,
                 phaseManifestId = phaseManifestId,
                 phase = phase,
                 captureEnabled = terminalEvidenceCaptureEnabled,
-                bundle = terminalEvidence,
+            )
+            request.validateGatewayBinding(
+                invocationId = invocationId,
+                phase = phase,
+                phaseManifestId = phaseManifestId,
+                effectiveInvocationHash = effectiveInvocationHash,
             )
 
-            return when (request.requiredString("operation")) {
+            return when (request.gatewayString("operation")) {
                 OPERATION_SUBMIT_DECISION -> {
-                    require(phase == LlmInvocationPhase.PROPOSER || phase == LlmInvocationPhase.RISK_REDUCTION_ONLY) {
-                        "submit_decision is not authorized for this phase."
-                    }
-                    val submission = LlmSubmissionGatewayCodec.decodeDecision(payload)
-                    require(submission.invocationId == invocationId) { "Decision invocation binding mismatch." }
+                    val phaseAuthorized = phase == LlmInvocationPhase.PROPOSER ||
+                        phase == LlmInvocationPhase.RISK_REDUCTION_ONLY
+                    rejectUnless(phaseAuthorized, SubmissionRejectionCode.PHASE_NOT_AUTHORIZED)
+                    val submission = runCatching { LlmSubmissionGatewayCodec.decodeDecision(request.gatewayPayload()) }
+                        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
+                    rejectUnless(
+                        submission.invocationId == invocationId,
+                        SubmissionRejectionCode.DECISION_INVOCATION_MISMATCH,
+                    )
                     if (phase == LlmInvocationPhase.RISK_REDUCTION_ONLY) {
-                        require(submission.action in RISK_REDUCTION_ONLY_ACTIONS) {
-                            "RISK_REDUCTION_ONLY rejects risk-increasing decisions."
-                        }
+                        rejectUnless(
+                            submission.action in RISK_REDUCTION_ONLY_ACTIONS,
+                            SubmissionRejectionCode.RISK_INCREASING_ACTION_REJECTED,
+                        )
                     }
                     LlmSubmissionGatewayCodec.decisionResult(
                         submitRepositoryRequest(submissionState) {
@@ -290,10 +298,12 @@ class LlmDecisionSubmissionGateway private constructor(
                     )
                 }
                 OPERATION_SUBMIT_FALSIFICATION -> {
-                    require(phase == LlmInvocationPhase.FALSIFIER) {
-                        "submit_falsification is not authorized for this phase."
-                    }
-                    val submission = LlmSubmissionGatewayCodec.decodeFalsification(payload)
+                    rejectUnless(
+                        phase == LlmInvocationPhase.FALSIFIER,
+                        SubmissionRejectionCode.PHASE_NOT_AUTHORIZED,
+                    )
+                    val submission = runCatching { LlmSubmissionGatewayCodec.decodeFalsification(request.gatewayPayload()) }
+                        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
                     LlmSubmissionGatewayCodec.falsificationResult(
                         submitRepositoryRequest(submissionState) {
                             repository.submitTerminalFalsification(
@@ -303,7 +313,7 @@ class LlmDecisionSubmissionGateway private constructor(
                         },
                     )
                 }
-                else -> error("Unknown submission gateway operation.")
+                else -> throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST)
             }
         }
 
@@ -319,13 +329,58 @@ class LlmDecisionSubmissionGateway private constructor(
 }
 
 private fun gatewayErrorResponse(throwable: Throwable): JsonObject = buildJsonObject {
-    val code = when (throwable) {
+    val errorCode = when (throwable) {
         is DecisionSubmissionConflictException -> DECISION_SUBMISSION_CONFLICT_CODE
         is DecisionSubmissionUnknownException -> DECISION_SUBMISSION_UNKNOWN_CODE
         else -> SUBMISSION_REJECTED_CODE
     }
     put("accepted", false)
-    put("error", code)
+    put("error", errorCode)
+    put("reason", throwable.gatewayRejectionCode().wireValue)
+}
+
+private fun rejectUnless(condition: Boolean, code: SubmissionRejectionCode) {
+    if (!condition) throw SubmissionRejectedException(code)
+}
+
+private fun JsonObject.validateGatewayBinding(
+    invocationId: String,
+    phase: LlmInvocationPhase,
+    phaseManifestId: String,
+    effectiveInvocationHash: String,
+) {
+    rejectUnless(gatewayString("invocationId") == invocationId, SubmissionRejectionCode.INVOCATION_BINDING_MISMATCH)
+    rejectUnless(gatewayString("phase") == phase.name, SubmissionRejectionCode.PHASE_BINDING_MISMATCH)
+    rejectUnless(gatewayString("phaseManifestId") == phaseManifestId, SubmissionRejectionCode.MANIFEST_BINDING_MISMATCH)
+    rejectUnless(
+        gatewayString("effectiveInvocationHash") == effectiveInvocationHash,
+        SubmissionRejectionCode.EFFECTIVE_HASH_MISMATCH,
+    )
+}
+
+private fun JsonObject.gatewayPayload(): JsonObject {
+    return runCatching { getValue("payload").jsonObject }
+        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
+}
+
+private fun JsonObject.trustedTerminalEvidence(
+    invocationId: String,
+    phaseManifestId: String,
+    phase: LlmInvocationPhase,
+    captureEnabled: Boolean,
+): TrustedTerminalToolEvidenceBundle {
+    return TrustedTerminalToolEvidenceBundle(
+        invocationId = invocationId,
+        phaseManifestId = phaseManifestId,
+        phase = phase,
+        captureEnabled = captureEnabled,
+        bundle = decodeTerminalEvidenceBundle(this, captureEnabled),
+    )
+}
+
+private fun JsonObject.gatewayString(name: String): String {
+    return runCatching { requiredString(name) }
+        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
 }
 
 private fun Throwable?.combineCleanupFailure(next: Throwable): Throwable {
@@ -598,21 +653,21 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.putStringList(name: Str
 
 /** activationとwire versionの組み合わせを検証し、trusted bundle候補へ正規化する。 */
 internal fun decodeTerminalEvidenceBundle(request: JsonObject, captureEnabled: Boolean): TerminalToolEvidenceBundle {
-    val version = request.requiredString("version").toInt()
-    val terminalEvidence = request["terminalEvidence"]
-    if (!captureEnabled) {
-        require(version == LEGACY_GATEWAY_PROTOCOL_VERSION && terminalEvidence == null) {
-            "Disabled terminal evidence requires the legacy gateway request."
+    return runCatching {
+        val version = request.requiredString("version").toInt()
+        val terminalEvidence = request["terminalEvidence"]
+        if (!captureEnabled) {
+            require(version == LEGACY_GATEWAY_PROTOCOL_VERSION && terminalEvidence == null)
+
+            return@runCatching TerminalToolEvidenceBundle.disabled()
         }
 
-        return TerminalToolEvidenceBundle.disabled()
-    }
+        require(version == TERMINAL_EVIDENCE_GATEWAY_PROTOCOL_VERSION && terminalEvidence != null)
 
-    require(version == TERMINAL_EVIDENCE_GATEWAY_PROTOCOL_VERSION && terminalEvidence != null) {
-        "Enabled terminal evidence requires the versioned evidence request."
+        LlmTerminalEvidenceCodec.decodeBundle(terminalEvidence.jsonObject)
+    }.getOrElse {
+        throw SubmissionRejectedException(SubmissionRejectionCode.TERMINAL_EVIDENCE_CONTRACT_VIOLATION)
     }
-
-    return LlmTerminalEvidenceCodec.decodeBundle(terminalEvidence.jsonObject)
 }
 
 /** serialized gateway payloadが既存単一frame上限内かを返す。 */

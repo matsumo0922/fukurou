@@ -12,6 +12,8 @@ import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
+import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
 import java.io.IOException
@@ -39,6 +41,92 @@ class LlmDecisionSubmissionGatewayTest {
         FalsificationVerdict.entries.forEach { verdict ->
             assertEquals(verdict == FalsificationVerdict.APPROVED, verdict.requiresCompleteTerminalEvidence())
         }
+    }
+
+    @Test
+    fun `rejection code wire values are unique closed snake case identifiers`() {
+        val wireValues = SubmissionRejectionCode.entries.map { code -> code.wireValue }
+
+        assertEquals(wireValues.size, wireValues.toSet().size)
+        assertTrue(wireValues.all { value -> value.matches(Regex("[a-z][a-z0-9_]*")) })
+        assertEquals(
+            SubmissionRejectionCode.entries.toSet(),
+            wireValues.mapNotNull(SubmissionRejectionCode::fromWireValue).toSet(),
+        )
+        assertEquals(null, SubmissionRejectionCode.fromWireValue("outside_vocabulary"))
+    }
+
+    @Test
+    fun `gateway distinguishes every binding rejection point`() {
+        val baseRequest = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+        val mismatches = mapOf(
+            "invocationId" to SubmissionRejectionCode.INVOCATION_BINDING_MISMATCH,
+            "phase" to SubmissionRejectionCode.PHASE_BINDING_MISMATCH,
+            "phaseManifestId" to SubmissionRejectionCode.MANIFEST_BINDING_MISMATCH,
+            "effectiveInvocationHash" to SubmissionRejectionCode.EFFECTIVE_HASH_MISMATCH,
+        )
+
+        mismatches.forEach { (field, expectedCode) ->
+            val changedRequest = baseRequest.toMutableMap()
+                .also { request -> request[field] = JsonPrimitive("mismatch") }
+                .let(::JsonObject)
+            val response = exchangeRequest(
+                repository = InMemoryDecisionRepository(),
+                phase = LlmInvocationPhase.PROPOSER,
+                request = changedRequest,
+            )
+
+            assertEquals("SUBMISSION_REJECTED", response.getValue("error").jsonPrimitive.content)
+            assertEquals(expectedCode.wireValue, response.getValue("reason").jsonPrimitive.content)
+        }
+    }
+
+    @Test
+    fun `gateway classifies phase payload operation and terminal evidence rejections`() {
+        val phaseResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.FALSIFIER,
+            request = request(LlmInvocationPhase.FALSIFIER, decision(DecisionAction.NO_TRADE)),
+        )
+        val mismatchedDecision = decision(DecisionAction.NO_TRADE).copy(invocationId = "other-invocation")
+        val decisionResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = request(LlmInvocationPhase.PROPOSER, mismatchedDecision),
+        )
+        val unknownOperation = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .toMutableMap()
+            .also { gatewayRequest -> gatewayRequest["operation"] = JsonPrimitive("UNKNOWN") }
+            .let(::JsonObject)
+        val operationResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = unknownOperation,
+        )
+        val malformedPayload = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .toMutableMap()
+            .also { gatewayRequest -> gatewayRequest["payload"] = JsonObject(emptyMap()) }
+            .let(::JsonObject)
+        val malformedResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = malformedPayload,
+        )
+        val terminalContractRequest = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .toMutableMap()
+            .also { gatewayRequest -> gatewayRequest["version"] = JsonPrimitive(2) }
+            .let(::JsonObject)
+        val terminalResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = terminalContractRequest,
+        )
+
+        assertEquals(SubmissionRejectionCode.PHASE_NOT_AUTHORIZED.wireValue, phaseResponse.reason())
+        assertEquals(SubmissionRejectionCode.DECISION_INVOCATION_MISMATCH.wireValue, decisionResponse.reason())
+        assertEquals(SubmissionRejectionCode.MALFORMED_REQUEST.wireValue, operationResponse.reason())
+        assertEquals(SubmissionRejectionCode.MALFORMED_REQUEST.wireValue, malformedResponse.reason())
+        assertEquals(SubmissionRejectionCode.TERMINAL_EVIDENCE_CONTRACT_VIOLATION.wireValue, terminalResponse.reason())
     }
 
     @Test
@@ -85,7 +173,7 @@ class LlmDecisionSubmissionGatewayTest {
 
         assertEquals("2", request.getValue("version").toString())
         assertEquals(TerminalToolEvidenceBundle.disabled(), decodeTerminalEvidenceBundle(request, true))
-        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(request, false) }
+        assertFailsWith<SubmissionRejectedException> { decodeTerminalEvidenceBundle(request, false) }
     }
 
     @Test
@@ -95,8 +183,8 @@ class LlmDecisionSubmissionGatewayTest {
             .also { request -> request["version"] = JsonPrimitive(2) }
             .let(::JsonObject)
 
-        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(legacy, true) }
-        assertFailsWith<IllegalArgumentException> { decodeTerminalEvidenceBundle(versionTwoWithoutEvidence, true) }
+        assertFailsWith<SubmissionRejectedException> { decodeTerminalEvidenceBundle(legacy, true) }
+        assertFailsWith<SubmissionRejectedException> { decodeTerminalEvidenceBundle(versionTwoWithoutEvidence, true) }
     }
 
     @Test
@@ -316,6 +404,8 @@ class LlmDecisionSubmissionGatewayTest {
         }
 
         assertEquals("false", response.getValue("accepted").toString())
+        assertEquals(SubmissionRejectionCode.UNCLASSIFIED.wireValue, response.reason())
+        assertFalse(response.toString().contains("repository completion was lost"))
         assertEquals(
             DecisionAction.NO_TRADE,
             delegate.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action,
@@ -354,6 +444,7 @@ class LlmDecisionSubmissionGatewayTest {
 
         assertEquals(first.getValue("decision_id"), retry.getValue("decision_id"))
         assertEquals(DECISION_SUBMISSION_CONFLICT_CODE, conflict.getValue("error").jsonPrimitive.content)
+        assertEquals(SubmissionRejectionCode.SUBMISSION_CONFLICT.wireValue, conflict.reason())
         assertEquals(1, repository.snapshots.decisions().size)
 
         val incompleteRepository = InMemoryDecisionRepository()
@@ -364,6 +455,7 @@ class LlmDecisionSubmissionGatewayTest {
         val unknown = exchangeDecision(incompleteRepository, submission)
 
         assertEquals(DECISION_SUBMISSION_UNKNOWN_CODE, unknown.getValue("error").jsonPrimitive.content)
+        assertEquals(SubmissionRejectionCode.SUBMISSION_UNKNOWN.wireValue, unknown.reason())
         assertTrue(incompleteRepository.snapshots.decisions().isEmpty())
     }
 
@@ -382,6 +474,7 @@ class LlmDecisionSubmissionGatewayTest {
         }
 
         assertEquals("false", response.getValue("accepted").toString())
+        assertEquals(SubmissionRejectionCode.RISK_INCREASING_ACTION_REJECTED.wireValue, response.reason())
         assertEquals(null, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow())
         gateway.close()
     }
@@ -438,10 +531,22 @@ class LlmDecisionSubmissionGatewayTest {
         )
 
     private fun exchangeDecision(repository: InMemoryDecisionRepository, submission: DecisionSubmission): JsonObject {
-        val path = Path.of("/tmp/fukurou-gateway-idempotency-${System.nanoTime()}.sock")
-        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        return exchangeRequest(
+            repository = repository,
+            phase = LlmInvocationPhase.PROPOSER,
+            request = request(LlmInvocationPhase.PROPOSER, submission),
+        )
+    }
+
+    private fun exchangeRequest(
+        repository: InMemoryDecisionRepository,
+        phase: LlmInvocationPhase,
+        request: JsonObject,
+    ): JsonObject {
+        val path = Path.of("/tmp/fukurou-gateway-exchange-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, phase)
         val response = connect(path).use { channel ->
-            LlmSubmissionGatewayCodec.writeFrame(channel, request(LlmInvocationPhase.PROPOSER, submission))
+            LlmSubmissionGatewayCodec.writeFrame(channel, request)
             LlmSubmissionGatewayCodec.readFrame(channel)
         }
         gateway.close()
@@ -489,6 +594,8 @@ class LlmDecisionSubmissionGatewayTest {
         connect(UnixDomainSocketAddress.of(path))
     }
 }
+
+private fun JsonObject.reason(): String = getValue("reason").jsonPrimitive.content
 
 private const val INVOCATION_ID = "gateway-test-invocation"
 private const val PHASE_MANIFEST_ID = "gateway-test-invocation:PROPOSER"
