@@ -37,4 +37,4 @@
 
 ## 6. Archive
 
-- [ ] 6.1 PR-B マージ後に `openspec archive expand-queue-snapshot-orderbook-depth` を 1 回だけ実行する
+- [x] 6.1 PR-B マージ後に `openspec archive expand-queue-snapshot-orderbook-depth` を 1 回だけ実行する
