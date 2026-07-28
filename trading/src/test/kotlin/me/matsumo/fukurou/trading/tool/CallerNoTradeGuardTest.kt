@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.domain.QueueSnapshotDiagnostics
 import java.nio.file.FileSystemException
 import java.time.Clock
 import java.time.Instant
@@ -55,7 +56,7 @@ class CallerNoTradeGuardTest {
     }
 
     @Test
-    fun codexStartupFailure_omitsExceptionMessageFromNoTradeExit() = runBlocking {
+    fun arbitraryStartupFailure_keepsOnlyTheCauseType() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val guard = CallerNoTradeGuard(eventLog, fixedClock())
         val failure = FileSystemException(
@@ -73,24 +74,43 @@ class CallerNoTradeGuardTest {
         assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
         assertTrue(event.payload.contains("caller_failed"))
         assertTrue(event.payload.contains("\"cause\":\"FileSystemException\""))
-        assertTrue(event.payload.contains("\"messageOmitted\":true"))
+        assertFalse(event.payload.contains("\"message\""))
         assertFalse(event.payload.contains("auth-path-marker"))
         assertFalse(event.payload.contains("path-message-marker"))
     }
 
     @Test
-    fun claudeStartupFailure_keepsExceptionMessageInNoTradeExit() = runBlocking {
+    fun queueSnapshotDiagnostic_isKeptForEveryProvider() = runBlocking {
+        val providers = listOf("codex", "claude")
+
+        for (provider in providers) {
+            val eventLog = InMemoryCommandEventLog()
+            val guard = CallerNoTradeGuard(eventLog, fixedClock())
+
+            val result = guard.run(createInvocation(llmProvider = provider)) {
+                error(QueueSnapshotDiagnostics.LIMIT_OUTSIDE_BID_DEPTH)
+            }
+            val event = eventLog.events().single()
+
+            assertTrue(result.isFailure)
+            assertTrue(event.payload.contains(QueueSnapshotDiagnostics.LIMIT_OUTSIDE_BID_DEPTH))
+            assertFalse(event.payload.contains("messageOmitted"))
+        }
+    }
+
+    @Test
+    fun messageStartingWithADiagnostic_isNotPersisted() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val guard = CallerNoTradeGuard(eventLog, fixedClock())
 
-        val result = guard.run(createInvocation(llmProvider = "claude")) {
-            error("MCP process failed before connect")
+        val result = guard.run(createInvocation()) {
+            error("${QueueSnapshotDiagnostics.LIMIT_OUTSIDE_BID_DEPTH} token=secret-marker")
         }
         val event = eventLog.events().single()
 
         assertTrue(result.isFailure)
-        assertTrue(event.payload.contains("MCP process failed before connect"))
-        assertFalse(event.payload.contains("messageOmitted"))
+        assertFalse(event.payload.contains("\"message\""))
+        assertFalse(event.payload.contains("secret-marker"))
     }
 
     @Test

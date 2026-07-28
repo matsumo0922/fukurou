@@ -49,7 +49,6 @@ class CallerNoTradeGuard(
         val payload = buildNoTradeFailurePayload(
             reason = reason,
             cause = cause,
-            llmProvider = invocation.decisionRunContext.llmProvider,
         )
 
         return commandEventLog.append(
