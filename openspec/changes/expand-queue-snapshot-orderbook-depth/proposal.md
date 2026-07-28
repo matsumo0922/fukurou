@@ -1,8 +1,10 @@
 ## Why
 
-Issue #320: falsifier が APPROVED を出した押し目 LIMIT entry が `place_order` 段階で `IllegalArgumentException` により fail-closed し、trade にならないケースが production で 5 回発生している（07-12 / 07-26 x3 / 07-27）。
+Issue #320: falsifier が APPROVED を出した押し目 LIMIT entry が `place_order` 段階で `IllegalArgumentException` により fail-closed し、trade にならないケースが production で 5 回発生している（07-12 / 07-26 x3 / 07-27）。いずれも proposer ENTER → falsifier APPROVED → `preview_order` accepted → 直後の `place_order` 失敗という同じ event pattern を示す。
 
-原因は `PaperBroker.calculateQueueAhead` が queue_ahead 算出用に取得する orderbook depth が 50 levels に固定されていることにある。`preview_order` は queue_ahead を計算しないため accepted=true を返し、その 100〜200ms 後の `place_order` だけが以下の require で落ちる。
+`preview_order` は queue_ahead を計算せず、`placeOrder` 経路だけが `createRestingOrderMarketEligibility` を通るため、preview accepted の直後に place が落ちる形になる。ただし audit payload が Codex provider の message を省略していたため、5 件が同関数の 7 つの require のどれで落ちたかは事後に特定できない。
+
+特定できないまま残る問題として、`PaperBroker.calculateQueueAhead` が queue_ahead 算出用に取得する orderbook depth が 50 levels に固定されている。この 50 は以下の require の判定範囲を決める。
 
 ```kotlin
 require(limitPrice >= minimumCoveredBid) {

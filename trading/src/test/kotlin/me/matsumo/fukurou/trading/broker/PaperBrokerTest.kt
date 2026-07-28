@@ -1916,7 +1916,9 @@ class PaperBrokerTest {
 
         assertTrue(result.isSuccess)
         assertEquals(listOf(OrderType.LIMIT), broker.getOpenOrders().getOrThrow().map { order -> order.orderType })
-        assertTrue(marketDataSource.requestedDepths.any { depth -> depth > LEGACY_QUEUE_SNAPSHOT_DEPTH })
+        // queue snapshot は全 levels を、約定価格の算出は既存 depth を要求する。
+        assertEquals(listOf(QUEUE_SNAPSHOT_DEPTH), marketDataSource.requestedDepths.filter { it != PAPER_EXECUTION_DEPTH })
+        assertTrue(marketDataSource.requestedDepths.contains(PAPER_EXECUTION_DEPTH))
     }
 
     @Test
@@ -1953,7 +1955,7 @@ class PaperBrokerTest {
         val marketDataSource = TruncatingOrderbookMarketDataSource(deepBidOrderbook())
         val broker = connectedRestingLimitBroker(repository, decisionRepository, marketDataSource, sessionId)
 
-        // 最深 bid は 60 段目の 9,941,000 円。その 1 tick 下は全 levels の圏外になる。
+        // 最深 bid は 60 段目の 9,941,000 円。それより低い指値は全 levels の圏外になる。
         val result = broker.placeOrder(
             approvedCommand(decisionRepository, restingLimitCommand(priceJpy = BigDecimal("9940000"))),
         )
@@ -1981,7 +1983,7 @@ class PaperBrokerTest {
         broker.placeOrder(approvedCommand(decisionRepository, marketEntryCommand())).getOrThrow()
 
         assertTrue(marketDataSource.requestedDepths.isNotEmpty())
-        assertTrue(marketDataSource.requestedDepths.all { depth -> depth == LEGACY_QUEUE_SNAPSHOT_DEPTH })
+        assertTrue(marketDataSource.requestedDepths.all { depth -> depth == PAPER_EXECUTION_DEPTH })
     }
 
     @Test
@@ -2301,9 +2303,14 @@ private fun marketEntryCommand(
 }
 
 /**
- * 変更前に queue_ahead 算出が要求していた orderbook depth。
+ * paper 約定価格の算出が要求する orderbook depth。
  */
-private const val LEGACY_QUEUE_SNAPSHOT_DEPTH = 50
+private const val PAPER_EXECUTION_DEPTH = 50
+
+/**
+ * queue_ahead 算出が要求する orderbook depth。取引所の返却上限を超え、client 側の切り詰めを無効にする。
+ */
+private const val QUEUE_SNAPSHOT_DEPTH = 500
 
 /**
  * `deepBidOrderbook` が持つ bid levels 数。

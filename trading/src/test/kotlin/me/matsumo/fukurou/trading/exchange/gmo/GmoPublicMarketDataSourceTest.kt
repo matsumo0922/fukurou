@@ -304,11 +304,30 @@ class GmoPublicMarketDataSourceTest {
     }
 
     @Test
-    fun parseOrderbookResponse_keepsEveryLevelForQueueSnapshotDepth() {
-        val orderbook = parseOrderbookResponse(ORDERBOOK_SUCCESS_RESPONSE, TradingSymbol.BTC, depth = 500)
+    fun getOrderbook_acceptsTheQueueSnapshotDepthInOneRequest() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf("symbol=BTC" to ORDERBOOK_SUCCESS_RESPONSE),
+        )
+        val dataSource = fakeMarketDataSource(httpClient = httpClient)
+
+        val orderbook = dataSource.getOrderbook(TradingSymbol.BTC, depth = QUEUE_SNAPSHOT_DEPTH).getOrThrow()
 
         assertEquals(2, orderbook.bids.size)
         assertEquals(2, orderbook.asks.size)
+        assertEquals(1, httpClient.requestCount)
+    }
+
+    @Test
+    fun getOrderbook_rejectsADepthAboveTheSupportedMaximum() = runBlocking {
+        val httpClient = FakeHttpClient(
+            responses = mapOf("symbol=BTC" to ORDERBOOK_SUCCESS_RESPONSE),
+        )
+        val dataSource = fakeMarketDataSource(httpClient = httpClient)
+
+        val failure = dataSource.getOrderbook(TradingSymbol.BTC, depth = QUEUE_SNAPSHOT_DEPTH + 1).exceptionOrNull()
+
+        assertIs<MarketInvalidRequestException>(failure)
+        assertEquals(0, httpClient.requestCount)
     }
 
     @Test
@@ -759,6 +778,11 @@ class GmoPublicMarketDataSourceTest {
         assertEquals(emptyList(), httpClient.requestQueries)
     }
 }
+
+/**
+ * paper の queue_ahead 算出が要求する orderbook depth。client が受理する上限と一致する。
+ */
+private const val QUEUE_SNAPSHOT_DEPTH = 500
 
 /**
  * ticker parse 成功 fixture。

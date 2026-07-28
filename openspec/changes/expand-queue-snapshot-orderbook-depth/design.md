@@ -98,20 +98,22 @@ allowlist を今後増やす場合は、追加する文字列が変数展開を�
 
 依存関係はない。PR-A は queue_ahead の観測範囲を広げ、PR-B は診断性の改善として独立に入る。OpenSpec change は PR-B 完了後に 1 回だけ archive する。
 
-### 5. 過去 5 件の救済は保証しない
+### 5. 過去 5 件の exact reason は特定できず、救済も保証しない
 
-issue #320 が挙げた 5 件のうち、当時の指値と市場価格の対応が示されているのは run `5b16ff53` の 1 件だけで、それも「限界価格と 1 分足終値の差 -0.23%」という proxy である。発注時点の best bid でも、返却された bid levels の最深値でもない。残り 4 件については指値も同時点の板も提示されていない。
+`createRestingOrderMarketEligibility` は同じ `IllegalArgumentException` になる require を 7 つ持つ（session not connected / session id unavailable / no trade event / stale / session changed during creation / no valid bid depth / outside returned depth）。audit payload は Codex provider の message を省略していたため、報告された 5 件がどの require で落ちたかは事後に特定できない。
 
-板 depth は永続化されていない（`docs/design.md` の execution replay の節が同じ制約を記録している）ため、過去の 5 件が depth 500 で受理されたかを事後に検証する手段は存在しない。
+板 depth も永続化されていない（`docs/design.md` の execution replay の節が同じ制約を記録している）。当時の指値と市場価格の対応が示されているのは run `5b16ff53` の 1 件だけで、それも「限界価格と 1 分足終値の差 -0.23%」という proxy であり、発注時点の best bid でも返却 bid levels の最深値でもない。残り 4 件は指値も同時点の板も不明である。
 
-したがって本 change は、指値の分布や頻度について何も主張しない。確認できる事実だけを根拠とする。
+したがって本 change は、5 件の exact reason も、depth 拡大による救済も主張しない。確認できる事実だけを根拠とする。
 
-- production で depth 50 圏外を理由とする `place_order_failed` が 5 回発生した
+- production で queue snapshot 作成境界の `place_order_failed` が 5 回発生した。exact require は message 省略のため不明である
 - うち 1 件は限界価格と 1 分足終値の差が -0.23% だった
 - 別時点（2026-07-27）の板実測では、50 levels が best bid から 0.080%、100 levels が 0.263% しか覆っていない
 - `getOrderbook` の depth は client 側の切り詰め幅にすぎず、取引所の返却内容を変えない
 
-以上から「client 側で 50 に固定して切り詰める実装は、取引所が実際に板を出している価格帯の指値を観測範囲から除外し得る」と言える。本 change はこの client truncation を撤去する。deploy 後は PR-B が可視化する `QUEUE_SNAPSHOT_UNAVAILABLE` の内訳から、同じ reason の再発有無を既存 audit で確認する。
+4 点目はコード上の確定事実である。「client 側で 50 に固定して切り詰める実装は、取引所が実際に板を出している価格帯の指値を観測範囲から除外し得る」という結論は、5 件の帰属とは独立に成立する。本 change はこの client truncation を撤去する。2 点目と 3 点目は depth 50 の不足と整合するが、それ自体は 5 件の原因を証明しない。
+
+deploy 後は PR-B が可視化する診断文言の内訳から、どの require で fail-closed しているかを既存 audit で確認できるようになる。
 
 ## Risks / Trade-offs
 
