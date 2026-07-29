@@ -6,21 +6,22 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 
 対応する受け入れ条件: 「`TestPostgresConnection.kt` の 3 module 重複が解消され、共通部が共有 fixture から参照されている」
 
-- [ ] `trading/src/testFixtures/kotlin/me/matsumo/fukurou/trading/testing/` に共有 helper を新設する
-  - [ ] `BoundedTestPostgresContainer` と timeout 定数（`connectTimeout` 10s / `loginTimeout` 30s / `socketTimeout` 300s）
-  - [ ] `retryTransientTestPostgresConnection`（現在 `trading` のみが持つ）
-  - [ ] `withJdbcQueryParameters`（現在 `mcp` のみが持つ）
-  - [ ] Docker 可用性判定 helper（PR2 で使う。PR1 では定義のみ）
-- [ ] `trading/build.gradle.kts` に `testFixturesApi(libs.testcontainers.postgresql)` を追加する
+- [x] `trading/src/testFixtures/kotlin/me/matsumo/fukurou/trading/testing/` に共有 helper を新設する
+  - [x] `BoundedTestPostgresContainer` と timeout 定数（`connectTimeout` 10s / `loginTimeout` 30s / `socketTimeout` 300s）
+  - [x] `retryTransientTestPostgresConnection`（現在 `trading` のみが持つ）
+  - [x] `withJdbcQueryParameters`（現在 `mcp` のみが持つ）
+  - [x] Docker 可用性判定 helper（PR2 で使う。PR1 では定義のみ）
+- [x] `trading/build.gradle.kts` に `testFixturesApi(libs.testcontainers.postgresql)` を追加する
   - 現在 Testcontainers は `testImplementation` にしかなく、`testFixtures` の compile classpath に無いため `PostgreSQLContainer` の import が解決しない
   - `BoundedTestPostgresContainer` の superclass に型が露出するので `testFixturesImplementation` ではなく `testFixturesApi` を使う（前例: `mcp-core/build.gradle.kts:15-17`）
   - `commons-compress` の CVE constraint（`trading/build.gradle.kts:24-31`）が fixture 経由の consumer にも効くことを確認する
-- [ ] helper に serial 実行前提であることをドキュメントコメントで明記する
+  - test source も Testcontainers を直接 import するため、`testImplementation` の明示宣言は残す（推移解決に依存させない）
+- [x] helper に serial 実行前提であることをドキュメントコメントで明記する
   - `pg_current_wal_insert_lsn()` と `pg_locks` は database per test では隔離されないこと（cluster-global）を併記する
-- [ ] `mcp/build.gradle.kts` に `testImplementation(testFixtures(project(":trading")))` を追加する
-- [ ] `trading` / `fukurou` / `mcp` の `TestPostgresConnection.kt` 3 本を削除し、参照を共有 helper に切り替える
-- [ ] `internal` 可視性が module 境界を越えられない点に対処する（共有 helper は `public`、必要なら利用側で alias）
-- [ ] full validation（`make test` + `make detekt`）を実行し、挙動が変わっていないことを確認する
+- [x] `mcp/build.gradle.kts` に `testImplementation(testFixtures(project(":trading")))` を追加する
+- [x] `trading` / `fukurou` / `mcp` の `TestPostgresConnection.kt` 3 本を削除し、参照を共有 helper に切り替える
+- [x] `internal` 可視性が module 境界を越えられない点に対処する（共有 helper は `public`、必要なら利用側で alias）
+- [x] full validation（`make test` + `make detekt`）を実行し、挙動が変わっていないことを確認する
 
 ## PR2: Docker 不在時の silent pass 廃止
 

@@ -2,7 +2,6 @@
 
 package me.matsumo.fukurou
 
-import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -13,6 +12,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import org.testcontainers.DockerClientFactory
 import java.time.Clock
 import java.time.Duration

@@ -20,6 +20,8 @@ dependencies {
     testFixturesApi(libs.testcontainers.postgresql)
 
     testImplementation(kotlin("test"))
+    // test source も Testcontainers を直接 import するため、fixture 経由の推移解決に依存しない。
+    testImplementation(libs.testcontainers.postgresql)
 
     constraints {
         testFixturesApi(libs.commons.compress) {
