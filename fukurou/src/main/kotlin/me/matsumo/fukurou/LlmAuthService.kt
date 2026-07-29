@@ -19,7 +19,9 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.invoker.CODEX_HOME_ENV
 import me.matsumo.fukurou.trading.invoker.DEFAULT_CODEX_HOME_DIRECTORY
 import me.matsumo.fukurou.trading.invoker.HOME_ENV
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceReader
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
+import me.matsumo.fukurou.trading.invoker.LlmProvider
 import java.io.BufferedReader
 import java.io.Closeable
 import java.io.InputStream
@@ -64,9 +66,17 @@ enum class LlmAuthStatus(
     val wireName: String,
 ) {
     /**
-     * 非 secret の login marker が存在する。
+     * 非 secret の login marker が存在し、現在の credential で認証失敗を観測していない。
      */
     LOGGED_IN("logged_in"),
+
+    /**
+     * login marker は存在するが、現在の credential を使った invocation が認証失敗を観測した。
+     *
+     * marker file が残っていても token が失効している状態を表す。解除は再ログイン
+     * （credential source の更新）だけで、成功した invocation では解除しない。
+     */
+    TOKEN_SUSPECT("token_suspect"),
 
     /**
      * login marker が見つからない。
@@ -357,6 +367,9 @@ data class LlmAuthServiceConfig(
  * @param scope process reader 用 scope
  * @param processStarter process 起動境界
  * @param idGenerator session ID generator
+ * @param authEvidenceReader 観測済み CLI auth 失敗 evidence の読み取り境界。
+ * null なら credential marker の存在だけで状態を決める（従来動作）
+ * @param markerModifiedAtReader credential marker の最終更新時刻を読む境界
  */
 class DefaultLlmAuthService(
     private val config: LlmAuthServiceConfig = LlmAuthServiceConfig.fromEnvironment(),
@@ -366,6 +379,8 @@ class DefaultLlmAuthService(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val processStarter: LlmAuthProcessStarter = JvmLlmAuthProcessStarter,
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
+    private val authEvidenceReader: LlmAuthEvidenceReader? = null,
+    private val markerModifiedAtReader: (Path) -> Instant = { path -> Files.getLastModifiedTime(path).toInstant() },
 ) : LlmAuthService, Closeable {
 
     private val sessions = ConcurrentHashMap<String, MutableLlmAuthLoginSession>()
@@ -552,17 +567,23 @@ class DefaultLlmAuthService(
 
             val marker = provider.authMarkerCandidates()
                 .firstOrNull { markerPath -> markerPath.isPresentNonEmptyRegularFile() }
-            val status = if (marker != null) LlmAuthStatus.LOGGED_IN else LlmAuthStatus.LOGGED_OUT
-            val detail = if (marker != null) {
-                "credential marker present"
-            } else {
-                "credential marker not found"
+
+            if (marker == null) {
+                return@runCatching LlmAuthProviderStatus(
+                    provider = provider,
+                    status = LlmAuthStatus.LOGGED_OUT,
+                    detail = "credential marker not found",
+                    homePath = homePath.toString(),
+                    checkedAt = checkedAt,
+                )
             }
+
+            val credentialStatus = provider.credentialStatus(marker)
 
             LlmAuthProviderStatus(
                 provider = provider,
-                status = status,
-                detail = detail,
+                status = credentialStatus.status,
+                detail = credentialStatus.detail,
                 homePath = homePath.toString(),
                 checkedAt = checkedAt,
             )
@@ -573,6 +594,51 @@ class DefaultLlmAuthService(
                 detail = throwable.javaClass.simpleName,
                 homePath = provider.authHomePath().toString(),
                 checkedAt = checkedAt,
+            )
+        }
+    }
+
+    /**
+     * credential marker が存在する provider の状態を、観測済みの認証失敗 evidence から決める。
+     *
+     * marker の存在だけでは token が使えることを示さないため、現在の credential 世代
+     * （marker の最終更新時刻）に属する失敗 evidence があれば [LlmAuthStatus.TOKEN_SUSPECT] へ降格する。
+     * marker の mtime を読めない場合は判定不能として [LlmAuthStatus.UNKNOWN] とし、
+     * 「正常」とは報告しない。
+     */
+    private fun LlmAuthProvider.credentialStatus(markerPath: Path): LlmAuthCredentialStatus {
+        val reader = authEvidenceReader ?: return LlmAuthCredentialStatus(
+            status = LlmAuthStatus.LOGGED_IN,
+            detail = CREDENTIAL_MARKER_PRESENT_DETAIL,
+        )
+        val markerModifiedAt = runCatching { markerModifiedAtReader(markerPath) }.getOrNull()
+            ?: return LlmAuthCredentialStatus(
+                status = LlmAuthStatus.UNKNOWN,
+                detail = CREDENTIAL_GENERATION_UNREADABLE_DETAIL,
+            )
+        val failure = runCatching { reader.lastFailure(toInvokerProvider()) }
+            .getOrElse {
+                return LlmAuthCredentialStatus(
+                    status = LlmAuthStatus.UNKNOWN,
+                    detail = CREDENTIAL_EVIDENCE_UNAVAILABLE_DETAIL,
+                )
+            }
+        val failureGeneration = failure?.credentialGeneration
+
+        // 世代不明の evidence は現 credential のものと判定できないため降格に使わない。
+        // marker 更新より厳密に古い世代は再ログインで解消済みとみなす
+        val failureBelongsToCurrentCredential = failureGeneration != null &&
+            !failureGeneration.isBefore(markerModifiedAt)
+
+        return if (failureBelongsToCurrentCredential) {
+            LlmAuthCredentialStatus(
+                status = LlmAuthStatus.TOKEN_SUSPECT,
+                detail = CREDENTIAL_AUTH_FAILURE_OBSERVED_DETAIL,
+            )
+        } else {
+            LlmAuthCredentialStatus(
+                status = LlmAuthStatus.LOGGED_IN,
+                detail = CREDENTIAL_MARKER_PRESENT_DETAIL,
             )
         }
     }
@@ -1112,6 +1178,25 @@ private class MutableLlmAuthLoginSession(
     }
 }
 
+/**
+ * credential marker が存在する provider の status と、その根拠を表す非 secret な補足。
+ *
+ * @param status 判定した login 状態
+ * @param detail secret を含まない固定文言
+ */
+private data class LlmAuthCredentialStatus(
+    val status: LlmAuthStatus,
+    val detail: String,
+)
+
+/** 監視 API の provider を、invocation 側の provider 表現へ変換する。 */
+private fun LlmAuthProvider.toInvokerProvider(): LlmProvider {
+    return when (this) {
+        LlmAuthProvider.CLAUDE -> LlmProvider.CLAUDE
+        LlmAuthProvider.CODEX -> LlmProvider.CODEX
+    }
+}
+
 private fun Path.isPresentNonEmptyRegularFile(): Boolean {
     return try {
         Files.isRegularFile(this) && Files.size(this) > 0
@@ -1164,6 +1249,11 @@ private const val PATH_ENV = "PATH"
 private const val CLOSE_AWAIT_STAGE_PROCESS_JOBS = "process_jobs"
 private const val CLOSE_AWAIT_STAGE_SCOPE_JOB = "scope_job"
 private const val CLOSE_AWAIT_AUDIT_REQUEST_ID = "llm-auth-close"
+private const val CREDENTIAL_MARKER_PRESENT_DETAIL = "credential marker present"
+private const val CREDENTIAL_AUTH_FAILURE_OBSERVED_DETAIL =
+    "an invocation using this credential reported an authentication failure"
+private const val CREDENTIAL_GENERATION_UNREADABLE_DETAIL = "credential marker timestamp is unreadable"
+private const val CREDENTIAL_EVIDENCE_UNAVAILABLE_DETAIL = "authentication evidence is unavailable"
 private const val LOGIN_ALREADY_IN_PROGRESS_REASON = "login already in progress"
 private const val SERVICE_CLOSING_REASON = "service is closing"
 private val DEFAULT_LLM_AUTH_LOGIN_TIMEOUT: Duration = Duration.ofMinutes(10)

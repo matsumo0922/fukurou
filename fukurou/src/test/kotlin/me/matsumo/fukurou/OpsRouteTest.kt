@@ -374,6 +374,39 @@ class OpsRouteTest {
     }
 
     @Test
+    fun opsRoutes_llmAuthExposesTokenSuspectOnTheWireWithoutSecrets() = testApplication {
+        val service = CapturingLlmAuthService(
+            snapshot = LlmAuthSnapshot(
+                providers = listOf(
+                    LlmAuthProviderStatus(
+                        provider = LlmAuthProvider.CODEX,
+                        status = LlmAuthStatus.TOKEN_SUSPECT,
+                        detail = "an invocation using this credential reported an authentication failure",
+                        homePath = "/tmp/fukurou-cli-home/.codex",
+                        checkedAt = fixedInstant(),
+                    ),
+                ),
+                checkedAt = fixedInstant(),
+            ),
+        )
+
+        application {
+            module(
+                readinessProbe = { true },
+                opsLlmAuthService = service,
+                tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            )
+        }
+
+        val response = client.get("/ops/llm-auth")
+        val responseBody = response.bodyAsText()
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(responseBody.contains(""""status":"token_suspect""""))
+        assertNoSecretLikeText(responseBody)
+    }
+
+    @Test
     fun opsRoutes_llmAuthLoginStartsAndPollsSessionWithoutSecrets() = testApplication {
         val session = LlmAuthLoginSessionSnapshot(
             provider = LlmAuthProvider.CODEX,

@@ -91,6 +91,7 @@ import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
 import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
@@ -344,6 +345,7 @@ class OneShotLlmRunner(
     private val logger: (String) -> Unit = { message -> println(message) },
     private val cliVersionProbe: LlmCliVersionProbe = ProcessScopedLlmCliVersionProbe,
     private val commandRendererConfig: LlmCommandRendererConfig = LlmCommandRendererConfig(),
+    private val authEvidenceState: LlmAuthEvidenceState? = null,
 ) {
     private val processOutputRedactor = SecretRedactor.fromEnvironment(parentEnvironment)
     private val invocationAuditor = LlmInvocationAuditor(
@@ -364,6 +366,7 @@ class OneShotLlmRunner(
             commandRendererConfig = commandRendererConfig,
         ),
         decisionRepository = tradingRuntime.decisionRepository,
+        authEvidenceState = authEvidenceState,
     )
     private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
         tradingRuntime = tradingRuntime,

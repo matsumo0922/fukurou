@@ -62,13 +62,23 @@ class LlmAuthEvidenceState : LlmAuthEvidenceReader {
 private fun LlmAuthFailureEvidence.supersedes(candidate: LlmAuthFailureEvidence): Boolean {
     val currentGeneration = credentialGeneration
     val candidateGeneration = candidate.credentialGeneration
-    val bothGenerationsKnown = currentGeneration != null && candidateGeneration != null
-    val generationsDiffer = bothGenerationsKnown && currentGeneration != candidateGeneration
 
-    if (generationsDiffer) {
-        return requireNotNull(currentGeneration).isAfter(candidateGeneration)
+    // 世代が分かっている evidence を、世代不明の evidence で失わない。
+    // status 判定は世代不明を無視するため、上書きを許すと観測済みの失効が logged_in へ戻る
+    if (currentGeneration != null && candidateGeneration == null) {
+        return true
     }
 
-    // 世代が同じか、どちらかが世代不明の場合は観測時刻で比べる
+    if (currentGeneration == null && candidateGeneration != null) {
+        return false
+    }
+
+    if (currentGeneration != null && candidateGeneration != null) {
+        if (currentGeneration != candidateGeneration) {
+            return currentGeneration.isAfter(candidateGeneration)
+        }
+    }
+
+    // 世代が同じか、両方とも世代不明の場合は観測時刻で比べる
     return observedAt.isAfter(candidate.observedAt)
 }

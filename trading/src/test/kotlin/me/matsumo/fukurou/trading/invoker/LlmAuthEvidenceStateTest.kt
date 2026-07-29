@@ -67,18 +67,53 @@ class LlmAuthEvidenceStateTest {
     }
 
     @Test
-    fun recordFailure_fallsBackToObservationTimeWhenAGenerationIsUnknown() {
+    fun recordFailure_doesNotLetAnUnknownGenerationDisplaceAKnownOne() {
+        // status 判定は世代不明の evidence を無視するため、世代既知の evidence が
+        // 後続の世代不明 evidence で上書きされると、観測済みの失効が logged_in へ戻る
         val state = LlmAuthEvidenceState()
-        val withoutGeneration = LlmAuthFailureEvidence(
+        val knownGeneration = evidence(observedAt = "2026-07-20T00:00:00Z", generation = "2026-07-20T00:00:00Z")
+        val unknownGeneration = LlmAuthFailureEvidence(
             observedAt = Instant.parse("2026-07-20T00:05:00Z"),
             credentialGeneration = null,
         )
-        val earlierWithGeneration = evidence(observedAt = "2026-07-20T00:00:00Z", generation = "2026-07-19T00:00:00Z")
 
-        state.recordFailure(LlmProvider.CODEX, withoutGeneration)
-        state.recordFailure(LlmProvider.CODEX, earlierWithGeneration)
+        state.recordFailure(LlmProvider.CODEX, knownGeneration)
+        state.recordFailure(LlmProvider.CODEX, unknownGeneration)
 
-        assertEquals(withoutGeneration, state.lastFailure(LlmProvider.CODEX))
+        assertEquals(knownGeneration, state.lastFailure(LlmProvider.CODEX))
+    }
+
+    @Test
+    fun recordFailure_replacesAnUnknownGenerationWithAKnownOne() {
+        val state = LlmAuthEvidenceState()
+        val unknownGeneration = LlmAuthFailureEvidence(
+            observedAt = Instant.parse("2026-07-20T00:05:00Z"),
+            credentialGeneration = null,
+        )
+        val knownGeneration = evidence(observedAt = "2026-07-20T00:00:00Z", generation = "2026-07-20T00:00:00Z")
+
+        state.recordFailure(LlmProvider.CODEX, unknownGeneration)
+        state.recordFailure(LlmProvider.CODEX, knownGeneration)
+
+        assertEquals(knownGeneration, state.lastFailure(LlmProvider.CODEX))
+    }
+
+    @Test
+    fun recordFailure_fallsBackToObservationTimeWhenBothGenerationsAreUnknown() {
+        val state = LlmAuthEvidenceState()
+        val later = LlmAuthFailureEvidence(
+            observedAt = Instant.parse("2026-07-20T00:05:00Z"),
+            credentialGeneration = null,
+        )
+        val earlier = LlmAuthFailureEvidence(
+            observedAt = Instant.parse("2026-07-20T00:00:00Z"),
+            credentialGeneration = null,
+        )
+
+        state.recordFailure(LlmProvider.CODEX, later)
+        state.recordFailure(LlmProvider.CODEX, earlier)
+
+        assertEquals(later, state.lastFailure(LlmProvider.CODEX))
     }
 }
 

@@ -1165,7 +1165,16 @@ private fun Route.registerOpsLlmAuthStatusRoute(llmAuthService: LlmAuthService?)
         call.respond(snapshot.toOpsLlmAuthResponse())
     }.describe {
         summary = "CLI auth 状態を取得する"
-        description = "Claude Code / Codex CLI の login state を専用 endpoint で返します。token や credential file の内容は返しません。"
+        description = "Claude Code / Codex CLI の login state を専用 endpoint で返します。" +
+            "token や credential file の内容は返しません。" +
+            "status は credential marker の存在だけでなく、現在の credential を使った LLM 起動が" +
+            "認証失敗を観測したかを反映します。" +
+            "logged_in は marker が存在し認証失敗を観測していない状態、" +
+            "token_suspect は marker は存在するが現在の credential で認証失敗を観測した状態" +
+            "（解除は再ログインのみで、成功した起動では解除しません）、" +
+            "logged_out は marker が無い状態、" +
+            "unknown は marker の更新時刻や認証 evidence を参照できず判定できない状態、" +
+            "error は auth home が directory でないなど状態取得自体に失敗した状態です。"
         tag(OPS_TAG)
         responses {
             HttpStatusCode.OK {

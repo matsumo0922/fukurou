@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.evaluation.EvaluationScope
 import me.matsumo.fukurou.trading.evaluation.EvaluationTradeQueryResult
 import me.matsumo.fukurou.trading.evaluation.InMemoryLlmRunRepository
 import me.matsumo.fukurou.trading.evaluation.KillCriterionStats
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
 import me.matsumo.fukurou.trading.reflection.ReflectionReportBuilder
 import me.matsumo.fukurou.trading.reflection.ReflectionRunner
@@ -48,11 +49,13 @@ class ReflectionRunnerWorkerTest {
             database = database,
             environment = emptyMap(),
             clock = FIXED_CLOCK,
+            authEvidenceState = LlmAuthEvidenceState(),
         )
         val explicitlyDisabledWorker = startReflectionRunnerWorker(
             database = database,
             environment = mapOf("FUKUROU_OBSIDIAN_ENABLED" to "false"),
             clock = FIXED_CLOCK,
+            authEvidenceState = LlmAuthEvidenceState(),
         )
 
         assertNull(unsetWorker)
@@ -67,6 +70,7 @@ class ReflectionRunnerWorkerTest {
             environment = reflectionEnvironment(vaultPath),
             clock = FIXED_CLOCK,
             bootstrap = { Result.success(Unit) },
+            authEvidenceState = LlmAuthEvidenceState(),
         )
 
         try {
