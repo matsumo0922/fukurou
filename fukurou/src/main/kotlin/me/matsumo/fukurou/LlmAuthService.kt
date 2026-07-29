@@ -369,6 +369,7 @@ data class LlmAuthServiceConfig(
  * @param idGenerator session ID generator
  * @param authEvidenceReader 観測済み CLI auth 失敗 evidence の読み取り境界。
  * null なら credential marker の存在だけで状態を決める（従来動作）
+ * @param markerModifiedAtReader credential marker の最終更新時刻を読む境界
  */
 class DefaultLlmAuthService(
     private val config: LlmAuthServiceConfig = LlmAuthServiceConfig.fromEnvironment(),
@@ -379,6 +380,7 @@ class DefaultLlmAuthService(
     private val processStarter: LlmAuthProcessStarter = JvmLlmAuthProcessStarter,
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
     private val authEvidenceReader: LlmAuthEvidenceReader? = null,
+    private val markerModifiedAtReader: (Path) -> Instant = { path -> Files.getLastModifiedTime(path).toInstant() },
 ) : LlmAuthService, Closeable {
 
     private val sessions = ConcurrentHashMap<String, MutableLlmAuthLoginSession>()
@@ -609,12 +611,18 @@ class DefaultLlmAuthService(
             status = LlmAuthStatus.LOGGED_IN,
             detail = CREDENTIAL_MARKER_PRESENT_DETAIL,
         )
-        val markerModifiedAt = runCatching { Files.getLastModifiedTime(markerPath).toInstant() }.getOrNull()
+        val markerModifiedAt = runCatching { markerModifiedAtReader(markerPath) }.getOrNull()
             ?: return LlmAuthCredentialStatus(
                 status = LlmAuthStatus.UNKNOWN,
                 detail = CREDENTIAL_GENERATION_UNREADABLE_DETAIL,
             )
-        val failure = reader.lastFailure(toInvokerProvider())
+        val failure = runCatching { reader.lastFailure(toInvokerProvider()) }
+            .getOrElse {
+                return LlmAuthCredentialStatus(
+                    status = LlmAuthStatus.UNKNOWN,
+                    detail = CREDENTIAL_EVIDENCE_UNAVAILABLE_DETAIL,
+                )
+            }
         val failureGeneration = failure?.credentialGeneration
 
         // 世代不明の evidence は現 credential のものと判定できないため降格に使わない。
@@ -1245,6 +1253,7 @@ private const val CREDENTIAL_MARKER_PRESENT_DETAIL = "credential marker present"
 private const val CREDENTIAL_AUTH_FAILURE_OBSERVED_DETAIL =
     "an invocation using this credential reported an authentication failure"
 private const val CREDENTIAL_GENERATION_UNREADABLE_DETAIL = "credential marker timestamp is unreadable"
+private const val CREDENTIAL_EVIDENCE_UNAVAILABLE_DETAIL = "authentication evidence is unavailable"
 private const val LOGIN_ALREADY_IN_PROGRESS_REASON = "login already in progress"
 private const val SERVICE_CLOSING_REASON = "service is closing"
 private val DEFAULT_LLM_AUTH_LOGIN_TIMEOUT: Duration = Duration.ofMinutes(10)

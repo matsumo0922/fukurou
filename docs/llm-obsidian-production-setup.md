@@ -52,7 +52,8 @@ status は次の4つを取る。
 | `logged_in` | credential marker が存在し、現在の credential で認証失敗を観測していない |
 | `token_suspect` | marker は存在するが、現在の credential を使った LLM 起動が認証失敗を観測した |
 | `logged_out` | credential marker が見つからない |
-| `unknown` | marker の更新時刻を読めず判定できない |
+| `unknown` | marker の更新時刻を読めない、または認証 evidence を参照できず判定できない |
+| `error` | auth home が directory でないなど、状態取得自体に失敗した |
 
 `token_suspect` は、marker file が残っていても token が失効している状態を表す。**解除は再ログインだけ**で、その後の起動が成功しても解除しない。LLM 起動は persistent な credential source を直接使わず per-run home への copy を使い、source へ書き戻さないため、起動の成功は source が今も有効であることの証拠にならない。
 

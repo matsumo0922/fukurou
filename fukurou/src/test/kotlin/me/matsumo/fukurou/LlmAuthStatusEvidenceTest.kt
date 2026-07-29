@@ -1,9 +1,11 @@
 package me.matsumo.fukurou
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceReader
 import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.invoker.LlmAuthFailureEvidence
 import me.matsumo.fukurou.trading.invoker.LlmProvider
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
@@ -105,6 +107,65 @@ class LlmAuthStatusEvidenceTest {
     }
 
     @Test
+    fun snapshot_keepsTokenSuspectWhenALaterFailureHasNoKnownGeneration() = runBlocking {
+        // 世代既知の失効を観測した後、世代を観測できない failure が続いても降格を維持する。
+        // 世代不明で上書きすると status 側がそれを無視して logged_in へ戻る
+        val home = codexHomeWithMarker(markerModifiedAt = MARKER_GENERATION)
+        val evidenceState = LlmAuthEvidenceState().apply {
+            recordFailure(LlmProvider.CODEX, failureEvidence(generation = MARKER_GENERATION))
+            recordFailure(
+                LlmProvider.CODEX,
+                LlmAuthFailureEvidence(
+                    observedAt = Instant.parse("2026-07-26T00:00:00Z"),
+                    credentialGeneration = null,
+                ),
+            )
+        }
+
+        val status = codexStatus(home, evidenceState)
+
+        assertEquals(LlmAuthStatus.TOKEN_SUSPECT, status.status)
+    }
+
+    @Test
+    fun snapshot_reportsUnknownWhenTheMarkerTimestampCannotBeRead() = runBlocking {
+        // marker は存在するが世代を判定できない。判定不能を「正常」と報告しない
+        val home = codexHomeWithMarker(markerModifiedAt = MARKER_GENERATION)
+        val marker = home.resolve(".codex").resolve("auth.json")
+        val unreadableTimestampService = DefaultLlmAuthService(
+            config = LlmAuthServiceConfig(
+                claudeCommandTemplate = listOf("claude"),
+                codexCommandTemplate = listOf("codex"),
+                cliHome = home,
+                codexHome = home.resolve(".codex"),
+                inheritedLoginEnvironment = emptyMap(),
+            ),
+            authEvidenceReader = LlmAuthEvidenceState(),
+            markerModifiedAtReader = { path ->
+                if (path == marker) throw IOException("synthetic timestamp failure") else Files.getLastModifiedTime(path).toInstant()
+            },
+        )
+
+        val status = unreadableTimestampService.use { service ->
+            service.snapshot().getOrThrow().providers.single { provider -> provider.provider == LlmAuthProvider.CODEX }
+        }
+
+        assertEquals(LlmAuthStatus.UNKNOWN, status.status)
+    }
+
+    @Test
+    fun snapshot_reportsUnknownWhenTheEvidenceSourceIsUnavailable() = runBlocking {
+        // evidence 参照自体が失敗した場合も logged_in へ倒さない
+        val home = codexHomeWithMarker(markerModifiedAt = MARKER_GENERATION)
+        val failingReader = LlmAuthEvidenceReader { throw IllegalStateException("evidence source unavailable") }
+
+        val status = codexStatus(home, failingReader)
+
+        assertEquals(LlmAuthStatus.UNKNOWN, status.status)
+        assertNoSecretLikeDetail(status.detail)
+    }
+
+    @Test
     fun snapshot_reportsLoggedOutWhenTheMarkerIsAbsent() = runBlocking {
         val home = Files.createTempDirectory("fukurou-llm-auth-status-home")
         Files.createDirectories(home.resolve(".codex"))
@@ -138,7 +199,7 @@ class LlmAuthStatusEvidenceTest {
     }
 }
 
-private suspend fun codexStatus(cliHome: Path, evidenceState: LlmAuthEvidenceState?): LlmAuthProviderStatus {
+private suspend fun codexStatus(cliHome: Path, evidenceState: LlmAuthEvidenceReader?): LlmAuthProviderStatus {
     return DefaultLlmAuthService(
         config = LlmAuthServiceConfig(
             claudeCommandTemplate = listOf("claude"),
