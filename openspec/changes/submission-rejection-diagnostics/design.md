@@ -38,7 +38,7 @@
 - `DECISION_PAYLOAD_DECODE_FAILED` / `FALSIFICATION_PAYLOAD_DECODE_FAILED`
 - `UNKNOWN_OPERATION`
 - `PAYLOAD_MISSING_OR_INVALID`（`payload` key の欠落または object 以外）
-- `REQUIRED_STRING_FIELD_MISSING`（binding / operation の必須 string field の欠落または非 primitive）
+- `REQUIRED_STRING_FIELD_MISSING`（binding / operation の必須 string field の欠落、非 primitive、または非 string primitive）
 - `SUBMISSION_CONFLICT` / `SUBMISSION_UNKNOWN`（typed exception 由来）
 - `UNCLASSIFIED`（上記に一致しない `Throwable`）
 

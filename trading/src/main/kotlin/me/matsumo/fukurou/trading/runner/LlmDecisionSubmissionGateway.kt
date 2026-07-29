@@ -391,8 +391,12 @@ private fun JsonObject.trustedTerminalEvidence(
 }
 
 private fun JsonObject.gatewayString(name: String): String {
-    return runCatching { requiredString(name) }
-        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.REQUIRED_STRING_FIELD_MISSING) }
+    return runCatching {
+        val value = getValue(name).jsonPrimitive
+        require(value.isString)
+
+        value.content
+    }.getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.REQUIRED_STRING_FIELD_MISSING) }
 }
 
 private fun Throwable?.combineCleanupFailure(next: Throwable): Throwable {

@@ -84,6 +84,34 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     @Test
+    fun `gateway classifies non string binding primitive as required string missing`() {
+        val request = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .withField("invocationId", JsonPrimitive(1))
+        val response = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = request,
+        )
+
+        assertEquals("SUBMISSION_REJECTED", response.getValue("error").jsonPrimitive.content)
+        assertEquals(SubmissionRejectionCode.REQUIRED_STRING_FIELD_MISSING.wireValue, response.reason())
+    }
+
+    @Test
+    fun `gateway classifies non string operation primitive as required string missing`() {
+        val request = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .withField("operation", JsonPrimitive(false))
+        val response = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = request,
+        )
+
+        assertEquals("SUBMISSION_REJECTED", response.getValue("error").jsonPrimitive.content)
+        assertEquals(SubmissionRejectionCode.REQUIRED_STRING_FIELD_MISSING.wireValue, response.reason())
+    }
+
+    @Test
     fun `gateway assigns distinct reasons to every request rejection point`() {
         val baseDecisionRequest = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
         val decisionPhaseResponse = exchangeRequest(

@@ -12,6 +12,7 @@
 - [x] 2.4 `gatewayErrorResponse()` が `reason` を付与し、未分類 `Throwable` は `UNCLASSIFIED` へ落ちるようにする
 - [x] 2.5 gateway テストに、8 つの request 拒否点が互いに異なる `reason` を返す検証と、binding 4 種、risk-increasing、conflict、unknown の検証を追加する
 - [x] 2.6 未分類例外の応答が message を含まないことの検証を追加する
+- [x] 2.7 binding / operation の非 string primitive を `REQUIRED_STRING_FIELD_MISSING` へ分類する回帰テストを追加する
 
 ## 3. Client と MCP tool error
 
