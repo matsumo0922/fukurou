@@ -1,13 +1,13 @@
 ## 1. PR 1: credential 世代の観測と evidence state（`:trading`）
 
-- [ ] 1.1 `DefaultLlmCommandRenderer` が credential source を **copy する前に** 観測した source mtime を `RenderedLlmCommand` へ載せ、`LlmInvoker` が `LlmInvocationResult` へ伝搬する。値は `FileTime.toInstant()` の精度を保つ（millis へ丸めない）。新 field は default 付きとし、既存 fixture を壊さない
-- [ ] 1.2 `LlmAuthEvidenceState` を定義する。provider ごとに「最後に観測した失敗 evidence（観測時刻、credential 世代）」だけを保持し、provider output・例外 message・credential 内容は持たない。更新は `ConcurrentHashMap.compute` で provider 単位に原子的とし、既存 evidence より古い世代では上書きしない（同一世代なら観測時刻の新しい方を残す）
-- [ ] 1.3 `LlmInvocationAuditor` が `authFailureSuspected`（issue #306 で `AUTHENTICATION || authEvidenceObserved` へ拡張済み）を観測したとき、`commandEventLog.append()` より **前に** evidence state を更新する。state は nullable な依存とし、未注入なら更新しない
-- [ ] 1.4 `LlmInvocationAuditor.phaseDetails()` が、source mtime を観測できたときだけ `authSourceObservedAt`（ISO-8601）を payload へ出す（人間の事後診断用）
-- [ ] 1.5 `LlmAuthEvidenceStateTest` を追加する: 初期状態は null / provider ごとに保持 / 古い世代が新しい世代を上書きしない / 新しい世代で置き換わる / 同一世代なら観測時刻の新しい方を残す / 世代不明なら観測時刻で比べる
-- [ ] 1.6 `LlmInvocationAuditorTest` に test を追加する: `authFailureSuspected` 観測で state が更新される / audit append が失敗しても state は更新済みである / 成功時に state が更新されない / payload に `authSourceObservedAt` が出る / 観測できないとき key が出ない / state 未注入でも動作する
-- [ ] 1.7 renderer の credential copy 経路に test を追加する: Codex / Claude それぞれで copy 前に観測した source mtime が rendered command に載る / source が無い場合は載らない / millis 未満の精度が保たれる
-- [ ] 1.8 `make test` / `make detekt` を通し、PR 1 を作成する
+- [x] 1.1 `DefaultLlmCommandRenderer` が credential source を **copy する前に** 観測した source mtime を `RenderedLlmCommand` へ載せ、`LlmInvoker` が `LlmInvocationResult` へ伝搬する。値は `FileTime.toInstant()` の精度を保つ（millis へ丸めない）。新 field は default 付きとし、既存 fixture を壊さない
+- [x] 1.2 `LlmAuthEvidenceState` を定義する。provider ごとに「最後に観測した失敗 evidence（観測時刻、credential 世代）」だけを保持し、provider output・例外 message・credential 内容は持たない。更新は `ConcurrentHashMap.compute` で provider 単位に原子的とし、既存 evidence より古い世代では上書きしない（同一世代なら観測時刻の新しい方を残す）
+- [x] 1.3 `LlmInvocationAuditor` が `authFailureSuspected`（issue #306 で `AUTHENTICATION || authEvidenceObserved` へ拡張済み）を観測したとき、`commandEventLog.append()` より **前に** evidence state を更新する。state は nullable な依存とし、未注入なら更新しない
+- [x] 1.4 `LlmInvocationAuditor.phaseDetails()` が、source mtime を観測できたときだけ `authSourceObservedAt`（ISO-8601）を payload へ出す（人間の事後診断用）
+- [x] 1.5 `LlmAuthEvidenceStateTest` を追加する: 初期状態は null / provider ごとに保持 / 古い世代が新しい世代を上書きしない / 新しい世代で置き換わる / 同一世代なら観測時刻の新しい方を残す / 世代不明なら観測時刻で比べる
+- [x] 1.6 `LlmInvocationAuditorTest` に test を追加する: `authFailureSuspected` 観測で state が更新される / audit append が失敗しても state は更新済みである / 成功時に state が更新されない / payload に `authSourceObservedAt` が出る / 観測できないとき key が出ない / state 未注入でも動作する
+- [x] 1.7 renderer の credential copy 経路に test を追加する: Codex / Claude それぞれで copy 前に観測した source mtime が rendered command に載る / source が無い場合は載らない / millis 未満の精度が保たれる
+- [x] 1.8 `make test` / `make detekt` を通し、PR 1 を作成する
 
 ## 2. PR 2: 監視 status の降格（`:fukurou`、base は PR 1）
 
