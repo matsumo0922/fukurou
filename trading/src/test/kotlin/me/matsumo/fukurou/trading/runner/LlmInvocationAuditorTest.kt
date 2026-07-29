@@ -360,6 +360,30 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
+    fun invokeAndAudit_recordsAuthEvidenceStateForTheAuthenticationCategoryWithoutEvidenceText() = runBlocking {
+        // authFailureSuspected は `AUTHENTICATION category || authEvidenceObserved` の OR であり、
+        // 監視 status は両方の枝に依存する。既知文言を観測しない構造化された認証失敗でも記録する
+        val evidenceState = LlmAuthEvidenceState()
+        val generation = Instant.parse("2026-07-20T00:00:00Z")
+        val auditor = auditorWithEvidenceState(InMemoryCommandEventLog(), evidenceState)
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", ""),
+            providerFailure = LlmProviderFailure(
+                LlmProviderFailureCategory.AUTHENTICATION,
+                "CODEX_LOGIN_RESTRICTION",
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            ),
+            authEvidenceObserved = false,
+            authSourceObservedAt = generation,
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        assertEquals(generation, evidenceState.lastFailure(LlmProvider.CODEX)?.credentialGeneration)
+    }
+
+    @Test
     fun invokeAndAudit_recordsAuthEvidenceStateEvenWhenTheAuditAppendFails() = runBlocking {
         // DB 障害中に認証失敗を観測しても /ops/llm-auth が logged_in を返し続けないよう、
         // state の更新は audit の永続化より前に行う

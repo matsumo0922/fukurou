@@ -134,10 +134,14 @@ data class LlmCommandRendererConfig(
  * claude / codex の headless command を生成する既定 renderer。
  *
  * @param config renderer 設定
+ * @param claudeAuthCopy Claude credential source を per-run home へ copy する境界
+ * @param codexAuthCopy Codex credential source を per-run home へ copy する境界
+ * @param artifactCleanup 生成 artifact の削除境界
  */
 class DefaultLlmCommandRenderer(
     private val config: LlmCommandRendererConfig = LlmCommandRendererConfig(),
     private val claudeAuthCopy: (Path, Path) -> Unit = ::copyClaudeAuthFile,
+    private val codexAuthCopy: (Path, Path) -> Unit = ::copyCodexAuthFileContent,
     private val artifactCleanup: (List<Path>) -> Unit = { paths -> paths.deleteGeneratedPaths() },
 ) : LlmCommandRenderer {
 
@@ -251,6 +255,7 @@ class DefaultLlmCommandRenderer(
             mcpServer = request.mcpServer,
             environment = request.environment,
             effort = request.effort,
+            authCopy = codexAuthCopy,
         )
         val commandEnvironment = request.environment.withoutLlmSecrets() + mapOf(
             CODEX_HOME_ENV to codexHome.path.toString(),
@@ -502,14 +507,16 @@ private fun writeCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
     effort: LlmEffort,
+    authCopy: (Path, Path) -> Unit,
 ): PrivateConfigPath {
-    return writeTemporaryCodexHome(mcpServer, environment, effort)
+    return writeTemporaryCodexHome(mcpServer, environment, effort, authCopy)
 }
 
 private fun writeTemporaryCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
     effort: LlmEffort,
+    authCopy: (Path, Path) -> Unit,
 ): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
@@ -523,7 +530,7 @@ private fun writeTemporaryCodexHome(
             StandardOpenOption.WRITE,
         )
         configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
-        val copiedAuth = copyCodexAuthFile(environment, directory)
+        val copiedAuth = copyCodexAuthFile(environment, directory, authCopy)
 
         PrivateConfigPath(
             path = directory,
@@ -537,7 +544,11 @@ private fun writeTemporaryCodexHome(
     }
 }
 
-private fun copyCodexAuthFile(environment: Map<String, String>, targetDirectory: Path): CopiedAuthFile? {
+private fun copyCodexAuthFile(
+    environment: Map<String, String>,
+    targetDirectory: Path,
+    authCopy: (Path, Path) -> Unit,
+): CopiedAuthFile? {
     val sourcePath = environment.codexAuthFilePath() ?: return null
 
     if (!Files.isRegularFile(sourcePath)) {
@@ -546,10 +557,14 @@ private fun copyCodexAuthFile(environment: Map<String, String>, targetDirectory:
 
     val sourceObservedAt = sourcePath.observedLastModifiedAtOrNull()
     val targetPath = targetDirectory.resolve(CODEX_AUTH_FILE_NAME)
-    Files.copy(sourcePath, targetPath, StandardCopyOption.COPY_ATTRIBUTES)
+    authCopy(sourcePath, targetPath)
     targetPath.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
 
     return CopiedAuthFile(targetPath, sourceObservedAt)
+}
+
+private fun copyCodexAuthFileContent(sourcePath: Path, targetPath: Path) {
+    Files.copy(sourcePath, targetPath, StandardCopyOption.COPY_ATTRIBUTES)
 }
 
 /**
