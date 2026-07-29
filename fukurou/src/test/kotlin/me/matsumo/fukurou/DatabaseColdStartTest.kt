@@ -5,6 +5,7 @@ import io.ktor.client.request.get
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
 import me.matsumo.fukurou.trading.config.TradingBotConfig
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import org.testcontainers.DockerClientFactory
 import java.net.InetAddress
 import java.net.Socket

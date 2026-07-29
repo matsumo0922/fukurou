@@ -2,7 +2,6 @@ package me.matsumo.fukurou.trading.runner
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
-import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
@@ -22,6 +21,7 @@ import me.matsumo.fukurou.trading.invoker.LlmProvider
 import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import org.testcontainers.DockerClientFactory
 import java.net.InetAddress
 import java.net.Socket

@@ -82,6 +82,7 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.SecretRedactor
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import java.io.File

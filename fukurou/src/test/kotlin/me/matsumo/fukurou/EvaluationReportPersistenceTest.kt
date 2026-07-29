@@ -2,6 +2,7 @@
 
 package me.matsumo.fukurou
 
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
