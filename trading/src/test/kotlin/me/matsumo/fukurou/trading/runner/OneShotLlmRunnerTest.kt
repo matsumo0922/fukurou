@@ -122,6 +122,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.ProcessStartAwareRunner
 import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
+import me.matsumo.fukurou.trading.invoker.REFRESH_TOKEN_FAILURE_STDERR
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.safeCodexFailureOrNull
@@ -1779,6 +1780,35 @@ class OneShotLlmRunnerTest {
         assertEquals("0", proposerDetails.stringValue("exitCode"))
         assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
         assertFalse(fixture.eventLog.events().containsNoTradeReason("proposer_no_tool_calls"))
+        assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
+    }
+
+    @Test
+    fun codexProposerRefreshTokenFailure_recordsAuthSuspicionDespiteOutputContractCategory() = runBlocking {
+        // issue #306 と同形の production 障害。stdout は Codex の JSONL contract を満たさないため
+        // primary category は OUTPUT_CONTRACT に解決されるが、stderr の refresh token 失効文言が
+        // 認証 evidence として観測され、authFailureSuspected が立つ
+        val humanLogs = mutableListOf<String>()
+        val fixture = runnerFixture(
+            logger = { message -> humanLogs += message },
+        ) {
+            nonZeroExit(
+                stdout = "thinking...",
+                stderr = REFRESH_TOKEN_FAILURE_STDERR,
+            )
+        }
+
+        val result = fixture.runOneShot(
+            defaultRequest().copy(proposerProvider = LlmProvider.CODEX),
+        ).getOrThrow()
+        val proposerDetails = fixture.eventLog.events().singleRunnerPhaseDetails("proposer")
+
+        assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
+        assertEquals("OUTPUT_CONTRACT", proposerDetails.stringValue("failureCategory"))
+        assertEquals("true", proposerDetails.stringValue("authFailureSuspected"))
+        assertFalse(proposerDetails.containsKey("stdout"))
+        assertFalse(proposerDetails.containsKey("stderr"))
+        assertTrue(fixture.eventLog.events().containsNoTradeReason("proposer_missing_decision"))
         assertTrue(humanLogs.any { message -> message.isAuthFailureRunbookLog() })
     }
 
