@@ -22,11 +22,13 @@ import java.math.BigDecimal
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
+import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermission
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -315,6 +317,172 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     @Test
+    fun `frame reader treats initial eof as connection end and partial prefix as failure`() {
+        withSocketPair("initial-eof") { client, serverSide ->
+            client.shutdownOutput()
+
+            assertEquals(null, LlmSubmissionGatewayCodec.readFrameOrNull(serverSide))
+        }
+        withSocketPair("partial-prefix") { client, serverSide ->
+            client.write(ByteBuffer.wrap(byteArrayOf(0, 0)))
+            client.shutdownOutput()
+
+            assertFailsWith<IllegalStateException> {
+                LlmSubmissionGatewayCodec.readFrameOrNull(serverSide)
+            }
+        }
+        withSocketPair("partial-payload") { client, serverSide ->
+            client.write(ByteBuffer.allocate(Int.SIZE_BYTES + 2).putInt(4).put(byteArrayOf(1, 2)).flip())
+            client.shutdownOutput()
+
+            assertFailsWith<IllegalStateException> {
+                LlmSubmissionGatewayCodec.readFrameOrNull(serverSide)
+            }
+        }
+    }
+
+    @Test
+    fun `rejected submission can be corrected on the same connection`() = runBlocking {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-same-connection-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val rejected = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .withField("effectiveInvocationHash", JsonPrimitive("mismatch"))
+
+        connect(path).use { channel ->
+            val rejectedResponse = exchangeFrame(channel, rejected)
+            val acceptedResponse = exchangeFrame(
+                channel,
+                request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)),
+            )
+
+            assertEquals("false", rejectedResponse.getValue("accepted").toString())
+            assertEquals("true", acceptedResponse.getValue("accepted").toString())
+        }
+
+        assertEquals(DecisionAction.NO_TRADE, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action)
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, gateway.semanticSubmissionState())
+        gateway.close()
+    }
+
+    @Test
+    fun `rejected submission can be corrected after reconnecting`() {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-reconnect-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val rejected = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+            .withField("effectiveInvocationHash", JsonPrimitive("mismatch"))
+
+        val rejectedResponse = connect(path).use { channel -> exchangeFrame(channel, rejected) }
+        val acceptedResponse = connect(path).use { channel ->
+            exchangeFrame(channel, request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)))
+        }
+
+        assertEquals("false", rejectedResponse.getValue("accepted").toString())
+        assertEquals("true", acceptedResponse.getValue("accepted").toString())
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, gateway.semanticSubmissionState())
+        gateway.close()
+    }
+
+    @Test
+    fun `same payload retry on one connection returns committed result without duplicate row`() = runBlocking {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-idempotent-session-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val submission = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+
+        connect(path).use { channel ->
+            val first = exchangeFrame(channel, submission)
+            val retry = exchangeFrame(channel, submission)
+
+            assertEquals(first.getValue("decision_id"), retry.getValue("decision_id"))
+        }
+
+        assertEquals(1, repository.snapshots.decisions().size)
+        gateway.close()
+    }
+
+    @Test
+    fun `conflict after commit keeps semantic submission committed`() {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-committed-conflict-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val firstSubmission = decision(DecisionAction.NO_TRADE)
+
+        connect(path).use { channel ->
+            val accepted = exchangeFrame(channel, request(LlmInvocationPhase.PROPOSER, firstSubmission))
+            val conflict = exchangeFrame(
+                channel,
+                request(LlmInvocationPhase.PROPOSER, firstSubmission.copy(reasonJa = "changed")),
+            )
+
+            assertEquals("true", accepted.getValue("accepted").toString())
+            assertEquals(DECISION_SUBMISSION_CONFLICT_CODE, conflict.getValue("error").jsonPrimitive.content)
+        }
+
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, gateway.semanticSubmissionState())
+        gateway.close()
+    }
+
+    @Test
+    fun `disconnect without request preserves gateway for a later connection`() {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-empty-connection-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+
+        connect(path).close()
+        val response = connect(path).use { channel ->
+            exchangeFrame(channel, request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)))
+        }
+
+        assertEquals("true", response.getValue("accepted").toString())
+        gateway.close()
+    }
+
+    @Test
+    fun `first request releases completion wait while gateway remains open`() {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-completion-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+        val waiter = Executors.newSingleThreadExecutor()
+        val completion = waiter.submit<Boolean> {
+            gateway.awaitCompletion()
+            true
+        }
+
+        connect(path).use { channel ->
+            exchangeFrame(channel, request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)))
+        }
+
+        assertTrue(completion.get(1, TimeUnit.SECONDS))
+        gateway.close()
+        waiter.shutdownNow()
+    }
+
+    @Test
+    fun `close without request releases completion and terminates worker`() {
+        val path = Path.of("/tmp/fukurou-gateway-close-empty-${System.nanoTime()}.sock")
+        val worker = Executors.newSingleThreadExecutor()
+        val waiter = Executors.newSingleThreadExecutor()
+        val gateway = gatewayWithHooks(
+            path = path,
+            hooks = LlmDecisionSubmissionGatewayStartHooks(createExecutor = { worker }),
+        )
+        val completion = waiter.submit<Boolean> {
+            gateway.awaitCompletion()
+            true
+        }
+
+        gateway.close()
+
+        assertTrue(completion.get(1, TimeUnit.SECONDS))
+        assertTrue(worker.isTerminated)
+        assertFalse(Files.exists(path))
+        assertFailsWith<IOException> { connect(path) }
+        waiter.shutdownNow()
+    }
+
+    @Test
     fun `terminal evidence extension preserves caller tool evidence ids order and duplicates`() = runBlocking {
         val repository = InMemoryDecisionRepository()
         val path = Path.of("/tmp/fukurou-gateway-caller-evidence-${System.nanoTime()}.sock")
@@ -561,6 +729,27 @@ class LlmDecisionSubmissionGatewayTest {
             hooks = hooks,
         )
 
+    private fun exchangeFrame(channel: SocketChannel, request: JsonObject): JsonObject {
+        LlmSubmissionGatewayCodec.writeFrame(channel, request)
+
+        return LlmSubmissionGatewayCodec.readFrame(channel)
+    }
+
+    @Suppress("NestedBlockDepth")
+    private fun withSocketPair(label: String, block: SocketPairBlock) {
+        val path = Path.of("/tmp/fukurou-gateway-codec-$label-${System.nanoTime()}.sock")
+        try {
+            ServerSocketChannel.open(StandardProtocolFamily.UNIX).use { server ->
+                server.bind(UnixDomainSocketAddress.of(path))
+                connect(path).use { client ->
+                    server.accept().use { serverSide -> block(client, serverSide) }
+                }
+            }
+        } finally {
+            Files.deleteIfExists(path)
+        }
+    }
+
     private fun exchangeDecision(repository: InMemoryDecisionRepository, submission: DecisionSubmission): JsonObject {
         return exchangeRequest(
             repository = repository,
@@ -661,6 +850,8 @@ class LlmDecisionSubmissionGatewayTest {
         connect(UnixDomainSocketAddress.of(path))
     }
 }
+
+private typealias SocketPairBlock = (client: SocketChannel, serverSide: SocketChannel) -> Unit
 
 private fun JsonObject.withField(name: String, value: JsonPrimitive): JsonObject {
     return toMutableMap()

@@ -5,6 +5,7 @@
 
 # Gradle / Kotlin
 .gradle/
+.gradle-home/
 build/
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/**/build/

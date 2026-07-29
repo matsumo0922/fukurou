@@ -92,14 +92,38 @@ class DecisionRunProjectionRepositoryTest {
     @Test
     fun outcomeRequiresFilledOrderOrExecutionEvidenceForExecuted() {
         val rejectedOnly = outcomeEvidence(action = "ENTER", orderCount = 1)
-        val canceledWithNoTradeExit = outcomeEvidence(
+        val committedExitWithEarlierNoTradeExit = outcomeEvidence(
             action = "EXIT",
             orderCount = 1,
             hasNoTradeExit = true,
         )
 
         assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(rejectedOnly))
-        assertEquals(DecisionRunOutcome.NO_ENTRY, classifyDecisionRunOutcome(canceledWithNoTradeExit))
+        assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(committedExitWithEarlierNoTradeExit))
+    }
+
+    @Test
+    fun committedEntryOverridesEarlierNoTradeExitEvidence() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = "ENTER",
+                hasNoTradeExit = true,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.FAILED, outcome)
+    }
+
+    @Test
+    fun rejectionWithoutCommittedDecisionRemainsNoEntry() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = null,
+                hasNoTradeExit = true,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
     }
 
     @Test

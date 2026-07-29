@@ -109,7 +109,11 @@ private fun DecisionRunOutcomeEvidence.hasNormalCancellationEvidence(): Boolean 
 }
 
 private fun DecisionRunOutcomeEvidence.hasNoEntryEvidence(): Boolean {
-    return action == DecisionAction.NO_TRADE.name || hasNoTradeExit
+    if (action == DecisionAction.NO_TRADE.name) return true
+
+    val hasCommittedDecision = action != null
+
+    return !hasCommittedDecision && hasNoTradeExit
 }
 
 /** outcome が目的別 filter に一致するかを返す。 */

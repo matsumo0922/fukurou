@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.activity.matches
 import me.matsumo.fukurou.trading.activity.safeDecisionRunFinalReason
 import me.matsumo.fukurou.trading.activity.withStrategyEvaluation
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
@@ -841,6 +842,11 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val ttlCanceledOrderCount = getInt("ttl_canceled_order_count")
     val canceledEntryOrderCount = getInt("canceled_entry_order_count")
     val actorCanceledOrderCount = getInt("actor_canceled_order_count")
+    val hasCommittedTradeDecision = action != null && action != DecisionAction.NO_TRADE.name
+    val rejectedSubmissionSuperseded = hasCommittedTradeDecision && noTradeReason == "tool_call_failed"
+    val finalReason = noTradeReason
+        .takeUnless { rejectedSubmissionSuperseded }
+        .safeDecisionRunFinalReason()
 
     return DecisionRunSummary(
         invocationId = getString("invocation_id"),
@@ -857,7 +863,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
         falsificationVerdict = getString("verdict"),
         safetyRule = safetyRule,
         safetyMessageJa = getString("message_ja"),
-        finalReason = noTradeReason.safeDecisionRunFinalReason(),
+        finalReason = finalReason,
         orderCount = orderCount,
         executionCount = executionCount,
         hasProcessFailure = terminalCause in setOf(
