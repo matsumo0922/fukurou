@@ -34,6 +34,7 @@ import me.matsumo.fukurou.trading.daemon.DefaultManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchResult
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchService
 import me.matsumo.fukurou.trading.daemon.MutableLlmDaemonTickStatus
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.evaluation.EvaluationRepository
 import me.matsumo.fukurou.trading.exchange.gmo.GmoPublicMarketDataSource
@@ -272,6 +273,9 @@ private fun createApplicationRuntimeResources(
         onStaleLlmRunsRecovered = inputs.onStaleLlmRunsRecovered,
         latestMarketQuoteStore = inputs.latestMarketQuoteStore,
         daemonTickStatus = inputs.daemonTickStatus,
+        // LLM invocation 経路と CLI auth status が共有する in-process evidence。
+        // application 起動ごとに 1 instance だけ作る
+        authEvidenceState = LlmAuthEvidenceState(),
     )
 }
 
@@ -528,6 +532,7 @@ private fun createEvaluationRouteDependencies(
                     clock = runtime.clock,
                     commandRendererConfig = commandRendererConfig,
                 ),
+                authEvidenceState = runtime.authEvidenceState,
             )
         },
         environment = databaseResources.environment,
@@ -725,6 +730,7 @@ private fun createDefaultManualLlmLaunchService(
         environment = databaseResources.environment,
         runtimeConfigState = runtime.runtimeConfigState,
         clock = runtime.clock,
+        authEvidenceState = runtime.authEvidenceState,
     )
 
     return CreatedManualLlmLaunchService(
@@ -748,6 +754,7 @@ private class RecoveringManualLlmLaunchService(
     private val environment: Map<String, String>,
     private val runtimeConfigState: ApplicationRuntimeConfigState,
     private val clock: Clock,
+    private val authEvidenceState: LlmAuthEvidenceState,
 ) : ManualLlmLaunchService, AutoCloseable {
     private val lock = Any()
     private var delegateKey: String? = null
@@ -793,6 +800,7 @@ private class RecoveringManualLlmLaunchService(
                 tradingConfig = runtimeConfigSnapshot.tradingConfig,
                 runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
                 clock = clock,
+                authEvidenceState = authEvidenceState,
             )
             delegate = nextDelegate
             delegateKey = nextDelegate?.let { nextDelegateKey }
@@ -816,6 +824,7 @@ private fun createDefaultLlmAuthService(
         config = LlmAuthServiceConfig.fromEnvironment(databaseResources.environment),
         commandEventLog = commandEventLog,
         clock = runtime.clock,
+        authEvidenceReader = runtime.authEvidenceState,
     )
 }
 
@@ -935,6 +944,7 @@ private fun startApplicationBackgroundWorkers(
             tradingConfig = runtime.tradingConfig,
             clock = runtime.clock,
             bootstrap = sharedPersistenceBootstrap,
+            authEvidenceState = runtime.authEvidenceState,
         ),
     )
 }
@@ -953,6 +963,7 @@ private fun startApplicationLlmDaemonWorker(
         onStaleLlmRunsRecovered = runtime.onStaleLlmRunsRecovered,
         latestMarketQuoteStore = runtime.latestMarketQuoteStore,
         tickStatus = runtime.daemonTickStatus,
+        authEvidenceState = runtime.authEvidenceState,
     )
 }
 
@@ -1154,6 +1165,7 @@ private data class ApplicationRuntimeResources(
     val onStaleLlmRunsRecovered: (Int) -> Unit,
     val latestMarketQuoteStore: LatestMarketQuoteStore,
     val daemonTickStatus: MutableLlmDaemonTickStatus,
+    val authEvidenceState: LlmAuthEvidenceState,
 )
 
 /**

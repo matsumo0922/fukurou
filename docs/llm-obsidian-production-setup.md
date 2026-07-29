@@ -43,7 +43,28 @@ ssh dxp4800plus \
   'sudo docker exec -u root fukurou-ktor sh -lc "chown -R 10001:10004 /tmp/fukurou-cli-home && chmod -R g+rwX /tmp/fukurou-cli-home"'
 ```
 
-WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out でも Ktor / DB / reconciler readiness の意味は変わらない。login state は非 secret の credential marker file で判定するため、CLI が keychain など marker file 以外へ credential を保存する構成では System が logged_out を示す場合がある。その場合は fallback 手順と smoke test で実際の CLI auth を確認する。
+WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out や token_suspect でも Ktor / DB / reconciler readiness の意味は変わらない。
+
+status は次の4つを取る。
+
+| status | 意味 |
+|---|---|
+| `logged_in` | credential marker が存在し、現在の credential で認証失敗を観測していない |
+| `token_suspect` | marker は存在するが、現在の credential を使った LLM 起動が認証失敗を観測した |
+| `logged_out` | credential marker が見つからない |
+| `unknown` | marker の更新時刻を読めず判定できない |
+
+`token_suspect` は、marker file が残っていても token が失効している状態を表す。**解除は再ログインだけ**で、その後の起動が成功しても解除しない。LLM 起動は persistent な credential source を直接使わず per-run home への copy を使い、source へ書き戻さないため、起動の成功は source が今も有効であることの証拠にならない。
+
+`token_suspect` が再ログイン後も残る場合は、`/tmp/fukurou-cli-home/.codex/auth.json`（Codex）の更新時刻を確認する。判定は marker の mtime を credential 世代として使うため、mtime が更新されていなければ降格は解除されない。root 実行の login は appuser の auth source を更新しないため使わない（後述の fallback 手順を参照）。再ログインが filesystem の timestamp 分解能内に収まって mtime が変わらなかった場合も解除されないため、その場合は少し待ってから再度 login する。
+
+検知には次の限界がある。いずれも意図的な範囲であり、`logged_in` が返っていても token が有効であることの証明にはならない。
+
+- 認証失敗の観測は Ktor process 内で実行された起動に限る。隔離された maintenance 操作として direct `OneShotRunnerMain` を実行した場合、そこで観測した失効は反映されない
+- 観測結果は process 内に保持するため、Ktor 再起動で失われる。再起動後は次の起動が失敗するまで `logged_in` に戻る。`daemon.enabled` と `llm.launchEnabled` がいずれも false の構成では、起動自体が発生しないためこの状態が続く
+- 検知は Codex CLI の既知の失敗文言と typed な認証カテゴリに依存する。CLI の出力文言が変わると検知できなくなる
+
+login state は非 secret の credential marker file で判定するため、CLI が keychain など marker file 以外へ credential を保存する構成では System が logged_out を示す場合がある。その場合は fallback 手順と smoke test で実際の CLI auth を確認する。
 
 WebUI の Controls 画面で `CLI Auth` を開き、Claude Code または Codex の login を reason 付きで開始する。Claude Code は表示された `authorizationUrl` を手元の browser で開き、browser flow が返した token/code を Claude Code session 専用の入力欄から 1 回だけ送信する。Codex は device auth flow のまま進め、WebUI に token/code 入力欄を出さない。WebUI / API / audit payload は access token、refresh token、API key、credential file content、送信した token/code を返さない。audit には provider、session ID、reason、status、secret を含まない detail だけを残す。
 

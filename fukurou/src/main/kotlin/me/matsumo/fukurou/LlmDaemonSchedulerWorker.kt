@@ -33,6 +33,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.MutableLlmDaemonTickStatus
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceDependencies
 import me.matsumo.fukurou.trading.daemon.ManualLlmLaunchServiceRuntime
 import me.matsumo.fukurou.trading.daemon.asDaemonLauncher
@@ -171,6 +172,7 @@ internal fun startLlmDaemonSchedulerWorker(
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
     latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
+    authEvidenceState: LlmAuthEvidenceState? = null,
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
 
@@ -192,6 +194,7 @@ internal fun startLlmDaemonSchedulerWorker(
                         requestBase = oneShotRequestFromEnvironment(environment),
                         latestMarketQuoteStore = latestMarketQuoteStore,
                         tickStatus = tickStatus,
+                        authEvidenceState = authEvidenceState,
                     ),
                 )
             }
@@ -276,6 +279,7 @@ internal fun createManualLlmLaunchService(
     tradingConfig: TradingBotConfig,
     runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     clock: Clock,
+    authEvidenceState: LlmAuthEvidenceState? = null,
 ): DefaultManualLlmLaunchService? {
     val requestBase = oneShotRequestFromRequiredEnvironment(environment) ?: return null
     val components = createLlmLaunchRuntimeComponents(
@@ -287,6 +291,7 @@ internal fun createManualLlmLaunchService(
             tradingConfig = tradingConfig,
             runtimeConfigSnapshot = runtimeConfigSnapshot,
             requestBase = requestBase,
+            authEvidenceState = authEvidenceState,
         ),
     )
 
@@ -347,6 +352,7 @@ private fun createLlmLaunchRuntimeComponents(inputs: LlmLaunchRuntimeInputs): Ll
         parentEnvironment = inputs.environment,
         clock = inputs.clock,
         commandRendererConfig = commandRendererConfig,
+        authEvidenceState = inputs.authEvidenceState,
     )
     val paperLedgerRepository = ExposedPaperLedgerRepository(
         database = inputs.database,
@@ -385,6 +391,7 @@ internal fun createProductionOneShotLlmRunner(
     clock: Clock,
     commandRendererConfig: LlmCommandRendererConfig,
     cliVersionProbe: me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe = ProcessScopedLlmCliVersionProbe,
+    authEvidenceState: LlmAuthEvidenceState? = null,
 ): OneShotLlmRunner {
     return OneShotLlmRunner(
         tradingRuntime = tradingRuntime,
@@ -396,6 +403,7 @@ internal fun createProductionOneShotLlmRunner(
         clock = clock,
         commandRendererConfig = commandRendererConfig,
         cliVersionProbe = cliVersionProbe,
+        authEvidenceState = authEvidenceState,
     )
 }
 
@@ -550,6 +558,7 @@ private data class LlmLaunchRuntimeInputs(
     val requestBase: OneShotRunnerRequest,
     val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     val tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
+    val authEvidenceState: LlmAuthEvidenceState? = null,
 )
 
 /**

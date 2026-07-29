@@ -21,12 +21,15 @@ import me.matsumo.fukurou.trading.domain.Ticker
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatus
 import me.matsumo.fukurou.trading.exchange.gmo.GmoExchangeStatusReader
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
+import me.matsumo.fukurou.trading.invoker.ProcessRunResult
+import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.market.MarketDataSource
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.runner.OneShotRunnerRequest
@@ -167,6 +170,83 @@ class LlmDaemonSchedulerCompositionTest {
             result.exceptionOrNull()?.toString() ?: audit,
         )
         assertEquals(material.snapshotContentHash, runManifest.materialContentHash)
+    }
+
+    @Test
+    fun productionRunnerFactoryDeliversAuthEvidenceToTheSharedState() = runBlocking {
+        // renderer → invoker → auditor → evidence state の配線が production factory 経由で
+        // 通ることを確認する。どこかで state の受け渡しが欠けると evidence が届かない
+        val config = TradingBotConfig.fromEnvironment(emptyMap())
+        val clock = Clock.fixed(Instant.parse("2026-07-16T00:00:00Z"), ZoneOffset.UTC)
+        val runtime = TradingRuntimeFactory.inMemory(
+            clock = clock,
+            marketDataSource = CompositionMarketDataSource,
+            tradingConfig = config,
+        )
+        val evidenceState = LlmAuthEvidenceState()
+        val credentialGeneration = Instant.parse("2026-07-15T00:00:00Z")
+        val runner = createProductionOneShotLlmRunner(
+            tradingRuntime = runtime,
+            tradingConfig = config,
+            materialMarketDataSource = CompositionMarketDataSource,
+            llmInvoker = object : LlmInvoker {
+                override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
+                    return Result.success(
+                        LlmInvocationResult(
+                            request = request,
+                            processResult = ProcessRunResult(
+                                status = ProcessRunStatus.EXITED,
+                                exitCode = 1,
+                                stdout = "",
+                                stderr = "refresh_token_reused",
+                            ),
+                            responseText = "",
+                            authEvidenceObserved = true,
+                            authSourceObservedAt = credentialGeneration,
+                        ),
+                    )
+                }
+            },
+            runtimeConfigSnapshot = null,
+            parentEnvironment = mapOf(
+                "DB_URL" to "jdbc:postgresql://127.0.0.1:5432/fukurou",
+                "DB_USER" to "fukurou",
+                "DB_PASSWORD" to "fixture-password",
+                "FUKUROU_LLM_ACCESS_TOKEN" to "fixture-token",
+            ),
+            clock = clock,
+            commandRendererConfig = LlmCommandRendererConfig(),
+            cliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
+            authEvidenceState = evidenceState,
+        )
+        val invocationId = "production-composition-auth-evidence"
+        val reservation = runtime.launchReservationRepository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+                triggerKey = "test:$invocationId",
+                reservedAt = clock.instant(),
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofDays(1),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+            ),
+        ).getOrThrow()
+        assertIs<LlmLaunchReservationOutcome.Reserved>(reservation)
+
+        runner.runOneShot(
+            OneShotRunnerRequest(
+                repositoryRoot = Path.of("..").toAbsolutePath().normalize(),
+                workingDirectory = Path.of(".").toAbsolutePath().normalize(),
+                mcpJarPath = "mcp/build/libs/fukurou-mcp-all.jar",
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.MANUAL,
+            ),
+        )
+
+        // proposer の既定 provider は Claude。どの provider の phase でも配線は同じ
+        val evidence = assertNotNull(evidenceState.lastFailure(config.llmRoleAssignments.proposer.provider))
+        assertEquals(credentialGeneration, evidence.credentialGeneration)
     }
 }
 

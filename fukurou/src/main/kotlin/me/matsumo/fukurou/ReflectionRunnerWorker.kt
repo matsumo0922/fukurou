@@ -14,6 +14,7 @@ import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
 import me.matsumo.fukurou.trading.config.RuntimeConfigCatalog
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.invoker.DefaultLlmCommandRenderer
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.invoker.LlmCommandRendererConfig
 import me.matsumo.fukurou.trading.invoker.ProcessScopedLlmCliVersionProbe
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
@@ -149,6 +150,7 @@ internal fun startReflectionRunnerWorker(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(environment),
     clock: Clock = Clock.systemUTC(),
     bootstrap: (() -> Result<Unit>)? = null,
+    authEvidenceState: LlmAuthEvidenceState? = null,
 ): ReflectionRunnerWorker? {
     if (!tradingConfig.obsidian.enabled) {
         return null
@@ -162,6 +164,7 @@ internal fun startReflectionRunnerWorker(
                     environment = environment,
                     tradingConfig = tradingConfig,
                     clock = clock,
+                    authEvidenceState = authEvidenceState,
                 )
             }
         },
@@ -187,6 +190,7 @@ private fun createReflectionRunner(
     environment: Map<String, String>,
     tradingConfig: TradingBotConfig,
     clock: Clock,
+    authEvidenceState: LlmAuthEvidenceState? = null,
 ): ReflectionRunner {
     val vaultPath = Path.of(tradingConfig.obsidian.vaultPath)
         .toAbsolutePath()
@@ -245,6 +249,7 @@ private fun createReflectionRunner(
                                 tradingConfig.llmModels,
                             ),
                         ),
+                        authEvidenceState = authEvidenceState,
                     ),
                     workingDirectory = workingDirectory,
                     parentEnvironment = environment,
