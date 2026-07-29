@@ -172,7 +172,7 @@ internal fun startLlmDaemonSchedulerWorker(
     onStaleLlmRunsRecovered: (Int) -> Unit = {},
     latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
-    authEvidenceState: LlmAuthEvidenceState? = null,
+    authEvidenceState: LlmAuthEvidenceState,
 ): LlmDaemonSchedulerWorker? {
     val environment = System.getenv()
 
@@ -270,28 +270,46 @@ internal fun createRestingOrderMaintenanceService(
 }
 
 /**
- * DB runtime から manual LLM launch service を構築する。
+ * manual LLM launch service の構築に必要な runtime input。
+ *
+ * @param dataSource DB 接続 pool
+ * @param database Exposed database
+ * @param environment process environment
+ * @param tradingConfig 取引 bot config
+ * @param runtimeConfigSnapshot active runtime config の監査 snapshot
+ * @param clock 時刻源
+ * @param authEvidenceState LLM invocation 経路と CLI auth status が共有する認証失敗 evidence
  */
-internal fun createManualLlmLaunchService(
-    dataSource: HikariDataSource,
-    database: ExposedDatabase,
-    environment: Map<String, String>,
-    tradingConfig: TradingBotConfig,
-    runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
-    clock: Clock,
-    authEvidenceState: LlmAuthEvidenceState? = null,
-): DefaultManualLlmLaunchService? {
+internal data class ManualLlmLaunchRuntime(
+    val dataSource: HikariDataSource,
+    val database: ExposedDatabase,
+    val environment: Map<String, String>,
+    val tradingConfig: TradingBotConfig,
+    val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot?,
+    val clock: Clock,
+    val authEvidenceState: LlmAuthEvidenceState,
+)
+
+/**
+ * DB runtime から manual LLM launch service を構築する。
+ *
+ * @param runtime DB 接続と runtime config を含む起動 input
+ */
+internal fun createManualLlmLaunchService(runtime: ManualLlmLaunchRuntime): DefaultManualLlmLaunchService? {
+    val environment = runtime.environment
+    val tradingConfig = runtime.tradingConfig
+    val runtimeConfigSnapshot = runtime.runtimeConfigSnapshot
     val requestBase = oneShotRequestFromRequiredEnvironment(environment) ?: return null
     val components = createLlmLaunchRuntimeComponents(
         inputs = LlmLaunchRuntimeInputs(
-            dataSource = dataSource,
-            database = database,
-            clock = clock,
+            dataSource = runtime.dataSource,
+            database = runtime.database,
+            clock = runtime.clock,
             environment = environment,
             tradingConfig = tradingConfig,
             runtimeConfigSnapshot = runtimeConfigSnapshot,
             requestBase = requestBase,
-            authEvidenceState = authEvidenceState,
+            authEvidenceState = runtime.authEvidenceState,
         ),
     )
 
@@ -307,7 +325,7 @@ internal fun createManualLlmLaunchService(
         runtime = ManualLlmLaunchServiceRuntime(
             requestBase = components.requestBase,
             launchOneShot = components.launchOneShot,
-            clock = clock,
+            clock = runtime.clock,
         ),
     )
 }
@@ -391,7 +409,7 @@ internal fun createProductionOneShotLlmRunner(
     clock: Clock,
     commandRendererConfig: LlmCommandRendererConfig,
     cliVersionProbe: me.matsumo.fukurou.trading.invoker.LlmCliVersionProbe = ProcessScopedLlmCliVersionProbe,
-    authEvidenceState: LlmAuthEvidenceState? = null,
+    authEvidenceState: LlmAuthEvidenceState,
 ): OneShotLlmRunner {
     return OneShotLlmRunner(
         tradingRuntime = tradingRuntime,
@@ -559,7 +577,7 @@ private data class LlmLaunchRuntimeInputs(
     val requestBase: OneShotRunnerRequest,
     val latestMarketQuoteStore: LatestMarketQuoteStore = LatestMarketQuoteStore(),
     val tickStatus: MutableLlmDaemonTickStatus = MutableLlmDaemonTickStatus(),
-    val authEvidenceState: LlmAuthEvidenceState? = null,
+    val authEvidenceState: LlmAuthEvidenceState,
 )
 
 /**

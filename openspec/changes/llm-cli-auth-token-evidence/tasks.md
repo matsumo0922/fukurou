@@ -20,7 +20,7 @@
 - [x] 2.7 `/ops/llm-auth` の `.describe {}` に `token_suspect` と `unknown` の意味を日本語で追記する
 - [x] 2.8 `LlmAuthStatusEvidenceTest` に spec の Scenario 対応 test を追加する: `authFailureSuspected` で降格 / 後続の成功が降格を解除しない / evidence なしで `logged_in`（回帰）/ marker 更新で古い世代の evidence を無視 / 世代が marker mtime と同値なら降格を維持 / 世代不明の後続 failure で降格を失わない / 他 provider の evidence で降格しない / marker 不在で `logged_out` / mtime を読めないとき `unknown` / evidence 参照が失敗したとき `unknown` / evidence state 未注入で `logged_in` / state が空（再起動相当）で `logged_in`
 - [x] 2.9 `OpsRouteTest` に production route 経由で `token_suspect` が wire に出る test を追加する（status detail に secret 相当が含まれないことは既存の `assertNoSecretLikeText` で確認する）
-- [x] 2.10 production factory 経由で renderer → invoker → auditor → evidence state の配線が通ることを composition test で確認し、production の auditor 構築箇所すべてが evidence state を受け取ることを `LlmAuthEvidenceWiringTest` で静的に確認する
+- [x] 2.10 evidence state の配線を3層で担保する: (1) `:fukurou` の中間 factory は `authEvidenceState` を必須引数とし、呼び出し側の渡し忘れをコンパイルエラーにする (2) production の auditor 構築箇所すべてが共有 state を受け取ることを `LlmAuthEvidenceWiringTest` で静的に確認する（`null` と新規生成を拒否）(3) one-shot 経路については runner → auditor → state が実行時に届くことを composition test で確認する
 - [x] 2.11 `token_suspect` / `unknown` が `/health/ready` と scheduler admission に影響しないことを、依存グラフ上 CLI auth を参照していないことの確認として記録する（新規 test が不要ならその旨を記録する）
 - [x] 2.12 `docs/llm-obsidian-production-setup.md` の CLI auth 判定の記述を現在形で更新する。`token_suspect` の意味、再ログインでのみ解除されること（false-positive でも他の解除経路が無いこと）、process 再起動で evidence が消えること、別プロセスの direct runner が検知対象外であること、解除されない場合に auth.json の mtime を確認し必要なら mtime が変わるまで待って再 login することを追記する
 - [x] 2.13 WebUI System 画面が `token_suspect` を「logged in ではない」として扱い、そのまま表示することを確認する（変更が不要なら不要と記録する）

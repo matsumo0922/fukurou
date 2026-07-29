@@ -794,13 +794,15 @@ private class RecoveringManualLlmLaunchService(
             currentDelegate?.close()
 
             val nextDelegate = createManualLlmLaunchService(
-                dataSource = dataSource,
-                database = database,
-                environment = environment,
-                tradingConfig = runtimeConfigSnapshot.tradingConfig,
-                runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
-                clock = clock,
-                authEvidenceState = authEvidenceState,
+                ManualLlmLaunchRuntime(
+                    dataSource = dataSource,
+                    database = database,
+                    environment = environment,
+                    tradingConfig = runtimeConfigSnapshot.tradingConfig,
+                    runtimeConfigSnapshot = runtimeConfigSnapshot.runtimeConfigSnapshot,
+                    clock = clock,
+                    authEvidenceState = authEvidenceState,
+                ),
             )
             delegate = nextDelegate
             delegateKey = nextDelegate?.let { nextDelegateKey }

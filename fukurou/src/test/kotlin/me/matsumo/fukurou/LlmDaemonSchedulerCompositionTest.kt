@@ -92,6 +92,7 @@ class LlmDaemonSchedulerCompositionTest {
             dataSource = dataSource,
             database = Database.connect("jdbc:postgresql://127.0.0.1:1/not-used"),
             tradingConfig = TradingBotConfig.fromEnvironment(emptyMap()),
+            authEvidenceState = LlmAuthEvidenceState(),
         )
 
         assertNull(worker)
@@ -134,6 +135,7 @@ class LlmDaemonSchedulerCompositionTest {
             clock = clock,
             commandRendererConfig = LlmCommandRendererConfig(),
             cliVersionProbe = LlmCliVersionProbe { Result.success("fixture-cli 1.0") },
+            authEvidenceState = LlmAuthEvidenceState(),
         )
         val invocationId = "production-composition-standard-snapshot"
         val reservation = runtime.launchReservationRepository.tryReserve(

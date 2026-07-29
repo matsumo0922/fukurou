@@ -45,7 +45,7 @@ ssh dxp4800plus \
 
 WebUI の System 画面は `/ops/llm-auth` を読み、Claude Code / Codex の login state を表示する。CLI auth は `/health` / `/health/ready` には混ぜないため、CLI が logged_out や token_suspect でも Ktor / DB / reconciler readiness の意味は変わらない。
 
-status は次の4つを取る。
+status は次の5つを取る。
 
 | status | 意味 |
 |---|---|

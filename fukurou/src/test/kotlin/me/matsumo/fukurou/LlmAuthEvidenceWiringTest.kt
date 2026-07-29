@@ -13,8 +13,11 @@ import kotlin.test.assertTrue
  *
  * evidence state は in-process であり、監視 API が読むのは 1 instance だけである。auditor を構築する
  * 経路が1つでも state を受け取らない、あるいは別 instance を受け取ると、その経路で観測した認証失敗は
- * `/ops/llm-auth` に届かず、失効中でも `logged_in` を返す。この配線漏れは型検査で防げず、実行時にも
- * 例外にならないため、構築箇所を静的に確認する。
+ * `/ops/llm-auth` に届かず、失効中でも `logged_in` を返す。
+ *
+ * `:fukurou` の中間 factory は `authEvidenceState` を必須引数として受けるため、呼び出し側が渡し忘れると
+ * コンパイルが失敗する。このテストが担うのは、その手前の「auditor 構築そのものが state を受け取らない、
+ * または別 instance を受け取る」形であり、型検査では防げない部分に限る。
  *
  * 新しい invocation 経路を追加したときは、その auditor へ共有 state を渡すこと。
  */

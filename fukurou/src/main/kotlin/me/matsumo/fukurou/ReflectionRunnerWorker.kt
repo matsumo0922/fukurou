@@ -150,7 +150,7 @@ internal fun startReflectionRunnerWorker(
     tradingConfig: TradingBotConfig = TradingBotConfig.fromEnvironment(environment),
     clock: Clock = Clock.systemUTC(),
     bootstrap: (() -> Result<Unit>)? = null,
-    authEvidenceState: LlmAuthEvidenceState? = null,
+    authEvidenceState: LlmAuthEvidenceState,
 ): ReflectionRunnerWorker? {
     if (!tradingConfig.obsidian.enabled) {
         return null
@@ -190,7 +190,7 @@ private fun createReflectionRunner(
     environment: Map<String, String>,
     tradingConfig: TradingBotConfig,
     clock: Clock,
-    authEvidenceState: LlmAuthEvidenceState? = null,
+    authEvidenceState: LlmAuthEvidenceState,
 ): ReflectionRunner {
     val vaultPath = Path.of(tradingConfig.obsidian.vaultPath)
         .toAbsolutePath()
