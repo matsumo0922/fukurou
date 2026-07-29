@@ -1,14 +1,15 @@
 ## 1. Frame 読み取りの EOF 分離
 
-- [x] 1.1 `LlmSubmissionGatewayCodec` に「接続終了なら null を返す」frame 読み取り経路を追加し、既存の `readFrame` の契約（途中 EOF は異常）を維持する
+- [x] 1.1 `LlmSubmissionGatewayCodec` に「接続終了なら null を返す」frame 読み取り経路を追加し、既存の `readFrame` の契約（size 範囲外は `IllegalArgumentException`、途中 EOF は `IllegalStateException`）を維持する
 - [x] 1.2 size prefix 先頭の EOF と途中 EOF を区別するテストを追加する
+- [x] 1.3 public な `readFrame()` の size 範囲外例外を `IllegalArgumentException` に戻し、client の境界テストを通す
 
 ## 2. 受付ループ
 
 - [x] 2.1 `submissionTask()` を accept ループ + frame ループの二重構造へ変更する
 - [x] 2.2 frame 処理中の例外を接続スコープに閉じ込め、応答可能なら `gatewayErrorResponse()` を返して次フレームを待つようにする
 - [x] 2.3 accept ループを「`accept()` の例外は種別を問わず抜ける、ループ条件は `Thread.currentThread().isInterrupted`」の規則で実装し、frame ループの例外だけを接続スコープに閉じ込める
-- [x] 2.4 `completion` を最初の要求完了時と task 終了時の双方で countDown するようにする
+- [x] 2.4 `completion` を response の `writeFrame` 成功時と task 終了時だけ countDown し、書き込み失敗を request 完了として扱わない
 
 ## 3. 状態遷移の単調性
 
@@ -18,9 +19,10 @@
 
 ## 4. Run outcome の判定
 
-- [x] 4.1 `hasNoEntryEvidence()` の判定で commit 済み decision の証跡を `NO_TRADE_EXIT` より優先させる（`DecisionRunProjectionRepository.kt:111-113`、必要なら `ExposedDecisionRunProjectionRepository` の projection 側も合わせる）
+- [x] 4.1 `hasNoEntryEvidence()` と SQL projection を、commit 済み trade decision がある場合でも `rejectionCode` を持つ `NO_TRADE_EXIT` だけを superseded とする判定へ精密化する
 - [x] 4.2 「拒否 → 再提出で entry 受理」の run が no-entry にならないテストを追加する
 - [x] 4.3 「拒否のみで受理なし」の run が従来どおり no-entry のままであるテストを追加する
+- [x] 4.4 「entry commit 後に `rejectionCode` を持たない `tool_call_failed`」の final reason と no-entry outcome が保持される単体・PostgreSQL 統合テストを追加する
 
 ## 5. 回帰テスト
 
@@ -30,6 +32,7 @@
 - [x] 5.4 close 後に socket へ接続できず、worker thread が終了しているテストを追加する
 - [x] 5.5 既存の in-flight close / commit 後 completion 喪失 / start 失敗 cleanup のテストが無変更で通ることを確認する
 - [x] 5.6 canary の `awaitCompletion()` 経路が 1 要求で解除されることを確認する
+- [x] 5.7 response loss テストを、応答送信失敗を completion と扱わない契約に合わせて更新する
 
 ## 6. 検証
 

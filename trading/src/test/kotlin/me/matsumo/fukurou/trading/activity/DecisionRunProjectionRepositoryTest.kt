@@ -96,6 +96,7 @@ class DecisionRunProjectionRepositoryTest {
             action = "EXIT",
             orderCount = 1,
             hasNoTradeExit = true,
+            noTradeExitHasRejectionCode = true,
         )
 
         assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(rejectedOnly))
@@ -103,15 +104,29 @@ class DecisionRunProjectionRepositoryTest {
     }
 
     @Test
-    fun committedEntryOverridesEarlierNoTradeExitEvidence() {
+    fun committedEntryOverridesEarlierSubmissionRejectionEvidence() {
         val outcome = classifyDecisionRunOutcome(
             outcomeEvidence(
                 action = "ENTER",
                 hasNoTradeExit = true,
+                noTradeExitHasRejectionCode = true,
             ),
         )
 
         assertEquals(DecisionRunOutcome.FAILED, outcome)
+    }
+
+    @Test
+    fun committedEntryKeepsGenericToolFailureAsNoEntryEvidence() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = "ENTER",
+                hasNoTradeExit = true,
+                noTradeExitHasRejectionCode = false,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
     }
 
     @Test
@@ -226,6 +241,7 @@ private fun outcomeEvidence(
     orderCount: Int = 0,
     filledOrderCount: Int = 0,
     hasNoTradeExit: Boolean = false,
+    noTradeExitHasRejectionCode: Boolean = false,
     openOrderCount: Int = 0,
     ttlCanceledOrderCount: Int = 0,
     canceledEntryOrderCount: Int = 0,
@@ -243,6 +259,7 @@ private fun outcomeEvidence(
         filledOrderCount = filledOrderCount,
         executionCount = 0,
         hasNoTradeExit = hasNoTradeExit,
+        noTradeExitHasRejectionCode = noTradeExitHasRejectionCode,
         openOrderCount = openOrderCount,
         ttlCanceledOrderCount = ttlCanceledOrderCount,
         canceledEntryOrderCount = canceledEntryOrderCount,

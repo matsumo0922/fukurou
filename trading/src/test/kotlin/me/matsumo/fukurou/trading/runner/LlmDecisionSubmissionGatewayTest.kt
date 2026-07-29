@@ -339,6 +339,13 @@ class LlmDecisionSubmissionGatewayTest {
                 LlmSubmissionGatewayCodec.readFrameOrNull(serverSide)
             }
         }
+        withSocketPair("oversized-frame") { client, serverSide ->
+            client.write(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(MAX_GATEWAY_FRAME_BYTES + 1).flip())
+
+            assertFailsWith<IllegalArgumentException> {
+                LlmSubmissionGatewayCodec.readFrame(serverSide)
+            }
+        }
     }
 
     @Test

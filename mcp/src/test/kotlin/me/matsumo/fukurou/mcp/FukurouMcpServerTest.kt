@@ -773,7 +773,12 @@ class FukurouMcpServerTest {
                 decisionGatewayRequest(invocationId, submission),
             )
         }
-        lostGateway.awaitCompletion()
+        var attempts = 0
+        while (lostGateway.semanticSubmissionState() != LlmSemanticSubmissionState.COMMITTED && attempts < 100) {
+            Thread.sleep(10)
+            attempts++
+        }
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, lostGateway.semanticSubmissionState())
         lostGateway.close()
         val committedId = appRepository.snapshots.decisions().single().decisionId
 

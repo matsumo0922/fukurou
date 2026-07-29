@@ -235,9 +235,9 @@ class LlmDecisionSubmissionGateway private constructor(
                     val responseWritten = runCatching {
                         LlmSubmissionGatewayCodec.writeFrame(channel, response)
                     }.isSuccess
-                    completion.countDown()
-
                     if (!responseWritten) return
+
+                    completion.countDown()
                     continue
                 }
                 val response = runCatching {
@@ -261,9 +261,9 @@ class LlmDecisionSubmissionGateway private constructor(
                 val responseWritten = runCatching {
                     LlmSubmissionGatewayCodec.writeFrame(channel, response)
                 }.isSuccess
-                completion.countDown()
-
                 if (!responseWritten) return
+
+                completion.countDown()
             }
         }
 
@@ -462,7 +462,10 @@ private fun Throwable?.combineCleanupFailure(next: Throwable): Throwable {
 }
 
 /** 接続を閉じるべき gateway frame 契約違反。 */
-private class SubmissionGatewayFrameContractException(message: String) : IllegalStateException(message)
+private open class SubmissionGatewayFrameContractException(message: String) : IllegalStateException(message)
+
+/** public codec では IllegalArgumentException へ戻す frame size 契約違反。 */
+private class SubmissionGatewayFrameSizeException(message: String) : SubmissionGatewayFrameContractException(message)
 
 /** bounded length-prefixed gateway protocol codec。 */
 @Suppress("TooManyFunctions")
@@ -583,8 +586,12 @@ object LlmSubmissionGatewayCodec {
     }
 
     fun readFrame(channel: SocketChannel): JsonObject {
-        return readFrameOrNull(channel)
-            ?: throw SubmissionGatewayFrameContractException("Submission gateway frame ended early.")
+        return try {
+            readFrameOrNull(channel)
+                ?: throw SubmissionGatewayFrameContractException("Submission gateway frame ended early.")
+        } catch (exception: SubmissionGatewayFrameSizeException) {
+            throw IllegalArgumentException(exception.message, exception)
+        }
     }
 
     fun readFrameOrNull(channel: SocketChannel): JsonObject? {
@@ -593,7 +600,7 @@ object LlmSubmissionGatewayCodec {
         sizeBuffer.flip()
         val size = sizeBuffer.int
         if (size !in 1..MAX_GATEWAY_FRAME_BYTES) {
-            throw SubmissionGatewayFrameContractException("Submission gateway frame size rejected.")
+            throw SubmissionGatewayFrameSizeException("Submission gateway frame size rejected.")
         }
         val payload = ByteBuffer.allocate(size)
         readFully(channel, payload)
