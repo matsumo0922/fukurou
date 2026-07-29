@@ -6,11 +6,11 @@
 
 ## 2. Gateway 側の分類と応答
 
-- [x] 2.1 `handleRequest()` の各検査点（invocation / phase / manifest / effective hash binding、phase 認可、RISK_REDUCTION_ONLY 制約、payload invocationId、未知 operation）を `SubmissionRejectedException` へ置き換える
+- [x] 2.1 `handleRequest()` の各検査点（invocation / phase / manifest / effective hash binding、operation ごとの phase 認可、RISK_REDUCTION_ONLY 制約、payload invocationId、未知 operation）を固有 code の `SubmissionRejectedException` へ置き換える
 - [x] 2.2 `decodeTerminalEvidenceBundle()` の契約違反を `TERMINAL_EVIDENCE_CONTRACT_VIOLATION` へ分類する
-- [x] 2.3 codec の decode 失敗を `MALFORMED_REQUEST` へ分類する
+- [x] 2.3 frame、decision payload、falsification payload、payload key、必須 string field の decode 失敗を拒否点ごとの固有 code へ分類する
 - [x] 2.4 `gatewayErrorResponse()` が `reason` を付与し、未分類 `Throwable` は `UNCLASSIFIED` へ落ちるようにする
-- [x] 2.5 gateway テストに、拒否点ごとに異なる `reason` が返ることの検証を追加する（binding 4 種、phase 認可、risk-increasing、conflict、unknown）
+- [x] 2.5 gateway テストに、8 つの request 拒否点が互いに異なる `reason` を返す検証と、binding 4 種、risk-increasing、conflict、unknown の検証を追加する
 - [x] 2.6 未分類例外の応答が message を含まないことの検証を追加する
 
 ## 3. Client と MCP tool error
@@ -18,7 +18,7 @@
 - [x] 3.1 `LlmDecisionSubmissionGatewayClient.submit()` が `reason` を読み、`SubmissionRejectedException` を投げるようにする。`reason` 欠落時は従来の例外を維持する
 - [x] 3.2 `toolErrorType` 表に `SubmissionRejectedException` → `submission_rejected` を追加する。`ToolErrorTypes` は線形探索のため、`IllegalArgumentException` を継承しない基底（`RuntimeException` 直下）にして写像順序への依存を作らない
 - [x] 3.3 `mcpErrorResult` に optional な `rejectionCode` 引数を追加し、`throwableResult` から渡す
-- [x] 3.4 client テストに、`reason` 付き応答から code が復元されること、`reason` なし応答で従来の例外になることの検証を追加する
+- [x] 3.4 client テストに、`reason` 付き応答から code が復元されること、typed conflict / unknown と汎用 `SUBMISSION_REJECTED` の `reason` なし応答が従来の例外になることの検証を追加する
 - [x] 3.5 MCP server テストに、gateway 拒否時の tool error へ `rejection_code` が載ることの検証を追加する
 
 ## 4. 監査 payload

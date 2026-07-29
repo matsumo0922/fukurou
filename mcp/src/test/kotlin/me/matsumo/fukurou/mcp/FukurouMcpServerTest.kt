@@ -829,11 +829,11 @@ class FukurouMcpServerTest {
         assertEquals(true, result.isError)
         assertEquals("submission_rejected", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
         assertEquals(
-            SubmissionRejectionCode.PHASE_NOT_AUTHORIZED.wireValue,
+            SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.wireValue,
             structuredContent.getValue("rejection_code").jsonPrimitive.contentOrNull,
         )
         assertEquals(
-            SubmissionRejectionCode.PHASE_NOT_AUTHORIZED.message,
+            SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.message,
             structuredContent.getValue("message").jsonPrimitive.contentOrNull,
         )
         fixture.close()

@@ -191,7 +191,7 @@ class LlmDecisionSubmissionGateway private constructor(
                         val response = runCatching {
                             val request = runCatching { LlmSubmissionGatewayCodec.readFrame(channel) }
                                 .getOrElse {
-                                    throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST)
+                                    throw SubmissionRejectedException(SubmissionRejectionCode.FRAME_DECODE_FAILED)
                                 }
                             runBlocking {
                                 handleRequest(
@@ -274,9 +274,8 @@ class LlmDecisionSubmissionGateway private constructor(
                 OPERATION_SUBMIT_DECISION -> {
                     val phaseAuthorized = phase == LlmInvocationPhase.PROPOSER ||
                         phase == LlmInvocationPhase.RISK_REDUCTION_ONLY
-                    rejectUnless(phaseAuthorized, SubmissionRejectionCode.PHASE_NOT_AUTHORIZED)
-                    val submission = runCatching { LlmSubmissionGatewayCodec.decodeDecision(request.gatewayPayload()) }
-                        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
+                    rejectUnless(phaseAuthorized, SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED)
+                    val submission = request.decodeDecisionPayload()
                     rejectUnless(
                         submission.invocationId == invocationId,
                         SubmissionRejectionCode.DECISION_INVOCATION_MISMATCH,
@@ -300,10 +299,9 @@ class LlmDecisionSubmissionGateway private constructor(
                 OPERATION_SUBMIT_FALSIFICATION -> {
                     rejectUnless(
                         phase == LlmInvocationPhase.FALSIFIER,
-                        SubmissionRejectionCode.PHASE_NOT_AUTHORIZED,
+                        SubmissionRejectionCode.FALSIFICATION_PHASE_NOT_AUTHORIZED,
                     )
-                    val submission = runCatching { LlmSubmissionGatewayCodec.decodeFalsification(request.gatewayPayload()) }
-                        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
+                    val submission = request.decodeFalsificationPayload()
                     LlmSubmissionGatewayCodec.falsificationResult(
                         submitRepositoryRequest(submissionState) {
                             repository.submitTerminalFalsification(
@@ -313,7 +311,7 @@ class LlmDecisionSubmissionGateway private constructor(
                         },
                     )
                 }
-                else -> throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST)
+                else -> throw SubmissionRejectedException(SubmissionRejectionCode.UNKNOWN_OPERATION)
             }
         }
 
@@ -360,7 +358,21 @@ private fun JsonObject.validateGatewayBinding(
 
 private fun JsonObject.gatewayPayload(): JsonObject {
     return runCatching { getValue("payload").jsonObject }
-        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
+        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.PAYLOAD_MISSING_OR_INVALID) }
+}
+
+private fun JsonObject.decodeDecisionPayload(): DecisionSubmission {
+    val payload = gatewayPayload()
+
+    return runCatching { LlmSubmissionGatewayCodec.decodeDecision(payload) }
+        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.DECISION_PAYLOAD_DECODE_FAILED) }
+}
+
+private fun JsonObject.decodeFalsificationPayload(): FalsificationSubmission {
+    val payload = gatewayPayload()
+
+    return runCatching { LlmSubmissionGatewayCodec.decodeFalsification(payload) }
+        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.FALSIFICATION_PAYLOAD_DECODE_FAILED) }
 }
 
 private fun JsonObject.trustedTerminalEvidence(
@@ -380,7 +392,7 @@ private fun JsonObject.trustedTerminalEvidence(
 
 private fun JsonObject.gatewayString(name: String): String {
     return runCatching { requiredString(name) }
-        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.MALFORMED_REQUEST) }
+        .getOrElse { throw SubmissionRejectedException(SubmissionRejectionCode.REQUIRED_STRING_FIELD_MISSING) }
 }
 
 private fun Throwable?.combineCleanupFailure(next: Throwable): Throwable {

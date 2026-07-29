@@ -4,15 +4,20 @@
 
 app-owned submission gateway が submission を拒否したとき、応答フレームは既存の `accepted=false` と `error` code に加えて、拒否点を識別する `reason` を含まなければならない (SHALL)。`reason` はコードが定義した閉じた集合の `snake_case` 識別子に限られ (MUST)、例外 message、payload 断片、filesystem path、環境変数値を含んではならない (MUST NOT)。集合の各値は gateway 内の単一の拒否点に対応し、既存の 3 つの `error` code は変更しない (SHALL)。
 
-#### Scenario: phase 認可違反の拒否理由が応答に載る
+#### Scenario: operation ごとの phase 認可違反が区別される
 
-- **WHEN** FALSIFIER phase の gateway へ `SUBMIT_DECISION` 要求を送る
-- **THEN** 応答は `accepted=false`、`error=SUBMISSION_REJECTED`、`reason` が phase 認可違反を表す識別子になる
+- **WHEN** FALSIFIER phase の gateway へ `SUBMIT_DECISION` 要求を送る、または PROPOSER phase の gateway へ `SUBMIT_FALSIFICATION` 要求を送る
+- **THEN** 応答は `accepted=false`、`error=SUBMISSION_REJECTED` となり、`reason` は decision と falsification の phase 認可違反を互いに異なる識別子で示す
 
 #### Scenario: binding mismatch の拒否理由が拒否点ごとに区別される
 
 - **WHEN** invocationId / phase / phaseManifestId / effectiveInvocationHash のいずれか 1 つだけが gateway の binding と異なる要求を送る
 - **THEN** 応答の `reason` は、どの binding が一致しなかったかを互いに異なる識別子で示す
+
+#### Scenario: request decode の拒否点がそれぞれ区別される
+
+- **WHEN** frame decode、decision payload decode、falsification payload decode、未知 operation、payload 欠落・型不正、必須 string field 欠落・型不正のいずれかで gateway が要求を拒否する
+- **THEN** 応答の `reason` は 6 拒否点を互いに異なる識別子で示し、frame decode 失敗は送信者の過失を断定しない中立な識別子になる
 
 #### Scenario: typed conflict と unknown も rejection code を持つ
 

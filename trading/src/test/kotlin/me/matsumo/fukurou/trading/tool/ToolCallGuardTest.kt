@@ -173,7 +173,7 @@ class ToolCallGuardTest {
     fun gateway_rejection_records_code_through_decision_tool_production_path() = runBlocking {
         val eventLog = InMemoryCommandEventLog()
         val guard = createGuard(eventLog = eventLog)
-        val rejection = SubmissionRejectedException(SubmissionRejectionCode.PHASE_NOT_AUTHORIZED)
+        val rejection = SubmissionRejectedException(SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED)
 
         val result = guard.runDecisionTool(createCall(toolName = "submit_decision")) {
             throw rejection
@@ -185,7 +185,7 @@ class ToolCallGuardTest {
         assertTrue(event.payload.contains("\"reason\":\"tool_call_failed\""))
         assertTrue(
             event.payload.contains(
-                "\"rejectionCode\":\"${SubmissionRejectionCode.PHASE_NOT_AUTHORIZED.wireValue}\"",
+                "\"rejectionCode\":\"${SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.wireValue}\"",
             ),
         )
     }

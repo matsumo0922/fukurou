@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
 import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
+import me.matsumo.fukurou.trading.decision.submissionRejectionCodeOrNull
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_CONFLICT_CODE
 import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_UNKNOWN_CODE
@@ -188,14 +189,25 @@ class LlmDecisionSubmissionGatewayClientTest {
     }
 
     @Test
+    fun `mcp client preserves generic legacy rejection without reason`() {
+        val exception = assertGatewayError<IllegalStateException>(
+            errorCode = "SUBMISSION_REJECTED",
+            rejectionCode = null,
+        )
+
+        assertEquals(null, exception.cause)
+        assertEquals(null, exception.submissionRejectionCodeOrNull())
+    }
+
+    @Test
     fun `mcp client restores rejection reason without gateway message`() {
         val exception = assertGatewayError<SubmissionRejectedException>(
             errorCode = "SUBMISSION_REJECTED",
-            rejectionCode = SubmissionRejectionCode.PHASE_NOT_AUTHORIZED,
+            rejectionCode = SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED,
         )
 
-        assertEquals(SubmissionRejectionCode.PHASE_NOT_AUTHORIZED, exception.code)
-        assertEquals(SubmissionRejectionCode.PHASE_NOT_AUTHORIZED.message, exception.message)
+        assertEquals(SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED, exception.code)
+        assertEquals(SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.message, exception.message)
     }
 
     @Test

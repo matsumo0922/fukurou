@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionAuthority
+import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
@@ -20,6 +21,7 @@ import java.io.IOException
 import java.math.BigDecimal
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
+import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
@@ -82,50 +84,79 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     @Test
-    fun `gateway classifies phase payload operation and terminal evidence rejections`() {
-        val phaseResponse = exchangeRequest(
+    fun `gateway assigns distinct reasons to every request rejection point`() {
+        val baseDecisionRequest = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
+        val decisionPhaseResponse = exchangeRequest(
             repository = InMemoryDecisionRepository(),
             phase = LlmInvocationPhase.FALSIFIER,
             request = request(LlmInvocationPhase.FALSIFIER, decision(DecisionAction.NO_TRADE)),
         )
+        val falsificationPhaseResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = falsificationRequest(LlmInvocationPhase.PROPOSER),
+        )
+        val decisionDecodeResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = baseDecisionRequest.withField("payload", JsonObject(emptyMap())),
+        )
+        val falsificationDecodeResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.FALSIFIER,
+            request = falsificationRequest(LlmInvocationPhase.FALSIFIER)
+                .withField("payload", JsonObject(emptyMap())),
+        )
+        val unknownOperationResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = baseDecisionRequest.withField("operation", JsonPrimitive("UNKNOWN")),
+        )
+        val payloadMissingResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = baseDecisionRequest.withoutField("payload"),
+        )
+        val requiredStringResponse = exchangeRequest(
+            repository = InMemoryDecisionRepository(),
+            phase = LlmInvocationPhase.PROPOSER,
+            request = baseDecisionRequest.withoutField("effectiveInvocationHash"),
+        )
+        val responses = mapOf(
+            SubmissionRejectionCode.FRAME_DECODE_FAILED to exchangeMalformedFrame(),
+            SubmissionRejectionCode.DECISION_PAYLOAD_DECODE_FAILED to decisionDecodeResponse,
+            SubmissionRejectionCode.FALSIFICATION_PAYLOAD_DECODE_FAILED to falsificationDecodeResponse,
+            SubmissionRejectionCode.UNKNOWN_OPERATION to unknownOperationResponse,
+            SubmissionRejectionCode.PAYLOAD_MISSING_OR_INVALID to payloadMissingResponse,
+            SubmissionRejectionCode.REQUIRED_STRING_FIELD_MISSING to requiredStringResponse,
+            SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED to decisionPhaseResponse,
+            SubmissionRejectionCode.FALSIFICATION_PHASE_NOT_AUTHORIZED to falsificationPhaseResponse,
+        )
+
+        responses.forEach { (expectedCode, response) ->
+            assertEquals("SUBMISSION_REJECTED", response.getValue("error").jsonPrimitive.content)
+            assertEquals(expectedCode.wireValue, response.reason())
+        }
+        assertEquals(responses.size, responses.values.map(JsonObject::reason).toSet().size)
+    }
+
+    @Test
+    fun `gateway classifies decision invocation and terminal evidence rejections`() {
         val mismatchedDecision = decision(DecisionAction.NO_TRADE).copy(invocationId = "other-invocation")
         val decisionResponse = exchangeRequest(
             repository = InMemoryDecisionRepository(),
             phase = LlmInvocationPhase.PROPOSER,
             request = request(LlmInvocationPhase.PROPOSER, mismatchedDecision),
         )
-        val unknownOperation = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
-            .toMutableMap()
-            .also { gatewayRequest -> gatewayRequest["operation"] = JsonPrimitive("UNKNOWN") }
-            .let(::JsonObject)
-        val operationResponse = exchangeRequest(
-            repository = InMemoryDecisionRepository(),
-            phase = LlmInvocationPhase.PROPOSER,
-            request = unknownOperation,
-        )
-        val malformedPayload = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
-            .toMutableMap()
-            .also { gatewayRequest -> gatewayRequest["payload"] = JsonObject(emptyMap()) }
-            .let(::JsonObject)
-        val malformedResponse = exchangeRequest(
-            repository = InMemoryDecisionRepository(),
-            phase = LlmInvocationPhase.PROPOSER,
-            request = malformedPayload,
-        )
         val terminalContractRequest = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE))
-            .toMutableMap()
-            .also { gatewayRequest -> gatewayRequest["version"] = JsonPrimitive(2) }
-            .let(::JsonObject)
+            .withField("version", JsonPrimitive(2))
         val terminalResponse = exchangeRequest(
             repository = InMemoryDecisionRepository(),
             phase = LlmInvocationPhase.PROPOSER,
             request = terminalContractRequest,
         )
 
-        assertEquals(SubmissionRejectionCode.PHASE_NOT_AUTHORIZED.wireValue, phaseResponse.reason())
         assertEquals(SubmissionRejectionCode.DECISION_INVOCATION_MISMATCH.wireValue, decisionResponse.reason())
-        assertEquals(SubmissionRejectionCode.MALFORMED_REQUEST.wireValue, operationResponse.reason())
-        assertEquals(SubmissionRejectionCode.MALFORMED_REQUEST.wireValue, malformedResponse.reason())
         assertEquals(SubmissionRejectionCode.TERMINAL_EVIDENCE_CONTRACT_VIOLATION.wireValue, terminalResponse.reason())
     }
 
@@ -554,6 +585,24 @@ class LlmDecisionSubmissionGatewayTest {
         return response
     }
 
+    private fun exchangeMalformedFrame(): JsonObject {
+        val path = Path.of("/tmp/fukurou-gateway-malformed-frame-${System.nanoTime()}.sock")
+        val gateway = gateway(path, InMemoryDecisionRepository(), LlmInvocationPhase.PROPOSER)
+        val response = connect(path).use { channel ->
+            val malformedJson = "{".encodeToByteArray()
+            val frame = ByteBuffer.allocate(Int.SIZE_BYTES + malformedJson.size)
+                .putInt(malformedJson.size)
+                .put(malformedJson)
+                .flip()
+            while (frame.hasRemaining()) channel.write(frame)
+
+            LlmSubmissionGatewayCodec.readFrame(channel)
+        }
+        gateway.close()
+
+        return response
+    }
+
     private fun request(
         phase: LlmInvocationPhase,
         decision: DecisionSubmission,
@@ -565,6 +614,24 @@ class LlmDecisionSubmissionGatewayTest {
             phaseManifestId = PHASE_MANIFEST_ID,
             effectiveInvocationHash = EFFECTIVE_HASH,
             payload = LlmSubmissionGatewayCodec.encodeDecision(decision),
+        )
+    }
+
+    private fun falsificationRequest(phase: LlmInvocationPhase): JsonObject {
+        val submission = FalsificationSubmission(
+            intentId = null,
+            verdict = FalsificationVerdict.REJECTED,
+            llmProvider = "fixture",
+            reasonJa = "fixture",
+        )
+
+        return LlmSubmissionGatewayCodec.request(
+            operation = OPERATION_SUBMIT_FALSIFICATION,
+            invocationId = INVOCATION_ID,
+            phase = phase,
+            phaseManifestId = PHASE_MANIFEST_ID,
+            effectiveInvocationHash = EFFECTIVE_HASH,
+            payload = LlmSubmissionGatewayCodec.encodeFalsification(submission),
         )
     }
 
@@ -593,6 +660,24 @@ class LlmDecisionSubmissionGatewayTest {
     private fun connect(path: Path): SocketChannel = SocketChannel.open(StandardProtocolFamily.UNIX).apply {
         connect(UnixDomainSocketAddress.of(path))
     }
+}
+
+private fun JsonObject.withField(name: String, value: JsonPrimitive): JsonObject {
+    return toMutableMap()
+        .also { request -> request[name] = value }
+        .let(::JsonObject)
+}
+
+private fun JsonObject.withField(name: String, value: JsonObject): JsonObject {
+    return toMutableMap()
+        .also { request -> request[name] = value }
+        .let(::JsonObject)
+}
+
+private fun JsonObject.withoutField(name: String): JsonObject {
+    return toMutableMap()
+        .also { request -> request.remove(name) }
+        .let(::JsonObject)
 }
 
 private fun JsonObject.reason(): String = getValue("reason").jsonPrimitive.content

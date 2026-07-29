@@ -30,11 +30,15 @@
 `SubmissionRejectionCode`（`trading` module、`decision` package）を新設し、`wireValue: String` を持つ enum とする。値は `[a-z][a-z0-9_]*` の `snake_case`。
 
 - `INVOCATION_BINDING_MISMATCH` / `PHASE_BINDING_MISMATCH` / `MANIFEST_BINDING_MISMATCH` / `EFFECTIVE_HASH_MISMATCH`
-- `PHASE_NOT_AUTHORIZED`（operation が phase に許されない）
+- `DECISION_PHASE_NOT_AUTHORIZED` / `FALSIFICATION_PHASE_NOT_AUTHORIZED`（各 operation が phase に許されない）
 - `RISK_INCREASING_ACTION_REJECTED`
 - `DECISION_INVOCATION_MISMATCH`（payload 内 invocationId 不一致）
 - `TERMINAL_EVIDENCE_CONTRACT_VIOLATION`（`decodeTerminalEvidenceBundle` の activation/version 不整合）
-- `MALFORMED_REQUEST`（codec の decode 失敗、未知 operation、frame 契約違反）
+- `FRAME_DECODE_FAILED`（frame size、JSON、EOF・socket reset を含め、frame を decode できなかった事実だけを示す）
+- `DECISION_PAYLOAD_DECODE_FAILED` / `FALSIFICATION_PAYLOAD_DECODE_FAILED`
+- `UNKNOWN_OPERATION`
+- `PAYLOAD_MISSING_OR_INVALID`（`payload` key の欠落または object 以外）
+- `REQUIRED_STRING_FIELD_MISSING`（binding / operation の必須 string field の欠落または非 primitive）
 - `SUBMISSION_CONFLICT` / `SUBMISSION_UNKNOWN`（typed exception 由来）
 - `UNCLASSIFIED`（上記に一致しない `Throwable`）
 
