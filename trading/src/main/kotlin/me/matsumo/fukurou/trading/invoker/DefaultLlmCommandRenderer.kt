@@ -11,6 +11,7 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermission
+import java.time.Instant
 import java.util.Comparator
 
 /**
@@ -133,10 +134,14 @@ data class LlmCommandRendererConfig(
  * claude / codex の headless command を生成する既定 renderer。
  *
  * @param config renderer 設定
+ * @param claudeAuthCopy Claude credential source を per-run home へ copy する境界
+ * @param codexAuthCopy Codex credential source を per-run home へ copy する境界
+ * @param artifactCleanup 生成 artifact の削除境界
  */
 class DefaultLlmCommandRenderer(
     private val config: LlmCommandRendererConfig = LlmCommandRendererConfig(),
     private val claudeAuthCopy: (Path, Path) -> Unit = ::copyClaudeAuthFile,
+    private val codexAuthCopy: (Path, Path) -> Unit = ::copyCodexAuthFileContent,
     private val artifactCleanup: (List<Path>) -> Unit = { paths -> paths.deleteGeneratedPaths() },
 ) : LlmCommandRenderer {
 
@@ -196,10 +201,13 @@ class DefaultLlmCommandRenderer(
                 ),
             )
         }
-        authSourcePath?.let { sourcePath ->
+        val authSourceObservedAt = authSourcePath?.let { sourcePath ->
+            val observedAt = sourcePath.observedLastModifiedAtOrNull()
             val targetPath = targetDirectory.resolve(sourcePath.fileName.toString())
             generatedPaths.add(1, targetPath)
             claudeAuthCopy(sourcePath, targetPath)
+
+            observedAt
         }
         val hasMcpServer = request.mcpServer != null
         val allowedTools = if (hasMcpServer) {
@@ -232,6 +240,7 @@ class DefaultLlmCommandRenderer(
                 stdin = null,
                 cleanupPaths = generatedPaths + listOfNotNull(request.mcpServer?.manifestPath),
                 configuredModelIdentity = request.configuredModelIdentity(config.claudeModel),
+                authSourceObservedAt = authSourceObservedAt,
             ),
         )
     }
@@ -246,6 +255,7 @@ class DefaultLlmCommandRenderer(
             mcpServer = request.mcpServer,
             environment = request.environment,
             effort = request.effort,
+            authCopy = codexAuthCopy,
         )
         val commandEnvironment = request.environment.withoutLlmSecrets() + mapOf(
             CODEX_HOME_ENV to codexHome.path.toString(),
@@ -270,6 +280,7 @@ class DefaultLlmCommandRenderer(
                     stdin = null,
                     cleanupPaths = codexHome.cleanupPaths + listOfNotNull(request.mcpServer?.manifestPath),
                     configuredModelIdentity = request.configuredModelIdentity(config.codexModel),
+                    authSourceObservedAt = codexHome.authSourceObservedAt,
                 ),
             )
         }.getOrElse { throwable ->
@@ -339,6 +350,7 @@ private fun List<String>.toRenderedCommand(request: RenderedCommandRequest): Ren
         stdin = request.stdin,
         cleanupPaths = request.cleanupPaths,
         configuredModelIdentity = request.configuredModelIdentity,
+        authSourceObservedAt = request.authSourceObservedAt,
     )
 }
 
@@ -354,6 +366,7 @@ private fun Map<String, String>.withoutLlmSecrets(): Map<String, String> =
  * @param timeout process timeout
  * @param stdin process stdin
  * @param cleanupPaths provider output の解析後に削除する path
+ * @param authSourceObservedAt per-run copy を作る直前に観測した credential source の最終更新時刻
  */
 private data class RenderedCommandRequest(
     val args: List<String>,
@@ -363,7 +376,20 @@ private data class RenderedCommandRequest(
     val stdin: String?,
     val cleanupPaths: List<Path>,
     val configuredModelIdentity: LlmConfiguredModelIdentity,
+    val authSourceObservedAt: Instant? = null,
 )
+
+/**
+ * credential source の最終更新時刻を copy より前に観測する。
+ *
+ * copy と観測を原子的には結べないため、copy より前に読むことで「記録した世代は、実際に copy された
+ * 内容と同じか、それより古い」ことを保証する。両者の間に再ログインが割り込んだ場合の誤りは
+ * 「失効を見逃す」方向に倒れ、後続の invocation が新しい世代で evidence を作り直す。
+ * 逆順にすると旧 credential の失敗が新世代として記録され、再ログイン済みなのに解除できない状態を作る。
+ */
+private fun Path.observedLastModifiedAtOrNull(): Instant? {
+    return runCatching { Files.getLastModifiedTime(this).toInstant() }.getOrNull()
+}
 
 private fun LlmMcpServerConfig.toClaudeMcpConfigJson(): String {
     return buildJsonObject {
@@ -481,14 +507,16 @@ private fun writeCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
     effort: LlmEffort,
+    authCopy: (Path, Path) -> Unit,
 ): PrivateConfigPath {
-    return writeTemporaryCodexHome(mcpServer, environment, effort)
+    return writeTemporaryCodexHome(mcpServer, environment, effort, authCopy)
 }
 
 private fun writeTemporaryCodexHome(
     mcpServer: LlmMcpServerConfig?,
     environment: Map<String, String>,
     effort: LlmEffort,
+    authCopy: (Path, Path) -> Unit,
 ): PrivateConfigPath {
     val directory = Files.createTempDirectory("fukurou-codex-home-")
     directory.setOwnerOnlyPermissions(PRIVATE_DIRECTORY_PERMISSIONS)
@@ -502,11 +530,12 @@ private fun writeTemporaryCodexHome(
             StandardOpenOption.WRITE,
         )
         configFile.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
-        val authFile = copyCodexAuthFile(environment, directory)
+        val copiedAuth = copyCodexAuthFile(environment, directory, authCopy)
 
         PrivateConfigPath(
             path = directory,
-            cleanupPaths = listOfNotNull(configFile, authFile, directory),
+            cleanupPaths = listOfNotNull(configFile, copiedAuth?.path, directory),
+            authSourceObservedAt = copiedAuth?.sourceObservedAt,
         )
     }.getOrElse { throwable ->
         directory.deleteGeneratedPath()
@@ -515,19 +544,39 @@ private fun writeTemporaryCodexHome(
     }
 }
 
-private fun copyCodexAuthFile(environment: Map<String, String>, targetDirectory: Path): Path? {
+private fun copyCodexAuthFile(
+    environment: Map<String, String>,
+    targetDirectory: Path,
+    authCopy: (Path, Path) -> Unit,
+): CopiedAuthFile? {
     val sourcePath = environment.codexAuthFilePath() ?: return null
 
     if (!Files.isRegularFile(sourcePath)) {
         return null
     }
 
+    val sourceObservedAt = sourcePath.observedLastModifiedAtOrNull()
     val targetPath = targetDirectory.resolve(CODEX_AUTH_FILE_NAME)
-    Files.copy(sourcePath, targetPath, StandardCopyOption.COPY_ATTRIBUTES)
+    authCopy(sourcePath, targetPath)
     targetPath.setOwnerOnlyPermissions(PRIVATE_FILE_PERMISSIONS)
 
-    return targetPath
+    return CopiedAuthFile(targetPath, sourceObservedAt)
 }
+
+private fun copyCodexAuthFileContent(sourcePath: Path, targetPath: Path) {
+    Files.copy(sourcePath, targetPath, StandardCopyOption.COPY_ATTRIBUTES)
+}
+
+/**
+ * per-run home へ copy した credential file と、その copy 元の観測世代。
+ *
+ * @param path copy 先 path
+ * @param sourceObservedAt copy 直前に観測した source の最終更新時刻
+ */
+private data class CopiedAuthFile(
+    val path: Path,
+    val sourceObservedAt: Instant?,
+)
 
 private fun Map<String, String>.claudeAuthSourcePath(): Path? {
     val configuredDirectory = readOptionalEnv(CLAUDE_CONFIG_DIR_ENV)?.let(Path::of)
@@ -629,6 +678,7 @@ private fun Path.deleteGeneratedPath() {
 private data class PrivateConfigPath(
     val path: Path,
     val cleanupPaths: List<Path>,
+    val authSourceObservedAt: Instant? = null,
 )
 
 /**

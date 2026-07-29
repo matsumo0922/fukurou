@@ -134,6 +134,7 @@ class ShellLlmInvoker(
                 configuredModelIdentity = parsedOutput.configuredModelIdentity,
                 observedModelIdentity = parsedOutput.observedModelIdentity,
                 providerFailure = parsedOutput.providerFailure,
+                authSourceObservedAt = command.authSourceObservedAt,
                 cleanupFailure = cleanupNonCancellable(command).exceptionOrNull()?.let { failure ->
                     LlmArtifactCleanupQuarantine.activate(failure)
                     failure.classifyLlmFailure(request.provider)

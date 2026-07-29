@@ -4,7 +4,9 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.LlmModelConfig
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
 import java.time.Duration
+import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -485,6 +487,139 @@ class DefaultLlmCommandRendererTest {
         assertEquals("""{"token":"persistent-auth-token"}""", Files.readString(authFile))
         Files.deleteIfExists(authFile)
         Files.deleteIfExists(authSourceHome)
+    }
+
+    @Test
+    fun renderCodex_recordsTheCredentialGenerationObservedBeforeTheCopy() {
+        val authSourceHome = Files.createTempDirectory("fukurou-codex-generation-source")
+        val authFile = authSourceHome.resolve(CODEX_AUTH_FILE_NAME)
+        Files.writeString(authFile, """{"token":"persistent-auth-token"}""")
+        // millisecond 未満の精度を持つ mtime を設定し、丸められずに運ばれることを確認する
+        Files.setLastModifiedTime(authFile, FileTime.from(Instant.parse("2026-07-20T00:00:00.123456789Z")))
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf(CODEX_HOME_ENV to authSourceHome.toString()),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+
+        assertEquals(Files.getLastModifiedTime(authFile).toInstant(), command.authSourceObservedAt)
+
+        command.deleteCleanupPaths()
+        Files.deleteIfExists(authFile)
+        Files.deleteIfExists(authSourceHome)
+    }
+
+    @Test
+    fun renderCodex_recordsNoCredentialGenerationWhenTheSourceIsAbsent() {
+        val emptyHome = Files.createTempDirectory("fukurou-codex-no-auth-source")
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf(CODEX_HOME_ENV to emptyHome.toString()),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+
+        assertNull(command.authSourceObservedAt)
+
+        command.deleteCleanupPaths()
+        Files.deleteIfExists(emptyHome)
+    }
+
+    @Test
+    fun renderClaude_recordsTheCredentialGenerationObservedBeforeTheCopy() {
+        val claudeHome = Files.createTempDirectory("fukurou-claude-generation-source")
+        val claudeConfigDirectory = claudeHome.resolve(".claude")
+        Files.createDirectories(claudeConfigDirectory)
+        val credentialFile = claudeConfigDirectory.resolve(".credentials.json")
+        Files.writeString(credentialFile, """{"token":"claude-persistent-token"}""")
+        Files.setLastModifiedTime(credentialFile, FileTime.from(Instant.parse("2026-07-21T00:00:00.987654321Z")))
+        val renderer = DefaultLlmCommandRenderer()
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.PROPOSER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf(HOME_ENV to claudeHome.toString()),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+
+        assertEquals(Files.getLastModifiedTime(credentialFile).toInstant(), command.authSourceObservedAt)
+
+        command.deleteCleanupPaths()
+    }
+
+    @Test
+    fun renderCodex_observesTheCredentialGenerationBeforeTheCopyRuns() {
+        // copy 中に再ログインが割り込んだ状況を模す（Claude 版と同じ退行を Codex 経路でも防ぐ）
+        val authSourceHome = Files.createTempDirectory("fukurou-codex-copy-race")
+        val authFile = authSourceHome.resolve(CODEX_AUTH_FILE_NAME)
+        Files.writeString(authFile, """{"token":"before-relogin"}""")
+        val generationBeforeCopy = Instant.parse("2026-07-21T00:00:00Z")
+        val generationAfterRelogin = Instant.parse("2026-07-22T00:00:00Z")
+        Files.setLastModifiedTime(authFile, FileTime.from(generationBeforeCopy))
+        val renderer = DefaultLlmCommandRenderer(
+            codexAuthCopy = { sourcePath, targetPath ->
+                Files.copy(sourcePath, targetPath)
+                Files.setLastModifiedTime(sourcePath, FileTime.from(generationAfterRelogin))
+            },
+        )
+        val request = request(
+            provider = LlmProvider.CODEX,
+            phase = LlmInvocationPhase.FALSIFIER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf(CODEX_HOME_ENV to authSourceHome.toString()),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+
+        assertEquals(generationBeforeCopy, command.authSourceObservedAt)
+        assertEquals(generationAfterRelogin, Files.getLastModifiedTime(authFile).toInstant())
+
+        command.deleteCleanupPaths()
+        Files.deleteIfExists(authFile)
+        Files.deleteIfExists(authSourceHome)
+    }
+
+    @Test
+    fun renderClaude_observesTheCredentialGenerationBeforeTheCopyRuns() {
+        // copy 中に再ログインが割り込んだ状況を模す。copy hook 内で source の mtime を進めても、
+        // 記録される世代は copy 前に観測した旧 mtime でなければならない。
+        // copy 後に観測する実装へ退行すると、旧 credential の失敗が新世代として記録され、
+        // 再ログイン済みなのに監視 status の降格を解除できない状態を作る
+        val claudeHome = Files.createTempDirectory("fukurou-claude-copy-race")
+        val claudeConfigDirectory = claudeHome.resolve(".claude")
+        Files.createDirectories(claudeConfigDirectory)
+        val credentialFile = claudeConfigDirectory.resolve(".credentials.json")
+        Files.writeString(credentialFile, """{"token":"before-relogin"}""")
+        val generationBeforeCopy = Instant.parse("2026-07-21T00:00:00Z")
+        val generationAfterRelogin = Instant.parse("2026-07-22T00:00:00Z")
+        Files.setLastModifiedTime(credentialFile, FileTime.from(generationBeforeCopy))
+        val renderer = DefaultLlmCommandRenderer(
+            claudeAuthCopy = { sourcePath, targetPath ->
+                Files.copy(sourcePath, targetPath)
+                Files.setLastModifiedTime(sourcePath, FileTime.from(generationAfterRelogin))
+            },
+        )
+        val request = request(
+            provider = LlmProvider.CLAUDE,
+            phase = LlmInvocationPhase.PROPOSER,
+            mcpServerName = "custom-mcp",
+            environment = mapOf(HOME_ENV to claudeHome.toString()),
+        )
+
+        val command = renderer.render(request).getOrThrow()
+
+        assertEquals(generationBeforeCopy, command.authSourceObservedAt)
+        assertEquals(generationAfterRelogin, Files.getLastModifiedTime(credentialFile).toInstant())
+
+        command.deleteCleanupPaths()
     }
 
     @Test

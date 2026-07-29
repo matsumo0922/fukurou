@@ -20,6 +20,8 @@ import me.matsumo.fukurou.trading.evaluation.LlmUsageParser
 import me.matsumo.fukurou.trading.invoker.CODEX_INVOCATION_RESULT_UNAVAILABLE
 import me.matsumo.fukurou.trading.invoker.DEFAULT_MCP_MANIFEST_DIRECTORY
 import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
+import me.matsumo.fukurou.trading.invoker.LlmAuthFailureEvidence
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
 import me.matsumo.fukurou.trading.invoker.LlmInvocationResult
 import me.matsumo.fukurou.trading.invoker.LlmInvoker
@@ -41,6 +43,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
 import java.time.Duration
+import java.time.Instant
 
 /**
  * LLM phase の process 実行結果を共通 event 形式で command_event_log へ保存する auditor。
@@ -52,6 +55,7 @@ import java.time.Duration
  * @param humanLogger 運用ログ出力
  * @param authFailureMessage 認証失敗疑いを検出したときに出す運用ログ。null なら出さない
  * @param unstartedManifestCleanup child process 起動前に残った MCP manifest の cleanup 境界
+ * @param authEvidenceState CLI auth 失敗 evidence の in-process state。null なら記録しない
  */
 class LlmInvocationAuditor(
     private val commandEventLog: CommandEventLog,
@@ -63,6 +67,7 @@ class LlmInvocationAuditor(
     private val phaseManifestRecorder: LlmPhaseManifestRecorder? = null,
     private val decisionRepository: DecisionRepository? = null,
     private val unstartedManifestCleanup: (Path) -> Unit = { path -> Files.deleteIfExists(path) },
+    private val authEvidenceState: LlmAuthEvidenceState? = null,
 ) {
 
     /**
@@ -130,7 +135,13 @@ class LlmInvocationAuditor(
             authFailureSuspected = authCategoryResolved || authEvidenceObserved,
             cleanupFailed = cleanupFailures.any { failure -> failure != null },
             providerFailure = providerFailure,
+            authSourceObservedAt = invocationResult?.authSourceObservedAt,
         )
+
+        // audit の永続化より先に記録する。DB 障害中に認証失敗を観測した場合でも
+        // /ops/llm-auth が logged_in を返し続けないようにするため
+        recordAuthFailureEvidence(request, auditSignals)
+
         val terminalProjection = LlmPhaseTerminalProjection(
             semanticCommit = semanticSubmissionState.toSemanticCommitTerminal(),
             processExit = processExitTerminal(request, processResult, processStarted),
@@ -220,6 +231,26 @@ class LlmInvocationAuditor(
                 authFailureSuspected = auditSignals.authFailureSuspected,
                 cliErrorReported = auditSignals.cliErrorReported,
                 observationAppendFailure = observationFailure,
+            ),
+        )
+    }
+
+    /**
+     * CLI auth の失敗 evidence を in-process state へ記録する。
+     *
+     * `authFailureSuspected` は issue #306 で `AUTHENTICATION` category 解決と認証 evidence 観測の
+     * いずれかで立つよう拡張済みであり、監視 status が表す意味と一致する。
+     */
+    private fun recordAuthFailureEvidence(request: LlmInvocationRequest, auditSignals: LlmPhaseAuditSignals) {
+        val state = authEvidenceState ?: return
+
+        if (!auditSignals.authFailureSuspected) return
+
+        state.recordFailure(
+            provider = request.provider,
+            evidence = LlmAuthFailureEvidence(
+                observedAt = clock.instant(),
+                credentialGeneration = auditSignals.authSourceObservedAt,
             ),
         )
     }
@@ -381,6 +412,9 @@ class LlmInvocationAuditor(
             }
             if (auditSignals.authFailureSuspected) {
                 put("authFailureSuspected", "true")
+            }
+            auditSignals.authSourceObservedAt?.let { observedAt ->
+                put("authSourceObservedAt", observedAt.toString())
             }
             if (auditSignals.cliErrorReported) {
                 put("cliErrorReported", "true")
@@ -622,6 +656,7 @@ data class LlmPhaseAuditResult(
  *  の先勝ち解決で別カテゴリへ吸収されても観測できるようにするため（issue #306）。運用通知専用で、
  *  raw output の公開範囲は一切広げない
  * @param cleanupFailed 一時 artifact の cleanup に失敗したか
+ * @param authSourceObservedAt この invocation が使った credential 世代
  */
 private data class LlmPhaseAuditSignals(
     val cliErrorReported: Boolean,
@@ -629,6 +664,7 @@ private data class LlmPhaseAuditSignals(
     val authFailureSuspected: Boolean = false,
     val cleanupFailed: Boolean = false,
     val providerFailure: LlmProviderFailure? = null,
+    val authSourceObservedAt: Instant? = null,
 )
 
 /**

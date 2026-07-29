@@ -4,6 +4,7 @@ import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
 import java.nio.file.Path
 import java.time.Duration
+import java.time.Instant
 
 /**
  * LLM CLI provider。
@@ -220,6 +221,10 @@ const val LLM_INVOCATION_CONTRACT_VERSION = "llm-invocation-contract-v1"
  * @param stdin 標準入力へ渡す文字列
  * @param cleanupPaths provider output の解析後に削除する runner 生成ファイル
  * @param configuredModelIdentity renderer が確定した configured model identity
+ * @param authSourceObservedAt per-run copy を作る直前に観測した credential source の最終更新時刻。
+ * この invocation がどの credential 世代に対して走ったかを表す。copy より前に観測するため、
+ * copy と再ログインが競合した場合でも「実際に copy された内容と同じか、それより古い世代」になる。
+ * credential source が無い構成では null
  */
 data class RenderedLlmCommand(
     val executable: String,
@@ -230,6 +235,7 @@ data class RenderedLlmCommand(
     val stdin: String?,
     val cleanupPaths: List<Path> = emptyList(),
     val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,
+    val authSourceObservedAt: Instant? = null,
 )
 
 /**
@@ -301,6 +307,8 @@ data class ProcessRunResult(
  * @param configuredModelIdentity renderer が確定した configured model identity
  * @param observedModelIdentity provider output が報告した model identity
  * @param providerFailure provider adapter が検出した typed failure
+ * @param authSourceObservedAt この invocation が使った credential 世代。
+ * renderer が per-run copy を作る直前に観測した credential source の最終更新時刻
  */
 data class LlmInvocationResult(
     val request: LlmInvocationRequest,
@@ -312,4 +320,5 @@ data class LlmInvocationResult(
     val configuredModelIdentity: LlmConfiguredModelIdentity = LlmConfiguredModelIdentity.CLI_DEFAULT,
     val observedModelIdentity: LlmObservedModelIdentity? = null,
     val providerFailure: LlmProviderFailure? = null,
+    val authSourceObservedAt: Instant? = null,
 )

@@ -9,6 +9,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryLlmInputManifestRepository
@@ -23,6 +25,7 @@ import me.matsumo.fukurou.trading.invoker.CODEX_OUTPUT_ADAPTER_VERSION
 import me.matsumo.fukurou.trading.invoker.CODEX_STDERR_AUTH_FAILURES
 import me.matsumo.fukurou.trading.invoker.DefaultLlmOutputParser
 import me.matsumo.fukurou.trading.invoker.LlmArtifactCleanupQuarantine
+import me.matsumo.fukurou.trading.invoker.LlmAuthEvidenceState
 import me.matsumo.fukurou.trading.invoker.LlmCommandRenderer
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmInvocationRequest
@@ -54,6 +57,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
@@ -327,6 +331,157 @@ class LlmInvocationAuditorTest {
         assertEquals(
             "post-turn teardown crashed with exit 1",
             details["stderr"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun invokeAndAudit_recordsAuthEvidenceStateWhenAuthFailureIsSuspected() = runBlocking {
+        // issue #306 により、認証 evidence 文言を観測した run は primary category を問わず
+        // authFailureSuspected=true になる。監視 status はその観測結果を evidence 源として使う
+        val evidenceState = LlmAuthEvidenceState()
+        val generation = Instant.parse("2026-07-20T00:00:00Z")
+        val auditor = auditorWithEvidenceState(InMemoryCommandEventLog(), evidenceState)
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", "refresh_token_reused"),
+            providerFailure = LlmProviderFailure(
+                LlmProviderFailureCategory.OUTPUT_CONTRACT,
+                "SCHEMA_DRIFT",
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            ),
+            authEvidenceObserved = true,
+            authSourceObservedAt = generation,
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        assertEquals(generation, evidenceState.lastFailure(LlmProvider.CODEX)?.credentialGeneration)
+        assertNull(evidenceState.lastFailure(LlmProvider.CLAUDE))
+    }
+
+    @Test
+    fun invokeAndAudit_recordsAuthEvidenceStateForTheAuthenticationCategoryWithoutEvidenceText() = runBlocking {
+        // authFailureSuspected は `AUTHENTICATION category || authEvidenceObserved` の OR であり、
+        // 監視 status は両方の枝に依存する。既知文言を観測しない構造化された認証失敗でも記録する
+        val evidenceState = LlmAuthEvidenceState()
+        val generation = Instant.parse("2026-07-20T00:00:00Z")
+        val auditor = auditorWithEvidenceState(InMemoryCommandEventLog(), evidenceState)
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", ""),
+            providerFailure = LlmProviderFailure(
+                LlmProviderFailureCategory.AUTHENTICATION,
+                "CODEX_LOGIN_RESTRICTION",
+                CODEX_OUTPUT_ADAPTER_VERSION,
+            ),
+            authEvidenceObserved = false,
+            authSourceObservedAt = generation,
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        assertEquals(generation, evidenceState.lastFailure(LlmProvider.CODEX)?.credentialGeneration)
+    }
+
+    @Test
+    fun invokeAndAudit_recordsAuthEvidenceStateEvenWhenTheAuditAppendFails() = runBlocking {
+        // DB 障害中に認証失敗を観測しても /ops/llm-auth が logged_in を返し続けないよう、
+        // state の更新は audit の永続化より前に行う
+        val evidenceState = LlmAuthEvidenceState()
+        val auditor = auditorWithEvidenceState(FailingCommandEventLog(), evidenceState)
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", "token_expired"),
+            authEvidenceObserved = true,
+            authSourceObservedAt = Instant.parse("2026-07-20T00:00:00Z"),
+        )
+
+        runCatching {
+            auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+        }
+
+        assertTrue(evidenceState.lastFailure(LlmProvider.CODEX) != null)
+    }
+
+    @Test
+    fun invokeAndAudit_doesNotRecordAuthEvidenceStateForASuccessfulInvocation() = runBlocking {
+        val evidenceState = LlmAuthEvidenceState()
+        val auditor = auditorWithEvidenceState(InMemoryCommandEventLog(), evidenceState)
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 0,
+                stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
+                stderr = "",
+            ),
+            authSourceObservedAt = Instant.parse("2026-07-20T00:00:00Z"),
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        assertNull(evidenceState.lastFailure(LlmProvider.CODEX))
+    }
+
+    @Test
+    fun invokeAndAudit_writesTheCredentialGenerationIntoTheAuditPayload() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = auditorWithEvidenceState(commandEventLog, LlmAuthEvidenceState())
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", "refresh_token_reused"),
+            authEvidenceObserved = true,
+            authSourceObservedAt = Instant.parse("2026-07-20T00:00:00.123456789Z"),
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        val details = auditedDetails(commandEventLog)
+
+        // 世代は nanosecond の精度を保ったまま記録する。millis へ丸めると、copy と再ログインが
+        // 同一 millisecond に入った場合に旧世代を現世代と誤認する
+        assertEquals("2026-07-20T00:00:00.123456789Z", details["authSourceObservedAt"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun invokeAndAudit_omitsTheCredentialGenerationWhenItWasNotObserved() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = auditorWithEvidenceState(commandEventLog, LlmAuthEvidenceState())
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(
+                status = ProcessRunStatus.EXITED,
+                exitCode = 0,
+                stdout = COMPLETE_SUCCESSFUL_CODEX_EVENT_STREAM,
+                stderr = "",
+            ),
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        assertNull(auditedDetails(commandEventLog)["authSourceObservedAt"])
+    }
+
+    @Test
+    fun invokeAndAudit_worksWithoutAnEvidenceState() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val invoker = ConfigurableAuditLlmInvoker(
+            processResult = ProcessRunResult(ProcessRunStatus.EXITED, 1, "", "refresh_token_reused"),
+            authEvidenceObserved = true,
+            authSourceObservedAt = Instant.parse("2026-07-20T00:00:00Z"),
+        )
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, invoker)
+
+        assertEquals(
+            "2026-07-20T00:00:00Z",
+            auditedDetails(commandEventLog)["authSourceObservedAt"]?.jsonPrimitive?.content,
         )
     }
 
@@ -1334,6 +1489,7 @@ private class ConfigurableAuditLlmInvoker(
     private val providerFailure: LlmProviderFailure? = null,
     private val cleanupFailure: Throwable? = null,
     private val authEvidenceObserved: Boolean = false,
+    private val authSourceObservedAt: Instant? = null,
 ) : LlmInvoker {
     override suspend fun invoke(request: LlmInvocationRequest): Result<LlmInvocationResult> {
         return Result.success(
@@ -1345,8 +1501,36 @@ private class ConfigurableAuditLlmInvoker(
                 usage = null,
                 providerFailure = providerFailure,
                 cleanupFailure = cleanupFailure,
+                authSourceObservedAt = authSourceObservedAt,
             ),
         )
+    }
+}
+
+private fun auditorWithEvidenceState(
+    commandEventLog: CommandEventLog,
+    evidenceState: LlmAuthEvidenceState,
+): LlmInvocationAuditor {
+    return LlmInvocationAuditor(
+        commandEventLog = commandEventLog,
+        redactor = SecretRedactor(emptySet()),
+        clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        authEvidenceState = evidenceState,
+    )
+}
+
+/** append が必ず失敗する command event log。DB 障害中の evidence 記録を確認するために使う。 */
+private class FailingCommandEventLog : CommandEventLog {
+    override suspend fun append(event: CommandEvent): Result<Unit> {
+        return Result.failure(IllegalStateException("audit append failed"))
+    }
+
+    override suspend fun countDistinctLlmLaunchesSince(since: Instant, excludedInvocationId: String?): Result<Int> {
+        return Result.success(0)
+    }
+
+    override suspend fun countToolCallEvents(decisionRunId: String, toolNames: Set<String>): Result<Int> {
+        return Result.success(0)
     }
 }
 
