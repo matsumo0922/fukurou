@@ -92,14 +92,66 @@ class DecisionRunProjectionRepositoryTest {
     @Test
     fun outcomeRequiresFilledOrderOrExecutionEvidenceForExecuted() {
         val rejectedOnly = outcomeEvidence(action = "ENTER", orderCount = 1)
-        val canceledWithNoTradeExit = outcomeEvidence(
+        val committedExitWithEarlierNoTradeExit = outcomeEvidence(
             action = "EXIT",
             orderCount = 1,
             hasNoTradeExit = true,
+            hasNonRejectionNoTradeExit = false,
         )
 
         assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(rejectedOnly))
-        assertEquals(DecisionRunOutcome.NO_ENTRY, classifyDecisionRunOutcome(canceledWithNoTradeExit))
+        assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(committedExitWithEarlierNoTradeExit))
+    }
+
+    @Test
+    fun committedEntryOverridesEarlierSubmissionRejectionEvidence() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = "ENTER",
+                hasNoTradeExit = true,
+                hasNonRejectionNoTradeExit = false,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.FAILED, outcome)
+    }
+
+    @Test
+    fun committedEntryKeepsGenericToolFailureAsNoEntryEvidence() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = "ENTER",
+                hasNoTradeExit = true,
+                hasNonRejectionNoTradeExit = true,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
+    }
+
+    @Test
+    fun committedEntryKeepsGenericFailureWhenLatestNoTradeExitIsRejection() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = "ENTER",
+                hasNoTradeExit = true,
+                hasNonRejectionNoTradeExit = true,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
+    }
+
+    @Test
+    fun rejectionWithoutCommittedDecisionRemainsNoEntry() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = null,
+                hasNoTradeExit = true,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
     }
 
     @Test
@@ -202,6 +254,7 @@ private fun outcomeEvidence(
     orderCount: Int = 0,
     filledOrderCount: Int = 0,
     hasNoTradeExit: Boolean = false,
+    hasNonRejectionNoTradeExit: Boolean = false,
     openOrderCount: Int = 0,
     ttlCanceledOrderCount: Int = 0,
     canceledEntryOrderCount: Int = 0,
@@ -219,6 +272,7 @@ private fun outcomeEvidence(
         filledOrderCount = filledOrderCount,
         executionCount = 0,
         hasNoTradeExit = hasNoTradeExit,
+        hasNonRejectionNoTradeExit = hasNonRejectionNoTradeExit,
         openOrderCount = openOrderCount,
         ttlCanceledOrderCount = ttlCanceledOrderCount,
         canceledEntryOrderCount = canceledEntryOrderCount,

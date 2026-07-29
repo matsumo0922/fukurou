@@ -186,40 +186,97 @@ class LlmDecisionSubmissionGateway private constructor(
             submissionState: AtomicReference<LlmSemanticSubmissionState>,
         ) = Runnable {
             try {
-                runCatching {
-                    server.accept().use { channel ->
-                        val response = runCatching {
-                            val request = runCatching { LlmSubmissionGatewayCodec.readFrame(channel) }
-                                .getOrElse {
-                                    throw SubmissionRejectedException(SubmissionRejectionCode.FRAME_DECODE_FAILED)
-                                }
-                            runBlocking {
-                                handleRequest(
-                                    request = request,
-                                    repository = repository,
-                                    invocationId = invocationId,
-                                    phase = phase,
-                                    phaseManifestId = phaseManifestId,
-                                    effectiveInvocationHash = effectiveInvocationHash,
-                                    terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
-                                    submissionState = submissionState,
-                                )
-                            }
-                        }.onSuccess {
-                            submissionState.set(LlmSemanticSubmissionState.COMMITTED)
-                        }.getOrElse { throwable ->
-                            submissionState.compareAndSet(
-                                LlmSemanticSubmissionState.NOT_ATTEMPTED,
-                                LlmSemanticSubmissionState.REJECTED,
+                while (!Thread.currentThread().isInterrupted) {
+                    val channel = runCatching { server.accept() }.getOrNull() ?: break
+
+                    runCatching {
+                        channel.use {
+                            processConnection(
+                                channel = channel,
+                                repository = repository,
+                                invocationId = invocationId,
+                                phase = phase,
+                                phaseManifestId = phaseManifestId,
+                                effectiveInvocationHash = effectiveInvocationHash,
+                                terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
+                                completion = completion,
+                                submissionState = submissionState,
                             )
-                            gatewayErrorResponse(throwable)
                         }
-                        LlmSubmissionGatewayCodec.writeFrame(channel, response)
                     }
                 }
             } finally {
                 completion.countDown()
             }
+        }
+
+        @Suppress("LongParameterList")
+        private fun processConnection(
+            channel: SocketChannel,
+            repository: DecisionRepository,
+            invocationId: String,
+            phase: LlmInvocationPhase,
+            phaseManifestId: String,
+            effectiveInvocationHash: String,
+            terminalEvidenceCaptureEnabled: Boolean,
+            completion: java.util.concurrent.CountDownLatch,
+            submissionState: AtomicReference<LlmSemanticSubmissionState>,
+        ) {
+            while (true) {
+                val request = try {
+                    LlmSubmissionGatewayCodec.readFrameOrNull(channel) ?: return
+                } catch (_: SubmissionGatewayFrameContractException) {
+                    return
+                } catch (_: Throwable) {
+                    val response = rejectSubmission(
+                        submissionState,
+                        SubmissionRejectedException(SubmissionRejectionCode.FRAME_DECODE_FAILED),
+                    )
+                    val responseWritten = runCatching {
+                        LlmSubmissionGatewayCodec.writeFrame(channel, response)
+                    }.isSuccess
+                    if (!responseWritten) return
+
+                    completion.countDown()
+                    continue
+                }
+                val response = runCatching {
+                    runBlocking {
+                        handleRequest(
+                            request = request,
+                            repository = repository,
+                            invocationId = invocationId,
+                            phase = phase,
+                            phaseManifestId = phaseManifestId,
+                            effectiveInvocationHash = effectiveInvocationHash,
+                            terminalEvidenceCaptureEnabled = terminalEvidenceCaptureEnabled,
+                            submissionState = submissionState,
+                        )
+                    }
+                }.onSuccess {
+                    submissionState.set(LlmSemanticSubmissionState.COMMITTED)
+                }.getOrElse { throwable ->
+                    rejectSubmission(submissionState, throwable)
+                }
+                val responseWritten = runCatching {
+                    LlmSubmissionGatewayCodec.writeFrame(channel, response)
+                }.isSuccess
+                if (!responseWritten) return
+
+                completion.countDown()
+            }
+        }
+
+        private fun rejectSubmission(
+            submissionState: AtomicReference<LlmSemanticSubmissionState>,
+            throwable: Throwable,
+        ): JsonObject {
+            submissionState.compareAndSet(
+                LlmSemanticSubmissionState.NOT_ATTEMPTED,
+                LlmSemanticSubmissionState.REJECTED,
+            )
+
+            return gatewayErrorResponse(throwable)
         }
 
         private fun cleanupFailedStart(
@@ -319,7 +376,9 @@ class LlmDecisionSubmissionGateway private constructor(
             submissionState: AtomicReference<LlmSemanticSubmissionState>,
             request: suspend () -> Result<T>,
         ): T {
-            submissionState.set(LlmSemanticSubmissionState.IN_FLIGHT)
+            submissionState.updateAndGet { currentState ->
+                if (currentState == LlmSemanticSubmissionState.COMMITTED) currentState else LlmSemanticSubmissionState.IN_FLIGHT
+            }
 
             return request().getOrThrow()
         }
@@ -406,7 +465,14 @@ private fun Throwable?.combineCleanupFailure(next: Throwable): Throwable {
     return primary
 }
 
+/** 接続を閉じるべき gateway frame 契約違反。 */
+private open class SubmissionGatewayFrameContractException(message: String) : IllegalStateException(message)
+
+/** public codec では IllegalArgumentException へ戻す frame size 契約違反。 */
+private class SubmissionGatewayFrameSizeException(message: String) : SubmissionGatewayFrameContractException(message)
+
 /** bounded length-prefixed gateway protocol codec。 */
+@Suppress("TooManyFunctions")
 object LlmSubmissionGatewayCodec {
     @Suppress("LongParameterList")
     fun request(
@@ -524,11 +590,22 @@ object LlmSubmissionGatewayCodec {
     }
 
     fun readFrame(channel: SocketChannel): JsonObject {
+        return try {
+            readFrameOrNull(channel)
+                ?: throw SubmissionGatewayFrameContractException("Submission gateway frame ended early.")
+        } catch (exception: SubmissionGatewayFrameSizeException) {
+            throw IllegalArgumentException(exception.message, exception)
+        }
+    }
+
+    fun readFrameOrNull(channel: SocketChannel): JsonObject? {
         val sizeBuffer = ByteBuffer.allocate(Int.SIZE_BYTES)
-        readFully(channel, sizeBuffer)
+        if (!readFullyAllowingInitialEof(channel, sizeBuffer)) return null
         sizeBuffer.flip()
         val size = sizeBuffer.int
-        require(size in 1..MAX_GATEWAY_FRAME_BYTES) { "Submission gateway frame size rejected." }
+        if (size !in 1..MAX_GATEWAY_FRAME_BYTES) {
+            throw SubmissionGatewayFrameSizeException("Submission gateway frame size rejected.")
+        }
         val payload = ByteBuffer.allocate(size)
         readFully(channel, payload)
 
@@ -543,8 +620,20 @@ object LlmSubmissionGatewayCodec {
         while (frame.hasRemaining()) channel.write(frame)
     }
 
+    private fun readFullyAllowingInitialEof(channel: SocketChannel, buffer: ByteBuffer): Boolean {
+        val firstRead = channel.read(buffer)
+        if (firstRead < 0) return false
+        readFully(channel, buffer)
+
+        return true
+    }
+
     private fun readFully(channel: SocketChannel, buffer: ByteBuffer) {
-        while (buffer.hasRemaining()) check(channel.read(buffer) >= 0) { "Submission gateway frame ended early." }
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer) < 0) {
+                throw SubmissionGatewayFrameContractException("Submission gateway frame ended early.")
+            }
+        }
     }
 
     private fun encodeEntryIntent(draft: EntryIntentDraft): JsonObject = buildJsonObject {

@@ -3726,6 +3726,111 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun decisionRunProjectionPrefersCommittedEntryAndPreservesEarlierRejectionAudit() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val acceptedRunId = "run-1"
+        val rejectedRunId = "rejected-only-run"
+
+        insertFinishedDecisionRun(llmRunRepository, acceptedRunId, status = "SUCCEEDED", errorMessage = null)
+        insertFinishedDecisionRun(llmRunRepository, rejectedRunId, status = "SUCCEEDED", errorMessage = null)
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = acceptedRunId,
+            payload = """{"reason":"tool_call_failed","rejectionCode":"effective_hash_mismatch"}""",
+            occurredAt = fixedInstant().plusSeconds(1),
+        )
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = rejectedRunId,
+            payload = """{"reason":"tool_call_failed","rejectionCode":"phase_binding_mismatch"}""",
+            occurredAt = fixedInstant().plusSeconds(2),
+        )
+        decisionRepository.submitDecision(enterDecisionSubmission()).getOrThrow()
+
+        val projection = ExposedDecisionRunProjectionRepository(database)
+        val summaries = projection.listRuns(cursor = null, limit = 10).getOrThrow().runs.associateBy { it.invocationId }
+        val rejectionEvents = ExposedCommandEventLog(database).findEvents(
+            limit = 10,
+            eventType = CommandEventType.NO_TRADE_EXIT,
+        ).getOrThrow()
+        val acceptedRejection = rejectionEvents.single { event ->
+            event.decisionRunContext.decisionRunId == acceptedRunId
+        }
+
+        assertEquals(DecisionRunOutcome.FAILED, summaries.getValue(acceptedRunId).outcome)
+        assertNull(summaries.getValue(acceptedRunId).finalReason)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summaries.getValue(rejectedRunId).outcome)
+        assertEquals("tool_call_failed", summaries.getValue(rejectedRunId).finalReason)
+        assertTrue(acceptedRejection.payload.contains("\"rejectionCode\":\"effective_hash_mismatch\""))
+    }
+
+    @Test
+    fun decisionRunProjectionPreservesGenericToolFailureAfterCommittedEntry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val decisionRepository = ExposedDecisionRepository(database, fixedClock())
+        val invocationId = "committed-entry-generic-tool-failure"
+
+        insertFinishedDecisionRun(llmRunRepository, invocationId, status = "SUCCEEDED", errorMessage = null)
+        decisionRepository.submitDecision(
+            enterDecisionSubmission().copy(invocationId = invocationId),
+        ).getOrThrow()
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = invocationId,
+            payload = """{"reason":"tool_call_failed"}""",
+            occurredAt = fixedInstant().plusSeconds(1),
+        )
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
+        val detail = requireNotNull(repository.findRun(invocationId).getOrThrow())
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
+        assertEquals("tool_call_failed", summary.finalReason)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, detail.summary.outcome)
+        assertEquals("tool_call_failed", detail.summary.finalReason)
+    }
+
+    @Test
+    fun decisionRunProjectionKeepsGenericFailureWhenLatestNoTradeExitIsRejection() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val invocationId = "generic-failure-before-submission-rejection"
+
+        insertFinishedDecisionRun(llmRunRepository, invocationId, status = "SUCCEEDED", errorMessage = null)
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = invocationId,
+            payload = """{"reason":"tool_call_failed"}""",
+            occurredAt = fixedInstant().plusSeconds(1),
+        )
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = invocationId,
+            payload = """{"reason":"tool_call_failed","rejectionCode":"phase_binding_mismatch"}""",
+            occurredAt = fixedInstant().plusSeconds(2),
+        )
+        ExposedDecisionRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(3), ZoneOffset.UTC),
+        ).submitDecision(
+            enterDecisionSubmission().copy(invocationId = invocationId),
+        ).getOrThrow()
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
+        val detail = requireNotNull(repository.findRun(invocationId).getOrThrow())
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
+        assertEquals("tool_call_failed", summary.finalReason)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, detail.summary.outcome)
+        assertEquals("tool_call_failed", detail.summary.finalReason)
+    }
+
+    @Test
     fun decisionRunProjectionKeepsInvalidNoTradePayloadFailSafe() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val llmRunRepository = ExposedLlmRunRepository(database)

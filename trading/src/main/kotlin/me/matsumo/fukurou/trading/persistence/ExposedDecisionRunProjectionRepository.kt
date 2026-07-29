@@ -32,6 +32,7 @@ import me.matsumo.fukurou.trading.activity.matches
 import me.matsumo.fukurou.trading.activity.safeDecisionRunFinalReason
 import me.matsumo.fukurou.trading.activity.withStrategyEvaluation
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.PaperOrderCancelReason
 import me.matsumo.fukurou.trading.domain.PaperOrderLifecyclePolicy
@@ -69,6 +70,10 @@ internal const val MAX_FILTER_SCAN_BATCHES = 10
 private const val SAFE_NO_TRADE_REASON_EXPRESSION =
     "CASE WHEN pg_input_is_valid(payload, 'jsonb') THEN payload::jsonb ->> 'reason' ELSE NULL END"
 
+/** TEXT payload が valid JSON かつ rejectionCode key を持つ場合だけ true にする PostgreSQL 式。 */
+private const val SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION =
+    "CASE WHEN pg_input_is_valid(payload, 'jsonb') THEN jsonb_exists(payload::jsonb, 'rejectionCode') ELSE FALSE END"
+
 private val LIST_RUNS_SQL = """
     WITH candidate_runs AS (
         SELECT invocation_id, mode, symbol, trigger_kind, status, started_at, finished_at, error_message, terminal_cause
@@ -104,6 +109,7 @@ private val LIST_RUNS_SQL = """
         execution_count.value AS execution_count,
         no_trade.reason AS no_trade_reason,
         no_trade.present AS has_no_trade_exit,
+        no_trade_aggregate.has_non_rejection AS has_non_rejection_no_trade_exit,
         entry_order.id AS entry_order_id,
         entry_order.intent_id AS entry_intent_id,
         entry_order.position_id AS entry_position_id,
@@ -190,13 +196,21 @@ private val LIST_RUNS_SQL = """
         WHERE decision_run_id = run.invocation_id
     ) execution_count ON TRUE
     LEFT JOIN LATERAL (
-        SELECT $SAFE_NO_TRADE_REASON_EXPRESSION AS reason, TRUE AS present
+        SELECT
+            $SAFE_NO_TRADE_REASON_EXPRESSION AS reason,
+            TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
             AND event_type = 'NO_TRADE_EXIT'
         ORDER BY ts DESC, id DESC
         LIMIT 1
     ) no_trade ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT BOOL_OR(NOT ($SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION)) AS has_non_rejection
+        FROM command_event_log
+        WHERE decision_run_id = run.invocation_id
+            AND event_type = 'NO_TRADE_EXIT'
+    ) no_trade_aggregate ON TRUE
     ORDER BY run.started_at DESC, run.invocation_id DESC
 """
 
@@ -289,7 +303,8 @@ private val FIND_RUN_SQL = """
                 AND status = ? AND cancel_reason IS DISTINCT FROM ?
         ) AS actor_canceled_order_count,
         no_trade.reason AS no_trade_reason,
-        no_trade.present AS has_no_trade_exit
+        no_trade.present AS has_no_trade_exit,
+        no_trade_aggregate.has_non_rejection AS has_non_rejection_no_trade_exit
     FROM llm_runs run
     LEFT JOIN LATERAL (
         SELECT * FROM decisions
@@ -317,13 +332,21 @@ private val FIND_RUN_SQL = """
         LIMIT 1
     ) safety ON TRUE
     LEFT JOIN LATERAL (
-        SELECT $SAFE_NO_TRADE_REASON_EXPRESSION AS reason, TRUE AS present
+        SELECT
+            $SAFE_NO_TRADE_REASON_EXPRESSION AS reason,
+            TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
             AND event_type = 'NO_TRADE_EXIT'
         ORDER BY ts DESC, id DESC
         LIMIT 1
     ) no_trade ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT BOOL_OR(NOT ($SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION)) AS has_non_rejection
+        FROM command_event_log
+        WHERE decision_run_id = run.invocation_id
+            AND event_type = 'NO_TRADE_EXIT'
+    ) no_trade_aggregate ON TRUE
     WHERE run.invocation_id = ?
         AND run.trigger_kind IS DISTINCT FROM 'REFLECTION'
 """
@@ -835,12 +858,20 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val terminalCause = getString("terminal_cause")?.let(LlmRunTerminalCause::valueOf)
     val noTradeReason = getString("no_trade_reason")
     val hasNoTradeExit = getBoolean("has_no_trade_exit")
+    val hasNonRejectionNoTradeExit = getBoolean("has_non_rejection_no_trade_exit")
     val openOrderCount = getInt("open_order_count")
     val expiringOpenOrderCount = getInt("expiring_open_order_count")
     val overdueOpenOrderCount = getInt("overdue_open_order_count")
     val ttlCanceledOrderCount = getInt("ttl_canceled_order_count")
     val canceledEntryOrderCount = getInt("canceled_entry_order_count")
     val actorCanceledOrderCount = getInt("actor_canceled_order_count")
+    val hasCommittedTradeDecision = action != null && action != DecisionAction.NO_TRADE.name
+    val onlySubmissionRejectionsSuperseded = hasCommittedTradeDecision &&
+        hasNoTradeExit &&
+        !hasNonRejectionNoTradeExit
+    val finalReason = noTradeReason
+        .takeUnless { onlySubmissionRejectionsSuperseded }
+        .safeDecisionRunFinalReason()
 
     return DecisionRunSummary(
         invocationId = getString("invocation_id"),
@@ -857,7 +888,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
         falsificationVerdict = getString("verdict"),
         safetyRule = safetyRule,
         safetyMessageJa = getString("message_ja"),
-        finalReason = noTradeReason.safeDecisionRunFinalReason(),
+        finalReason = finalReason,
         orderCount = orderCount,
         executionCount = executionCount,
         hasProcessFailure = terminalCause in setOf(
@@ -880,6 +911,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
                 filledOrderCount = filledOrderCount,
                 executionCount = executionCount,
                 hasNoTradeExit = hasNoTradeExit,
+                hasNonRejectionNoTradeExit = hasNonRejectionNoTradeExit,
                 openOrderCount = openOrderCount,
                 expiringOpenOrderCount = expiringOpenOrderCount,
                 overdueOpenOrderCount = overdueOpenOrderCount,

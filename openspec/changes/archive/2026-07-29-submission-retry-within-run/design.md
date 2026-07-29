@@ -67,7 +67,8 @@ executor は既存の single thread を維持するため、要求は逐次で�
 現在の `readFully()` は `channel.read(buffer) >= 0` を `check` するため、client が切断すると `IllegalStateException("Submission gateway frame ended early.")` になる。ループ化するとこれが「正常な接続終了」と区別できないため、frame の先頭読み取りだけ EOF を許容する形へ分ける。
 
 - size prefix の最初の read が `-1` を返す → その接続は正常終了、accept ループへ戻る
-- size prefix の途中、または payload の途中で `-1` → 従来どおり異常（ただし接続を閉じるだけで gateway は継続）
+- size prefix の途中、または payload の途中で `-1` → 従来どおり `IllegalStateException`（ただし接続を閉じるだけで gateway は継続）
+- frame size が許容範囲外 → public な `readFrame()` は従来どおり `IllegalArgumentException`。内部の `readFrameOrNull()` は接続を閉じるべき契約違反として専用例外を使ってよいが、既存 client から見た例外型は変えない
 
 **なぜ分けるか**: 「要求を送らずに閉じた」を異常として扱うと、client の close だけで gateway が壊れる。Requirement「client の切断で gateway は終了しない」の直接の根拠。
 
@@ -77,11 +78,11 @@ frame ループ内の例外は、応答を書ける状態なら `gatewayErrorRes
 
 これにより、1 つの壊れた接続が gateway 全体を落とさない。
 
-### D4: `completion` は最初の要求処理でだけ countDown し、停止時にも countDown する
+### D4: `completion` は最初の応答送信成功時に countDown し、停止時にも countDown する
 
-`awaitCompletion()` の意味論（「最初の 1 request が完了するまで待つ」）は canary が依存しているため変えない。`CountDownLatch.countDown()` は 2 回目以降が no-op なので、frame 処理の完了ごとに呼んでも意味論は保たれる。加えて task の `finally` でも countDown し、要求が 1 度も来ないまま停止した場合にも待機が解除されるようにする。
+`awaitCompletion()` の意味論（「最初の 1 request の応答が client へ送信されるまで待つ」）は canary が依存しているため変えない。frame 処理が response を生成しても、`writeFrame` が失敗して client へ届かなければ request 完了とは扱わない。`writeFrame` が成功した場合だけ `completion.countDown()` を呼ぶ。`CountDownLatch.countDown()` は 2 回目以降が no-op なので、後続 frame の送信成功時にも呼んでよい。加えて task の `finally` でも countDown し、要求が 1 度も来ない場合や応答を書けずに停止した場合にも gateway 停止時は待機を解除する。
 
-canary は `awaitCompletion()` の後 `use { }` を抜けて `close()` する。gateway が複数要求を受け付けられるようになっても、canary は 1 要求で閉じる。canary の目的は「gateway 経由で 1 提出が成立する」ことの確認であり、複数提出の検証ではない。
+canary は `awaitCompletion()` の後 `use { }` を抜けて `close()` する。gateway が複数要求を受け付けられるようになっても、canary は client が 1 応答を受信した時点で閉じる。canary の目的は「gateway 経由で 1 提出が成立し、応答が client へ届く」ことの確認であり、複数提出の検証ではない。
 
 ### D4b: accept ループは例外種別を問わず抜ける
 
@@ -99,9 +100,11 @@ canary は `awaitCompletion()` の後 `use { }` を抜けて `close()` する。
 
 `ToolCallGuard.runAndAudit` は tool 失敗を検知した時点で `NO_TRADE_EXIT` を書く（`ToolCallGuard.kt:174`）。single-shot の現在は初回拒否が run terminal なので「拒否イベントがある run」と「entry が成立した run」は排他だが、再提出が可能になるとこの前提が崩れる。
 
-run outcome は `hasNoEntryEvidence()`（`DecisionRunProjectionRepository.kt:111-113`）が `action == NO_TRADE || hasNoTradeExit` で判定しており、後者は `command_event_log` の最新 `NO_TRADE_EXIT` 1 行の存在（`ExposedDecisionRunProjectionRepository.kt:193-199`）に基づく。このままだと「拒否 → 再提出で ENTER 受理」の run が `NO_ENTRY` かつ finalReason `tool_call_failed` として表示される。
+run outcome は `hasNoEntryEvidence()`（`DecisionRunProjectionRepository.kt:112-120`）が `action == NO_TRADE || hasNoTradeExit` を基礎に判定する。再提出対応では、commit 済み trade decision がある run の submission 拒否を superseded にする必要がある一方、同じ run に汎用 tool 失敗が混在する場合は no-entry 証跡を保持する必要がある。最新 `NO_TRADE_EXIT` 1 行だけから rejection の種類を判定すると、先行する汎用 tool 失敗の有無が後続イベントの順序で見えなくなる。
 
-判定を「commit 済み decision の証跡を `NO_TRADE_EXIT` より優先する」形へ変える。拒否イベント自体は診断価値があるため削除しない。
+SQL projection は 2 つの独立した LATERAL に分ける。既存の LATERAL は `ORDER BY ts DESC, id DESC LIMIT 1` を維持して表示用の最新 reason と `NO_TRADE_EXIT` の存在を返す。隣の集約用 LATERAL は全 `NO_TRADE_EXIT` を対象に、`rejectionCode` を持たない行が 1 件でもあるかを `BOOL_OR` で返す。payload は TEXT なので、既存の `pg_input_is_valid(payload, 'jsonb')` と `jsonb_exists(payload::jsonb, 'rejectionCode')` の安全な式を再利用し、invalid JSON も supersede できない証跡として扱う。行が 1 件もない場合の NULL は JDBC の `getBoolean` により false になる。
+
+commit 済み trade decision があり、`NO_TRADE_EXIT` が存在し、かつ全行が `rejectionCode` を持つ場合だけ、no-entry 証跡と final reason を superseded とする。`rejectionCode` を持たない汎用 tool 失敗が 1 件でもあれば、記録順序にかかわらず最新 reason と no-entry outcome を残す。拒否イベント自体は診断価値があるため削除しない。
 
 **代替案**: 再提出成功時に先行の `NO_TRADE_EXIT` を削除または無効化する。却下 — 監査イベントの遡及的な書き換えになり、「観測できなかった事象を後から作らない / 消さない」原則に反する。診断のための記録が消えると issue #316 の目的も損なう。
 
@@ -120,7 +123,7 @@ state 更新を次の規則にする。
 ## Risks / Trade-offs
 
 - **[accept ループが busy loop 化する]** → D4b の規則（accept 例外は種別を問わず抜ける、ループ条件は `isInterrupted`）で閉じる。テストで close 後に worker thread が終了することを確認する
-- **[再提出成功後も先行拒否の `NO_TRADE_EXIT` が残り run が誤分類される]** → D4c で outcome 判定に commit 済み decision の優先規則を入れる。拒否イベントは診断のため残す
+- **[再提出成功後も先行拒否の `NO_TRADE_EXIT` が残り run が誤分類される]** → D4c で `rejectionCode` を持つ submission 拒否だけに commit 済み trade decision の優先規則を適用する。汎用 tool 失敗の理由と拒否イベントは診断のため残す
 - **[close 時に処理中の要求が中断される]** → 既存挙動と同じ。`awaitTermination(500ms)` を超えたら `close()` が例外を投げる契約は維持し、in-flight transaction が `IN_FLIGHT`（audit では `UNKNOWN`）で残る既存テストも維持する
 - **[LLM が拒否を繰り返して run が長引く]** → tool call 上限と LLM 側の timeout が上流で効いている。gateway 側に回数制限を足すと、正当な修正提出まで打ち切る危険がある
 - **[複数提出により authority の並行性が露出する]** → 逐次処理のため、同一 gateway 内で並行にはならない。異なる gateway / phase 間の並行性は既存の authority テストが担保している
