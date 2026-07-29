@@ -379,6 +379,40 @@ class DefaultLlmOutputParserTest {
     }
 
     @Test
+    fun parseCodex_observesAuthEvidenceForRefreshTokenFailureStderrAlongsideNonJsonStdout() {
+        // 2026-07-23 の production 障害と同形。refresh token 失効の stderr が出ている一方、
+        // stdout は JSONL contract を満たさないため primary category は OUTPUT_CONTRACT に解決される
+        val output = DefaultLlmOutputParser().parse(
+            request(LlmProvider.CODEX),
+            command(Files.createTempDirectory("codex-refresh-token-failure-test")),
+            processResult("thinking...", exitCode = 1)
+                .copy(stderr = REFRESH_TOKEN_FAILURE_STDERR),
+            Instant.EPOCH,
+            Instant.EPOCH,
+        )
+
+        assertEquals(LlmProviderFailureCategory.OUTPUT_CONTRACT, output.providerFailure?.category)
+        assertEquals(true, output.authEvidenceObserved)
+    }
+
+    @Test
+    fun parseCodex_observesAuthEvidenceForEachRefreshTokenFailureText() {
+        val refreshTokenTexts = listOf("Failed to refresh token", "refresh_token_reused", "token_expired")
+
+        refreshTokenTexts.forEachIndexed { index, evidenceText ->
+            val output = DefaultLlmOutputParser().parse(
+                request(LlmProvider.CODEX),
+                command(Files.createTempDirectory("codex-refresh-token-text-$index-test")),
+                processResult("thinking...", exitCode = 1).copy(stderr = "codex: $evidenceText"),
+                Instant.EPOCH,
+                Instant.EPOCH,
+            )
+
+            assertEquals(true, output.authEvidenceObserved, evidenceText)
+        }
+    }
+
+    @Test
     fun parseClaudeMapsSupportedStructuredFailureCodes() {
         val cases = mapOf(
             "authentication_error" to LlmProviderFailureCategory.AUTHENTICATION,
@@ -451,3 +485,15 @@ private fun processResult(stdout: String, exitCode: Int = 0): ProcessRunResult {
 }
 
 private fun failedProcess(stderr: String) = processResult("", 1).copy(stderr = stderr)
+
+/**
+ * 2026-07-23 の production 障害（issue #306）で Codex が stderr へ出した refresh token 失効の出力。
+ *
+ * 認証と無関係な診断行と混在しているため、`CODEX_STDERR_AUTH_FAILURES` の完全一致判定には掛からず、
+ * `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` の部分一致検査だけが認証 evidence として観測できる。
+ */
+internal val REFRESH_TOKEN_FAILURE_STDERR = """
+    codex: starting session
+    ERROR codex_login: Failed to refresh token: 401 Unauthorized
+    ERROR codex_core: auth error: token_expired
+""".trimIndent()

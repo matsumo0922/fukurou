@@ -38,6 +38,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.ProcessStartAwareRunner
 import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProvenCancellationException
+import me.matsumo.fukurou.trading.invoker.REFRESH_TOKEN_FAILURE_STDERR
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
 import me.matsumo.fukurou.trading.invoker.ShellLlmInvoker
 import me.matsumo.fukurou.trading.invoker.ShellProcessRunner
@@ -1052,6 +1053,141 @@ class LlmInvocationAuditorTest {
         assertEquals("OUTPUT_CONTRACT", details["failureCategory"]?.jsonPrimitive?.content)
         assertFalse(details.containsKey("stdout"))
         assertFalse(details.containsKey("stderr"))
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
+    /**
+     * issue #306 と同形の production 障害（refresh token 失効の stderr と、JSONL contract を
+     * 満たさない stdout）を production 配線で通し、primary category が `OUTPUT_CONTRACT` に
+     * 解決されても `authFailureSuspected` が立ち、raw output は記録されないことを証明する。
+     */
+    @Test
+    fun invokeAndAudit_suspectsAuthFailureForRefreshTokenStderrResolvedAsOutputContract() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val humanLogs = mutableListOf<String>()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            humanLogger = { message -> humanLogs += message },
+            authFailureMessage = LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE,
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val processResult = ProcessRunResult(
+            status = ProcessRunStatus.EXITED,
+            exitCode = 1,
+            stdout = "thinking...",
+            stderr = REFRESH_TOKEN_FAILURE_STDERR,
+        )
+        val shellInvoker = ShellLlmInvoker(
+            commandRenderer = StaticAuditCommandRenderer,
+            processRunner = FixedProcessRunner(processResult),
+            outputParser = DefaultLlmOutputParser(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = shellInvoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("OUTPUT_CONTRACT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertEquals("true", details["authFailureSuspected"]?.jsonPrimitive?.content)
+        assertFalse(details.containsKey("stdout"))
+        assertFalse(details.containsKey("stderr"))
+        assertTrue(humanLogs.contains(LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE))
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
+    /**
+     * 認証 evidence を含まない `OUTPUT_CONTRACT` では `authFailureSuspected` が立たないことを
+     * 証明する（issue #306 の OR 追加が無条件 true 化ではないことの回帰防止）。
+     */
+    @Test
+    fun invokeAndAudit_omitsAuthSuspicionForOutputContractWithoutAuthEvidence() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val humanLogs = mutableListOf<String>()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            humanLogger = { message -> humanLogs += message },
+            authFailureMessage = LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE,
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val processResult = ProcessRunResult(
+            status = ProcessRunStatus.EXITED,
+            exitCode = 1,
+            stdout = "mcp handshake failed: unexpected token at position 0",
+            stderr = "codex: failed to initialize MCP server",
+        )
+        val shellInvoker = ShellLlmInvoker(
+            commandRenderer = StaticAuditCommandRenderer,
+            processRunner = FixedProcessRunner(processResult),
+            outputParser = DefaultLlmOutputParser(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = shellInvoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertEquals("OUTPUT_CONTRACT", details["failureCategory"]?.jsonPrimitive?.content)
+        assertFalse(details.containsKey("authFailureSuspected"))
+        assertFalse(humanLogs.contains(LLM_CLI_AUTH_FAILURE_RUNBOOK_MESSAGE))
+        LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
+    }
+
+    /**
+     * 成功した invocation の出力本文に認証 evidence 文言が含まれる場合も `authFailureSuspected` が
+     * 立つことを証明する（design.md D2 で明示的に受容した false positive 経路。意図された挙動と
+     * 回帰を将来の読み手が区別できるようにするため pin する）。
+     */
+    @Test
+    fun invokeAndAudit_suspectsAuthFailureForSuccessfulInvocationCarryingAuthEvidenceText() = runBlocking {
+        val commandEventLog = InMemoryCommandEventLog()
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = commandEventLog,
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CODEX)
+        val evidenceBearingStdout = """
+            {"type":"thread.started","thread_id":"thread-1"}
+            {"type":"item.completed","item":{"type":"agent_message","text":"the log line says token_expired"}}
+            {"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+        """.trimIndent()
+        val shellInvoker = ShellLlmInvoker(
+            commandRenderer = StaticAuditCommandRenderer,
+            processRunner = FixedProcessRunner(
+                ProcessRunResult(
+                    status = ProcessRunStatus.EXITED,
+                    exitCode = 0,
+                    stdout = evidenceBearingStdout,
+                    stderr = "",
+                ),
+            ),
+            outputParser = DefaultLlmOutputParser(),
+        )
+
+        auditor.invokeAndAudit(
+            phaseName = "falsifier",
+            context = request.decisionRunContext,
+            request = request,
+            llmInvoker = shellInvoker,
+        )
+
+        val details = auditedDetails(commandEventLog)
+
+        assertFalse(details.containsKey("failureCategory"))
+        assertEquals("true", details["authFailureSuspected"]?.jsonPrimitive?.content)
         LlmProcessTreeTerminationRegistry.resolve(request.invocationId)
     }
 
