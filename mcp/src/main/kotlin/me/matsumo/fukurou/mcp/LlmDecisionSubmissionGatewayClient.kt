@@ -1,11 +1,14 @@
 package me.matsumo.fukurou.mcp
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionConflictException
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
+import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
+import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_CONFLICT_CODE
 import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_UNKNOWN_CODE
@@ -83,10 +86,20 @@ class LlmDecisionSubmissionGatewayClient private constructor(
         val response = LlmSubmissionGatewayCodec.readFrame(channel)
         if (response["accepted"]?.toString() == "true") return response
 
-        when (response["error"]?.toString()?.trim('"')) {
-            DECISION_SUBMISSION_CONFLICT_CODE -> throw DecisionSubmissionConflictException()
-            DECISION_SUBMISSION_UNKNOWN_CODE -> throw DecisionSubmissionUnknownException()
-            else -> error("App-owned submission gateway rejected request.")
+        val rejection = response["reason"]
+            ?.jsonPrimitive
+            ?.content
+            ?.let(SubmissionRejectionCode::fromWireValue)
+            ?.let(::SubmissionRejectedException)
+
+        when (response["error"]?.jsonPrimitive?.content) {
+            DECISION_SUBMISSION_CONFLICT_CODE -> throw DecisionSubmissionConflictException().withRejection(rejection)
+            DECISION_SUBMISSION_UNKNOWN_CODE -> throw DecisionSubmissionUnknownException().withRejection(rejection)
+            else -> if (rejection != null) {
+                throw rejection
+            } else {
+                error("App-owned submission gateway rejected request.")
+            }
         }
     }
 
@@ -104,6 +117,12 @@ class LlmDecisionSubmissionGatewayClient private constructor(
             binding: McpSubmissionGatewayBinding,
         ): LlmDecisionSubmissionGatewayClient = LlmDecisionSubmissionGatewayClient(channel, binding)
     }
+}
+
+private fun <T : Throwable> T.withRejection(rejection: SubmissionRejectedException?): T {
+    if (rejection != null) initCause(rejection)
+
+    return this
 }
 
 /** manifest と submission gateway の相互 binding。 */

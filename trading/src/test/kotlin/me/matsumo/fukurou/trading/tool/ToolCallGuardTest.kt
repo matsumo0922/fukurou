@@ -15,6 +15,8 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
+import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
+import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
 import me.matsumo.fukurou.trading.lock.InMemoryTradingLock
 import me.matsumo.fukurou.trading.lock.TradingLock
 import me.matsumo.fukurou.trading.lock.TradingLockLease
@@ -27,6 +29,7 @@ import java.time.ZoneOffset
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -164,6 +167,41 @@ class ToolCallGuardTest {
         assertTrue(result.exceptionOrNull() is NoTradeExitException)
         assertEquals(CommandEventType.NO_TRADE_EXIT, noTradeEvent.eventType)
         assertTrue(noTradeEvent.payload.contains("\"noTrade\":true"))
+    }
+
+    @Test
+    fun gateway_rejection_records_code_through_decision_tool_production_path() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val guard = createGuard(eventLog = eventLog)
+        val rejection = SubmissionRejectedException(SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED)
+
+        val result = guard.runDecisionTool(createCall(toolName = "submit_decision")) {
+            throw rejection
+        }
+        val event = eventLog.events().single()
+
+        assertTrue(result.exceptionOrNull() === rejection)
+        assertEquals(CommandEventType.NO_TRADE_EXIT, event.eventType)
+        assertTrue(event.payload.contains("\"reason\":\"tool_call_failed\""))
+        assertTrue(
+            event.payload.contains(
+                "\"rejectionCode\":\"${SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.wireValue}\"",
+            ),
+        )
+    }
+
+    @Test
+    fun non_gateway_failure_does_not_create_rejection_code_from_message() = runBlocking {
+        val eventLog = InMemoryCommandEventLog()
+        val guard = createGuard(eventLog = eventLog)
+
+        guard.runDecisionTool(createCall(toolName = "submit_decision")) {
+            error("outside_vocabulary")
+        }
+        val event = eventLog.events().single()
+
+        assertFalse(event.payload.contains("rejectionCode"))
+        assertFalse(event.payload.contains("outside_vocabulary"))
     }
 
     @Test

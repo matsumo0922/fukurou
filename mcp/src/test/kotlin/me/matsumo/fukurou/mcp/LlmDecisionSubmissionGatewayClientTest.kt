@@ -15,6 +15,9 @@ import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
+import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
+import me.matsumo.fukurou.trading.decision.submissionRejectionCodeOrNull
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_CONFLICT_CODE
 import me.matsumo.fukurou.trading.runner.DECISION_SUBMISSION_UNKNOWN_CODE
@@ -180,9 +183,52 @@ class LlmDecisionSubmissionGatewayClientTest {
     }
 
     @Test
-    fun `mcp client restores typed decision authority errors`() {
+    fun `mcp client restores typed decision authority errors without legacy rejection code`() {
         assertTypedGatewayError<DecisionSubmissionConflictException>(DECISION_SUBMISSION_CONFLICT_CODE)
         assertTypedGatewayError<DecisionSubmissionUnknownException>(DECISION_SUBMISSION_UNKNOWN_CODE)
+    }
+
+    @Test
+    fun `mcp client preserves generic legacy rejection without reason`() {
+        val exception = assertGatewayError<IllegalStateException>(
+            errorCode = "SUBMISSION_REJECTED",
+            rejectionCode = null,
+        )
+
+        assertEquals(null, exception.cause)
+        assertEquals(null, exception.submissionRejectionCodeOrNull())
+    }
+
+    @Test
+    fun `mcp client restores rejection reason without gateway message`() {
+        val exception = assertGatewayError<SubmissionRejectedException>(
+            errorCode = "SUBMISSION_REJECTED",
+            rejectionCode = SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED,
+        )
+
+        assertEquals(SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED, exception.code)
+        assertEquals(SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.message, exception.message)
+    }
+
+    @Test
+    fun `mcp client preserves typed error while carrying rejection reason`() {
+        val conflict = assertGatewayError<DecisionSubmissionConflictException>(
+            errorCode = DECISION_SUBMISSION_CONFLICT_CODE,
+            rejectionCode = SubmissionRejectionCode.SUBMISSION_CONFLICT,
+        )
+        val unknown = assertGatewayError<DecisionSubmissionUnknownException>(
+            errorCode = DECISION_SUBMISSION_UNKNOWN_CODE,
+            rejectionCode = SubmissionRejectionCode.SUBMISSION_UNKNOWN,
+        )
+
+        assertEquals(
+            SubmissionRejectionCode.SUBMISSION_CONFLICT,
+            (conflict.cause as SubmissionRejectedException).code,
+        )
+        assertEquals(
+            SubmissionRejectionCode.SUBMISSION_UNKNOWN,
+            (unknown.cause as SubmissionRejectedException).code,
+        )
     }
 
     private fun noTradeDecision() = DecisionSubmission(
@@ -244,6 +290,15 @@ class LlmDecisionSubmissionGatewayClientTest {
     }
 
     private inline fun <reified T : Throwable> assertTypedGatewayError(code: String) {
+        val exception = assertGatewayError<T>(code, null)
+
+        assertEquals(null, exception.cause)
+    }
+
+    private inline fun <reified T : Throwable> assertGatewayError(
+        errorCode: String,
+        rejectionCode: SubmissionRejectionCode?,
+    ): T {
         val path = Path.of("/tmp/fukurou-mcp-error-${System.nanoTime()}.sock")
         val server = ServerSocketChannel.open(StandardProtocolFamily.UNIX).apply {
             bind(UnixDomainSocketAddress.of(path))
@@ -256,19 +311,22 @@ class LlmDecisionSubmissionGatewayClientTest {
                     accepted,
                     buildJsonObject {
                         put("accepted", false)
-                        put("error", code)
+                        put("error", errorCode)
+                        rejectionCode?.let { code -> put("reason", code.wireValue) }
                     },
                 )
             }
         }
 
-        connectedClient(path, LlmInvocationPhase.PROPOSER).use { client ->
+        val exception = connectedClient(path, LlmInvocationPhase.PROPOSER).use { client ->
             assertFailsWith<T> { client.submitDecision(noTradeDecision()) }
         }
         response.get(5, TimeUnit.SECONDS)
         server.close()
         executor.shutdownNow()
         Files.deleteIfExists(path)
+
+        return exception
     }
 
     private fun connectedClient(path: Path, phase: LlmInvocationPhase): LlmDecisionSubmissionGatewayClient {

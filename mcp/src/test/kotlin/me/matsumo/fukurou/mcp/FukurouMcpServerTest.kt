@@ -77,6 +77,7 @@ import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateManifest
 import me.matsumo.fukurou.trading.decision.identity.DecisionTriggerKind
 import me.matsumo.fukurou.trading.decision.identity.MaterialFreshness
@@ -796,13 +797,46 @@ class FukurouMcpServerTest {
         val conflict = callTool(conflictServer, "submit_decision", changedArguments)
 
         assertEquals(true, conflict.isError)
+        val conflictContent = assertNotNull(conflict.structuredContent)
         assertEquals(
             "decision_submission_conflict",
-            assertNotNull(conflict.structuredContent).getValue("type").jsonPrimitive.contentOrNull,
+            conflictContent.getValue("type").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(
+            SubmissionRejectionCode.SUBMISSION_CONFLICT.wireValue,
+            conflictContent.getValue("rejection_code").jsonPrimitive.contentOrNull,
         )
         assertEquals(1, appRepository.snapshots.decisions().size)
         assertTrue((directRuntime.decisionRepository as InMemoryDecisionRepository).snapshots.decisions().isEmpty())
         conflictFixture.close()
+    }
+
+    @Test
+    fun submitDecisionTool_exposesGatewayRejectionCodeWithFixedMessage() = runBlocking {
+        val invocationId = "mcp-rejection-code-run"
+        val context = decisionSubmissionContext(invocationId)
+        val runtime = TradingRuntimeFactory.inMemory(clock = fixedClock())
+        val fixture = startMcpDecisionGateway(
+            repository = InMemoryDecisionRepository(fixedClock()),
+            invocationId = invocationId,
+            phase = LlmInvocationPhase.FALSIFIER,
+        )
+        val server = productionDecisionServer(runtime, context, fixture.client)
+
+        val result = callTool(server, "submit_decision", noTradeDecisionArguments())
+        val structuredContent = assertNotNull(result.structuredContent)
+
+        assertEquals(true, result.isError)
+        assertEquals("submission_rejected", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
+        assertEquals(
+            SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.wireValue,
+            structuredContent.getValue("rejection_code").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(
+            SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED.message,
+            structuredContent.getValue("message").jsonPrimitive.contentOrNull,
+        )
+        fixture.close()
     }
 
     @Test
@@ -822,7 +856,11 @@ class FukurouMcpServerTest {
         val intentId = submitApprovedEnterIntent(setupServer)
         callTool(setupServer, "place_order", placeOrderArguments(intentId))
         val positionId = runtime.broker.getPositions().getOrThrow().single().positionId
-        val unknownFixture = startTypedErrorGateway(invocationId, DECISION_SUBMISSION_UNKNOWN_CODE)
+        val unknownFixture = startTypedErrorGateway(
+            invocationId = invocationId,
+            errorCode = DECISION_SUBMISSION_UNKNOWN_CODE,
+            rejectionCode = SubmissionRejectionCode.SUBMISSION_UNKNOWN,
+        )
         val productionServer = FukurouMcpServer(
             clientRole = GmoPublicClientRole.PROPOSER,
             marketDataSource = PreviewMarketDataSource,
@@ -841,9 +879,14 @@ class FukurouMcpServerTest {
         )
 
         assertEquals(true, unknown.isError)
+        val unknownContent = assertNotNull(unknown.structuredContent)
         assertEquals(
             "decision_submission_unknown",
-            assertNotNull(unknown.structuredContent).getValue("type").jsonPrimitive.contentOrNull,
+            unknownContent.getValue("type").jsonPrimitive.contentOrNull,
+        )
+        assertEquals(
+            SubmissionRejectionCode.SUBMISSION_UNKNOWN.wireValue,
+            unknownContent.getValue("rejection_code").jsonPrimitive.contentOrNull,
         )
         assertTrue(close.isError != true)
         assertEquals("0.002500000000", runtime.broker.getPositions().getOrThrow().single().sizeBtc)
@@ -2606,8 +2649,11 @@ private fun decisionGatewayRequest(invocationId: String, submission: DecisionSub
     )
 }
 
-private fun startMcpDecisionGateway(repository: InMemoryDecisionRepository, invocationId: String): GatewayFixture {
-    val phase = LlmInvocationPhase.PROPOSER
+private fun startMcpDecisionGateway(
+    repository: InMemoryDecisionRepository,
+    invocationId: String,
+    phase: LlmInvocationPhase = LlmInvocationPhase.PROPOSER,
+): GatewayFixture {
     val path = Path.of("/tmp/fukurou-mcp-idempotency-${System.nanoTime()}.sock")
     val gateway = startDecisionGateway(path, repository, invocationId, phase)
     val channel = SocketChannel.open(StandardProtocolFamily.UNIX).apply {
@@ -2643,7 +2689,11 @@ private fun productionDecisionServer(
     ).createServer()
 }
 
-private fun startTypedErrorGateway(invocationId: String, errorCode: String): TypedErrorGatewayFixture {
+private fun startTypedErrorGateway(
+    invocationId: String,
+    errorCode: String,
+    rejectionCode: SubmissionRejectionCode? = null,
+): TypedErrorGatewayFixture {
     val path = Path.of("/tmp/fukurou-mcp-typed-error-${System.nanoTime()}.sock")
     val server = ServerSocketChannel.open(StandardProtocolFamily.UNIX).apply {
         bind(UnixDomainSocketAddress.of(path))
@@ -2657,6 +2707,7 @@ private fun startTypedErrorGateway(invocationId: String, errorCode: String): Typ
                 buildJsonObject {
                     put("accepted", false)
                     put("error", errorCode)
+                    rejectionCode?.let { code -> put("reason", code.wireValue) }
                 },
             )
         }

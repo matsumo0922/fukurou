@@ -67,6 +67,7 @@ fun mcpErrorResult(
     message: String,
     executed: Boolean? = null,
     failureKind: String? = null,
+    rejectionCode: String? = null,
 ): CallToolResult {
     val resolvedMessage = message.ifBlank { "unknown error" }
 
@@ -81,6 +82,9 @@ fun mcpErrorResult(
             }
             if (failureKind != null) {
                 put("failure_kind", failureKind)
+            }
+            if (rejectionCode != null) {
+                put("rejection_code", rejectionCode)
             }
         },
         isError = true,
