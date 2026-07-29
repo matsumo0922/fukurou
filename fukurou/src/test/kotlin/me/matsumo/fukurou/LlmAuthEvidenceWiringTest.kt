@@ -15,9 +15,13 @@ import kotlin.test.assertTrue
  * 経路が1つでも state を受け取らない、あるいは別 instance を受け取ると、その経路で観測した認証失敗は
  * `/ops/llm-auth` に届かず、失効中でも `logged_in` を返す。
  *
- * `:fukurou` の中間 factory は `authEvidenceState` を必須引数として受けるため、呼び出し側が渡し忘れると
- * コンパイルが失敗する。このテストが担うのは、その手前の「auditor 構築そのものが state を受け取らない、
- * または別 instance を受け取る」形であり、型検査では防げない部分に限る。
+ * 配線は3層で担保する。
+ *
+ * 1. `:fukurou` の中間 factory は `authEvidenceState` を必須引数として受けるため、呼び出し側が渡し忘れると
+ *    コンパイルが失敗する
+ * 2. production の state 生成を1箇所に固定する。中間 factory へ別 instance を注入すると生成箇所が増えるため、
+ *    引数の値を見なくても共有が崩れたことを検出できる
+ * 3. auditor 構築が `null` を受け取る形を検出する
  *
  * 新しい invocation 経路を追加したときは、その auditor へ共有 state を渡すこと。
  */
@@ -30,6 +34,16 @@ class LlmAuthEvidenceWiringTest {
         // 走査対象が空になると検査が無意味に green になるため、既知の構築数を下回らないことを確認する
         assertTrue(constructions.size >= KNOWN_PRODUCTION_CONSTRUCTION_COUNT, "found ${constructions.size}")
         assertEquals(emptyList(), constructions.filterNot(AuditorConstruction::passesSharedState))
+    }
+
+    @Test
+    fun productionCreatesTheEvidenceStateExactlyOnce() {
+        // 共有 instance であることは、構築箇所の引数を見るだけでは判定できない。中間 factory へ
+        // 別 instance を注入すると型検査も引数検査も通るため、生成そのものを 1 箇所に固定する。
+        // production で state を生成してよいのは application runtime resource の組み立てだけ
+        val instantiations = productionSourceRoots().flatMap { root -> evidenceStateInstantiations(root) }
+
+        assertEquals(listOf(SOLE_PRODUCTION_INSTANTIATION), instantiations)
     }
 
     @Test
@@ -85,14 +99,17 @@ private fun productionSourceRoots(): List<Path> {
 
 /** 指定 root 配下の全 Kotlin source から auditor 構築を集める。 */
 private fun auditorConstructions(root: Path): List<AuditorConstruction> {
+    return kotlinSources(root).flatMap(::auditorConstructionsInFile)
+}
+
+/** 指定 path が directory ならその配下の Kotlin source を、file ならそれ自体を返す。 */
+private fun kotlinSources(root: Path): List<Path> {
     if (!Files.isDirectory(root)) {
-        return auditorConstructionsInFile(root)
+        return listOf(root)
     }
 
     return Files.walk(root).use { paths ->
-        paths.filter { path -> Files.isRegularFile(path) && path.extension == "kt" }
-            .toList()
-            .flatMap(::auditorConstructionsInFile)
+        paths.filter { path -> Files.isRegularFile(path) && path.extension == "kt" }.toList()
     }
 }
 
@@ -140,10 +157,10 @@ private fun String.isAuditorConstructionStart(): Boolean {
 }
 
 /**
- * `authEvidenceState` に共有 instance を forward しているかを判定する。
+ * `authEvidenceState` に値を forward しているかを判定する。
  *
- * `null` と新規生成（`LlmAuthEvidenceState()`）は、値としては通っても経路ごとに別 instance になり、
- * 監視 API が読む state へ evidence が届かないため受理しない。
+ * `null` と直書きの新規生成は受理しない。ただし別変数として渡された孤立 instance はこの検査では
+ * 判別できないため、共有の保証は生成箇所を1つに固定する検査が担う。
  */
 private fun String.forwardsSharedEvidenceState(): Boolean {
     val assignment = substringAfter("authEvidenceState = ", missingDelimiterValue = "").trim().trimEnd(',')
@@ -153,5 +170,19 @@ private fun String.forwardsSharedEvidenceState(): Boolean {
     return assignment != "null" && !assignment.startsWith("LlmAuthEvidenceState(")
 }
 
+/** 指定 root 配下から `LlmAuthEvidenceState()` の生成箇所を集める。 */
+private fun evidenceStateInstantiations(root: Path): List<String> {
+    return kotlinSources(root).flatMap { source ->
+        source.readText().lines().mapIndexedNotNull { index, line ->
+            val code = line.substringBefore("//")
+
+            if (code.contains("LlmAuthEvidenceState(")) "${source.fileName}:${index + 1}" else null
+        }
+    }
+}
+
 /** 現在の production 経路数。走査が空振りしていないことの下限として使う。 */
 private const val KNOWN_PRODUCTION_CONSTRUCTION_COUNT = 4
+
+/** production で唯一 state を生成してよい場所。 */
+private const val SOLE_PRODUCTION_INSTANTIATION = "Application.kt:278"
