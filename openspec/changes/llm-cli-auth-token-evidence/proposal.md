@@ -4,11 +4,13 @@
 
 ## What Changes
 
-- `LlmAuthStatus` に `token_suspect` を追加する。credential marker は存在するが、直近の LLM invocation が認証失敗 evidence を残している状態を表す。
-- `DefaultLlmAuthService.snapshot()` が、marker を検出した provider について、既存の invocation 監査記録（`command_event_log` の `RUNNER_PHASE_COMPLETED`）に認証失敗 evidence があるかを bounded read で確認する。evidence があれば `logged_in` から `token_suspect` へ降格する。
-- 再ログイン後に古い evidence が残り続けないよう、evidence の観測範囲を credential marker file の最終更新時刻以降に限定する。WebUI login と `docker exec` fallback login のどちらでも marker が更新されるため、両経路で降格が解除される。
-- evidence 参照が失敗した場合（DB 到達不能、監査 payload が解釈不能）は `logged_in` を維持せず `unknown` を返す。判定できない状態を「正常」と報告しない。
-- evidence source を注入していない構成（DB なし、既存 test double）では現行どおり marker 存在だけで `logged_in` を返す。
+- `LlmAuthStatus` に `token_suspect` を追加する。credential marker は存在するが、現在の credential を使った LLM invocation が認証失敗 evidence を残している状態を表す。
+- Codex の output parser が、既存の認証 evidence 判定では捕捉できない credential lifecycle の失敗文言（`refresh_token_reused` / `token_expired` / `Failed to refresh token`）を独立に追跡する。
+- LLM invocation が失敗 evidence を観測した時点で、in-process の live state に記録する。daemon tick の liveness を `MutableLlmDaemonTickStatus` が保持しているのと同じ形にし、監視 API は DB を検索しない。
+- 再ログイン後に古い evidence が残り続けないよう、evidence にその run が使った credential source の mtime を持たせ、現在の marker mtime より古い世代の evidence は無視する。WebUI login と `docker exec` fallback login のどちらでも marker が更新されるため、両経路で降格が解除される。
+- 成功した invocation では降格を解除しない。invocation は persistent credential source の per-run copy を使い source へ書き戻さないため、成功は source が今も有効であることの証拠にならない。
+- marker の mtime を読めない場合は `logged_in` を維持せず `unknown` を返す。判定できない状態を「正常」と報告しない。
+- evidence state を注入していない構成（既存 test double）では現行どおり marker 存在だけで `logged_in` を返す。
 
 **BREAKING**: `/ops/llm-auth` の `status` に新しい値 `token_suspect` が現れる。既存 consumer（WebUI System 画面）は status 文字列をそのまま表示し、`logged_in` との完全一致で logged-in 件数を数えるため、`token_suspect` は自動的に「logged in ではない」として扱われる。
 
@@ -24,9 +26,12 @@
 
 ## Impact
 
-- `fukurou/src/main/kotlin/me/matsumo/fukurou/LlmAuthService.kt`: `LlmAuthStatus` 拡張、`providerStatus()` の判定、evidence source 境界の追加。
-- `fukurou/src/main/kotlin/me/matsumo/fukurou/Application.kt`: evidence source の wiring。
-- 新規 evidence source 実装: `command_event_log` を bounded read する repository（`ExposedMonitoringRepository` と同じ read-only 境界のパターン）。
+- `trading/.../invoker/DefaultLlmOutputParser.kt`: credential lifecycle 文言の独立追跡。
+- `trading/.../invoker/DefaultLlmCommandRenderer.kt`: credential source の mtime 観測。
+- `trading/.../runner/LlmInvocationAuditor.kt`: audit payload への診断 field 追加と、in-process evidence state の更新。
+- 新規 `LlmAuthEvidenceState`: provider ごとの最後の失敗 evidence を保持する in-process state（`MutableLlmDaemonTickStatus` と同型）。
+- `fukurou/src/main/kotlin/me/matsumo/fukurou/LlmAuthService.kt`: `LlmAuthStatus` 拡張と判定の変更。
+- `fukurou/src/main/kotlin/me/matsumo/fukurou/Application.kt`: evidence state の wiring。
 - `fukurou/src/main/kotlin/me/matsumo/fukurou/OpsRoutes.kt`: `/ops/llm-auth` の `.describe {}` に新 status 値を記載。
-- 外部 API 呼び出し、LLM 起動、schema 変更、DB migration は伴わない。readiness・SafetyFloor・order lifecycle には触れない。
+- 外部 API 呼び出し、LLM 起動、schema 変更、DB migration、DB query の追加、index の追加は伴わない。readiness・SafetyFloor・order lifecycle には触れない。
 - docs: `docs/llm-obsidian-production-setup.md` の「login state は非 secret の credential marker file で判定する」記述を現在形で更新する。

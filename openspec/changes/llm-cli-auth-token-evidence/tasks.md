@@ -1,27 +1,32 @@
-## 1. PR 1: parser と auditor の credential lifecycle signal（`:trading`）
+## 1. PR 1: evidence の観測と記録（`:trading` runtime + cross-module fixture）
 
 - [ ] 1.1 `DefaultLlmOutputParser` に `CODEX_CREDENTIAL_LIFECYCLE_FAILURE_TEXTS`（`refresh_token_reused` / `token_expired` / `Failed to refresh token`）を追加し、根拠となる障害の出典を KDoc に残す
-- [ ] 1.2 `ParsedLlmOutput` に `credentialLifecycleFailureObserved` を default なしで追加し、`parseCodex()` が stdout / stderr の部分一致で立てる。`parseClaude()` は常に false とする
-- [ ] 1.3 `LlmInvocationResult` へ signal を伝搬し、`LlmInvoker` の全構築経路を更新する
-- [ ] 1.4 `LlmPhaseAuditSignals` に signal を追加し、`LlmInvocationAuditor.phaseDetails()` が true のときだけ `authTokenFailureObserved` を payload へ出す
-- [ ] 1.5 signal が raw output 保持判定（`isSafeCodexLifecycleFailure`）に影響しないことを確認する
-- [ ] 1.6 `DefaultLlmOutputParserTest` に、issue #305 の実 stderr を模した入力で signal が true になる test と、`401 Unauthorized` 単独で false のままである test を追加する
-- [ ] 1.7 `LlmInvocationAuditorTest` に、signal true で `authTokenFailureObserved` が payload に出る test と、`OUTPUT_CONTRACT` + signal true でも redacted stdout / stderr が保持される test を追加する
-- [ ] 1.8 `make test` / `make detekt` を通し、PR 1 を作成する
+- [ ] 1.2 `ParsedLlmOutput` に `credentialLifecycleFailureObserved` を default なしで追加する。`parseCodex()` は文言の部分一致に加えて失敗 context（provider failure あり、または terminal event が1つも解析できていない）を条件とする。`parseClaude()` は常に false とする
+- [ ] 1.3 `LlmInvocationResult` へ signal を伝搬し、`LlmInvoker` の構築経路を更新する
+- [ ] 1.4 `DefaultLlmCommandRenderer` が credential source を **copy する前に** 観測した source mtime を `RenderedLlmCommand` へ載せ、`LlmInvoker` が `LlmInvocationResult` へ伝搬する。値は `FileTime.toInstant()` の精度を保つ（millis へ丸めない）
+- [ ] 1.5 `LlmAuthEvidenceState` を定義する。provider ごとに「最後に観測した失敗 evidence（provider、観測時刻、credential 世代）」だけを保持し、provider output・例外 message・credential 内容は持たない。更新は `ConcurrentHashMap.compute` で provider 単位に原子的とし、既存 evidence より古い世代では上書きしない（同一世代なら観測時刻の新しい方を残す）
+- [ ] 1.6 `LlmInvocationAuditor` が失敗 evidence（`authFailureSuspected` または credential lifecycle signal）を観測したとき、`commandEventLog.append()` より **前に** evidence state を更新する。state は nullable な依存とし、未注入なら更新しない
+- [ ] 1.7 `LlmInvocationAuditor.phaseDetails()` が、signal true のときだけ `authTokenFailureObserved` を、source mtime を観測できたときだけ `authSourceObservedAt`（ISO-8601）を payload へ出す（人間の事後診断用）
+- [ ] 1.8 signal が raw output 保持判定（`isSafeCodexLifecycleFailure`）に影響しないことを確認する
+- [ ] 1.9 default なし field の追加で compile が壊れる全 fixture を更新する（`:trading` test、および `:fukurou` の `OpsRouteTest` が直接構築する `LlmInvocationResult`）
+- [ ] 1.10 `DefaultLlmOutputParserTest` に test を追加する: issue #305 の実 stderr（stdout に JSONL が一切無い状態）で signal true / provider failure ありで文言を含む場合に true / 成功 terminal + response 本文に文言があっても false / `401 Unauthorized` 単独で false
+- [ ] 1.11 `LlmInvocationAuditorTest` に test を追加する: 失敗 evidence 観測で state が更新される / audit append が失敗しても state は更新済みである / 成功時に state が消えない / 古い世代の evidence が新しい世代を上書きしない / `OUTPUT_CONTRACT` + signal true でも redacted stdout / stderr が保持される / payload に `authTokenFailureObserved` と `authSourceObservedAt` が出る / 観測できないとき key 自体が出ない / state 未注入でも動作する
+- [ ] 1.12 renderer の credential copy 経路に test を追加する: Codex / Claude それぞれで copy 前に観測した source mtime が rendered command に載る / source が無い場合は載らない / millis 未満の精度が保たれる
+- [ ] 1.13 `make test` / `make detekt` を通し、PR 1 を作成する
 
 ## 2. PR 2: 監視 status の降格（`:fukurou`、base は PR 1）
 
 - [ ] 2.1 `LlmAuthStatus` に `TOKEN_SUSPECT("token_suspect")` を追加する
-- [ ] 2.2 `LlmAuthEvidenceSource` 境界（provider と observation 下限時刻を受け、最新1件の evidence 有無を返す）を定義する
-- [ ] 2.3 `command_event_log` を bounded read する Exposed 実装を追加する。`MonitoringRepository` と同じ `statement_timeout` / `lock_timeout` / row bound を適用し、`RUNNER_PHASE_COMPLETED` を `ts DESC` で読んで該当 provider の最初の1件で打ち切る
-- [ ] 2.4 payload 解釈は fail-closed とする。JSON 不正、`details` 欠落、marker 値が想定外語彙、bound 到達で未解決 — いずれも malformed として扱う
-- [ ] 2.5 `DefaultLlmAuthService.providerStatus()` を更新する。marker 検出時に marker の mtime を下限として evidence を照会し、failure evidence があれば `TOKEN_SUSPECT`、なければ `LOGGED_IN`、照会失敗は `UNKNOWN` とする。evidence source が null なら現行動作を維持する
-- [ ] 2.6 `providerStatus()` が suspend になることによる `snapshot()` の呼び出し形を整える
-- [ ] 2.7 `Application.kt` で DB 接続時に evidence source を注入する
-- [ ] 2.8 `/ops/llm-auth` の `.describe {}` に `token_suspect` と `unknown` の意味を日本語で追記する
-- [ ] 2.9 `LlmAuthServiceTest` に spec の Scenario 対応 test を追加する: credential lifecycle evidence で降格 / `authFailureSuspected` で降格 / 最新 run 成功で `logged_in`（回帰）/ evidence なしで `logged_in` / marker 更新後の古い evidence を無視 / 新旧2件で新しい方を採用 / query 失敗で `unknown` / payload malformed で `unknown` / evidence source 未注入で `logged_in`
-- [ ] 2.10 `OpsRouteTest` に production route 経由で `token_suspect` が wire に出る test を追加する
-- [ ] 2.11 evidence repository の bounded read を Postgres 統合テストで確認する（既存の統合テスト基盤に合わせる）
-- [ ] 2.12 `docs/llm-obsidian-production-setup.md` の CLI auth 判定の記述を現在形で更新し、`token_suspect` が残る場合に auth.json の mtime を確認する運用を追記する
+- [ ] 2.2 `DefaultLlmAuthService` に evidence state を nullable な constructor 引数として受け取る。null なら現行動作（marker 存在だけで `LOGGED_IN`）を維持する
+- [ ] 2.3 `providerStatus()` を更新する。marker 検出時に marker の mtime を読み、evidence の世代が marker mtime より厳密に古ければ無視、同値以降なら `TOKEN_SUSPECT`、evidence が無ければ `LOGGED_IN` とする
+- [ ] 2.4 marker の mtime を読めない場合（`IOException` など）は `UNKNOWN` を返す
+- [ ] 2.5 status detail を固定の非 secret 文字列にする（evidence の種別を示すが、provider output・例外・credential 内容は含めない）
+- [ ] 2.6 `Application.kt` に evidence state を runtime resource として1 instance 作り、`DefaultLlmAuthService` と、Ktor 内の全 invocation 経路（decision-run one-shot、daemon pre-filter、reflection runner、evaluation）の auditor 構築箇所へ明示的に渡す
+- [ ] 2.7 `/ops/llm-auth` の `.describe {}` に `token_suspect` と `unknown` の意味を日本語で追記する
+- [ ] 2.8 `LlmAuthServiceTest` に spec の Scenario 対応 test を追加する: credential lifecycle evidence で降格 / `authFailureSuspected` で降格 / 後続の成功が降格を解除しない / 後続の非認証 failure が降格を解除しない / evidence なしで `logged_in`（回帰）/ marker 更新で古い世代の evidence を無視 / 世代が marker mtime と同値なら降格を維持 / 他 provider の evidence で降格しない / marker 不在で `logged_out` / mtime を読めないとき `unknown` / evidence state 未注入で `logged_in` / state が空（再起動相当）で `logged_in`
+- [ ] 2.9 `OpsRouteTest` に production route 経由で `token_suspect` が wire に出る test と、status detail に secret 相当が含まれない test を追加する
+- [ ] 2.10 renderer → invoker → auditor → evidence state → auth service → route の配線が通ることを production wiring 経由の統合テストで確認する。加えて、4つの invocation 経路（one-shot / pre-filter / reflection / evaluation）それぞれが同一 state instance を受け取っていることを composition test で確認する
+- [ ] 2.11 `token_suspect` / `unknown` が `/health/ready` と scheduler admission に影響しないことを、依存グラフ上 CLI auth を参照していないことの確認として記録する（新規 test が不要ならその旨を記録する）
+- [ ] 2.12 `docs/llm-obsidian-production-setup.md` の CLI auth 判定の記述を現在形で更新する。`token_suspect` の意味、再ログインでのみ解除されること（false-positive でも他の解除経路が無いこと）、process 再起動で evidence が消えること、別プロセスの direct runner が検知対象外であること、解除されない場合に auth.json の mtime を確認し必要なら mtime が変わるまで待って再 login することを追記する
 - [ ] 2.13 WebUI System 画面が `token_suspect` を「logged in ではない」として扱い、そのまま表示することを確認する（変更が不要なら不要と記録する）
 - [ ] 2.14 `make test` / `make detekt` / web の test を通し、PR 2 を PR 1 の branch を base として作成する
