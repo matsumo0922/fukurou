@@ -43,7 +43,7 @@ class LlmAuthEvidenceWiringTest {
         // production で state を生成してよいのは application runtime resource の組み立てだけ
         val instantiations = productionSourceRoots().flatMap { root -> evidenceStateInstantiations(root) }
 
-        assertEquals(listOf(SOLE_PRODUCTION_INSTANTIATION), instantiations)
+        assertEquals(listOf(SOLE_PRODUCTION_INSTANTIATION_FILE), instantiations)
     }
 
     @Test
@@ -170,13 +170,13 @@ private fun String.forwardsSharedEvidenceState(): Boolean {
     return assignment != "null" && !assignment.startsWith("LlmAuthEvidenceState(")
 }
 
-/** 指定 root 配下から `LlmAuthEvidenceState()` の生成箇所を集める。 */
+/** 指定 root 配下から `LlmAuthEvidenceState()` を生成しているファイル名を集める。 */
 private fun evidenceStateInstantiations(root: Path): List<String> {
     return kotlinSources(root).flatMap { source ->
-        source.readText().lines().mapIndexedNotNull { index, line ->
+        source.readText().lines().mapIndexedNotNull { _, line ->
             val code = line.substringBefore("//")
 
-            if (code.contains("LlmAuthEvidenceState(")) "${source.fileName}:${index + 1}" else null
+            if (code.contains("LlmAuthEvidenceState(")) source.fileName.toString() else null
         }
     }
 }
@@ -184,5 +184,10 @@ private fun evidenceStateInstantiations(root: Path): List<String> {
 /** 現在の production 経路数。走査が空振りしていないことの下限として使う。 */
 private const val KNOWN_PRODUCTION_CONSTRUCTION_COUNT = 4
 
-/** production で唯一 state を生成してよい場所。 */
-private const val SOLE_PRODUCTION_INSTANTIATION = "Application.kt:278"
+/**
+ * production で唯一 state を生成してよい場所。
+ *
+ * 行番号は含めない。無関係な編集で行がずれるたびに落ちると、検査の意図（生成箇所が増えていないか）
+ * とは無関係な保守コストになる。
+ */
+private const val SOLE_PRODUCTION_INSTANTIATION_FILE = "Application.kt"
