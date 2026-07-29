@@ -11,7 +11,12 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
   - [ ] `retryTransientTestPostgresConnection`（現在 `trading` のみが持つ）
   - [ ] `withJdbcQueryParameters`（現在 `mcp` のみが持つ）
   - [ ] Docker 可用性判定 helper（PR2 で使う。PR1 では定義のみ）
+- [ ] `trading/build.gradle.kts` に `testFixturesApi(libs.testcontainers.postgresql)` を追加する
+  - 現在 Testcontainers は `testImplementation` にしかなく、`testFixtures` の compile classpath に無いため `PostgreSQLContainer` の import が解決しない
+  - `BoundedTestPostgresContainer` の superclass に型が露出するので `testFixturesImplementation` ではなく `testFixturesApi` を使う（前例: `mcp-core/build.gradle.kts:15-17`）
+  - `commons-compress` の CVE constraint（`trading/build.gradle.kts:24-31`）が fixture 経由の consumer にも効くことを確認する
 - [ ] helper に serial 実行前提であることをドキュメントコメントで明記する
+  - `pg_current_wal_insert_lsn()` と `pg_locks` は database per test では隔離されないこと（cluster-global）を併記する
 - [ ] `mcp/build.gradle.kts` に `testImplementation(testFixtures(project(":trading")))` を追加する
 - [ ] `trading` / `fukurou` / `mcp` の `TestPostgresConnection.kt` 3 本を削除し、参照を共有 helper に切り替える
 - [ ] `internal` 可視性が module 境界を越えられない点に対処する（共有 helper は `public`、必要なら利用側で alias）
@@ -38,7 +43,8 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 - [ ] `runPostgresTest` を database per test に変える
   - [ ] test ごとに一意名の database を `CREATE DATABASE` する
   - [ ] その database を指す JDBC URL で base DataSource を作る
-  - [ ] test 終了時に全接続を close してから `DROP DATABASE` する
+  - [ ] test 終了時に `DROP DATABASE <name> WITH (FORCE)` で破棄する（残存接続を強制切断する。`TradingRuntimeFactory.postgres()` が所有する pool は test から close できず、`runtime.close()` が `finally` 外にある箇所が 7 件あるため）
+  - [ ] `DROP DATABASE` を実行する admin 接続は対象 database 以外へ接続し、autocommit で実行する
 - [ ] `PostgresTestContext` に test database の JDBC URL を保持させ、補助 factory を全て切り替える（**最重要チェックポイント**）
   - [ ] `createDataSource(connectionInitSql)`（`:11414-11416`）
   - [ ] `createDeadlineDataSource()`（`:11418-11424`）
@@ -47,6 +53,10 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
   - [ ] test 本体に `container.jdbcUrl` の直接参照が残っていないことを grep で確認する
 - [ ] `bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite`（`:5230`）を専用 container で実行する経路に分離する（`ALTER SYSTEM` と `container.logs` 依存のため）
 - [ ] 220 テスト全件の pass を確認する
+- [ ] cleanup が実際に行われたことを確認する（「220 個の database を作って 1 つも DROP しない」実装でも全件 pass するため、pass だけでは cleanup の証拠にならない）
+  - [ ] class 終了時点で container 上に test database が残っていないことを確認する
+  - [ ] `DROP DATABASE` が例外を投げずに完了することを確認する
+  - [ ] テストが例外で中断した場合も database が破棄されることを確認する（意図的に失敗させる一時テストか、helper の単体検証で確認する）
 - [ ] 変更後の `make test` 所要時間を計測し、変更前と比較して記録する
 - [ ] container 起動回数が 220 → 2 になったことを確認する
 - [ ] full validation を実行する
@@ -55,7 +65,7 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 
 対応する受け入れ条件: PR3 と同じ（container 起動回数の削減）
 
-PR3 の実測効果を見て要否を判断する。PR3 で十分改善し replay 系 17 起動の寄与が誤差なら、本 PR は follow-up issue に落とす。
+本 change の必須スコープ。delta spec が replay 3 class の共有化を MUST として規定しているため、省略すると change を完了できない。
 
 - [ ] `TtlShorteningReplayIntegrationTest`（`runReplayTest`、`:331-349`）を database per test に変える
 - [ ] `TailFactSheetIntegrationTest` を同様に変える

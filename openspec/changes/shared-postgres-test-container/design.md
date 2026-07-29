@@ -11,7 +11,8 @@
 - **schema を破壊したまま終了するテストが 13 件以上ある**。column / table の DROP、cleanup されない trigger・function・sequence、invalid index、`CHECK(false)` constraint が残る（`:1673-1687`, `:2298-2304`, `:2481,2517-2523`, `:4363-4374`, `:5414-5459`, `:5463-5500`, `:5504-5553`, `:5797-5805`, `:6986`, `:9660,9724-9728`, `:10685-10701`, `:11061-11084`）
 - instance-global な副作用は `ALTER SYSTEM SET log_statement = 'ddl'` + `pg_reload_conf()` の 1 件のみで、`RESET` されない（`:5251-5252`, helper `:13746-13752`）。`CREATE DATABASE` / `CREATE ROLE` / `CREATE EXTENSION` / `pg_terminate_backend` / replication slot は存在しない
 - `container.logs` を使うのは 1 テスト・2 call site。logging 有効化後の offset から DDL 文を数え `assertEquals(6, ...)` する（`:5230`, `:5251-5252`, `:5280-5281`, matcher `:13755-13768`）
-- `HikariDataSource` は全 call site で `.use` されており、pool leak は見つかっていない（base factory `:13277-13292`、fault factory `:11426-11442`）
+- test が直接生成する `HikariDataSource` は全 call site で `.use` されている（base factory `:13277-13292`、fault factory `:11426-11442`）
+- **ただし `TradingRuntimeFactory.postgres()` が内部生成する pool は test の管理外にある**。runtime は自前の Hikari pool と gate-shadow pool を所有し、`runtime.close()` でのみ閉じる（`trading/src/main/kotlin/me/matsumo/fukurou/trading/runtime/TradingRuntime.kt:352-378,440-472,733-743`）。この `close()` が `finally` の外にある箇所が 7 件あり（`:4459`, `:10863`, `:10936`, `:10988`, `:11017`, `:11157`, `:11280`）、assertion 失敗時に接続が test database へ残る
 
 ## Goals / Non-Goals
 
@@ -44,6 +45,19 @@
 
 **採用理由**: 各テストは現状と同じ「空の public schema に `ensureSchema()` を適用する」構造をそのまま得る。schema 破壊・残存 trigger・追加 schema・統計を database 単位でまとめて破棄でき、220 テスト分の FK 順序を考慮した TRUNCATE リストや修復処理が不要になる。
 
+### D1b: `DROP DATABASE ... WITH (FORCE)` で残存接続を強制切断する
+
+test database の破棄は `DROP DATABASE <name> WITH (FORCE)` で行う。PostgreSQL 13 以降で利用でき、対象 database への既存接続を強制切断してから削除する。container image は `postgres:16-alpine`（`:250`）なので利用可能。
+
+**却下した代替案**
+
+- **全 `runtime.close()` を `finally` へ移す**: 7 箇所の書き換えが必要で、テスト本体の構造に手を入れることになる。かつ「今後追加されるテストが同じ罠を踏まない」保証にならない。将来 `runtime` 以外に pool を所有する production 型が増えたときも同じ修正が要る
+- **`pg_terminate_backend` で明示的に切断してから DROP**: `WITH (FORCE)` と等価だが、対象 database の backend を自力で列挙する処理を書くことになる。標準機能で済む
+
+**採用理由**: cleanup の正しさを「テスト側が接続を漏らさないこと」に依存させず、helper 側で完結させる。テストが assertion 失敗や例外で中断しても、次のテストは確実に新しい database で始まる。falsifier が指摘した failure isolation の穴を、テスト本体を書き換えずに閉じられる。
+
+`DROP DATABASE` を実行する admin 接続は対象 database 以外（container の default database）へ接続し、autocommit で実行する必要がある。
+
 ### D2: `PostgresTestContext` に test database の JDBC URL を保持させる
 
 補助 DataSource factory（`createDataSource(connectionInitSql)` / `createDeadlineDataSource()` / `createRecoveryCommitFaultDataSource()`、`:11414-11442`）と `tradingDatabaseConfig()`（`:11448-11453`）は現在 `container.jdbcUrl` を直接参照する。これらを context 保持の test database URL 経由に変える。
@@ -73,7 +87,8 @@ skip 件数がレポートに出れば「CI で Docker が壊れても緑」は�
 ## Risks / Trade-offs
 
 - **[補助接続の URL 差し替え漏れ]** → D2 の全 call site を実装時に列挙し、`container.jdbcUrl` の直接参照が test 本体に残っていないことを grep で確認する。レビューの重点確認対象とする
-- **[テスト間のデータ漏れ]** → 各テストが独立 database を持つため構造的に防がれるが、`DROP DATABASE` 前に接続が残っていると失敗する。close 順序を helper に閉じ込め、テスト個別の後始末に依存しない
+- **[テスト間のデータ漏れ]** → 各テストが独立 database を持つため構造的に防がれる。`DROP DATABASE` は D1b の `WITH (FORCE)` で残存接続ごと破棄するため、テスト個別の後始末に依存しない
+- **[観測系は database 境界で隔離されない]** → `pg_current_wal_insert_lsn()`（`:9316-9338`）は cluster 全体の WAL 末尾を返し、`pg_locks`（`:13975-13988`, `:14061-14076`, `:15027-15067`）は cluster-global view で database OID による絞り込みが無い。serial 実行かつ各テストが接続を残さない前提では実害が出ないが、この 2 点は database per test では守られない。将来テストを並列化する場合は先にここを直す必要がある。helper のドキュメントコメントに明記する
 - **[共有 container の serial 前提]** → 現在 `trading` の `test` タスクは `maxParallelForks` 未指定（Gradle 既定 1）で serial（`trading/build.gradle.kts:33-35`）。将来並列化すると `container.logs` と WAL 観測（`:9316-9338`）が壊れうる。helper のドキュメントコメントに serial 前提を明記する
 - **[`ensureSchema()` の非冪等パスの発見]** → 220 テストのうち一部が「fresh container だから通っていた」可能性は残る。database per test は fresh database を与えるため大半は影響しないが、実行して初めて分かる。PR3 の検証で全 220 テストの pass を確認する
 - **[所要時間の改善が見込みより小さい]** → container 起動が支配的という推定が外れた場合。変更前後を計測して記録し、効果が出なければ PR4 以降の判断材料にする
@@ -87,11 +102,13 @@ stacked PR で 4 段に分ける。各 PR は独立して意味を持ち、前�
 3. **PR3（本命）**: `PostgresPersistenceIntegrationTest` を database per test 化。220 → 2 起動
 4. **PR4（横展開）**: replay 系 3 ファイルを同方式に統一。17 → 3 起動
 
+PR4 は本 change の必須スコープとする。delta spec が replay 3 class の共有化を MUST として規定しており、これを満たさずに change を完了できない。replay 系は `PostgresPersistenceIntegrationTest` と同じ per-test container 構造の複製であり、放置すると「共有化済みと per-test が混在する」状態が固定化して、次に触る実装者がどちらに倣うべきか判断できなくなる。
+
 PR1 と PR2 を分ける理由は、PR2 が 12 ファイルに触れる機械的置換で、基盤の設計レビューと混ぜると diff が読みにくくなるため。
 
 ロールバックは PR 単位の revert で可能。production コードに触れないため運用への影響はない。
 
 ## Open Questions
 
-- PR4 の要否は PR3 の実測効果を見て判断する。PR3 で所要時間が十分改善し、replay 系 17 起動の寄与が誤差なら、PR4 は follow-up issue に落として本 change を 3 PR で閉じる（agent 仮決め。人間の確認事項として PR3 の description に記載する）
 - `make test` の計測は同一マシン・同一条件で行うが、Docker のイメージキャッシュ状態に左右される。変更前後を連続実行して比較する
+- テストの並列化（`maxParallelForks` の引き上げ）は本 change の Non-Goal だが、container 共有化によって並列化の前提条件が変わる。並列化を検討する場合は先に WAL / `pg_locks` の観測系を database 単位へ絞る必要がある（Risks 参照）。follow-up issue の候補として PR3 の description に記載する（agent 仮決め）
