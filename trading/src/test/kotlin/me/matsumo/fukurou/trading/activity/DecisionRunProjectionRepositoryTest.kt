@@ -96,7 +96,7 @@ class DecisionRunProjectionRepositoryTest {
             action = "EXIT",
             orderCount = 1,
             hasNoTradeExit = true,
-            noTradeExitHasRejectionCode = true,
+            hasNonRejectionNoTradeExit = false,
         )
 
         assertEquals(DecisionRunOutcome.FAILED, classifyDecisionRunOutcome(rejectedOnly))
@@ -109,7 +109,7 @@ class DecisionRunProjectionRepositoryTest {
             outcomeEvidence(
                 action = "ENTER",
                 hasNoTradeExit = true,
-                noTradeExitHasRejectionCode = true,
+                hasNonRejectionNoTradeExit = false,
             ),
         )
 
@@ -122,7 +122,20 @@ class DecisionRunProjectionRepositoryTest {
             outcomeEvidence(
                 action = "ENTER",
                 hasNoTradeExit = true,
-                noTradeExitHasRejectionCode = false,
+                hasNonRejectionNoTradeExit = true,
+            ),
+        )
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, outcome)
+    }
+
+    @Test
+    fun committedEntryKeepsGenericFailureWhenLatestNoTradeExitIsRejection() {
+        val outcome = classifyDecisionRunOutcome(
+            outcomeEvidence(
+                action = "ENTER",
+                hasNoTradeExit = true,
+                hasNonRejectionNoTradeExit = true,
             ),
         )
 
@@ -241,7 +254,7 @@ private fun outcomeEvidence(
     orderCount: Int = 0,
     filledOrderCount: Int = 0,
     hasNoTradeExit: Boolean = false,
-    noTradeExitHasRejectionCode: Boolean = false,
+    hasNonRejectionNoTradeExit: Boolean = false,
     openOrderCount: Int = 0,
     ttlCanceledOrderCount: Int = 0,
     canceledEntryOrderCount: Int = 0,
@@ -259,7 +272,7 @@ private fun outcomeEvidence(
         filledOrderCount = filledOrderCount,
         executionCount = 0,
         hasNoTradeExit = hasNoTradeExit,
-        noTradeExitHasRejectionCode = noTradeExitHasRejectionCode,
+        hasNonRejectionNoTradeExit = hasNonRejectionNoTradeExit,
         openOrderCount = openOrderCount,
         ttlCanceledOrderCount = ttlCanceledOrderCount,
         canceledEntryOrderCount = canceledEntryOrderCount,

@@ -40,7 +40,7 @@ app-owned submission gateway は、1 度の要求処理で接続と受付を終�
 
 ### Requirement: 再提出が成立した run を no-entry へ誤分類しない
 
-同一 run 内で先行する提出が拒否され、後続の trade decision が受理された場合、`rejectionCode` を持つ拒否時の `NO_TRADE_EXIT` によって run の outcome を no-entry と判定してはならない (MUST NOT)。run outcome の判定は、commit 済み trade decision の存在を、`rejectionCode` を持つ `NO_TRADE_EXIT` より優先しなければならない (SHALL)。`rejectionCode` を持たない汎用 tool 失敗の `NO_TRADE_EXIT` は superseded としてはならず (MUST NOT)、final reason と no-entry 証跡を維持しなければならない (SHALL)。拒否イベント自体は診断のため監査に残さなければならない (SHALL)。
+同一 run 内で先行する提出が拒否され、後続の trade decision が受理された場合、run にあるすべての `NO_TRADE_EXIT` が `rejectionCode` を持つときだけ、それらを superseded として no-entry 判定から除外しなければならない (SHALL)。`rejectionCode` を持たない汎用 tool 失敗の `NO_TRADE_EXIT` が 1 件でもあれば、記録順序にかかわらず superseded としてはならず (MUST NOT)、最新の `NO_TRADE_EXIT` の final reason と no-entry 証跡を維持しなければならない (SHALL)。拒否イベント自体は診断のため監査に残さなければならない (SHALL)。
 
 #### Scenario: 拒否後に受理された entry run が no-entry にならない
 
@@ -56,6 +56,11 @@ app-owned submission gateway は、1 度の要求処理で接続と受付を終�
 
 - **WHEN** entry decision が commit されたあと、`place_order` など別の tool が失敗し、`rejectionCode` を持たない `tool_call_failed` の `NO_TRADE_EXIT` が記録される
 - **THEN** run outcome は従来どおり no-entry で、final reason は `tool_call_failed` のまま保持される
+
+#### Scenario: 拒否と汎用 tool 失敗が混在しても順序に依存しない
+
+- **WHEN** `rejectionCode` を持たない汎用 tool 失敗の `NO_TRADE_EXIT`、より新しい `rejectionCode` を持つ拒否の `NO_TRADE_EXIT`、commit 済み entry decision が同じ run に存在する
+- **THEN** run outcome は no-entry のままで、final reason は最新の `NO_TRADE_EXIT` の reason を保持する
 
 #### Scenario: 拒否イベントは削除されない
 

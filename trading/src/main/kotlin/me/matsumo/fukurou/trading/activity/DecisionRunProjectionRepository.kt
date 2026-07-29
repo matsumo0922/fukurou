@@ -55,7 +55,7 @@ data class DecisionRunOutcomeEvidence(
     val filledOrderCount: Int,
     val executionCount: Int,
     val hasNoTradeExit: Boolean,
-    val noTradeExitHasRejectionCode: Boolean = false,
+    val hasNonRejectionNoTradeExit: Boolean = false,
     val openOrderCount: Int = 0,
     val expiringOpenOrderCount: Int = 0,
     val overdueOpenOrderCount: Int = 0,
@@ -113,9 +113,11 @@ private fun DecisionRunOutcomeEvidence.hasNoEntryEvidence(): Boolean {
     if (action == DecisionAction.NO_TRADE.name) return true
 
     val hasCommittedTradeDecision = action != null && action != DecisionAction.NO_TRADE.name
-    val rejectedSubmissionSuperseded = hasCommittedTradeDecision && noTradeExitHasRejectionCode
+    val onlySubmissionRejectionsSuperseded = hasCommittedTradeDecision &&
+        hasNoTradeExit &&
+        !hasNonRejectionNoTradeExit
 
-    return hasNoTradeExit && !rejectedSubmissionSuperseded
+    return hasNoTradeExit && !onlySubmissionRejectionsSuperseded
 }
 
 /** outcome が目的別 filter に一致するかを返す。 */

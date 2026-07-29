@@ -109,7 +109,7 @@ private val LIST_RUNS_SQL = """
         execution_count.value AS execution_count,
         no_trade.reason AS no_trade_reason,
         no_trade.present AS has_no_trade_exit,
-        no_trade.has_rejection_code AS no_trade_exit_has_rejection_code,
+        no_trade_aggregate.has_non_rejection AS has_non_rejection_no_trade_exit,
         entry_order.id AS entry_order_id,
         entry_order.intent_id AS entry_intent_id,
         entry_order.position_id AS entry_position_id,
@@ -198,7 +198,6 @@ private val LIST_RUNS_SQL = """
     LEFT JOIN LATERAL (
         SELECT
             $SAFE_NO_TRADE_REASON_EXPRESSION AS reason,
-            $SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION AS has_rejection_code,
             TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
@@ -206,6 +205,12 @@ private val LIST_RUNS_SQL = """
         ORDER BY ts DESC, id DESC
         LIMIT 1
     ) no_trade ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT BOOL_OR(NOT ($SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION)) AS has_non_rejection
+        FROM command_event_log
+        WHERE decision_run_id = run.invocation_id
+            AND event_type = 'NO_TRADE_EXIT'
+    ) no_trade_aggregate ON TRUE
     ORDER BY run.started_at DESC, run.invocation_id DESC
 """
 
@@ -299,7 +304,7 @@ private val FIND_RUN_SQL = """
         ) AS actor_canceled_order_count,
         no_trade.reason AS no_trade_reason,
         no_trade.present AS has_no_trade_exit,
-        no_trade.has_rejection_code AS no_trade_exit_has_rejection_code
+        no_trade_aggregate.has_non_rejection AS has_non_rejection_no_trade_exit
     FROM llm_runs run
     LEFT JOIN LATERAL (
         SELECT * FROM decisions
@@ -329,7 +334,6 @@ private val FIND_RUN_SQL = """
     LEFT JOIN LATERAL (
         SELECT
             $SAFE_NO_TRADE_REASON_EXPRESSION AS reason,
-            $SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION AS has_rejection_code,
             TRUE AS present
         FROM command_event_log
         WHERE decision_run_id = run.invocation_id
@@ -337,6 +341,12 @@ private val FIND_RUN_SQL = """
         ORDER BY ts DESC, id DESC
         LIMIT 1
     ) no_trade ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT BOOL_OR(NOT ($SAFE_NO_TRADE_REJECTION_CODE_EXPRESSION)) AS has_non_rejection
+        FROM command_event_log
+        WHERE decision_run_id = run.invocation_id
+            AND event_type = 'NO_TRADE_EXIT'
+    ) no_trade_aggregate ON TRUE
     WHERE run.invocation_id = ?
         AND run.trigger_kind IS DISTINCT FROM 'REFLECTION'
 """
@@ -848,7 +858,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val terminalCause = getString("terminal_cause")?.let(LlmRunTerminalCause::valueOf)
     val noTradeReason = getString("no_trade_reason")
     val hasNoTradeExit = getBoolean("has_no_trade_exit")
-    val noTradeExitHasRejectionCode = getBoolean("no_trade_exit_has_rejection_code")
+    val hasNonRejectionNoTradeExit = getBoolean("has_non_rejection_no_trade_exit")
     val openOrderCount = getInt("open_order_count")
     val expiringOpenOrderCount = getInt("expiring_open_order_count")
     val overdueOpenOrderCount = getInt("overdue_open_order_count")
@@ -856,9 +866,11 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
     val canceledEntryOrderCount = getInt("canceled_entry_order_count")
     val actorCanceledOrderCount = getInt("actor_canceled_order_count")
     val hasCommittedTradeDecision = action != null && action != DecisionAction.NO_TRADE.name
-    val rejectedSubmissionSuperseded = hasCommittedTradeDecision && noTradeExitHasRejectionCode
+    val onlySubmissionRejectionsSuperseded = hasCommittedTradeDecision &&
+        hasNoTradeExit &&
+        !hasNonRejectionNoTradeExit
     val finalReason = noTradeReason
-        .takeUnless { rejectedSubmissionSuperseded }
+        .takeUnless { onlySubmissionRejectionsSuperseded }
         .safeDecisionRunFinalReason()
 
     return DecisionRunSummary(
@@ -899,7 +911,7 @@ private fun ResultSet.toSummary(includeOrder: Boolean = true): DecisionRunSummar
                 filledOrderCount = filledOrderCount,
                 executionCount = executionCount,
                 hasNoTradeExit = hasNoTradeExit,
-                noTradeExitHasRejectionCode = noTradeExitHasRejectionCode,
+                hasNonRejectionNoTradeExit = hasNonRejectionNoTradeExit,
                 openOrderCount = openOrderCount,
                 expiringOpenOrderCount = expiringOpenOrderCount,
                 overdueOpenOrderCount = overdueOpenOrderCount,

@@ -100,11 +100,11 @@ canary は `awaitCompletion()` の後 `use { }` を抜けて `close()` する。
 
 `ToolCallGuard.runAndAudit` は tool 失敗を検知した時点で `NO_TRADE_EXIT` を書く（`ToolCallGuard.kt:174`）。single-shot の現在は初回拒否が run terminal なので「拒否イベントがある run」と「entry が成立した run」は排他だが、再提出が可能になるとこの前提が崩れる。
 
-run outcome は `hasNoEntryEvidence()`（`DecisionRunProjectionRepository.kt:111-113`）が `action == NO_TRADE || hasNoTradeExit` で判定しており、後者は `command_event_log` の最新 `NO_TRADE_EXIT` 1 行の存在（`ExposedDecisionRunProjectionRepository.kt:193-199`）に基づく。このままだと「拒否 → 再提出で ENTER 受理」の run が `NO_ENTRY` かつ finalReason `tool_call_failed` として表示される。
+run outcome は `hasNoEntryEvidence()`（`DecisionRunProjectionRepository.kt:112-120`）が `action == NO_TRADE || hasNoTradeExit` を基礎に判定する。再提出対応では、commit 済み trade decision がある run の submission 拒否を superseded にする必要がある一方、同じ run に汎用 tool 失敗が混在する場合は no-entry 証跡を保持する必要がある。最新 `NO_TRADE_EXIT` 1 行だけから rejection の種類を判定すると、先行する汎用 tool 失敗の有無が後続イベントの順序で見えなくなる。
 
-判定を「commit 済み trade decision があり、最新 `NO_TRADE_EXIT` payload が `rejectionCode` キーを持つ場合だけ、その拒否理由を superseded とする」形へ変える。`tool_call_failed` は `submit_decision` 以外の tool 失敗にも使う汎用 reason なので、reason だけでは submission 拒否由来と判定しない。payload は TEXT だが PostgreSQL の `pg_input_is_valid(payload, 'jsonb')` で valid JSON を確認したうえで、`jsonb_exists(payload::jsonb, 'rejectionCode')` により top-level key の有無を判定する。拒否イベント自体は診断価値があるため削除しない。
+SQL projection は 2 つの独立した LATERAL に分ける。既存の LATERAL は `ORDER BY ts DESC, id DESC LIMIT 1` を維持して表示用の最新 reason と `NO_TRADE_EXIT` の存在を返す。隣の集約用 LATERAL は全 `NO_TRADE_EXIT` を対象に、`rejectionCode` を持たない行が 1 件でもあるかを `BOOL_OR` で返す。payload は TEXT なので、既存の `pg_input_is_valid(payload, 'jsonb')` と `jsonb_exists(payload::jsonb, 'rejectionCode')` の安全な式を再利用し、invalid JSON も supersede できない証跡として扱う。行が 1 件もない場合の NULL は JDBC の `getBoolean` により false になる。
 
-これにより、拒否後に entry が受理された run では先行する拒否由来の `NO_TRADE_EXIT` を no-entry 証跡から除外する一方、entry commit 後の `place_order` 失敗など `rejectionCode` を持たない `tool_call_failed` は final reason と no-entry outcome に残る。
+commit 済み trade decision があり、`NO_TRADE_EXIT` が存在し、かつ全行が `rejectionCode` を持つ場合だけ、no-entry 証跡と final reason を superseded とする。`rejectionCode` を持たない汎用 tool 失敗が 1 件でもあれば、記録順序にかかわらず最新 reason と no-entry outcome を残す。拒否イベント自体は診断価値があるため削除しない。
 
 **代替案**: 再提出成功時に先行の `NO_TRADE_EXIT` を削除または無効化する。却下 — 監査イベントの遡及的な書き換えになり、「観測できなかった事象を後から作らない / 消さない」原則に反する。診断のための記録が消えると issue #316 の目的も損なう。
 

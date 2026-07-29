@@ -3795,6 +3795,42 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun decisionRunProjectionKeepsGenericFailureWhenLatestNoTradeExitIsRejection() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val llmRunRepository = ExposedLlmRunRepository(database)
+        val invocationId = "generic-failure-before-submission-rejection"
+
+        insertFinishedDecisionRun(llmRunRepository, invocationId, status = "SUCCEEDED", errorMessage = null)
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = invocationId,
+            payload = """{"reason":"tool_call_failed"}""",
+            occurredAt = fixedInstant().plusSeconds(1),
+        )
+        appendNoTradeExit(
+            database = database,
+            decisionRunId = invocationId,
+            payload = """{"reason":"tool_call_failed","rejectionCode":"phase_binding_mismatch"}""",
+            occurredAt = fixedInstant().plusSeconds(2),
+        )
+        ExposedDecisionRepository(
+            database = database,
+            clock = Clock.fixed(fixedInstant().plusSeconds(3), ZoneOffset.UTC),
+        ).submitDecision(
+            enterDecisionSubmission().copy(invocationId = invocationId),
+        ).getOrThrow()
+
+        val repository = ExposedDecisionRunProjectionRepository(database)
+        val summary = repository.listRuns(cursor = null, limit = 10).getOrThrow().runs.single()
+        val detail = requireNotNull(repository.findRun(invocationId).getOrThrow())
+
+        assertEquals(DecisionRunOutcome.NO_ENTRY, summary.outcome)
+        assertEquals("tool_call_failed", summary.finalReason)
+        assertEquals(DecisionRunOutcome.NO_ENTRY, detail.summary.outcome)
+        assertEquals("tool_call_failed", detail.summary.finalReason)
+    }
+
+    @Test
     fun decisionRunProjectionKeepsInvalidNoTradePayloadFailSafe() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val llmRunRepository = ExposedLlmRunRepository(database)

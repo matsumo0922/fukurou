@@ -23,6 +23,7 @@
 - [x] 4.2 「拒否 → 再提出で entry 受理」の run が no-entry にならないテストを追加する
 - [x] 4.3 「拒否のみで受理なし」の run が従来どおり no-entry のままであるテストを追加する
 - [x] 4.4 「entry commit 後に `rejectionCode` を持たない `tool_call_failed`」の final reason と no-entry outcome が保持される単体・PostgreSQL 統合テストを追加する
+- [x] 4.5 全 `NO_TRADE_EXIT` から supersede できない汎用 failure の有無を集約し、「generic failure → submission 拒否 → entry commit」の混在順序を単体・PostgreSQL 統合テストで固定する
 
 ## 5. 回帰テスト
 
@@ -38,3 +39,4 @@
 
 - [x] 6.1 `make detekt` を通す
 - [x] 6.2 `make test` を通す
+- [x] 6.3 blocking review 修正後に `openspec validate submission-retry-within-run --strict`、`make detekt`、`make test` を再実行する
