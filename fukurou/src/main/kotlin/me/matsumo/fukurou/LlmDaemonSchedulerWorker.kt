@@ -441,6 +441,7 @@ private fun createLlmDaemonPreFilter(
                     clock = inputs.clock,
                     commandRendererConfig = commandRendererConfig.copy(claudeModel = HAIKU_PRE_FILTER_MODEL),
                 ),
+                authEvidenceState = inputs.authEvidenceState,
             ),
         ),
         parentEnvironment = inputs.environment,
