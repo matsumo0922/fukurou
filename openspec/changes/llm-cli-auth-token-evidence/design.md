@@ -4,13 +4,9 @@
 
 失効の事実は監査記録（`command_event_log` の `RUNNER_PHASE_COMPLETED`）には残っていた。issue #295 で導入した output-interpreted 経路により、Codex の OUTPUT_CONTRACT failure で redaction 後の stderr が保存されるため、operator は PR #300 のデプロイ後に stderr 本文を読んで原因を特定できた。つまり evidence は既に DB にあり、監視 API がそれを見ていないだけである。
 
-重要な制約が1つある。**当該障害の stderr は既存の認証 evidence 判定のどれにも一致しない**。
+issue #306（PR #324）が既にこの evidence の観測を解決している。当該障害の stderr 文言（`refresh_token_reused` / `token_expired` / `Failed to refresh token`）が `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` に追加され、`authFailureSuspected` が `primary category == AUTHENTICATION || authEvidenceObserved` へ変わった。したがって、当該障害と同形の run は既に `authFailureSuspected = true` として観測される。
 
-- `stderrAuthFailure`（primary category `AUTHENTICATION` の判定）は `CODEX_STDERR_AUTH_FAILURES` の2文言と stderr 全体の完全一致を要求する。障害時の stderr は複数行の log であり一致しない。
-- `knownCompatibilityFailureCategory()` は `turn.failed` / `error` event の message を `trim()` 後の完全一致で分類する。障害時は JSONL event 自体が出ていない。
-- `authEvidenceObserved` は `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS`（上記2文言 + "Not logged in" / "Invalid authentication credentials"）の部分一致で立つ。`refresh_token_reused` も `token_expired` も含まれない。
-
-したがって `authFailureSuspected` や `authEvidenceObserved` をそのまま監視 API へ繋ぐだけでは、issue が根拠として挙げた当の障害を検知できない。credential lifecycle の失敗文言を追跡する signal を新設する必要がある。
+本 change はその観測結果を監視 API の status へ繋ぐ部分だけを担う。文言の追跡や新しい signal は追加しない。
 
 もう1つ、判定規則の設計を強く縛る事実がある。**LLM invocation は persistent credential source を直接使わず、per-run home への copy を使う。** `DefaultLlmCommandRenderer.copyCodexAuthFile()` は source を temp directory へ `Files.copy(..., COPY_ATTRIBUTES)` し、run 後は copy を削除するだけで source へ書き戻さない。したがって「invocation が成功した」は per-run copy が使えたことの証拠であり、次回も copy 元になる persistent source が今も有効であることの証拠ではない。Codex CLI が実行中に refresh token を rotate して copy 側にだけ書く場合、成功直後の次 run が `refresh_token_reused` になり得る。この非対称性が本設計の判定規則を決める。
 
@@ -35,44 +31,19 @@
 
 ## Decisions
 
-### D1: 監視 API は evidence を監査記録から読み、実 probe を行わない
+### D1: 監視 API は観測済み evidence を使い、実 probe を行わない
 
 issue の候補1（失効 evidence の反映）を採る。候補2（実 probe）は、Codex CLI に副作用のない軽量な認証検証 subcommand が存在せず、`codex login --device-auth` は新しい device flow を開始してしまう。`codex exec` 相当を叩けば LLM 起動回数 policy と衝突する。監視 endpoint が polling される（WebUI System は 30 秒間隔で refetch する）ことを踏まえると、実 probe は policy 上も負荷上も採用できない。
 
 **代替案**: `auth.json` の JWT payload を読んで exp を検証する。却下する。credential file の中身を読むことは secret 境界を監視 layer へ広げる。また Codex の auth.json 形式は CLI の内部実装であり pin していないため、形式変更で silent に壊れる。
 
-### D2: credential lifecycle failure を独立 signal として audit payload に出す
+### D2: evidence 源は既存の `authFailureSuspected` とする
 
-`RUNNER_PHASE_COMPLETED.details` に `authTokenFailureObserved` を追加する。`DefaultLlmOutputParser.parseCodex()` が、既存の `authEvidenceObserved` とは独立に、`CODEX_CREDENTIAL_LIFECYCLE_FAILURE_TEXTS` の部分一致を stdout / stderr に対して追跡する。
+issue #306 が `authFailureSuspected` を `primary category == AUTHENTICATION || authEvidenceObserved` へ拡張し、本 issue が根拠とする障害の文言を evidence 集合へ追加した。監視 API はこの既存 signal をそのまま evidence 源として使う。
 
-既存の `authEvidenceObserved` を拡張するのではなく別 signal にする理由は、`authEvidenceObserved` が raw output 保持の抑止条件として使われているため。文言を足すと OUTPUT_CONTRACT 系 failure の stdout / stderr が保存されなくなり、まさに今回の障害を人間が診断できた経路を塞ぐ。監視 status の強化と診断情報の抑止は別の関心事であり、片方の変更が他方の policy を動かしてはならない。
+**新しい signal を追加しない。** 同じ文言を2箇所で追跡すると、CLI の log 文言が変わったときに片方だけ更新される。`authFailureSuspected` は「認証失敗を疑う」ことを表す運用 signal として既に定義されており、監視 status が表す意味と一致する。
 
-**代替案 A**: `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` に文言を追加する。却下する。上記のとおり raw output 保持 policy（`llm-cli-invocation-contract` の requirement）を変えてしまい、変更の scope が監視強化を超える。
-
-**代替案 B**: auth service が audit payload に保存された redacted stderr を読み、そこで文言照合する。却下する。raw provider output を監視 layer へ持ち込むうえ、保持条件（issue #291 / #295 で2度変わっている）に依存するため、保持 policy が変わった瞬間に検知が silent に壊れる。
-
-追跡する文言は、issue に記録された実 stderr から取る。
-
-| 文言 | 根拠 |
-|---|---|
-| `refresh_token_reused` | 障害時の `codex_login::auth::manager` stderr |
-| `token_expired` | 障害時の `codex_models_manager::manager` stderr |
-| `Failed to refresh token` | 同上。refresh 失敗の一般形 |
-
-`401 Unauthorized` は含めない。認証以外の 401（MCP や外部 HTTP の失敗が stdout へ混ざる場合）を credential 失効として誤検知するため。
-
-### D2a: signal は失敗 context に限定する
-
-文言の部分一致だけを条件にすると、valid token の正常 invocation が semantic response でこれらの文言に言及した場合（障害の事後分析を LLM に投げる、prompt が過去の障害 log を含む、など）に false-positive で `token_suspect` になる。監視 API が「正常時は `logged_in`」を破る。
-
-そこで signal は次の両方を満たす場合にだけ立てる。
-
-1. 追跡文言のいずれかを stdout または stderr に含む
-2. その invocation が provider failure に終わっている（`providerFailure != null`）、または terminal event を1つも解析できていない
-
-1つの成功 terminal event を持ち provider failure の無い invocation では、文言が本文に現れても signal を立てない。CLI が失敗を報告していない以上、その文言は agent の出力内容であって credential lifecycle の事実ではない。
-
-なお条件2 を満たす失敗 invocation の本文に文言が現れる false-positive は残る（失敗した run の途中出力が過去の障害文言を含む場合）。この残存 risk は受容する。結果は「`token_suspect` と表示され、operator が auth.json の mtime と直近 run を確認する」であり、逆方向の誤り（失効中に `logged_in` を返す）より害が小さい。
+**代替案**: credential lifecycle 専用の signal を別に持つ。却下する。#306 以前は「文言を `CODEX_KNOWN_AUTH_EVIDENCE_TEXTS` へ足すと raw output 保持 policy が変わる」ことが分離の理由だったが、#306 がその変更を意図的な trade-off として既に受け入れたため、分離する理由が残っていない。
 
 ### D3: evidence は in-process の live state として保持し、DB を検索しない
 
@@ -160,26 +131,27 @@ reflection は provider として Codex を選択し得るため、one-shot だ�
 
 ### D7: PR を2段の stacked PR に分ける
 
-- **PR 1（`:trading` の runtime 変更 + cross-module の fixture 更新）**: parser の credential lifecycle 追跡、renderer が観測する credential source mtime の運搬、auditor による `authTokenFailureObserved` / `authSourceObservedAt` の payload 出力、`LlmAuthEvidenceState` の定義と auditor からの更新。`ParsedLlmOutput` / `LlmInvocationResult` に default なしの field を足すため、`:fukurou` の test fixture（`OpsRouteTest` が直接 `LlmInvocationResult(...)` を構築している）も同じ PR で更新する。監視側の挙動は変えない。
+- **PR 1（`:trading`）**: credential 世代（`authSourceObservedAt`）の観測と運搬、`LlmAuthEvidenceState` の定義、auditor からの記録。監視側の挙動は変えない。
 - **PR 2（`:fukurou`、base は PR 1）**: `TOKEN_SUSPECT` status、`DefaultLlmAuthService` の判定、`Application.kt` の wiring、route の `.describe {}`、docs。
 
-PR 2 は PR 1 が定義する state と payload field に依存するため、この順序でなければ PR 2 単独では evidence を作れない。PR 1 は単独で merge しても、payload に key が2つ増え in-process state が誰にも読まれないだけで、既存 consumer に影響しない。
+PR 2 は PR 1 が定義する state に依存するため、この順序でなければ PR 2 単独では evidence を作れない。PR 1 は単独で merge しても、payload に診断 key が1つ増え in-process state が誰にも読まれないだけで、既存 consumer に影響しない。
+
+新しい field は既存 data class の default 付き引数として足すため、cross-module の test fixture を壊さない。
 
 ## Risks / Trade-offs
 
-- **[既知文言の照合は不完全]** → CLI の log 文言が変われば検知が silent に落ちる。緩和: 文言集合を `internal` な定数として1箇所に置き、根拠（どの障害の stderr か）を KDoc に残す。加えて `authFailureSuspected`（primary category `AUTHENTICATION`）も evidence として併用するため、CLI が構造化された認証失敗を返す経路は文言に依存せず検知できる。これは完全性の主張ではなく、既知の失敗形に対する検知である旨を spec に明記する。
+- **[既知文言の照合は不完全]** → `authFailureSuspected` は既知文言との一致と primary category 解決に依存するため、CLI の log 文言が変われば検知が silent に落ちる。これは #306 が既に受け入れている限界であり、本 change はそれを引き継ぐ。完全性の主張ではなく既知の失敗形に対する検知である旨を spec に明記する。
 - **[降格は再ログインでしか解除されない]** → 一過性の認証失敗が自然回復しても `token_suspect` が残り、operator が不要な再ログインをする。D4 の意図的な trade-off として受容する。逆方向（失効中に `logged_in`）が本 issue の原因であり、そちらを確実に潰すことを優先する。
-- **[失敗 invocation の本文に文言が現れる false-positive]** → D2a の条件2 を満たす run が本文で追跡文言に言及すると降格する。受容する。結果は operator の確認作業であり、取引には影響しない。
+- **[本文への言及による false-positive]** → invocation の出力本文が既知の認証文言に言及すると `authFailureSuspected` が立ち、降格する。#306 が受け入れた限界を引き継ぐ。結果は operator の確認作業であり、取引には影響しない。
 - **[marker mtime が更新されない再ログイン経路があると降格が解除されない]** → 誤って `token_suspect` のまま残る。緩和: root 実行 login が appuser の auth source を更新しない問題は `llm-cli-invocation-contract` で既に「使ってはならない手順」として規定済み。正規手順は auth.json を更新する。運用 doc に「再ログイン後も token_suspect が残る場合は auth.json の mtime を確認する」を追記する。
 - **[process 再起動で evidence state が消える]** → 再起動直後は失効中でも `logged_in` を返し、次の in-process invocation まで戻らない。`daemon.enabled` / `llm.launchEnabled` が false の構成では長期間続き得る。D3 の検知範囲としてユーザー確認済みで受容する。
 - **[別プロセスの direct runner が対象外]** → `OneShotRunnerMain` で観測した失効は監視 API に届かない。D3 の検知範囲としてユーザー確認済みで受容し、spec で明示的に除外する。
 - **[再ログインが同一 mtime 内に収まると解除できない]** → filesystem の timestamp 分解能内で再ログインが完了し marker の mtime が失敗時と同値のままだと、equality を現世代として扱う規則により `token_suspect` が解除されない。解除手段が再ログインだけなので、operator は mtime が変わるまで待って再度 login する必要がある。runbook に明記する。同値を旧世代側に倒すと失効を見逃すため、この向きを選ぶ。
 - **[Claude の credential file 選択が renderer と auth service で一致しない]** → renderer は候補のうち最初の regular file を copy し、auth service は最初の非空 regular file を marker とする。先頭候補が空 file の異常時にだけ、両者が別 file を指し Claude の世代比較が誤る。issue の「やらないこと」に沿って Claude 側の深追いはせず、既知の限界として PR に記録する。Codex は候補が1つのため影響しない。
 - **[copy と mtime 取得の race]** → 両者の間に再ログインが割り込むと世代が実際より古く記録され得る。D3a のとおり誤りは「失効を見逃す」方向に倒し、次の invocation が作り直す。
-- **[運用上の詰み]** → D2a の残存 false-positive や一過性の失敗で `token_suspect` になった場合、成功 run では解除できず、operator が device login を完了できない状況では表示が固定される。取引・readiness には影響しないため受容し、runbook に「再ログイン以外の解除経路はない」と明記する。別の解除機構は scope 拡大のため本 change では追加しない。
+- **[運用上の詰み]** → 上記の false-positive や一過性の失敗で `token_suspect` になった場合、成功 run では解除できず、operator が device login を完了できない状況では表示が固定される。取引・readiness には影響しないため受容し、runbook に「再ログイン以外の解除経路はない」と明記する。別の解除機構は scope 拡大のため本 change では追加しない。
 - **[status 値の追加が consumer を壊す]** → WebUI は status 文字列をそのまま表示し `logged_in` との完全一致で件数を数えるため、`token_suspect` は「logged in ではない」として自動的に正しく扱われる。緩和: WebUI の変更は不要だが、表示文言の確認を tasks に含める。
-- **[Codex 限定]** → Claude の refresh token 失効は同じ精度で検知できない。issue の「やらないこと」に沿って先送りし、PR 2 の description に既知の限界として記録する。
-- **[既存の raw output 保持に伴う residual risk]** → tracked lifecycle 文言を含む stderr は issue #291 / #295 の policy により既に保持されており、redactor が知らない値が同居する可能性は現状のまま残る。本変更は新しい保持経路を作らない（D2 により signal は保持判定に参加しない）。既存の accepted risk として PR に明記する。
+- **[Codex 限定の検知精度]** → Claude は `authEvidenceObserved` の対象外であり、`authFailureSuspected` は primary category が `AUTHENTICATION` の場合しか立たない。Claude の refresh token 失効は同じ精度で検知できない。issue の「やらないこと」に沿って先送りする。
 
 ## Migration Plan
 

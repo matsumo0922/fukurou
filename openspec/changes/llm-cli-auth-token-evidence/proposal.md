@@ -5,8 +5,7 @@
 ## What Changes
 
 - `LlmAuthStatus` に `token_suspect` を追加する。credential marker は存在するが、現在の credential を使った LLM invocation が認証失敗 evidence を残している状態を表す。
-- Codex の output parser が、既存の認証 evidence 判定では捕捉できない credential lifecycle の失敗文言（`refresh_token_reused` / `token_expired` / `Failed to refresh token`）を独立に追跡する。
-- LLM invocation が失敗 evidence を観測した時点で、in-process の live state に記録する。daemon tick の liveness を `MutableLlmDaemonTickStatus` が保持しているのと同じ形にし、監視 API は DB を検索しない。
+- LLM invocation が認証失敗を観測した時点（issue #306 が拡張した `authFailureSuspected`）で、in-process の live state に記録する。新しい signal は追加しない。daemon tick の liveness を `MutableLlmDaemonTickStatus` が保持しているのと同じ形にし、監視 API は DB を検索しない。
 - 再ログイン後に古い evidence が残り続けないよう、evidence にその run が使った credential source の mtime を持たせ、現在の marker mtime より古い世代の evidence は無視する。WebUI login と `docker exec` fallback login のどちらでも marker が更新されるため、両経路で降格が解除される。
 - 成功した invocation では降格を解除しない。invocation は persistent credential source の per-run copy を使い source へ書き戻さないため、成功は source が今も有効であることの証拠にならない。
 - marker の mtime を読めない場合は `logged_in` を維持せず `unknown` を返す。判定できない状態を「正常」と報告しない。
@@ -26,7 +25,6 @@
 
 ## Impact
 
-- `trading/.../invoker/DefaultLlmOutputParser.kt`: credential lifecycle 文言の独立追跡。
 - `trading/.../invoker/DefaultLlmCommandRenderer.kt`: credential source の mtime 観測。
 - `trading/.../runner/LlmInvocationAuditor.kt`: audit payload への診断 field 追加と、in-process evidence state の更新。
 - 新規 `LlmAuthEvidenceState`: provider ごとの最後の失敗 evidence を保持する in-process state（`MutableLlmDaemonTickStatus` と同型）。

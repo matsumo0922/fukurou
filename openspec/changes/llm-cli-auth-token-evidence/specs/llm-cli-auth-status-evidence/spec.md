@@ -1,44 +1,5 @@
 ## ADDED Requirements
 
-### Requirement: Codex credential lifecycle failures are tracked independently of raw output retention
-
-**Trace:** Issue #305 受け入れ条件「Codex の token が失効している状態（または失効 evidence が直近 run に存在する状態）で、`/ops/llm-auth` が `logged_in` 以外の状態を返す」
-
-The Codex output parser SHALL track, independently of both its first-match primary category resolution and its `authEvidenceObserved` tracking, whether the invocation reported a credential lifecycle failure. The tracked text set SHALL consist of texts observed in a real production credential expiry (`refresh_token_reused`, `token_expired`, `Failed to refresh token`) and SHALL NOT include bare HTTP status text such as `401 Unauthorized`, because a non-authentication 401 from another source in the same output would otherwise be misread as credential expiry.
-
-The signal SHALL require a failure context in addition to the text match: the invocation SHALL have resolved to a provider failure, or SHALL have produced no parseable terminal event. An invocation that completed with exactly one successful terminal event and no provider failure SHALL NOT set the signal even when its response text mentions a tracked string, so that a valid-token invocation discussing a past incident is not reported as a credential failure.
-
-This signal SHALL NOT participate in the raw stdout/stderr retention decision defined by the provider-failure-category requirements. Adding a text to the credential lifecycle set SHALL NOT change which invocations retain redacted raw output, so that the diagnostic evidence that allows a human to identify an unknown failure mode remains available.
-
-The LLM invocation auditor SHALL record this signal in the `RUNNER_PHASE_COMPLETED` audit payload as an allowlisted non-secret marker, present only when the signal is true.
-
-This is detection of known failure shapes, not a proof of credential validity. A CLI log wording change SHALL be treated as a detection gap, not as evidence that credentials are valid.
-
-#### Scenario: Codex stderr reports a reused refresh token
-
-- **WHEN** a Codex invocation's stderr contains `refresh_token_reused` while its stdout carries no parseable terminal event
-- **THEN** the parsed output records the credential lifecycle failure signal as true, and the audit payload for that phase carries the corresponding marker
-
-#### Scenario: Codex output reports an expired token during a failed invocation
-
-- **WHEN** a Codex invocation resolves to a provider failure and its stdout or stderr contains `token_expired` or `Failed to refresh token`
-- **THEN** the parsed output records the credential lifecycle failure signal as true
-
-#### Scenario: A successful invocation mentions a tracked text in its response
-
-- **WHEN** a Codex invocation completes with exactly one successful terminal event and no provider failure, and its agent message text contains `refresh_token_reused`
-- **THEN** the credential lifecycle failure signal remains false, and the audit payload omits the marker
-
-#### Scenario: Raw output retention is unchanged by the new signal
-
-- **WHEN** a Codex invocation resolves to `OUTPUT_CONTRACT`, observes no known authentication-evidence text, and contains a credential lifecycle failure text
-- **THEN** the audit payload still retains the redacted stdout and stderr, because the credential lifecycle signal is not a retention-suppressing condition
-
-#### Scenario: A non-authentication 401 appears in output
-
-- **WHEN** a Codex invocation's output contains `401 Unauthorized` without any tracked credential lifecycle text
-- **THEN** the credential lifecycle failure signal remains false
-
 ### Requirement: Invocation evidence records the credential generation it ran against
 
 **Trace:** Issue #305 受け入れ条件「正常時は従来どおり `logged_in` を返す（回帰テスト 1 本）」
@@ -68,7 +29,7 @@ The same value SHALL also be written to the phase audit payload as a non-secret 
 
 **Trace:** Issue #305 受け入れ条件「Codex の token が失効している状態で `/ops/llm-auth` が `logged_in` 以外の状態を返す」「正常時は従来どおり `logged_in` を返す」
 
-`GET /ops/llm-auth` SHALL NOT report a provider as `logged_in` on the basis of credential marker file presence alone. When a credential marker is present, the service SHALL consult in-process invocation evidence for that provider and SHALL report `token_suspect` instead of `logged_in` when that evidence records an authentication or credential lifecycle failure for the current credential generation.
+`GET /ops/llm-auth` SHALL NOT report a provider as `logged_in` on the basis of credential marker file presence alone. When a credential marker is present, the service SHALL consult in-process invocation evidence for that provider and SHALL report `token_suspect` instead of `logged_in` when that evidence records an authentication failure for the current credential generation.
 
 The evidence SHALL be held as in-process live state, updated by the invocation path at the point where it observes a failure, and read by the status endpoint without querying the audit database. The state SHALL hold only the provider, the observation time, and the credential generation — not provider output, exception text, or credential content.
 
@@ -80,7 +41,7 @@ Every invocation path inside the serving process SHALL share one evidence state 
 
 **Scope of detection.** This requirement covers failures observed by invocations running inside the serving process. It does NOT cover a separate maintenance process that runs the one-shot runner directly, whose observations cannot reach the serving process's state, and it does NOT survive a restart of the serving process. Both are accepted limitations rather than defects: the direct runner is an isolated operator-supervised maintenance action, and a process that runs no invocations is also producing no invocation failures.
 
-Authentication evidence SHALL consist of the authentication-failure suspicion signal and the Codex credential lifecycle failure signal.
+Authentication evidence SHALL be the existing authentication-failure suspicion signal, which is already set both when the invocation resolves to the authentication category and when known authentication-evidence text is observed in its output. This change SHALL NOT introduce a second, parallel signal tracking the same texts.
 
 A later invocation without a failure signal SHALL NOT clear an earlier failure of the same generation, because an invocation succeeds against a per-run copy of the credential and therefore does not prove that the persistent source is still valid, and because an invocation may fail for non-authentication reasons without carrying any authentication signal. The downgrade SHALL be cleared only by a credential marker update, which starts a new generation.
 
@@ -90,12 +51,12 @@ The status vocabulary SHALL remain a closed set of stable wire values, and `toke
 
 #### Scenario: A current-generation run shows credential expiry
 
-- **WHEN** the Codex credential marker is present and the in-process evidence records a credential lifecycle failure for the current generation
-- **THEN** `/ops/llm-auth` reports `token_suspect` for Codex with a non-secret detail that names the evidence, rather than `logged_in`
+- **WHEN** the Codex credential marker is present and a Codex invocation running against the current credential reports a refresh-token expiry, so the authentication-failure suspicion signal is set
+- **THEN** `/ops/llm-auth` reports `token_suspect` for Codex with a non-secret detail, rather than `logged_in`
 
-#### Scenario: A current-generation run shows an authentication category failure
+#### Scenario: A current-generation run resolves to the authentication category
 
-- **WHEN** the credential marker is present and the evidence records an authentication-failure suspicion for the current generation
+- **WHEN** the credential marker is present and an invocation running against the current credential resolves to the authentication failure category
 - **THEN** `/ops/llm-auth` reports `token_suspect` for that provider
 
 #### Scenario: A later invocation succeeds
