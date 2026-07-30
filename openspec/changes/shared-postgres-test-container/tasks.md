@@ -75,10 +75,20 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 
 本 change の必須スコープ。delta spec が replay 3 class の共有化を MUST として規定しているため、省略すると change を完了できない。
 
+### PR3 から送られた項目
+
+- [ ] `withDatabase` を suspend 化し、`runPostgresTest` の二重 `runBlocking` を解消する（PR3 レビュー F8）
+- [ ] JDBC URL の query parse を共有 helper 1 箇所に集約する（PR3 レビュー NEW-3。現在 `TestPostgresSupport` / `SharedTestPostgres` / `SharedTestPostgresTest` の 3 箇所）
+- [ ] `adminQueryParameters()` の値を decode してから `withJdbcQueryParameters` へ渡す（PR3 レビュー NEW-1。percent-encoded な値で二重 encode になる。現状は到達不能）
+- [ ] `POSTGRES_IMAGE` の重複を共有 fixture の定数へ集約する（現在 5 箇所）
+- [ ] `SharedTestPostgres` の型パラメータ `SELF` を除去する（どのメンバも露出しておらず `BoundedTestPostgresContainer<*>` で足りる）
+
+### replay 系の載せ替え
+
 - [ ] `TtlShorteningReplayIntegrationTest`（`runReplayTest`、`:331-349`）を database per test に変える
 - [ ] `TailFactSheetIntegrationTest` を同様に変える
 - [ ] `OneShotRunnerMainTest` を同様に変える
-- [ ] container 起動回数が 17 → 3 になったことを確認する
+- [ ] container 起動回数が 11 → 3 になったことを確認する（実測: `TtlShorteningReplayIntegrationTest` 5 / `TailFactSheetIntegrationTest` 5 / `OneShotRunnerMainTest` 1。当初見積もりの 17 は誤り）
 - [ ] full validation を実行する
 
 ## 全 PR 共通の確認

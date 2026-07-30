@@ -13034,7 +13034,7 @@ private class FukurouPostgresContainer :
 /**
  * 共有 container 上の専用 database で Postgres integration test を実行する。
  *
- * container は class 全体で 1 個だけ起動し、test method ごとに空の database を貸す。
+ * container は [sharedPostgres] が 1 個だけ起動し、test method ごとに空の database を貸す。
  * schema を破壊する test や migration 前の状態を要求する test も互いに影響しない。
  */
 private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = runBlocking {

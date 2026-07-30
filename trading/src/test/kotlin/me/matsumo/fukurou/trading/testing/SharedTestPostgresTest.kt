@@ -156,12 +156,16 @@ class SharedTestPostgresTest {
             }
         }
 
+        // stop() の失敗で class 全体を failure にしないよう包む。test の結果を cleanup が上書きしない。
         @AfterClass
         @JvmStatic
         fun stopSharedContainer() {
-            container?.stop()
+            val probe = container
+
             container = null
             sharedOrNull = null
+
+            runCatching { probe?.stop() }
         }
     }
 }

@@ -5,16 +5,16 @@ import java.sql.ResultSet
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * test class 全体で 1 個の PostgreSQL container を共有し、test method ごとに専用 database を貸す。
+ * 1 個の PostgreSQL container を共有し、test method ごとに専用 database を貸す。
  *
- * container を per-test で start/stop すると、220 test で 220 回の起動になり実行時間と Docker 資源を消耗する。
+ * container を per-test で start/stop すると test 数と同じ回数の起動になり、実行時間と Docker 資源を消耗する。
  * database 単位で貸し出すことで、schema を破壊する test や migration 前の状態を要求する test も
  * 互いに影響せず動く。
  *
  * serial 実行を前提とする。`pg_current_wal_insert_lsn()` の WAL 位置と `pg_locks` view は
  * cluster 全体を対象とするため、database を分けても隔離されない。
  *
- * @param container 共有する container。呼び出し側が生存期間を管理する
+ * @param container 共有する container。起動と停止は呼び出し側が管理する
  */
 class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
     private val container: BoundedTestPostgresContainer<SELF>,
