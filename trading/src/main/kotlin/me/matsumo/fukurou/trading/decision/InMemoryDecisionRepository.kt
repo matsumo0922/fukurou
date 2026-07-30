@@ -479,6 +479,11 @@ internal class InMemoryAuthorizedAtomicEntryDecisionTransaction internal constru
         return intentConsumptions.toList()
     }
 
+    fun requireOrderIdsUnused(orderIds: Set<UUID>) {
+        requireActive()
+        require(intentConsumptions.none { consumption -> consumption.orderId in orderIds })
+    }
+
     fun restoreIntentConsumptions(snapshot: List<TradeIntentConsumptionRecord>) {
         requireActive()
 

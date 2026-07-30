@@ -1,5 +1,11 @@
 package me.matsumo.fukurou.trading.broker
 
+import me.matsumo.fukurou.trading.domain.OrderType
+import java.math.BigDecimal
+import java.time.Duration
+import java.time.Instant
+import java.util.UUID
+
 /**
  * authorized entry の replay と新規作成を同じ backend 境界で確定する内部 capability。
  *
@@ -42,6 +48,21 @@ internal sealed interface AuthorizedAtomicEntryCreationProposal {
     ) : AuthorizedAtomicEntryCreationProposal {
         override val command: PlaceOrderCommand = request.order.command
         override val consumption: TradeIntentConsumptionRequest = request.consumption
+    }
+}
+
+internal fun AuthorizedAtomicEntryCreationProposal.freshEntityIds(): Set<UUID> {
+    return when (this) {
+        is AuthorizedAtomicEntryCreationProposal.Market -> setOf(
+            request.entry.command.commandId,
+            request.entry.positionId,
+            request.entry.stopOrderId,
+            request.entry.fill.executionId,
+        )
+        is AuthorizedAtomicEntryCreationProposal.Resting -> setOf(
+            request.order.command.commandId,
+            request.order.orderId,
+        )
     }
 }
 
@@ -99,6 +120,62 @@ private fun AuthorizedAtomicEntryCreationProposal.requireMatches(identity: Autho
     require(command.protectiveStopPriceJpy.compareTo(identity.protectiveStopPriceJpy) == 0)
     require(command.takeProfitPriceJpy.matches(identity.takeProfitPriceJpy))
     require(command.estimatedWinProbability.compareTo(identity.estimatedWinProbability) == 0)
+
+    when (this) {
+        is AuthorizedAtomicEntryCreationProposal.Market -> request.requireValidMarketProposal()
+        is AuthorizedAtomicEntryCreationProposal.Resting -> request.requireValidRestingProposal()
+    }
+}
+
+private fun IntentConsumingMarketEntryFillRequest.requireValidMarketProposal() {
+    val entry = entry
+    val command = entry.command
+    val fill = entry.fill
+    val allIds = setOf(
+        command.commandId,
+        entry.positionId,
+        entry.tradeGroupId,
+        entry.stopOrderId,
+        entry.fill.executionId,
+    )
+
+    require(command.orderType == OrderType.MARKET || command.orderType == OrderType.LIMIT)
+    require(command.tradeGroupId == entry.tradeGroupId)
+    require(allIds.size == 5)
+    require(fill.priceJpy > BigDecimal.ZERO)
+    require(fill.sizeBtc.compareTo(command.sizeBtc) == 0)
+    require(fill.feeJpy >= BigDecimal.ZERO)
+    require(fill.realizedPnlJpy.compareTo(BigDecimal.ZERO) == 0)
+    entry.positionMarketEligibility?.let { eligibility ->
+        require(eligibility.eligibleAfterSequence >= 0)
+    }
+}
+
+private fun IntentConsumingRestingEntryOrderRequest.requireValidRestingProposal() {
+    val order = order
+    val command = order.command
+    val eligibility = order.marketEligibility
+
+    require(command.tradeGroupId == order.tradeGroupId)
+    require(command.orderType == OrderType.LIMIT || command.orderType == OrderType.STOP)
+    require(setOf(command.commandId, order.orderId, order.tradeGroupId).size == 3)
+    require(!order.expiresAt.isBefore(order.createdAt))
+    require(order.effectiveTtlSeconds == Duration.between(order.createdAt, order.expiresAt).seconds)
+    eligibility?.requireMatches(command.orderType, order.createdAt)
+}
+
+private fun RestingOrderMarketEligibility.requireMatches(orderType: OrderType, createdAt: Instant) {
+    require(eligibleAfterSequence >= 0)
+    require(!eligibleFrom.isBefore(createdAt))
+
+    if (orderType == OrderType.LIMIT) {
+        require(queueAheadBtc != null && queueAheadBtc >= BigDecimal.ZERO)
+        require(queueSnapshotAt != null)
+        require(!queueSnapshotAt.isAfter(eligibleFrom))
+    } else {
+        require(queueAheadBtc == null)
+        require(queueSnapshotAt == null)
+    }
 }
 
 private fun java.math.BigDecimal?.matches(expected: java.math.BigDecimal?): Boolean {

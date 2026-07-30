@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.broker
 
 import me.matsumo.fukurou.trading.config.PaperMarketConfig
+import me.matsumo.fukurou.trading.decision.InMemoryAuthorizedAtomicEntryDecisionTransaction
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.Order
@@ -17,6 +18,7 @@ import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.domain.isRestingEntryLifecycleCandidate
 import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotRepository
+import me.matsumo.fukurou.trading.evaluation.InMemoryEquitySnapshotTransaction
 import me.matsumo.fukurou.trading.evaluation.toFillEquitySnapshotRecord
 import me.matsumo.fukurou.trading.feed.StableFeedCursor
 import me.matsumo.fukurou.trading.knowledge.ClosedPaperPosition
@@ -115,11 +117,34 @@ class InMemoryPaperLedgerRepository private constructor(
         ),
     )
 
+    /** A2a coordinator だけが使う、ledger write lock 内の原子 entry mutation。 */
+    internal fun commitAuthorizedAtomicEntry(
+        decision: InMemoryAuthorizedAtomicEntryDecisionTransaction,
+        request: AuthorizedAtomicPaperEntryRequest,
+        faultAfterPublish: (() -> Unit)? = null,
+    ): AuthorizedAtomicEntryResult {
+        return state.write {
+            equitySnapshotRepository.withExclusiveTransaction {
+                InMemoryPaperLedgerMutationWriter(state).commitAuthorizedAtomicEntryLocked(
+                    decision = decision,
+                    request = request,
+                    equity = this,
+                    faultAfterPublish = faultAfterPublish,
+                )
+            }
+        }
+    }
+
     /**
      * unit test で closed position を含む watermark 確定値を検証するため、全 position を返す。
      */
     internal fun getAllPositionsForTest(): List<Position> {
         return state.read { positions.toList() }
+    }
+
+    /** authorized entry rollback test 用の ledger mutable state snapshot。 */
+    internal fun snapshotAuthorizedAtomicState(): InMemoryPaperLedgerBeforeImage {
+        return state.read { beforeImage() }
     }
 
     internal suspend fun findAuthorizedPlaceOrderReplay(
@@ -276,6 +301,103 @@ private class InMemoryPaperLedgerState(
     fun <T> write(block: InMemoryPaperLedgerState.() -> T): T {
         return accountStateBoundary.write { block() }
     }
+}
+
+/** authorized mutation の失敗時に復元する、ledger mutable state の完全な before-image。 */
+internal data class InMemoryPaperLedgerBeforeImage(
+    val orders: List<Order>,
+    val positions: List<Position>,
+    val executions: List<Execution>,
+    val accountSnapshot: AccountSnapshot,
+    val accountUpdatedAt: Instant,
+    val decisionRunIdsByPositionId: Map<String, String?>,
+    val thesisCandidatesByIntentId: Map<String, Set<String?>>,
+    val orderMarketEligibility: Map<String, RestingOrderMarketEligibility>,
+    val orderQueueConsumedBtc: Map<String, BigDecimal>,
+    val positionMarketEligibility: Map<String, PositionMarketEligibility>,
+    val executionMarketSources: Map<String, PaperMarketTradeEvent>,
+    val marketSessionId: UUID?,
+    val lastMarketSequence: Long,
+)
+
+private fun InMemoryPaperLedgerState.beforeImage(): InMemoryPaperLedgerBeforeImage = InMemoryPaperLedgerBeforeImage(
+    orders = orders.toList(),
+    positions = positions.toList(),
+    executions = executions.toList(),
+    accountSnapshot = accountSnapshot,
+    accountUpdatedAt = accountUpdatedAt,
+    decisionRunIdsByPositionId = decisionRunIdsByPositionId.toMap(),
+    thesisCandidatesByIntentId = thesisCandidatesByIntentId.mapValues { (_, values) -> values.toSet() },
+    orderMarketEligibility = orderMarketEligibility.toMap(),
+    orderQueueConsumedBtc = orderQueueConsumedBtc.toMap(),
+    positionMarketEligibility = positionMarketEligibility.toMap(),
+    executionMarketSources = executionMarketSources.toMap(),
+    marketSessionId = marketSessionId,
+    lastMarketSequence = lastMarketSequence,
+)
+
+private fun InMemoryPaperLedgerState.restore(beforeImage: InMemoryPaperLedgerBeforeImage) {
+    orders.replaceWith(beforeImage.orders)
+    positions.replaceWith(beforeImage.positions)
+    executions.replaceWith(beforeImage.executions)
+    accountSnapshot = beforeImage.accountSnapshot
+    accountUpdatedAt = beforeImage.accountUpdatedAt
+    decisionRunIdsByPositionId.replaceWith(beforeImage.decisionRunIdsByPositionId)
+    thesisCandidatesByIntentId.clear()
+    beforeImage.thesisCandidatesByIntentId.forEach { (intentId, candidates) ->
+        thesisCandidatesByIntentId[intentId] = candidates.toMutableSet()
+    }
+    orderMarketEligibility.replaceWith(beforeImage.orderMarketEligibility)
+    orderQueueConsumedBtc.replaceWith(beforeImage.orderQueueConsumedBtc)
+    positionMarketEligibility.replaceWith(beforeImage.positionMarketEligibility)
+    executionMarketSources.replaceWith(beforeImage.executionMarketSources)
+    marketSessionId = beforeImage.marketSessionId
+    lastMarketSequence = beforeImage.lastMarketSequence
+}
+
+private fun InMemoryPaperLedgerState.requireFlatForAuthorizedEntry() {
+    val hasOpenPosition = positions.any { position -> position.status == PositionStatus.OPEN }
+    val hasOpenBuyEntry = orders.any { order ->
+        order.side == OrderSide.BUY && (order.status == OrderStatus.OPEN || order.status == OrderStatus.PENDING_CANCEL)
+    }
+
+    if (hasOpenPosition || hasOpenBuyEntry) throw AuthorizedAtomicEntryNotFlatException()
+}
+
+private fun InMemoryPaperLedgerState.requireAuthorizedEntryProposalFresh(
+    proposal: AuthorizedAtomicEntryCreationProposal,
+) {
+    val proposedEntityIds = proposal.freshEntityIds().mapTo(mutableSetOf(), UUID::toString)
+    val usedEntityIds = buildSet {
+        orders.forEach { order ->
+            add(order.orderId)
+            order.positionId?.let(::add)
+        }
+        positions.forEach { position -> add(position.positionId) }
+        executions.forEach { execution ->
+            add(execution.executionId)
+            execution.orderId?.let(::add)
+            execution.positionId?.let(::add)
+        }
+    }
+    val resolvedTradeGroupId = requireNotNull(proposal.command.tradeGroupId).toString()
+    val usedTradeGroupIds = buildSet {
+        orders.mapNotNullTo(this) { order -> order.tradeGroupId }
+        positions.mapTo(this) { position -> position.tradeGroupId }
+    }
+
+    require(proposedEntityIds.none(usedEntityIds::contains))
+    require(resolvedTradeGroupId !in usedTradeGroupIds)
+}
+
+private fun <T> MutableCollection<T>.replaceWith(values: Collection<T>) {
+    clear()
+    addAll(values)
+}
+
+private fun <K, V> MutableMap<K, V>.replaceWith(values: Map<K, V>) {
+    clear()
+    putAll(values)
 }
 
 /**
@@ -513,6 +635,65 @@ private class InMemoryPaperLedgerHistoryReader(
 private class InMemoryPaperLedgerMutationWriter(
     private val state: InMemoryPaperLedgerState,
 ) : PaperLedgerMutationRepository {
+    fun commitAuthorizedAtomicEntryLocked(
+        decision: InMemoryAuthorizedAtomicEntryDecisionTransaction,
+        request: AuthorizedAtomicPaperEntryRequest,
+        equity: InMemoryEquitySnapshotTransaction,
+        faultAfterPublish: (() -> Unit)?,
+    ): AuthorizedAtomicEntryResult {
+        request.requireStableIdentityValid()
+
+        val replay = classifyAuthorizedAtomicEntryReplay(
+            identity = request.identity,
+            orders = state.orders,
+            positions = state.positions,
+            executions = state.executions,
+            stopClientRequestIdPolicy = ProtectiveStopClientRequestIdPolicy.SAME_AS_ENTRY,
+        )
+        when (replay) {
+            is AuthorizedPlaceOrderReplay.Exact -> return AuthorizedAtomicEntryResult.Exact(replay.result)
+            AuthorizedPlaceOrderReplay.Ambiguous -> throw AuthorizedAtomicEntryReplayIndeterminateException()
+            AuthorizedPlaceOrderReplay.Missing -> Unit
+        }
+
+        request.requireCreationProposalValid()
+        state.requireAuthorizedEntryProposalFresh(request.proposal)
+        decision.requireOrderIdsUnused(request.proposal.freshEntityIds())
+        decision.requireIntentAvailable(request.identity.intentId)
+        state.requireFlatForAuthorizedEntry()
+        state.requireRiskIncreaseAllowedLocked()
+
+        val beforeImage = state.beforeImage()
+        val equityBeforeImage = equity.snapshot()
+        val consumptionBeforeImage = decision.snapshotIntentConsumptions()
+
+        try {
+            val result = when (val proposal = request.proposal) {
+                is AuthorizedAtomicEntryCreationProposal.Market -> state.fillEntryLocked(
+                    EntryFillWriteRequest(
+                        entry = proposal.request.entry,
+                        entryOrderId = proposal.request.entry.command.commandId,
+                        insertEntryOrder = true,
+                    ),
+                )
+                is AuthorizedAtomicEntryCreationProposal.Resting -> state.createRestingEntryOrderLocked(proposal.request.order)
+            }
+            faultAfterPublish?.invoke()
+            decision.appendIntentConsumption(
+                intentId = request.identity.intentId,
+                orderId = UUID.fromString(result.orderIds.first()),
+                consumedAt = request.proposal.consumption.consumedAt,
+            )
+
+            return AuthorizedAtomicEntryResult.Created(result)
+        } catch (throwable: Throwable) {
+            state.restore(beforeImage)
+            equity.replace(equityBeforeImage)
+            decision.restoreIntentConsumptions(consumptionBeforeImage)
+            throw throwable
+        }
+    }
+
     override suspend fun fillMarketEntry(request: MarketEntryFillRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
@@ -531,37 +712,41 @@ private class InMemoryPaperLedgerMutationWriter(
     override suspend fun createRestingEntryOrder(request: RestingEntryOrderRequest): Result<PaperTradeResult> {
         return runCatching {
             state.write {
-                requireRiskIncreaseAllowedLocked()
-                recordIntentThesisLocked(request.command)
-                val order = request.command.toEntryOrder(
-                    orderId = request.orderId,
-                    positionId = null,
-                    tradeGroupId = request.tradeGroupId,
-                    status = OrderStatus.OPEN,
-                    recordedAt = request.createdAt,
-                    expiresAt = request.expiresAt,
-                    expirySource = request.expirySource,
-                    effectiveTtlSeconds = request.effectiveTtlSeconds,
-                )
-
-                orders += order
-                request.marketEligibility?.let { eligibility ->
-                    orderMarketEligibility[order.orderId] = eligibility
-                    if (eligibility.queueAheadBtc != null) {
-                        orderQueueConsumedBtc[order.orderId] = BigDecimal.ZERO.btcScale()
-                    }
-                }
-
-                PaperTradeResult(
-                    accepted = true,
-                    status = OrderStatus.OPEN,
-                    orderIds = listOf(order.orderId),
-                    positionIds = emptyList(),
-                    executionIds = emptyList(),
-                    messageJa = "resting entry intent を保存しました。",
-                )
+                createRestingEntryOrderLocked(request)
             }
         }
+    }
+
+    private fun InMemoryPaperLedgerState.createRestingEntryOrderLocked(
+        request: RestingEntryOrderRequest,
+    ): PaperTradeResult {
+        requireRiskIncreaseAllowedLocked()
+        recordIntentThesisLocked(request.command)
+        val order = request.command.toEntryOrder(
+            orderId = request.orderId,
+            positionId = null,
+            tradeGroupId = request.tradeGroupId,
+            status = OrderStatus.OPEN,
+            recordedAt = request.createdAt,
+            expiresAt = request.expiresAt,
+            expirySource = request.expirySource,
+            effectiveTtlSeconds = request.effectiveTtlSeconds,
+        )
+
+        orders += order
+        request.marketEligibility?.let { eligibility ->
+            orderMarketEligibility[order.orderId] = eligibility
+            if (eligibility.queueAheadBtc != null) orderQueueConsumedBtc[order.orderId] = BigDecimal.ZERO.btcScale()
+        }
+
+        return PaperTradeResult(
+            accepted = true,
+            status = OrderStatus.OPEN,
+            orderIds = listOf(order.orderId),
+            positionIds = emptyList(),
+            executionIds = emptyList(),
+            messageJa = "resting entry intent を保存しました。",
+        )
     }
 
     override suspend fun closePosition(
