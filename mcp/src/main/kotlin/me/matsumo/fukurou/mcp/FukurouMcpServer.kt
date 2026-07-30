@@ -498,7 +498,7 @@ class FukurouMcpServer(
     private val invocationPhase: LlmInvocationPhase? = null,
     private val submissionGatewayClient: LlmDecisionSubmissionGatewayClient? = null,
     terminalEvidenceCaptureEnabled: Boolean = false,
-    allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
+    private val allowedToolNames: Set<String>? = mcpAllowedToolNamesFromEnvironment(),
     expiresAt: Instant? = null,
     private val toolCallLimiter: McpToolCallLimiter = McpToolCallLimiter(
         config = tradingConfig.runner,
@@ -535,6 +535,7 @@ class FukurouMcpServer(
         val server = createMcpServer()
 
         registerTools(server)
+        removeDisallowedTools(server)
 
         return server
     }
@@ -561,6 +562,13 @@ class FukurouMcpServer(
         registerDecisionTools(server)
         registerTradeTools(server)
         registerDiagnosticTools(server)
+    }
+
+    private fun removeDisallowedTools(server: Server) {
+        val allowedNames = allowedToolNames ?: return
+        val disallowedNames = server.tools.keys.filterNot(allowedNames::contains)
+
+        server.removeTools(disallowedNames)
     }
 
     private fun registerMarketDataTools(server: Server) {

@@ -497,7 +497,7 @@ scripts/prod-curl /ops/runtime-config
 
 MCP subprocess は Ktor service と同じ application role（compose の `DB_USER=${POSTGRES_USER}`）で PostgreSQL へ接続する。`OneShotLlmRunner` は manifest の `dbUser` に `DB_USER` を記録し、`DB_PASSWORD` は MCP subprocess の server-local literal env にだけ渡す。CLI process 本体の env/config/session には DB password を渡さない。decision と falsification の production write path は application role の権限ではなく、owner-only Unix socket上の `LlmDecisionSubmissionGateway` が validation とtransactional persistenceを担う境界を正本とする。
 
-`McpApplicationDatabaseRoleIntegrationTest` は disposable PostgreSQL の application role で production bootstrap/server path を起動し、Proposer/Falsifier union の16 required call、gateway の `COMMITTED`、decision/falsification repository persistenceを検証する。
+`McpApplicationDatabaseRoleIntegrationTest` は disposable PostgreSQL の application role で production bootstrap/server path を起動し、Proposer/Falsifier union の15 required call、gateway の `COMMITTED`、decision/falsification repository persistenceを検証する。
 
 ### 残存 dedicated role の owner cleanup
 
