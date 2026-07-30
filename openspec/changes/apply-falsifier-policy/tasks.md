@@ -19,7 +19,6 @@
 - [ ] 3.4 `docs/mcp-runtime.md` を policy attribution/permit foundation と既存 gate 維持の現在形へ更新する
 - [ ] 3.5 関連 docs grep、OpenSpec strict validation、関連 test、detekt、build を実行する
 
-## Deferred enforcement change
+## Deferred
 
-- [ ] 4.1 OFF ENTER の Falsifier skip、SafetyFloor/Broker durable permit verification、place-lock open-position 再検査を実装する
-- [ ] 4.2 `runner-place-v2-` namespace の pre-lookup validation、replay fingerprint、outcome unknown classification を実装する
+OFF ENTER の Falsifier skip、SafetyFloor/Broker durable permit verification、place-lock open-position 再検査、`runner-place-v2-` namespace、replay fingerprint、outcome unknown classification は後続 enforcement change で扱う。
