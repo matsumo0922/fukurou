@@ -50,7 +50,8 @@ entry intent 保存後、runner は一度だけ次を評価する。
 active account epoch / current cohort の最新 2 closed position を `closed_at DESC, position_id DESC` で先に固定する。
 2 件未満、attribution missing、infrastructure / market-data gap、execution semantics 不一致、または読み取り失敗が一つでもあれば `RECENT_OUTCOME_UNKNOWN` として Falsifier を起動する。
 unknown row を飛ばして古い eligible trade へ遡ってはならない。
-regime は `regime:trend_up` / `regime:trend_down` / `regime:range` / `regime:unknown` の exact tag を prompt で要求し、欠損・未知 tag は不明として起動側に倒す。
+regime は `regime:trend_up` / `regime:trend_down` / `regime:range` / `regime:unknown` の exact tag を prompt で一つだけ要求する。
+recognized `regime:` tag が 0 件、2 件以上、未知、または競合する場合は `REGIME_UNKNOWN` として起動側に倒す。
 
 planned risk は、同じ order command と `SafetyFloorContext` に対して `SafetyFloorRiskCalculator.placeOrderRiskDetails` が返す `groupRiskAfterOrderJpy / maxRiskPerTradeJpy` を使う。
 これにより MARKET の ask、slippage、volatility、cost reserve と ADD_LONG の merge 後 group risk を SafetyFloor と一致させる。
@@ -71,7 +72,9 @@ runner は intent ID を unique key にする `falsifier_policy_decisions` へ�
 reason code は bounded enum とし、raw prompt、自由文、価格、secret を保存しない。
 同じ intent / 同じ payload の retry は既存 record を返し、異なる payload は conflict として fail closed する。
 durable record の commit 後に、同じ ID を持つ `FALSIFIER_POLICY_EVALUATED` command event を append する。
-event append に失敗した場合は entry を行わず、同じ policy decision ID で retry できる。
+policy event append は decision ID と canonical payload に対して idempotent とする。
+同じ ID / 同じ payload の既存 event は成功扱い、異なる payload は conflict として fail closed にする。
+event append に失敗または応答を失った場合は entry を行わず、同じ policy decision ID / event ID で exact readback 後に retry できる。
 Falsifier を起動しない場合も falsifications row を作らない。
 
 ### 4. SafetyFloor bypass は runner 内部の型だけで表す

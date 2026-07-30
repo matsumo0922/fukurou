@@ -21,6 +21,7 @@ production paper trading の Falsifier を version 付き policy で期間比較
 システムは SafetyFloor と同じ snapshot / risk calculator による post-order group risk が最大 1 trade risk の 50% 以上、不利または不明な regime、active epoch / current cohort の直近 2 連敗のいずれかで Falsifier を起動しなければならない（MUST）。
 policy 入力の取得に失敗または欠損がある場合は Falsifier を起動しなければならない（MUST）。
 recent outcome は最新 2 closed position を先に固定し、attribution / gap / cohort / execution semantics の unknown row を飛ばして古い trade へ遡ってはならない（MUST NOT）。
+recognized `regime:` tag は exactly one でなければならず、0 件、2 件以上、未知、競合は `REGIME_UNKNOWN` として起動側へ倒さなければならない（MUST）。
 
 #### Scenario: 小口かつ有利 regime で連敗がない
 
@@ -32,16 +33,27 @@ recent outcome は最新 2 closed position を先に固定し、attribution / ga
 - **WHEN** current cohort の recent closed trade 読み取りに失敗する
 - **THEN** Falsifier を起動し、unknown reason を監査する
 
+#### Scenario: regime tag が競合する
+
+- **WHEN** entry が `regime:trend_up` と `regime:trend_down` を同時に持つ
+- **THEN** regime を unknown とし、Falsifier を起動する
+
 ### Requirement: policy decision を append-only audit に記録する
 
 システムは entry intent ごとに policy decision ID、policy version、required、bounded reason、intent ID、runtime config version ID / hash を一意な durable record と command event に記録しなければならない（MUST）。
 異なる payload で同じ intent の decision を上書きしてはならず（MUST NOT）、command event append に失敗した decision から entry を実行してはならない（MUST NOT）。
+policy event は decision ID / canonical payload に対して idempotent でなければならず（MUST）、lost ACK 後の同一 retry を成功として収束させ、異なる payload を conflict として拒否しなければならない（MUST）。
 Falsifier を起動しない decision のために falsification verdict を作ってはならない（MUST NOT）。
 
 #### Scenario: OFF policy を監査する
 
 - **WHEN** `OFF_V1` で entry intent を評価する
 - **THEN** required=false の policy event が記録され、falsifications row は作られない
+
+#### Scenario: policy event commit 後に ACK を失う
+
+- **WHEN** policy event INSERT は commit したが caller が応答を受け取れず、同じ event ID / payload で retry する
+- **THEN** retry は既存 event を exact readback して成功し、重複 event を作らない
 
 ### Requirement: policy 非起動でも intent integrity と SafetyFloor を維持する
 

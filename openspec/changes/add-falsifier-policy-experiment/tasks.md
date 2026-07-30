@@ -12,9 +12,9 @@
 
 ## 3. Regression evidence
 
-- [ ] 3.1 ALWAYS_ON / OFF / CONDITIONAL と failure fail-safe の runner test を追加する
+- [ ] 3.1 ALWAYS_ON / OFF / CONDITIONAL、regime tag 競合、failure fail-safe の runner test を追加する
 - [ ] 3.2 OFF でも permit mismatch / intent mismatch / consumed / stop loss を拒否し、MCP caller が bypass できない test を追加する
-- [ ] 3.3 policy decision idempotency / conflict / event failure と production recent outcome query を test する
+- [ ] 3.3 policy decision idempotency / conflict、policy event lost-ACK exact retry、production recent outcome query を test する
 
 ## 4. Documentation and validation
 
