@@ -204,17 +204,9 @@ common_source_line="$(grep -n 'source "${SCRIPT_DIRECTORY}/backup-common"' "${SE
 [[ "${pre_source_lock_line}" =~ ^[0-9]+$ && "${common_source_line}" =~ ^[0-9]+$ ]] || fail_selftest "pre-source lock ordering was not discoverable"
 (( pre_source_lock_line < common_source_line )) || fail_selftest "backup lock was not acquired before common source"
 assert_contains "${script_text}" '--tag fukurou-postgres,integrity-checked --keep-daily 14 --prune' "retention AND predicate"
-assert_contains "${script_text}" "WHERE pid = \${expected_pid} AND application_name = '\${APPLICATION_NAME}'" "exact watchdog recheck"
-assert_contains "${script_text}" 'timeout --signal=KILL --kill-after=1 "${timeout_seconds}"' "bounded watchdog database control"
-assert_contains "${script_text}" 'termination_deadline=$(( hard_deadline - WATCHDOG_TERMINATION_GRACE_SECONDS ))' "watchdog termination reserve"
-assert_contains "${script_text}" '"$((DUMP_DEADLINE_SECONDS - WATCHDOG_TERMINATION_GRACE_SECONDS))"' "dump client hard-deadline fallback"
-assert_contains "${script_text}" 'remaining=$(( WATCHDOG_DEADLINE_EPOCH - $(backup_epoch) ))' "deadline-aware watchdog query"
-assert_contains "${script_text}" 'jobs -pr | grep -Fx -- "${WATCHDOG_PID}"' "completed watchdog reap detection"
-assert_contains "${script_text}" 'kill -TERM "${WATCHDOG_PID}"' "watchdog cancellation"
-assert_contains "${script_text}" 'wait "${WATCHDOG_PID}"' "watchdog reap"
+assert_contains "${script_text}" 'timeout --signal=TERM --kill-after=10 "${DUMP_TIMEOUT_SECONDS}"' "in-container dump bound"
 assert_contains "${script_text}" 'cat >/dev/null' "archive EOF drain"
 assert_contains "${script_text}" '--compression auto' "explicit restic compression"
-assert_contains "${script_text}" 'DUMP_DEADLINE_SECONDS <= 60' "dump deadline cap"
 assert_contains "${script_text}" 'readonly POSTGRES_CONTROL_TIMEOUT_SECONDS=5' "postgres control query tail-latency budget"
 
 cat >"${SELFTEST_ROOT}/bin/flock" <<'FAKE'
@@ -230,46 +222,6 @@ set -e
 (( pre_source_busy_status != 0 )) || fail_selftest "pre-source lock contention unexpectedly succeeded"
 [[ "${pre_source_busy_output}" == 'fukurou-backup: result=BACKUP_BUSY' ]] || fail_selftest "pre-source lock contention output was not stable"
 rm -f "${SELFTEST_ROOT}/bin/flock"
-
-(
-  bash -c 'trap "" TERM; sleep 30' &
-  WATCHDOG_PID="$!"
-  WATCHDOG_DEADLINE_EPOCH="$(backup_epoch)"
-  cancel_and_reap_dump_watchdog
-  [[ -z "${WATCHDOG_PID}" ]]
-) || fail_selftest "deadline-expired watchdog was not forcibly reaped"
-
-WATCHDOG_EVENTS=""
-WATCHDOG_PID=123
-dump_watchdog_is_running() { return 0; }
-cancel_and_reap_dump_watchdog() { WATCHDOG_EVENTS="${WATCHDOG_EVENTS} cancel"; WATCHDOG_PID=""; }
-wait_for_dump_watchdog() { WATCHDOG_EVENTS="${WATCHDOG_EVENTS} wait"; WATCHDOG_PID=""; }
-dump_backend_count() { printf '%s\n' 1; }
-settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-present"
-[[ "${WATCHDOG_EVENTS}" == " wait" ]] || fail_selftest "producer failure cancelled a watchdog while its backend was present"
-
-WATCHDOG_EVENTS=""
-WATCHDOG_PID=124
-dump_backend_count() { printf '%s\n' 0; }
-settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-absent"
-[[ "${WATCHDOG_EVENTS}" == " cancel" ]] || fail_selftest "zero-backend producer failure did not cancel/reap watchdog"
-
-WATCHDOG_EVENTS=""
-WATCHDOG_PID=125
-dump_backend_count() { printf '%s\n' 2; }
-expect_failure multiple-backends settle_watchdog_after_pipeline_failure "${SELFTEST_ROOT}/watchdog-multiple"
-[[ "$(<"${SELFTEST_ROOT}/watchdog-multiple")" == "WATCHDOG_TERMINATION_FAILED" ]] || fail_selftest "multiple backends were not failed closed"
-
-APPLICATION_NAME=fukurou_backup_fixture
-postgres_scalar() { printf 'gone\n'; }
-postgres_scalar_bounded() { printf 'gone\n'; }
-terminate_or_observe_dump_backend 9876 "${SELFTEST_ROOT}/watchdog-gone" "$(( $(backup_epoch) + 5 ))" || fail_selftest "completed backend was treated as termination failure"
-[[ ! -e "${SELFTEST_ROOT}/watchdog-gone" ]] || fail_selftest "completed backend created a failure marker"
-
-postgres_scalar() { printf 'mismatch\n'; }
-postgres_scalar_bounded() { printf 'mismatch\n'; }
-expect_failure pid-reuse terminate_or_observe_dump_backend 9876 "${SELFTEST_ROOT}/watchdog-reused" "$(( $(backup_epoch) + 5 ))"
-[[ "$(<"${SELFTEST_ROOT}/watchdog-reused")" == "WATCHDOG_TERMINATION_FAILED" ]] || fail_selftest "PID reuse was not failed closed"
 
 run_entrypoint_scenario() (
   local scenario="$1" expected_result="$2" calls output status fixture_production_id fixture_application_id
@@ -289,8 +241,6 @@ run_entrypoint_scenario() (
   APPLICATION_CONTAINER_ID=""
   INTERRUPTED_CANDIDATE_COUNT=null
   REPOSITORY_READ_READY=false
-  WATCHDOG_PID=""
-  WATCHDOG_DEADLINE_EPOCH=""
   WORK_DIRECTORY=""
   CURRENT_PARTIAL_SNAPSHOT=""
 
@@ -321,6 +271,11 @@ run_entrypoint_scenario() (
       printf '\n'
       return 0
     fi
+    if [[ "$1" == exec && "$*" == *" timeout "*pg_dump* ]]; then
+      printf 'custom-dump-stream'
+      [[ "${scenario}" != producer_failure && "${scenario}" != timeout_hang ]]
+      return
+    fi
     if [[ "$1" == exec && "$2" == "${fixture_production_id}" ]]; then
       printf 'fukurou\nfukurou\n'
       return 0
@@ -332,20 +287,11 @@ run_entrypoint_scenario() (
     return 1
   }
   validate_capacity_floor() { return 0; }
-  watch_dump_backend() { return 0; }
-  dump_watchdog_is_running() { return 1; }
-  cancel_and_reap_dump_watchdog() { WATCHDOG_PID=""; }
-  wait_for_dump_watchdog() { WATCHDOG_PID=""; }
   verify_archive_stream() {
     printf 'verify\n' >>"${calls}"
     [[ "${scenario}" != integrity_failure ]]
   }
   count_interrupted_candidates() { printf '0\n'; }
-  timeout() {
-    printf 'timeout %s\n' "$*" >>"${calls}"
-    printf 'custom-dump-stream'
-    [[ "${scenario}" != producer_failure && "${scenario}" != timeout_hang ]]
-  }
   restic_command() {
     printf 'restic %s\n' "$*" >>"${calls}"
     case "$1" in
@@ -394,8 +340,8 @@ run_entrypoint_scenario() (
       sed 's/^/call: /' "${calls}" >&2
       exit 91
     fi
-    if ! grep -F -- "-i ${fixture_production_id} pg_dump " "${calls}" >/dev/null; then
-      printf 'scenario=%s captured dump call missing\n' "${scenario}" >&2
+    if ! grep -E -- "-i ${fixture_production_id} timeout --signal=TERM --kill-after=10 [0-9]+ pg_dump " "${calls}" >/dev/null; then
+      printf 'scenario=%s captured in-container bounded dump call missing\n' "${scenario}" >&2
       sed 's/^/call: /' "${calls}" >&2
       exit 103
     fi
@@ -431,7 +377,7 @@ run_entrypoint_scenario() (
     ! grep -Fx 'verify' "${calls}" >/dev/null || exit 96
   fi
   if [[ "${scenario}" == timeout_hang ]]; then
-    grep -E '^timeout .* 55 docker exec ' "${calls}" >/dev/null || exit 97
+    grep -E ' timeout --signal=TERM --kill-after=10 [0-9]+ pg_dump ' "${calls}" >/dev/null || exit 97
   fi
 )
 
@@ -466,4 +412,4 @@ schema_codes="$(jq -r '.["$defs"].resultCode.enum[]' "${SELFTEST_DIRECTORY}/back
 file_codes="$(sort "${SELFTEST_DIRECTORY}/backup-result-codes-v1.txt")"
 [[ "${schema_codes}" == "${file_codes}" ]] || fail_selftest "status schema and result-code allowlist drifted"
 
-printf '%s\n' 'BACKUP_SELFTEST_OK status=atomic-last-good-redacted routing=captured-id-aba pipeline=producer-consumer-drained watchdog=exact-cancel-reap retention=and-tags-no-uncertain-prune capacity=fail-closed locks=nonblocking'
+printf '%s\n' 'BACKUP_SELFTEST_OK status=atomic-last-good-redacted routing=captured-id-aba pipeline=producer-consumer-drained dump-bound=in-container retention=and-tags-no-uncertain-prune capacity=fail-closed locks=nonblocking'

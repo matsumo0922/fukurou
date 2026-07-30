@@ -9,6 +9,10 @@ User=root
 Group=root
 UMask=0077
 Environment=FUKUROU_BACKUP_SHARE_DIRECTORY=/usr/local/share/fukurou
+# ProtectHome=yes が /root を隠すため、restic の既定 cache（/root/.cache/restic）は
+# unit 経由では書けない。CacheDirectory の割当先を明示して cache を有効に保つ。
+CacheDirectory=fukurou-restic
+Environment=RESTIC_CACHE_DIR=/var/cache/fukurou-restic
 ExecStartPre=/usr/local/libexec/fukurou/publish-backup-monitoring start backup
 ExecStart=/usr/local/libexec/fukurou/backup-fukurou
 ExecStopPost=/usr/local/libexec/fukurou/publish-backup-monitoring terminal backup ${SERVICE_RESULT} ${EXIT_CODE} ${EXIT_STATUS}

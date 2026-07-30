@@ -622,7 +622,7 @@ systemdの`ExecStartPre`はservice本体より先にcurrent invocation / boot id
 
 最新の`backup.lastAttempt`が`SUCCESS`かつ`retentionSucceeded=true`、最新の`restore.lastAttempt`が`SUCCESS`であり、各attemptのsnapshot IDが対応する`lastSuccess`と一致することを確認する。backupとrestoreの`lastSuccess.snapshotId`も同じであり、そのexact IDが現在開いているrepositoryの固定host/pathと`fukurou-postgres,integrity-checked` AND tagsで一意に存在する必要がある。両attemptにはsystemdが付与した相異なる`serviceInvocationId`と現在のkernel boot IDに一致する`serviceBootId`が必要である。さらにcurrent bootの各unit journalにある最新のstable resultが`SUCCESS`であり、その`_SYSTEMD_INVOCATION_ID`がstatusと一致しなければならない。これによりstatus publication failure後に残る旧successをrejectし、garbage collectionされるoneshot unitの`ExecMain*` runtime stateへ依存しない。両attempt時刻、statusの`updatedAt`とfile mtimeはinstall markerより後で、verification時点から24時間以内でなければならない。status publication失敗後の古いsuccess evidence、artifact reinstall前のdrill、再起動前のboot evidence、systemd外で直接実行したattemptを通さない。NAS再起動またはartifact reinstall後はbackupとrestore drillをsystemctlで再実行してからrollout verificationを行う。古い`lastSuccess`が残っていても、最新retentionまたはrestore cleanupが失敗していればgateは失敗する。status directory/fileはroot:root 0700/0600である。bounded Docker inventoryで`me.matsumo.fukurou.restore.attempt` labelを持つcontainer、network、volumeがすべて0件であることも確認する。Docker global pruneは行わない。
 
-初回backupの成功によってcustom dumpが固定60秒bound内に完了したことを確認し、`durationSeconds`はdump、repository write、full-stream integrity readを含むattempt全体の実測時間として記録する。60秒はbackup性能の目標ではなく、backup開始後にdeployが始まるraceでも`pg_dump`のACCESS SHARE lockがDDL/rollbackを長時間止めないためのhard safety capであり、environmentから延長できない。rollout時のdatabase bytesを運用baselineとして記録し、database sizeがbaselineから25%以上増えた場合、または`DUMP_FAILED` / `WATCHDOG_BACKEND_NOT_OBSERVED` / `WATCHDOG_TERMINATION_FAILED`が1回でも発生した場合はtimerをdisableしてdump所要時間とdeploy coordinationを再評価する。60秒へ近づいた状態をenvironment overrideで延命せず、必要なcoordination方式を別changeで設計する。capacity floorを満たさない場合、last-known-good backup/restoreのいずれかがない場合、cleanup failureがある場合もtimerをdisabledのままにする。
+`durationSeconds`はdump、repository write、full-stream integrity readを含むattempt全体の実測時間として記録する。dumpはcontainer内側の`timeout`（840秒、TERM + KILL追撃）でboundされる。この値は実行時間の予測に基づくタイトなcapではなく、無限stall（lock待ち・パイプ背圧）の防止だけを目的とする緩いboundである（issue #336: 60秒のwatchdog deadlineがresticのrepository index読み込み由来の背圧で健全なdumpを誤終了させた）。`DUMP_FAILED`が繰り返し発生する場合はtimerをdisableしてdump所要時間とdeploy coordinationを再評価する。capacity floorを満たさない場合、last-known-good backup/restoreのいずれかがない場合、cleanup failureがある場合もtimerをdisabledのままにする。
 
 gateを満たした後だけtimerを有効にする。
 
@@ -657,7 +657,7 @@ projectionだけをrollbackする場合は両timerと実行中serviceを停止�
 
 - `BACKUP_BUSY` / `DEPLOY_IN_PROGRESS`: 競合jobまたはdeploy終了後にmanual再実行する。start-time probe後に始まるdeploy raceまで相互排他とはみなさない。
 - `CAPACITY_FLOOR_NOT_MET`: DB sizeの測定失敗を含む。PostgreSQL connectivityとDB size、free spaceを再測定し、原因を解消するまで再実行しない。
-- `WATCHDOG_TERMINATION_FAILED`: 対象backendのPID/application identityを確認できていない。timerを止め、production lock影響を調査する。
+- `DUMP_FAILED`: pg_dumpのexitが非0（container内timeoutによる終了を含む）。stderrはdeploy log（GitHub Actions）またはjournalに残るため、まずそれを確認する。
 - `INTEGRITY_CHECK_FAILED` / `SNAPSHOT_IDENTITY_FAILED`: retention/pruneを行わずrepositoryとattempt-tagged candidateをroot-onlyで調査する。
 - `RETENTION_FAILED`: integrity-checked snapshot evidenceは残るがhousekeepingは失敗している。repositoryを確認してmanual retentionを判断する。
 - `BACKUP_SIGNALLED`: backup serviceがsignalで中断された。`lastSuccess`は維持されるため、候補snapshotとjournalを確認してから再実行する。
