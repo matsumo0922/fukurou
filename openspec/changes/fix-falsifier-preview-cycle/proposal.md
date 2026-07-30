@@ -4,7 +4,7 @@ Issue #207 Phase 1: Falsifier が承認前に `preview_order` を呼べるため
 
 ## What Changes
 
-- （ユーザー確認済み）Falsifier の canonical tool policy から `preview_order` を除外し、承認前に deterministic preview を実行できないようにする。
+- （ユーザー確認済み）Falsifier の canonical tool policy と model-visible `tools/list` から `preview_order` を除外し、承認前に deterministic preview を発見・実行できないようにする。
 - （agent 仮決め）Falsifier prompt では read tools による独立検証だけを求め、preview の利用を示唆しない。
 - （ユーザー確認済み）Falsifier が APPROVED を保存した後に runner が `preview_order` と `place_order` を順に実行する既存経路は維持する。
 - （ユーザー確認済み）Phase 2 の期間比較、policy version 記録、判定コメントは後続の独立 change / stacked PR に分離する。
@@ -28,5 +28,6 @@ Issue #207 Phase 1: Falsifier が承認前に `preview_order` を呼べるため
 ## Impact
 
 - `trading` module の Falsifier canonical MCP tool catalog、prompt、runner regression test。
+- `mcp` module の phase-aware tool registration と production bootstrap regression test。
 - Falsifier の利用可能 tool contract と MCP manifest hash が変わる。
 - DB schema、paper ledger、SafetyFloor、注文 lifecycle の承認後処理、public API は変更しない。

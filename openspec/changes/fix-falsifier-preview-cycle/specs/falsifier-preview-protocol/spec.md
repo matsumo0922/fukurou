@@ -1,11 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: Falsifier は承認前 deterministic preview を利用しない
-Issue #207 Phase 1。システムは、Falsifier phase の canonical tool policy と実行時 manifest から `preview_order` を除外しなければならない（MUST）。Falsifier は intent、market、account、knowledge の read evidence から verdict を提出しなければならない（MUST）。
+Issue #207 Phase 1。システムは、Falsifier phase の canonical tool policy、実行時 manifest、model-visible `tools/list` から `preview_order` を除外しなければならない（MUST）。Falsifier は intent、market、account、knowledge の read evidence から verdict を提出しなければならない（MUST）。
 
-#### Scenario: Falsifier process の tool manifest
-- **WHEN** entry intent に対して production の OneShot runner が Falsifier process を構築する
-- **THEN** manifest は `get_trade_intent` と `submit_falsification` を含み、`preview_order` と `place_order` を含まない
+#### Scenario: Falsifier process の model-visible tool surface
+- **WHEN** entry intent に対して production bootstrap 経路が Falsifier MCP server を構築する
+- **THEN** `tools/list` は `get_trade_intent` と `submit_falsification` を含み、`preview_order` と `place_order` を含まない
 
 #### Scenario: production-equivalent canary の tool policy
 - **WHEN** production-equivalent CLI canary が Falsifier phase の MCP tool list を構築する
