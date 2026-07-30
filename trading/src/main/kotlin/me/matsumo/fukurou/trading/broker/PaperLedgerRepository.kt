@@ -205,6 +205,23 @@ interface PaperLedgerHistoryRepository {
     suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?>
 }
 
+/** internal authorized path だけが使う、厳密な client request replay 読み取り。 */
+internal interface AuthorizedPlaceOrderReplayReader {
+    suspend fun findAuthorizedPlaceOrderReplay(
+        clientRequestId: String,
+        intentId: UUID,
+    ): Result<AuthorizedPlaceOrderReplay>
+}
+
+/** authorized replay の曖昧さを public lookup と区別する結果。 */
+internal sealed interface AuthorizedPlaceOrderReplay {
+    data class Exact(val result: PaperTradeResult) : AuthorizedPlaceOrderReplay
+
+    data object Missing : AuthorizedPlaceOrderReplay
+
+    data object Ambiguous : AuthorizedPlaceOrderReplay
+}
+
 /**
  * paper ledger の mutation repository。
  */

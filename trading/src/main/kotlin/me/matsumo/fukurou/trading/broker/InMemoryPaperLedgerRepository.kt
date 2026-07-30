@@ -122,6 +122,13 @@ class InMemoryPaperLedgerRepository private constructor(
         return state.read { positions.toList() }
     }
 
+    internal suspend fun findAuthorizedPlaceOrderReplay(
+        clientRequestId: String,
+        intentId: UUID,
+    ): Result<AuthorizedPlaceOrderReplay> = Result.success(
+        state.read { findAuthorizedPlaceOrderReplayLocked(clientRequestId, intentId) },
+    )
+
     /** material manifest 向けに account / position / order を同じ ledger lock 内で取得する。 */
     internal fun readDecisionAccountSnapshot(positionLimit: Int, orderLimit: Int): InMemoryDecisionLedgerSnapshot {
         return state.read {
@@ -1515,6 +1522,44 @@ private fun InMemoryPaperLedgerState.findPlaceOrderResultByClientRequestIdLocked
         positionIds = relatedPositionIds,
         executionIds = relatedExecutionIds,
         messageJa = "client_request_id に一致する既存 paper entry を返しました。",
+    )
+}
+
+private fun InMemoryPaperLedgerState.findAuthorizedPlaceOrderReplayLocked(
+    clientRequestId: String,
+    intentId: UUID,
+): AuthorizedPlaceOrderReplay {
+    val rows = orders.filter { order -> order.clientRequestId == clientRequestId }
+    val entries = rows.filter { order -> order.side == OrderSide.BUY }
+    if (entries.isEmpty()) return AuthorizedPlaceOrderReplay.Missing
+    if (entries.size != 1) return AuthorizedPlaceOrderReplay.Ambiguous
+
+    val entry = entries.single()
+    val tradeGroupId = entry.tradeGroupId
+    val hasMatchingIdentity = entry.intentId == intentId.toString() && tradeGroupId != null
+    val hasOnlyOneTradeGroup = tradeGroupId != null && rows.all { it.tradeGroupId == tradeGroupId }
+    if (!hasMatchingIdentity || !hasOnlyOneTradeGroup) {
+        return AuthorizedPlaceOrderReplay.Ambiguous
+    }
+
+    val relatedOrders = orders.filter { order -> order.tradeGroupId == tradeGroupId }
+    val relatedOrderIds = relatedOrders.map { order -> order.orderId }.toSet()
+    val relatedPositionIds = positions
+        .filter { position -> position.tradeGroupId == tradeGroupId }
+        .map { position -> position.positionId }
+    val relatedExecutionIds = executions
+        .filter { execution -> execution.orderId in relatedOrderIds }
+        .map { execution -> execution.executionId }
+
+    return AuthorizedPlaceOrderReplay.Exact(
+        PaperTradeResult(
+            accepted = true,
+            status = entry.status,
+            orderIds = relatedOrders.map { order -> order.orderId },
+            positionIds = relatedPositionIds,
+            executionIds = relatedExecutionIds,
+            messageJa = "authorized client_request_id に一致する既存 paper entry を返しました。",
+        ),
     )
 }
 

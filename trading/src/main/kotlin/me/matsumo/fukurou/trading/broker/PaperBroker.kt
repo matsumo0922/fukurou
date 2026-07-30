@@ -3,7 +3,9 @@ package me.matsumo.fukurou.trading.broker
 import me.matsumo.fukurou.trading.config.DecisionProtocolConfig
 import me.matsumo.fukurou.trading.decision.AtomicIntentConsumptionRepository
 import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.InMemoryFalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
 import me.matsumo.fukurou.trading.domain.AccountStatus
 import me.matsumo.fukurou.trading.domain.CandleInterval
@@ -93,6 +95,12 @@ class PaperBroker private constructor(
     internal val marketDataSource = runtime.market.marketDataSource
     internal val fillSimulator = runtime.market.fillSimulator
 
+    internal val authorizedFalsifierPolicyBoundary = AuthorizedFalsifierPolicyBoundary(
+        policyDecisionRepository = runtime.stores.falsifierPolicyDecisionRepository,
+        replayReader = runtime.stores.ledgerRepository.authorizedReplayReaderOrNull(),
+        preview = { command -> PaperBrokerTradeDelegate(runtime).previewAuthorized(command) },
+    )
+
     init {
         val hasAtomicLedgerRepository = ledgerRepository is IntentConsumingPaperLedgerRepository
         val hasAtomicDecisionRepository = runtime.stores.decisionRepository is AtomicIntentConsumptionRepository
@@ -108,6 +116,8 @@ class PaperBroker private constructor(
         riskStateRepository: RiskStateRepository,
         riskStateCommandService: RiskStateCommandService? = null,
         decisionRepository: DecisionRepository = InMemoryDecisionRepository(),
+        falsifierPolicyDecisionRepository: FalsifierPolicyDecisionRepository =
+            InMemoryFalsifierPolicyDecisionRepository(),
         falsificationFreshnessWindow: Duration = DecisionProtocolConfig().falsificationFreshnessWindow,
         restingEntryOrderTtl: Duration = DecisionProtocolConfig().restingEntryOrderTtl,
         safetyViolationRepository: SafetyViolationRepository = InMemorySafetyViolationRepository(),
@@ -131,6 +141,7 @@ class PaperBroker private constructor(
                 ledgerRepository = ledgerRepository,
                 riskStateRepository = riskStateRepository,
                 decisionRepository = decisionRepository,
+                falsifierPolicyDecisionRepository = falsifierPolicyDecisionRepository,
             ),
             safety = run {
                 val resolvedSafetyFloor = safetyFloor ?: SafetyFloor(
@@ -167,6 +178,14 @@ class PaperBroker private constructor(
             reconcilerStatusProvider = reconcilerStatusProvider,
         ),
     )
+
+    internal suspend fun previewAuthorizedOrder(request: AuthorizedPreviewOrder): Result<PreviewOrderResult> {
+        return authorizedFalsifierPolicyBoundary.previewOrder(request)
+    }
+
+    internal suspend fun placeAuthorizedOrder(request: AuthorizedPlaceOrder): Result<PaperTradeResult> {
+        return authorizedFalsifierPolicyBoundary.placeOrder(request)
+    }
 }
 
 /**
@@ -212,6 +231,7 @@ private data class PaperBrokerStores(
     val ledgerRepository: PaperLedgerRepository,
     val riskStateRepository: RiskStateRepository,
     val decisionRepository: DecisionRepository,
+    val falsifierPolicyDecisionRepository: FalsifierPolicyDecisionRepository,
 )
 
 /**
@@ -414,6 +434,7 @@ private class PaperBrokerTradeDelegate(
 
     override suspend fun placeOrder(command: PlaceOrderCommand): Result<PaperTradeResult> {
         return runCatching {
+            rejectReservedAuthorizedClientRequestId(command)
             validatePlaceOrderCommand(command)
 
             runtime.findExistingPlaceOrderResult(command)?.let { existingResult ->
@@ -629,6 +650,14 @@ private class PaperBrokerTradeDelegate(
     }
 
     override suspend fun previewOrder(command: PlaceOrderCommand): Result<PreviewOrderResult> {
+        if (command.hasReservedAuthorizedClientRequestId()) {
+            return Result.failure(ReservedAuthorizedClientRequestIdException())
+        }
+
+        return previewAuthorized(command)
+    }
+
+    internal suspend fun previewAuthorized(command: PlaceOrderCommand): Result<PreviewOrderResult> {
         return runCatching {
             validatePlaceOrderCommand(command)
 
@@ -1486,6 +1515,20 @@ private fun validatePlaceOrderCommand(command: PlaceOrderCommand) {
         "sizeBtc must be greater than zero."
     }
 }
+
+internal const val AUTHORIZED_CLIENT_REQUEST_ID_PREFIX = "runner-place-v2-"
+
+private fun PlaceOrderCommand.hasReservedAuthorizedClientRequestId(): Boolean {
+    return auditContext.clientRequestId?.startsWith(AUTHORIZED_CLIENT_REQUEST_ID_PREFIX) == true
+}
+
+private fun rejectReservedAuthorizedClientRequestId(command: PlaceOrderCommand) {
+    if (command.hasReservedAuthorizedClientRequestId()) throw ReservedAuthorizedClientRequestIdException()
+}
+
+internal class ReservedAuthorizedClientRequestIdException : IllegalArgumentException(
+    "runner-place-v2 client request IDs require the internal authorized boundary.",
+)
 
 private fun validateClosePositionCommand(command: ClosePositionCommand) {
     validateReason(command.reasonJa)

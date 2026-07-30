@@ -309,6 +309,7 @@ object TradingRuntimeFactory {
             riskStateRepository = riskStateRepository,
             riskStateCommandService = riskStateCommandService,
             decisionRepository = decisionRepository,
+            falsifierPolicyDecisionRepository = falsifierPolicyDecisionRepository,
             safetyViolationRepository = safetyViolationRepository,
         )
         val broker = tradingConfig.createInMemoryBroker(
@@ -524,6 +525,7 @@ private data class InMemoryBrokerRepositories(
     val riskStateRepository: RiskStateRepository,
     val riskStateCommandService: RiskStateCommandService,
     val decisionRepository: DecisionRepository,
+    val falsifierPolicyDecisionRepository: FalsifierPolicyDecisionRepository,
     val safetyViolationRepository: SafetyViolationRepository,
 )
 
@@ -539,6 +541,7 @@ private fun TradingBotConfig.createInMemoryBroker(
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = repositories.riskStateCommandService,
         decisionRepository = repositories.decisionRepository,
+        falsifierPolicyDecisionRepository = repositories.falsifierPolicyDecisionRepository,
         falsificationFreshnessWindow = decisionProtocol.falsificationFreshnessWindow,
         restingEntryOrderTtl = decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = repositories.safetyViolationRepository,
@@ -644,6 +647,7 @@ private fun createPostgresBroker(
         riskStateRepository = repositories.riskStateRepository,
         riskStateCommandService = riskStateCommandService,
         decisionRepository = repositories.decisionRepository,
+        falsifierPolicyDecisionRepository = repositories.falsifierPolicyDecisionRepository,
         falsificationFreshnessWindow = context.tradingConfig.decisionProtocol.falsificationFreshnessWindow,
         restingEntryOrderTtl = context.tradingConfig.decisionProtocol.restingEntryOrderTtl,
         safetyViolationRepository = safetyViolationRepository,
