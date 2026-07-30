@@ -16,12 +16,15 @@ dependencies {
     implementation(libs.exposed.jdbc)
 
     testFixturesImplementation(platform(libs.kotlin.bom))
+    // BoundedTestPostgresContainer が PostgreSQLContainer を superclass に露出するため api で公開する。
+    testFixturesApi(libs.testcontainers.postgresql)
 
     testImplementation(kotlin("test"))
+    // test source も Testcontainers を直接 import するため、fixture 経由の推移解決に依存しない。
     testImplementation(libs.testcontainers.postgresql)
 
     constraints {
-        testImplementation(libs.commons.compress) {
+        testFixturesApi(libs.commons.compress) {
             because(
                 "Testcontainers pulls commons-compress 1.24.0; " +
                     "1.26.0+ fixes CVE-2024-25710/CVE-2024-26308.",

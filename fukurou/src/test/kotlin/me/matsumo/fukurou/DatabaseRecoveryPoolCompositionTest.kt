@@ -10,6 +10,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import org.testcontainers.DockerClientFactory
 import java.sql.Connection
 import java.time.Clock

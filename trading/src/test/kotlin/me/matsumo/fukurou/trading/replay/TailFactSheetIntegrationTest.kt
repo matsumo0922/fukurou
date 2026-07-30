@@ -3,10 +3,10 @@ package me.matsumo.fukurou.trading.replay
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import kotlinx.coroutines.runBlocking
-import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.jdbcConnection
-import me.matsumo.fukurou.trading.retryTransientTestPostgresConnection
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import java.math.BigDecimal

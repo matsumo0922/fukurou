@@ -15,7 +15,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import me.matsumo.fukurou.trading.BoundedTestPostgresContainer
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
 import me.matsumo.fukurou.trading.activity.DecisionRunOutcome
@@ -164,7 +163,6 @@ import me.matsumo.fukurou.trading.reconciler.LatestMarketQuote
 import me.matsumo.fukurou.trading.reconciler.LatestMarketQuoteStore
 import me.matsumo.fukurou.trading.reconciler.TickSnapshot
 import me.matsumo.fukurou.trading.reflection.ReflectionDataCollector
-import me.matsumo.fukurou.trading.retryTransientTestPostgresConnection
 import me.matsumo.fukurou.trading.risk.HardHaltCleanupState
 import me.matsumo.fukurou.trading.risk.HardHaltTradingRejectedException
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateCommandService
@@ -205,6 +203,8 @@ import me.matsumo.fukurou.trading.shadow.GateShadowResolution
 import me.matsumo.fukurou.trading.shadow.GateShadowScanProgress
 import me.matsumo.fukurou.trading.shadow.InMemoryGateShadowRepository
 import me.matsumo.fukurou.trading.shadow.ShadowDataQuality
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.DockerClientFactory

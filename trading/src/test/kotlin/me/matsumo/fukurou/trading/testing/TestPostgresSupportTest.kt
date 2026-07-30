@@ -1,4 +1,4 @@
-package me.matsumo.fukurou.trading
+package me.matsumo.fukurou.trading.testing
 
 import java.net.ConnectException
 import java.net.InetAddress
@@ -16,7 +16,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /** Testcontainers PostgreSQL connection timeout contract。 */
-class TestPostgresConnectionTest {
+class TestPostgresSupportTest {
     @Test
     fun boundedContainerConfiguresDriverTimeoutParameters() {
         val parameters = InspectablePostgresContainer().configuredUrlParameters()
@@ -24,6 +24,25 @@ class TestPostgresConnectionTest {
         assertEquals(TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_CONNECT_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_LOGIN_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_SOCKET_TIMEOUT_KEY])
+    }
+
+    @Test
+    fun queryParameterOverrideReplacesTimeoutsWithoutBreakingUrlStructure() {
+        val url = "jdbc:postgresql://localhost:5432/test" +
+            "?connectTimeout=10&loginTimeout=30&socketTimeout=300&applicationName=fukurou%20test"
+
+        val overridden = url.withJdbcQueryParameters(
+            mapOf(
+                TEST_POSTGRES_CONNECT_TIMEOUT_KEY to "2",
+                TEST_POSTGRES_SOCKET_TIMEOUT_KEY to "2",
+            ),
+        )
+
+        assertEquals(1, overridden.count { character -> character == '?' })
+        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("connectTimeout=2") })
+        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("socketTimeout=2") })
+        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("loginTimeout=30") })
+        assertEquals(true, overridden.endsWith("applicationName=fukurou%20test"))
     }
 
     @Test

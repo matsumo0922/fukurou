@@ -25,6 +25,7 @@ dependencies {
     testImplementation(libs.postgresql)
     testImplementation(libs.testcontainers.postgresql)
     testImplementation(testFixtures(project(":mcp-core")))
+    testImplementation(testFixtures(project(":trading")))
     testImplementation(kotlin("test"))
 
     constraints {

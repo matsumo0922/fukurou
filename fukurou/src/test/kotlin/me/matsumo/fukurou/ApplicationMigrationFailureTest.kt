@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
+import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.testcontainers.DockerClientFactory
 import java.sql.Connection
