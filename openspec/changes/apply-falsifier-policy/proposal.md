@@ -1,26 +1,23 @@
 ## Why
 
-Issue #207 の段階実験を始めるには、foundation が保存する `ALWAYS_ON_V1` / `OFF_V1` の policy decision を runner と SafetyFloor の両方で同じ権限として適用する必要がある。
-Falsifier を省略しても intent integrity と資金保護を維持し、policy decision の保存や読取に失敗した場合は entry を閉じる。
+Issue #207 の on/off 実験を安全に適用するには、entry intent ごとの policy attribution を Falsifier 起動より先に固定し、後続の enforcement が検証できる internal permit を作る必要がある。
+この change はその正本を runner に接続する基盤だけを扱う。Falsifier と SafetyFloor の現在の gate は変更しない。
 
 ## What Changes
 
-- entry intent ごとに active runtime config から `ALWAYS_ON_V1` / `OFF_V1` の policy decision を作り、Falsifier 起動前に durable 保存する
-- `ALWAYS_ON_V1` は従来どおり Falsifier の fresh `APPROVED` を必須とする
-- `OFF_V1` は `ENTER` に限り、durable decision と active runtime config identity が一致する場合だけ Falsifier を省略する
-- `ADD_LONG` は action/group identity の後続修正まで policy にかかわらず Falsifier を必須とする
-- SafetyFloor は runner 内の分岐だけを信用せず、同じ durable decision を読み直して bypass authority を検証する
-- 新規副作用前の policy decision 保存・読取・identity 照合が失敗または不一致なら entry を fail closed にする
-- runner の client request identity を canonical order payload と policy authority に束縛し、同一 identity の retry だけ既存結果を replay する
-- commit の可能性を否定できない recovery failure は no-trade ではなく outcome unknown として扱う
-- `CONDITIONAL_V1` はこの変更では適用せず、選択された場合は Falsifier 必須として扱う
-- runtime docs と回帰テストを同じ変更で更新する
+- policy/action ごとに canonical な `required` と reason codes を解決する
+- typed `TradingBotConfig` から canonical runtime config hash を再計算し、snapshot identity を検証する
+- entry intent ごとに durable policy decision を exact readback または原子保存する
+- `OFF_V1` の `ENTER` decision から、MCP wire に露出しない immutable internal permit を作る
+- decision/permit を runner の内部 audit context に残す。ただし、この PR では Falsifier を省略せず、permit を preview/place command に渡さない
+- `ALWAYS_ON_V1`、`CONDITIONAL_V1`、`ADD_LONG` は常に `required=true` として保存する
+- runtime docs と foundation の回帰テストを更新する
 
 ## Capabilities
 
 ### New Capabilities
 
-- `falsifier-policy-application`: version 付き policy decision を runner と SafetyFloor の entry gateへ適用する契約
+- `falsifier-policy-application`: policy attribution と internal permit foundation の契約
 
 ### Modified Capabilities
 
@@ -28,11 +25,9 @@ Falsifier を省略しても intent integrity と資金保護を維持し、poli
 
 ## Impact
 
-- `OneShotLlmRunner` の entry flow と Falsifier phase selection
-- `TradingRuntime` / `PaperBroker` の policy repository wiring
-- `SafetyFloor` の fresh falsification gate
-- runner、broker、SafetyFloor、PostgreSQL wiring のテスト
+- `OneShotLlmRunner` の entry intent 後の durable policy attribution
+- `TradingRuntime` の policy decision repository wiring
+- policy resolution / config identity / runner persistence のテスト
 - `docs/mcp-runtime.md`
 
-外部 API と schema は foundation から変更しない。
-実取引は引き続き未実装で、対象は paper entry のみ。
+外部 API と MCP wire schema は変更しない。paper entry は引き続き fresh `APPROVED` を要求し、実取引と policy activation は対象外である。

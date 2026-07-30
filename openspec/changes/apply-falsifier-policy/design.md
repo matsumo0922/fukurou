@@ -1,126 +1,77 @@
 ## Context
 
-Foundation は version 付き policy enum と、intent ごとに一意な `FalsifierPolicyDecision` / canonical event の原子保存を提供するが、runner と SafetyFloor はまだ参照しない。
-現在の entry flow は Falsifier の fresh `APPROVED` がなければ必ず停止し、`PlaceOrderCommand` と SafetyFloor の間に policy bypass authority は存在しない。
+Foundation は version 付き policy enum と、intent ごとに一意な `FalsifierPolicyDecision` / canonical event の原子保存を提供する。
+現在の entry flow は Falsifier の fresh `APPROVED` がなければ停止し、`PlaceOrderCommand` と SafetyFloor の間に bypass authority はない。
 
-Issue #207 は最初に Falsifier on/off を比較し、その後に conditional policy を試す。
-この変更は最初の on/off 適用だけを扱い、評価期間や rejected-intent shadow を混ぜない。
+Issue #207 は最初に Falsifier on/off を比較する。本 change はそのための attribution/permit foundation を runner に接続し、実際の gate replacement は後続 enforcement change に残す。
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- `ALWAYS_ON_V1` と `OFF_V1` を paper entry flow に適用する
-- policy decision を Falsifier 起動または省略より前に durable 保存する
-- `OFF_V1` の省略権限を intent、decision、policy、runtime config identity に束縛する
-- runner 分岐と SafetyFloor の独立検証を一致させる
-- 欠損、不一致、保存失敗、読取失敗を fail closed にする
+- policy/action ごとの canonical decision attributes を決定する
+- typed config と runtime snapshot identity の一致を検証する
+- decision を Falsifier 起動前に durable に exact readback または保存する
+- `OFF_V1` / `ENTER` 専用の immutable internal permit を生成する
 
 **Non-Goals:**
 
+- Falsifier の省略、SafetyFloor/Broker の gate または paper order behavior の変更
+- permit の `PlaceOrderCommand` / MCP wire schema への追加
+- reserved `runner-place-v2-` namespace、placement-lock 再検査、broker replay 検証、post-place outcome classification
 - `CONDITIONAL_V1` の risk / regime / recent-loss 判定
-- policy の production activation
-- rejected intent の反実仮想 shadow
-- policy 間の成績集計や実験期間の判定
-- live trading
+- policy activation、rejected-intent shadow、評価集計、live trading
 
 ## Decisions
 
-### 1. on/off 適用を conditional より先に独立 PR にする
+### 1. canonical attributes は policy と action だけから決定する
 
-`ALWAYS_ON_V1` は `required=true / ALWAYS_ON` とする。
-`OFF_V1` の `ENTER` は `required=false / POLICY_OFF`、`ADD_LONG` は `required=true / ADD_LONG_REQUIRES_FALSIFIER` とする。
-`CONDITIONAL_V1` は `required=true / CONDITIONAL_NOT_APPLIED` として従来の Falsifier gate を維持する。
+`ALWAYS_ON_V1` は action を問わず `required=true / ALWAYS_ON` とする。
+`OFF_V1` の `ENTER` だけは `required=false / POLICY_OFF` とする。
+`OFF_V1` の `ADD_LONG` は `required=true / ADD_LONG_REQUIRES_FALSIFIER` とする。
+`CONDITIONAL_V1` は action を問わず `required=true / CONDITIONAL_NOT_APPLIED` とする。
 
-これにより Issue #207 の「まず on/off」の順序を守り、SafetyFloor risk 計算、regime taxonomy、closed-position attribution をこの PR に持ち込まない。
-`ADD_LONG` は action と target group を durable intent に束縛し、place lock 内で再検証する後続変更まで OFF bypass の対象外にする。
-conditional を推測で実装する案は paper truth を歪めるため採用しない。
+この段階では `ADD_LONG` の group binding と conditional 判定を実装しない。したがって、どちらも既存 Falsifier gate を維持する。
 
-### 2. runner は既存 decision を exact readback してから必要なら作る
+### 2. runner は policy decision を exact readback してから欠損時だけ保存する
 
 entry intent 発行後、runner は `FalsifierPolicyDecisionRepository.findFalsifierPolicyDecision(intentId)` を先に呼ぶ。
-既存 decision がある場合は、policy と action から導出した canonical `required` / `reasonCodes`、runtime config version/hash が全て完全一致する場合だけ再利用する。
-欠損時だけ新しい decision ID を生成し、foundation の原子 repository で decision と event を保存する。
+既存 decision は policy、required、reasonCodes、runtime config version/hash が canonical attributes と完全一致する場合だけ再利用する。
+欠損時だけ新しい decision ID を生成し、foundation repository の原子保存を使う。
 
-repository の failure、片側欠損、既存 decision の属性不一致は no-trade とする。
-既存 row を現在の config に合わせて上書きする案は、intent の因果時点を改変するため採用しない。
+repository failure、監査片側欠損、属性不一致は no-trade とする。既存 row を現在の config に合わせて上書きしない。
 
-### 3. runtime config identity は runner が実際に使う snapshot に固定する
+### 3. config identity は typed config と実行 snapshot を照合する
 
-runner は `RuntimeConfigCatalog.runtimeItems(tradingConfig)` の全 key/effective value から `calculateRuntimeConfigHash` で canonical typed config hash を再計算する。
-production entry flow は、注入された `RuntimeConfigAuditSnapshot.hash` がこの canonical hash と一致する場合だけ version ID / hash を decision と event に保存する。
-snapshot がない direct/test runner は version ID `process-config-v1` と同じ canonical hash を使う。
-空値や任意文字列での bypass は許さない。
+runner は `RuntimeConfigCatalog.runtimeItems(tradingConfig)` の key/effective value から canonical hash を再計算する。
+snapshot がある実行では hash が一致する場合だけ snapshot version ID/hash を decision に使う。
+snapshot がない direct/test runner は `process-config-v1` と canonical typed hash を使う。
 
-後から active config を再読して attribution を変更する案は、run 中の config switch と競合するため採用しない。
-typed config と snapshot を照合せず別々に信用する案も、別 config の identity へ OFF 挙動を帰属できるため採用しない。
+任意文字列の hash/version を trust しない。snapshot mismatch は decision、Falsifier、paper entry を開始しない。
 
-### 4. OFF bypass は internal permit と durable readback の両方を要求する
+### 4. OFF permit は internal data だけで表現する
 
-runner は `required=false` の durable decision から、次を含む immutable な internal permit を作る。
+runner は durable decision が `OFF_V1 / ENTER / required=false / POLICY_OFF` と完全一致する場合だけ、decision ID、intent ID、action、policy、required/reason codes、runtime config version/hash を持つ immutable internal permit を作る。
 
-- decision ID
-- intent ID
-- decision action
-- policy
-- required / reason codes
-- runtime config version ID / hash
+permit は runner 内部の audit と後続 enforcement への引数だけに使う。`PlaceOrderCommand`、`preview_order`、`place_order` の wire schema には含めない。この change では permit があっても Falsifier を省略せず、SafetyFloor/Broker は permit を読まない。
 
-permit は runner の `PlaceOrderCommand` 構築経路だけが設定し、MCP `preview_order` / `place_order` の wire schema には追加しない。
-`PaperBroker` は intent ID で durable policy decision を読み、`SafetyFloorContext` に渡す。
-SafetyFloor は permit と durable decision の全 identity が一致し、policy が `OFF_V1`、`required=false`、reason が `POLICY_OFF`、action が `ENTER` の場合だけ fresh `APPROVED` の代替 authority とする。
-place lock 内の最新 context で open position が 0 件であることも要求し、preview 後に resting BUY が約定していれば拒否する。
+### 5. enforcement は別 change で原子的に導入する
 
-runner の Boolean だけで Falsifier を省略する案は、別 caller や再試行時に SafetyFloor が権限を検証できないため採用しない。
-durable decision だけで自動 bypass する案も、MCP caller が既存 intent ID を渡すだけで省略権限を再利用できるため採用しない。
+後続 enforcement change は permit を command の internal-only path に束縛し、SafetyFloor の durable readback、place lock 内の open-position 再検査、`runner-place-v2-` namespace の pre-lookup validation、replay fingerprint、commit 可能性のある failure の outcome-unknown を同時に実装する。
 
-### 5. intent integrity と他の SafetyFloor rule は変更しない
-
-消費済み intent、intent/command payload 不一致、STOP、最大 risk、drawdown、exposure、cash、EV、blackout の検証順と意味は維持する。
-OFF permit は fresh falsification の条件だけを置換し、resting fill 再評価や他 action へは伝播させない。
-
-注文理由は実際の authority に合わせ、fresh approval の場合と policy bypass の場合を区別する。
-Falsifier を実行していない entry に「Falsifier APPROVED」と記録しない。
-
-### 6. runner replay identity を command と authority に束縛する
-
-新しい preview/place 副作用の前に policy repository を読めない場合は fail closed にする。
-OFF ENTER runner の place `clientRequestId` は、normalized `PlaceOrderCommand` business fields と policy permit 全 identity の canonical projection を SHA-256 で hash し、`runner-place-v2-<hash>` とする。
-`runner-place-v2-` namespace は OFF internal permit 専用に予約する。
-broker は既存 result lookup より前に、permit が存在し、現在 command から再計算した ID と一致することを検証する。
-この検証は新規 mutation と既存 replay の両方に必須とする。
-ALWAYS_ON / CONDITIONAL の fresh approval 経路は既存 client request namespace を使い、v2 authority envelope を作らない。
-permit を wire schema に持たない MCP caller、別 intent、別数量・価格・STOP/TP・time stop、別 policy authority は同じ ID を replay できない。
-
-ToolCallGuard に新しい pre-mutation event は追加しない。
-元 authority は mutation 前に保存済みの policy decision/event と、order に保存される intent ID / fingerprinted client request ID から復元する。
-completion audit / ACK loss 後に commit の可能性を否定できず、authority read もできない場合は outcome unknown とし、no-trade を記録しない。
-exact authority を再構築できる retry だけ既存 result を返す。
-
-### 7. policy event は LLM phase を捏造しない
-
-policy decision の canonical event は proposer の decision-run context と runtime config identity で保存する。
-OFF では Falsifier invocation、falsification record、Falsifier phase observation を作らない。
-runner phase audit は machine-readable に `policy`, `required`, `reasonCodes`, `decisionId` を記録する。
+基盤だけで Falsifier を省略することは禁止する。これにより、MCP caller が policy decision を発見しただけで bypass できない。
 
 ## Risks / Trade-offs
 
-- [direct/test runner に persisted runtime version がない] → typed config から安定した fallback identity を導出し、production snapshot がある場合は必ずそちらを使う
-- [既存 decision と再起動後 config または canonical attributes が違う] → 上書きせず no-trade にして、intent の attribution を保存する
-- [snapshot と typed config が別々に注入される] → canonical typed hash を再計算して snapshot hash と一致しなければ no-trade にする
-- [MCP caller が OFF decision を発見する] → wire command から internal permit を設定できず、SafetyFloor で拒否する
-- [新規 side effect 前に policy repository read が停止する] → preview/place を実行せず no-trade にする
-- [commit 後 ACK loss の retry 時に policy repository が停止する] → commit の可能性があれば outcome unknown とし、authority を再構築できる retry だけ fingerprint 一致で replay する
-- [MCP caller が runner client request ID を新規作成または replay に使う] → OFF 専用 v2 namespace は既存 lookup より前に internal permit と canonical command fingerprint の再計算を必須にする
-- [ADD_LONG が preview/place 間に ENTER へ化ける] → OFF bypass を ENTER に限定し、ADD_LONG は後続の action/group binding まで Falsifier 必須にする
-- [ENTER が preview/place 間に ADD_LONG へ化ける] → OFF ENTER は place lock 内で open position 0 件を再検証する
-- [`CONDITIONAL_V1` が誤って activate される] → Falsifier 必須へ倒し、conditional 実験としては使用禁止を docs に残す
+- [config switch 後に同じ intent を再実行する] → exact identity mismatch で no-trade にし attribution を書換えない
+- [MCP caller が OFF decision を知る] → permit は wire に存在せず、現時点では既存 fresh-approval gate が残る
+- [permit foundation を実験適用と誤認する] → docs に current behavior を明記し、activation と enforcement を後続に分離する
 
 ## Migration Plan
 
-1. repository wiring、runner decision、internal permit、SafetyFloor 検証を同時に deploy する。
-2. default `ALWAYS_ON_V1` のまま回帰を確認する。
-3. この PR では `OFF_V1` / `CONDITIONAL_V1` を production activate しない。
+1. repository wiring、runner decision、internal permit generation を deploy する。
+2. `ALWAYS_ON_V1` default のまま、全 entry が既存 Falsifier gate を通ることを確認する。
+3. enforcement change が deploy されるまで `OFF_V1` / `CONDITIONAL_V1` を activate しない。
 4. rollback は code を戻すだけで、保存済み decision/event を削除・書換えしない。
 
 ## Open Questions
