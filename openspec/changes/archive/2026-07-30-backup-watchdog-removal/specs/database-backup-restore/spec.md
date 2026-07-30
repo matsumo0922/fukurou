@@ -70,8 +70,3 @@ Backup and restore jobs MUST share a non-blocking root lock and MUST probe the p
 - **WHEN** the deploy lock was free at the probe and a deploy starts later
 - **THEN** the backup contract does not report full mutual exclusion, the dump remains bounded by the in-container timeout and the job by its invoker's timeout, and any resulting partial snapshot or child failure remains failed evidence without destructive retention
 
-## REMOVED Requirements
-
-### Requirement: Watchdog-bounded dump phase（旧 Requirement 内の記述として削除）
-
-理由: dump phase の 60 秒 bound と independent exact-backend termination watchdog は、deploy executor の `timeout 900` および systemd `TimeoutStartSec=20min` と二重の時間制限を構成し、2026-07-30 に restic `--no-cache` の index 読み込み背圧と複合して健全な pg_dump を誤終了させ、main の全デプロイを停止させた（issue #336）。single-owner 構成で backend を秒単位で強制終了すべき脅威は存在せず、Epic #286 の線引きに従い撤去する。これに伴い旧 Scenario「Host-side dump client cannot stop the database backend」「Dump completes before the watchdog deadline」「A watchdog control query hangs」を削除する。
