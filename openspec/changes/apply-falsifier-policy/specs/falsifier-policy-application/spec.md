@@ -83,7 +83,7 @@ SafetyFloor は fresh `APPROVED` がない `ENTER` を、wire から設定でき
 
 #### Scenario: permit と durable decision が不一致
 
-- **WHEN** decision ID、intent ID、policy、runtime config version/hash、required、reasonCodes のいずれかが一致しない
+- **WHEN** decision ID、intent ID、action、policy、runtime config version/hash、required、reasonCodes のいずれかが一致しない
 - **THEN** SafetyFloor は entry を拒否する
 
 #### Scenario: 新規 entry で durable decision を読めない
@@ -96,24 +96,44 @@ SafetyFloor は fresh `APPROVED` がない `ENTER` を、wire から設定でき
 - **WHEN** fresh `APPROVED` のない `ADD_LONG` に OFF permit を渡す
 - **THEN** SafetyFloor は entry を拒否する
 
-### Requirement: commit 済み client request は paper truth を replay する
+#### Scenario: preview 後に position が出現する
 
-broker は deterministic client request の ledger result が既に durable な場合、新しい mutation と policy authority 判定を行わず既存結果を replay しなければならない（MUST）。
+- **WHEN** OFF ENTER の preview 後、place lock 取得前に resting BUY が約定して open position が出現する
+- **THEN** place 時の SafetyFloor は OFF bypass を拒否し、買い増しを作らない
 
-#### Scenario: commit 後 ACK loss と policy repository outage
+### Requirement: runner replay identity は command と authority に一致する
 
-- **WHEN** 初回 OFF order が commit 済みだが応答を失い、同じ client request を policy repository outage 中に retry する
-- **THEN** broker は既存 result を mutation なしで返し、runner は実在 order を no-trade として扱わない
+runner は normalized order business fields と policy authority の canonical SHA-256 fingerprint を client request ID に使用し、broker は同じ internal permit から fingerprint を再計算できる場合だけ既存結果を replay しなければならない（MUST）。
 
-#### Scenario: durable result がない policy repository outage
+#### Scenario: exact internal retry
 
-- **WHEN** 同じ client request の durable result がなく policy decision を読めない
-- **THEN** broker は fail closed し、order を作らない
+- **WHEN** runner が同じ intent、normalized command fields、policy permit から同じ fingerprinted client request を retry する
+- **THEN** broker は既存 result を mutation なしで返す
+
+#### Scenario: wire caller が runner ID を再利用する
+
+- **WHEN** internal permit を持たない MCP caller が既存 `runner-place-v2-` client request ID を別 intent または payload で送る
+- **THEN** broker は既存 accepted result を返さず拒否する
+
+#### Scenario: internal retry の payload が違う
+
+- **WHEN** permit は同じでも数量、価格、STOP/TP、time stop その他の normalized business field が異なる
+- **THEN** fingerprint が一致せず broker は既存 result を返さない
 
 #### Scenario: authority recovery
 
 - **WHEN** commit 後の retry を監査する
-- **THEN** mutation 前 request audit から元の policy decision ID と canonical authority を特定できる
+- **THEN** durable order の intent ID、fingerprinted client request ID、policy decision/event から元 authority を特定できる
+
+#### Scenario: commit の可能性がある recovery failure
+
+- **WHEN** place 実行後の completion audit/ACK を失い、policy authority を再構築できない
+- **THEN** runner は結果を outcome unknown とし、no-trade を記録しない
+
+#### Scenario: durable result がない policy repository outage
+
+- **WHEN** 同じ fingerprinted client request の durable result がなく policy decision を読めない
+- **THEN** broker は fail closed し、order を作らない
 
 ### Requirement: ALWAYS_ON の既存 gate を維持する
 

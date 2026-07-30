@@ -11,7 +11,8 @@ Falsifier を省略しても intent integrity と資金保護を維持し、poli
 - `ADD_LONG` は action/group identity の後続修正まで policy にかかわらず Falsifier を必須とする
 - SafetyFloor は runner 内の分岐だけを信用せず、同じ durable decision を読み直して bypass authority を検証する
 - 新規副作用前の policy decision 保存・読取・identity 照合が失敗または不一致なら entry を fail closed にする
-- ledger commit 済みの同一 client request retry は policy read failure 時も mutation なしで既存結果を replay する
+- runner の client request identity を canonical order payload と policy authority に束縛し、同一 identity の retry だけ既存結果を replay する
+- commit の可能性を否定できない recovery failure は no-trade ではなく outcome unknown として扱う
 - `CONDITIONAL_V1` はこの変更では適用せず、選択された場合は Falsifier 必須として扱う
 - runtime docs と回帰テストを同じ変更で更新する
 

@@ -61,12 +61,15 @@ runner は `required=false` の durable decision から、次を含む immutable
 
 - decision ID
 - intent ID
+- decision action
 - policy
+- required / reason codes
 - runtime config version ID / hash
 
 permit は runner の `PlaceOrderCommand` 構築経路だけが設定し、MCP `preview_order` / `place_order` の wire schema には追加しない。
 `PaperBroker` は intent ID で durable policy decision を読み、`SafetyFloorContext` に渡す。
 SafetyFloor は permit と durable decision の全 identity が一致し、policy が `OFF_V1`、`required=false`、reason が `POLICY_OFF`、action が `ENTER` の場合だけ fresh `APPROVED` の代替 authority とする。
+place lock 内の最新 context で open position が 0 件であることも要求し、preview 後に resting BUY が約定していれば拒否する。
 
 runner の Boolean だけで Falsifier を省略する案は、別 caller や再試行時に SafetyFloor が権限を検証できないため採用しない。
 durable decision だけで自動 bypass する案も、MCP caller が既存 intent ID を渡すだけで省略権限を再利用できるため採用しない。
@@ -79,15 +82,17 @@ OFF permit は fresh falsification の条件だけを置換し、resting fill �
 注文理由は実際の authority に合わせ、fresh approval の場合と policy bypass の場合を区別する。
 Falsifier を実行していない entry に「Falsifier APPROVED」と記録しない。
 
-### 6. commit 済み idempotent replay と新規副作用を分ける
+### 6. runner replay identity を command と authority に束縛する
 
 新しい preview/place 副作用の前に policy repository を読めない場合は fail closed にする。
-一方、同じ deterministic `clientRequestId` の ledger result が既に durable なら、broker は SafetyFloor と policy repository を再実行せず mutation なしで既存結果を replay する。
-これは新しい entry authority ではなく、既に成立した paper truth の応答回復として扱う。
+runner の place `clientRequestId` は、normalized `PlaceOrderCommand` business fields と policy permit 全 identity の canonical projection を SHA-256 で hash し、`runner-place-v2-<hash>` とする。
+broker はこの namespace の既存 result を、permit が存在し、現在 command から再計算した ID と一致する場合だけ mutation なしで replay する。
+permit を wire schema に持たない MCP caller、別 intent、別数量・価格・STOP/TP・time stop、別 policy authority は同じ ID を replay できない。
 
-runner の guarded tool request payload は、mutation 前の durable audit として policy decision ID、policy、required、reason、runtime config identity を含む。
-completion audit / ACK loss 後も、元の authority と replay result を照合できるようにする。
-commit 済み order を policy read failure によって no-trade へ書き換える案は paper truth を壊すため採用しない。
+ToolCallGuard に新しい pre-mutation event は追加しない。
+元 authority は mutation 前に保存済みの policy decision/event と、order に保存される intent ID / fingerprinted client request ID から復元する。
+completion audit / ACK loss 後に commit の可能性を否定できず、authority read もできない場合は outcome unknown とし、no-trade を記録しない。
+exact authority を再構築できる retry だけ既存 result を返す。
 
 ### 7. policy event は LLM phase を捏造しない
 
@@ -102,8 +107,10 @@ runner phase audit は machine-readable に `policy`, `required`, `reasonCodes`,
 - [snapshot と typed config が別々に注入される] → canonical typed hash を再計算して snapshot hash と一致しなければ no-trade にする
 - [MCP caller が OFF decision を発見する] → wire command から internal permit を設定できず、SafetyFloor で拒否する
 - [新規 side effect 前に policy repository read が停止する] → preview/place を実行せず no-trade にする
-- [commit 後 ACK loss の retry 時に policy repository が停止する] → deterministic client request の durable result だけを mutation なしで replay し、元 authority は request audit から追跡する
+- [commit 後 ACK loss の retry 時に policy repository が停止する] → commit の可能性があれば outcome unknown とし、authority を再構築できる retry だけ fingerprint 一致で replay する
+- [MCP caller が runner client request ID を衝突させる] → runner v2 namespace は internal permit と canonical command fingerprint の再計算を必須にする
 - [ADD_LONG が preview/place 間に ENTER へ化ける] → OFF bypass を ENTER に限定し、ADD_LONG は後続の action/group binding まで Falsifier 必須にする
+- [ENTER が preview/place 間に ADD_LONG へ化ける] → OFF ENTER は place lock 内で open position 0 件を再検証する
 - [`CONDITIONAL_V1` が誤って activate される] → Falsifier 必須へ倒し、conditional 実験としては使用禁止を docs に残す
 
 ## Migration Plan
