@@ -1,7 +1,10 @@
 package me.matsumo.fukurou.trading.decision
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentConsumedException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentMissingException
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.InMemoryDecisionMaterialStateRepository
@@ -411,6 +414,29 @@ class InMemoryDecisionRepository(
         }
     }
 
+    /**
+     * authorized atomic entry coordinator 用の decision mutex 境界。
+     *
+     * callback は suspend せず、ledger、equity の順で同期 lock を取得する。
+     */
+    internal suspend fun <T> withAuthorizedAtomicEntryTransaction(
+        block: InMemoryAuthorizedAtomicEntryDecisionTransaction.() -> T,
+    ): Result<T> {
+        mutex.lock()
+        val transaction = InMemoryAuthorizedAtomicEntryDecisionTransaction(tradeIntents, intentConsumptions)
+
+        return try {
+            Result.success(transaction.block())
+        } catch (throwable: CancellationException) {
+            throw throwable
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
+        } finally {
+            transaction.invalidate()
+            mutex.unlock()
+        }
+    }
+
     private fun DecisionRecord.toJournalRecordLocked(): DecisionJournalRecord {
         val tradeIntent = tradeIntents.firstOrNull { intent -> intent.decisionId == decisionId }
         val tradePlan = tradePlans.firstOrNull { plan -> plan.decisionId == decisionId }
@@ -426,6 +452,62 @@ class InMemoryDecisionRepository(
             tradePlan = tradePlan,
             falsification = falsification,
         )
+    }
+}
+
+/** decision mutex 保持中だけ使える authorized entry の consumption transaction。 */
+internal class InMemoryAuthorizedAtomicEntryDecisionTransaction internal constructor(
+    private val tradeIntents: List<TradeIntentRecord>,
+    private val intentConsumptions: MutableList<TradeIntentConsumptionRecord>,
+) {
+    private var active = true
+
+    fun requireIntentAvailable(intentId: UUID) {
+        requireActive()
+
+        if (tradeIntents.none { intent -> intent.intentId == intentId }) {
+            throw AuthorizedAtomicEntryIntentMissingException()
+        }
+        if (intentConsumptions.any { consumption -> consumption.intentId == intentId }) {
+            throw AuthorizedAtomicEntryIntentConsumedException()
+        }
+    }
+
+    fun snapshotIntentConsumptions(): List<TradeIntentConsumptionRecord> {
+        requireActive()
+
+        return intentConsumptions.toList()
+    }
+
+    fun restoreIntentConsumptions(snapshot: List<TradeIntentConsumptionRecord>) {
+        requireActive()
+
+        intentConsumptions.clear()
+        intentConsumptions += snapshot
+    }
+
+    fun appendIntentConsumption(
+        intentId: UUID,
+        orderId: UUID?,
+        consumedAt: Instant,
+    ): TradeIntentConsumptionRecord {
+        requireActive()
+        requireIntentAvailable(intentId)
+
+        return TradeIntentConsumptionRecord(
+            consumptionId = UUID.randomUUID(),
+            intentId = intentId,
+            orderId = orderId,
+            consumedAt = consumedAt,
+        ).also(intentConsumptions::add)
+    }
+
+    internal fun invalidate() {
+        active = false
+    }
+
+    private fun requireActive() {
+        check(active) { "authorized atomic entry decision transaction is no longer active." }
     }
 }
 

@@ -1,9 +1,12 @@
 package me.matsumo.fukurou.trading.decision
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentConsumedException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentMissingException
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
@@ -17,6 +20,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
@@ -208,6 +212,72 @@ class DecisionSubmissionAuthorityTest {
 
         assertEquals(1, results.map { result -> result.decision.decisionId }.distinct().size)
         assertEquals(1, repository.snapshots.decisions().size)
+    }
+
+    @Test
+    fun `authorized atomic transaction restores consumption snapshot`() = runBlocking {
+        val repository = InMemoryDecisionRepository(FIXED_CLOCK)
+        val intentId = requireNotNull(repository.submitDecision(completeSubmission()).getOrThrow().tradeIntent).intentId
+
+        val result = repository.withAuthorizedAtomicEntryTransaction {
+            requireIntentAvailable(intentId)
+            val snapshot = snapshotIntentConsumptions()
+            appendIntentConsumption(intentId, UUID.randomUUID(), Instant.now(FIXED_CLOCK))
+            restoreIntentConsumptions(snapshot)
+            snapshotIntentConsumptions()
+        }.getOrThrow()
+
+        assertTrue(result.isEmpty())
+        assertTrue(repository.snapshots.intentConsumptions().isEmpty())
+    }
+
+    @Test
+    fun `authorized atomic transaction serializes consumption and reports typed failures`(): Unit = runBlocking {
+        val repository = InMemoryDecisionRepository(FIXED_CLOCK)
+        val intentId = requireNotNull(repository.submitDecision(completeSubmission()).getOrThrow().tradeIntent).intentId
+
+        val results = coroutineScope {
+            List(16) {
+                async {
+                    repository.withAuthorizedAtomicEntryTransaction {
+                        appendIntentConsumption(intentId, UUID.randomUUID(), Instant.now(FIXED_CLOCK))
+                    }
+                }
+            }.awaitAll()
+        }
+
+        assertEquals(1, results.count(Result<*>::isSuccess))
+        assertEquals(15, results.count { it.exceptionOrNull() is AuthorizedAtomicEntryIntentConsumedException })
+        assertEquals(1, repository.snapshots.intentConsumptions().size)
+        val missing = repository.withAuthorizedAtomicEntryTransaction {
+            requireIntentAvailable(UUID.randomUUID())
+        }
+        assertIs<AuthorizedAtomicEntryIntentMissingException>(missing.exceptionOrNull())
+    }
+
+    @Test
+    fun `authorized atomic transaction rejects escaped receiver after unlock`(): Unit = runBlocking {
+        val repository = InMemoryDecisionRepository(FIXED_CLOCK)
+        var escaped: InMemoryAuthorizedAtomicEntryDecisionTransaction? = null
+
+        repository.withAuthorizedAtomicEntryTransaction {
+            escaped = this
+        }.getOrThrow()
+
+        assertFailsWith<IllegalStateException> {
+            requireNotNull(escaped).snapshotIntentConsumptions()
+        }
+    }
+
+    @Test
+    fun `authorized atomic transaction preserves structured cancellation`(): Unit = runBlocking {
+        val repository = InMemoryDecisionRepository(FIXED_CLOCK)
+
+        assertFailsWith<CancellationException> {
+            repository.withAuthorizedAtomicEntryTransaction {
+                throw CancellationException("test cancellation")
+            }
+        }
     }
 }
 

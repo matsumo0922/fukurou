@@ -1,21 +1,21 @@
 ## 1. Internal capability contract
 
-- [ ] 1.1 module-internal `AuthorizedAtomicPaperEntryBackend`へstable replay identityとsealed MARKET / resting creation proposal、`Exact` / `Created` resultを追加し、public repository / broker contractへ露出しない
+- [x] 1.1 module-internal `AuthorizedAtomicPaperEntryBackend`へstable replay identityとsealed MARKET / resting creation proposal、`Exact` / `Created` resultを追加し、public repository / broker contractへ露出しない
 - [x] 1.2 stable identityのv2 prefix、non-null command intent、fingerprint-bound symbol / mode / side / order type / business fields、明示nullable trade groupを副作用前に検証する
 - [x] 1.3 creation proposalを参照しないinternal replay classifierを追加し、persisted FILLED lifecycleはentry・position・direct-linked STOP・direct-linked execution各1件、non-filled resting lifecycleは単一entryの場合だけ`Exact`にする
 - [ ] 1.4 same v2 / 明示stable group / v2 audit-linked intent artifactが全てない場合だけ`Missing`とし、entry / position / STOP / executionの欠損、duplicate entry / STOP / execution、stable identity / direct-link不一致を`Ambiguous`にする
 - [ ] 1.5 fresh command / resting order / position / STOP / execution ID、resolved group、prepared subtype、fill / TTL / eligibilityを`Missing`後のcreateだけで検証・使用する
 - [x] 1.6 A1 InMemory replay readerへauthorized command由来のstable business identityを渡してcomplete-bundle shape rulesへ寄せ、FILLED BUY-onlyを`Ambiguous`、完全fixtureを`Exact`としてfail closedを強化する
-- [ ] 1.7 replay-indeterminate、intent-missing、intent-consumed、account-not-flat、backend-unavailable、outcome-indeterminateをtyped failureとして追加する
+- [x] 1.7 replay-indeterminate、intent-missing、intent-consumed、account-not-flat、backend-unavailable、outcome-indeterminateをtyped failureとして追加する
 - [ ] 1.8 A1 `AuthorizedFalsifierPolicyBoundary`へcapabilityを注入せず、`Missing` fail-closedとpublic place / previewのv2 guardを維持し、close / update / cancelへblanket prefix guardを追加しない
 
 ## 2. InMemory atomic backend
 
-- [ ] 2.1 `InMemoryDecisionRepository`へdecision mutex内でexact replayを優先できるnon-suspend internal commit helperを追加する
+- [x] 2.1 `InMemoryDecisionRepository`へdecision mutex内でexact replayを優先できるnon-suspend internal commit helperを追加する
 - [ ] 2.2 `decision mutex -> ledger write lock -> equity snapshot lock`の順で、strict replay、Missing時のintent検証、flat predicateを実行するInMemory adapterを追加する
 - [ ] 2.3 `OPEN position == 0 AND BUY (OPEN / PENDING_CANCEL) order == 0`をlocked stateから判定し、protective SELLを除外する
 - [ ] 2.4 orders / positions / executions、account / updatedAt、decision / lineage auxiliary、eligibility / queue / source map、market cursorを含むledger before-imageを取得・完全restoreするinternal protocolを追加する
-- [ ] 2.5 `InMemoryEquitySnapshotRepository`へprivate equity lock内でsnapshot / replaceするmodule-internal non-suspend exclusive transaction helperを追加し、public append / DAILY append / readと同じlockを共有する
+- [x] 2.5 `InMemoryEquitySnapshotRepository`へprivate equity lock内でsnapshot / replaceするmodule-internal non-suspend exclusive transaction helperを追加し、public append / DAILY append / readと同じlockを共有する
 - [ ] 2.6 equity lockをbefore-image取得からledger / equity publish、consumption append、成功returnまたはrestore完了まで連続保持し、保持中のcallbackから外部I/O、suspend call、account source、ledger lock取得を呼ばない
 - [ ] 2.7 既存locked writer semanticsを再利用してMARKET相当entryまたはLIMIT / STOP resting entryをpublishし、その後にconsumptionをappendする
 - [ ] 2.8 ledger / equity publish後・consumption append前のtest fault seamを追加し、failure時に全before-imageを全3 lock内で完全restoreする

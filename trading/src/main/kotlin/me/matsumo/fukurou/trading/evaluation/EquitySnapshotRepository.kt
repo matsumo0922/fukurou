@@ -181,4 +181,58 @@ class InMemoryEquitySnapshotRepository : EquitySnapshotRepository {
             }
         }
     }
+
+    /**
+     * authorized atomic entry coordinator 用の exclusive transaction。
+     *
+     * callback は suspend せず、ledger や account source を取得しない。
+     */
+    internal fun <T> withExclusiveTransaction(block: InMemoryEquitySnapshotBlock<T>): T {
+        return synchronized(lock) {
+            val transaction = InMemoryEquitySnapshotTransaction(snapshots)
+
+            try {
+                transaction.block()
+            } finally {
+                transaction.invalidate()
+            }
+        }
+    }
+}
+
+/** equity snapshot exclusive transaction の同期 callback。 */
+internal typealias InMemoryEquitySnapshotBlock<T> = InMemoryEquitySnapshotTransaction.() -> T
+
+/** equity snapshot lock 保持中だけ使える snapshot transaction。 */
+internal class InMemoryEquitySnapshotTransaction internal constructor(
+    private val snapshots: MutableList<EquitySnapshotRecord>,
+) {
+    private var active = true
+
+    fun snapshot(): List<EquitySnapshotRecord> {
+        requireActive()
+
+        return snapshots.toList()
+    }
+
+    fun replace(snapshot: List<EquitySnapshotRecord>) {
+        requireActive()
+
+        snapshots.clear()
+        snapshots += snapshot
+    }
+
+    fun append(snapshot: EquitySnapshotRecord) {
+        requireActive()
+
+        snapshots += snapshot
+    }
+
+    internal fun invalidate() {
+        active = false
+    }
+
+    private fun requireActive() {
+        check(active) { "in-memory equity snapshot transaction is no longer active." }
+    }
 }

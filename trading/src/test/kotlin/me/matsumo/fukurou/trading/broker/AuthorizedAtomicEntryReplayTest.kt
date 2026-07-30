@@ -3,6 +3,7 @@ package me.matsumo.fukurou.trading.broker
 import me.matsumo.fukurou.trading.domain.Execution
 import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
+import me.matsumo.fukurou.trading.domain.OrderExpirySource
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
@@ -188,6 +189,102 @@ class AuthorizedAtomicEntryReplayTest {
         }
     }
 
+    @Test
+    fun atomic_creation_proposal_is_validated_against_stable_identity() {
+        val identity = identity(entry())
+        val command = PlaceOrderCommand(
+            commandId = UUID.randomUUID(),
+            intentId = identity.intentId,
+            symbol = identity.symbol,
+            side = identity.side,
+            orderType = identity.orderType,
+            sizeBtc = identity.sizeBtc,
+            priceJpy = identity.priceJpy,
+            tradeGroupId = identity.tradeGroupId,
+            protectiveStopPriceJpy = identity.protectiveStopPriceJpy,
+            takeProfitPriceJpy = identity.takeProfitPriceJpy,
+            estimatedWinProbability = identity.estimatedWinProbability,
+            reasonJa = "test",
+            auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = identity.clientRequestId),
+        )
+        val request = atomicMarketRequest(identity, command)
+
+        request.requireStableIdentityValid()
+        request.requireCreationProposalValid()
+
+        val changedIntent = atomicMarketRequest(identity, command.copy(intentId = UUID.randomUUID()))
+        changedIntent.requireStableIdentityValid()
+        assertFailsWith<IllegalArgumentException> { changedIntent.requireCreationProposalValid() }
+    }
+
+    @Test
+    fun atomic_creation_proposal_allows_resolved_group_for_null_stable_group() {
+        val identity = identity(entry()).copy(tradeGroupId = null)
+        val command = PlaceOrderCommand(
+            commandId = UUID.randomUUID(),
+            intentId = identity.intentId,
+            symbol = identity.symbol,
+            side = identity.side,
+            orderType = identity.orderType,
+            sizeBtc = identity.sizeBtc,
+            priceJpy = identity.priceJpy,
+            tradeGroupId = UUID.randomUUID(),
+            protectiveStopPriceJpy = identity.protectiveStopPriceJpy,
+            takeProfitPriceJpy = identity.takeProfitPriceJpy,
+            estimatedWinProbability = identity.estimatedWinProbability,
+            reasonJa = "test",
+            auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = identity.clientRequestId),
+        )
+
+        atomicMarketRequest(identity, command, requireNotNull(command.tradeGroupId)).run {
+            requireStableIdentityValid()
+            requireCreationProposalValid()
+        }
+    }
+
+    @Test
+    fun atomic_resting_creation_proposal_validates_against_stable_identity() {
+        val identity = identity(entry(OrderType.LIMIT, OrderStatus.OPEN))
+        val command = PlaceOrderCommand(
+            commandId = UUID.randomUUID(),
+            intentId = identity.intentId,
+            symbol = identity.symbol,
+            side = identity.side,
+            orderType = identity.orderType,
+            sizeBtc = identity.sizeBtc,
+            priceJpy = identity.priceJpy,
+            tradeGroupId = identity.tradeGroupId,
+            protectiveStopPriceJpy = identity.protectiveStopPriceJpy,
+            takeProfitPriceJpy = identity.takeProfitPriceJpy,
+            estimatedWinProbability = identity.estimatedWinProbability,
+            reasonJa = "test",
+            auditContext = PaperTradeAuditContext.EMPTY.copy(clientRequestId = identity.clientRequestId),
+        )
+        val request = AuthorizedAtomicPaperEntryRequest(
+            identity = identity,
+            proposal = AuthorizedAtomicEntryCreationProposal.Resting(
+                IntentConsumingRestingEntryOrderRequest(
+                    order = RestingEntryOrderRequest(
+                        command = command,
+                        orderId = UUID.randomUUID(),
+                        tradeGroupId = requireNotNull(identity.tradeGroupId),
+                        createdAt = java.time.Instant.parse("2026-07-31T00:00:00Z"),
+                        expiresAt = java.time.Instant.parse("2026-07-31T00:05:00Z"),
+                        expirySource = OrderExpirySource.SYSTEM_TTL,
+                        effectiveTtlSeconds = 300,
+                    ),
+                    consumption = TradeIntentConsumptionRequest(
+                        identity.intentId,
+                        java.time.Instant.parse("2026-07-31T00:00:00Z"),
+                    ),
+                ),
+            ),
+        )
+
+        request.requireStableIdentityValid()
+        request.requireCreationProposalValid()
+    }
+
     private fun classify(
         entry: Order,
         orders: List<Order>,
@@ -221,6 +318,36 @@ class AuthorizedAtomicEntryReplayTest {
         estimatedWinProbability = BigDecimal("0.5"),
         tradeGroupId = UUID.fromString("00000000-0000-0000-0000-000000000001"),
     )
+
+    private fun atomicMarketRequest(
+        identity: AuthorizedAtomicEntryIdentity,
+        command: PlaceOrderCommand,
+        resolvedTradeGroupId: UUID = requireNotNull(identity.tradeGroupId),
+    ): AuthorizedAtomicPaperEntryRequest {
+        return AuthorizedAtomicPaperEntryRequest(
+            identity = identity,
+            proposal = AuthorizedAtomicEntryCreationProposal.Market(
+                IntentConsumingMarketEntryFillRequest(
+                    entry = MarketEntryFillRequest(
+                        command = command,
+                        fill = SimulatedFill(
+                            executionId = UUID.randomUUID(),
+                            priceJpy = BigDecimal("101"),
+                            sizeBtc = identity.sizeBtc,
+                            feeJpy = BigDecimal.ZERO,
+                            realizedPnlJpy = BigDecimal.ZERO,
+                            liquidity = ExecutionLiquidity.TAKER,
+                            executedAt = java.time.Instant.parse("2026-07-31T00:00:00Z"),
+                        ),
+                        positionId = UUID.randomUUID(),
+                        tradeGroupId = resolvedTradeGroupId,
+                        stopOrderId = UUID.randomUUID(),
+                    ),
+                    consumption = TradeIntentConsumptionRequest(identity.intentId, java.time.Instant.parse("2026-07-31T00:00:00Z")),
+                ),
+            ),
+        )
+    }
 
     private fun entry(type: OrderType = OrderType.MARKET, status: OrderStatus = OrderStatus.FILLED): Order = Order(
         orderId = "entry",
