@@ -22,7 +22,7 @@ import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
-import org.testcontainers.DockerClientFactory
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketAddress
@@ -58,7 +58,7 @@ class OneShotRunnerMainTest {
 
     @Test
     fun coldRuntimeConfigPoolReachesLaunchDisabledGateWithoutChildLaunch() = runBlocking {
-        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
+        requireTestDocker()
 
         RunnerColdStartSocketFactory.reset()
         RunnerColdStartPostgresContainer().use { container ->

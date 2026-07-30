@@ -83,8 +83,8 @@ import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.LlmInvocationAuditor
 import me.matsumo.fukurou.trading.runner.SecretRedactor
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
-import org.testcontainers.DockerClientFactory
 import java.io.File
 import java.math.BigDecimal
 import java.nio.file.FileSystemException
@@ -122,10 +122,7 @@ class OpsRouteTest {
 
     @Test
     fun sharedPersistenceBootstrap_recoversStaleRunThroughProductionFactory() = runBlocking {
-        if (!isDockerAvailable()) {
-            println("Skipping shared persistence bootstrap test because Docker is unavailable.")
-            return@runBlocking
-        }
+        requireTestDocker()
 
         val container = FukurouPostgresContainer()
         container.start()
@@ -2302,10 +2299,7 @@ private class FukurouPostgresContainer :
 private fun withFukurouPostgresTestApplication(
     block: suspend ApplicationTestBuilder.(FukurouPostgresContainer, ApplicationShutdownResultCapture) -> Unit,
 ) {
-    if (!isDockerAvailable()) {
-        println("Skipping DB-backed module test because Docker is unavailable.")
-        return
-    }
+    requireTestDocker()
 
     val tradingConfig = TradingBotConfig()
     assertFalse(tradingConfig.daemon.enabled)
@@ -2319,13 +2313,6 @@ private fun withFukurouPostgresTestApplication(
 
         shutdownResult.assertSucceeded()
     }
-}
-
-private fun isDockerAvailable(): Boolean {
-    return runCatching {
-        DockerClientFactory.instance().client().pingCmd().exec()
-        true
-    }.getOrDefault(false)
 }
 
 private fun deleteRuntimeConfigValues(database: ExposedDatabase) {

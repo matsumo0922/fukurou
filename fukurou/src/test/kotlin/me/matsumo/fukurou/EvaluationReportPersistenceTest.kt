@@ -13,7 +13,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
-import org.testcontainers.DockerClientFactory
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -41,7 +41,7 @@ class EvaluationReportPersistenceTest {
 
     @Test
     fun admission_serializesWithSharedReservationAndRecoversRejectedAndInterruptedJobs() = runBlocking {
-        if (!reportDockerAvailable()) return@runBlocking
+        requireTestDocker()
         val container = ReportPostgresContainer().also { it.start() }
         try {
             val database = ExposedDatabase.connect(container.jdbcUrl, "org.postgresql.Driver", container.username, container.password)
@@ -127,8 +127,3 @@ private fun testJob(jobId: String) = EvaluationReportJobResponse(
 
 private class ReportPostgresContainer :
     BoundedTestPostgresContainer<ReportPostgresContainer>("postgres:16-alpine")
-
-private fun reportDockerAvailable(): Boolean = runCatching {
-    DockerClientFactory.instance().client().pingCmd().exec()
-    true
-}.getOrDefault(false)

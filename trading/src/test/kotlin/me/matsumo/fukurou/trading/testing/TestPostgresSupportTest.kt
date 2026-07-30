@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.testing
 
+import org.junit.AssumptionViolatedException
 import java.net.ConnectException
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -24,6 +25,54 @@ class TestPostgresSupportTest {
         assertEquals(TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_CONNECT_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_LOGIN_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_SOCKET_TIMEOUT_KEY])
+    }
+
+    // Docker 不在を success として集計させないための契約。silent pass（無条件 return）へ戻すと fail する。
+    @Test
+    fun dockerGuardRaisesAssumptionFailureWhenDockerIsUnavailable() {
+        val failure = assertFailsWith<AssumptionViolatedException> {
+            requireTestDocker(available = false)
+        }
+
+        assertEquals(TEST_DOCKER_UNAVAILABLE_MESSAGE, failure.message)
+    }
+
+    // Docker がある場合は guard が素通りし、test 本体の実行を妨げない。
+    @Test
+    fun dockerGuardProceedsWhenDockerIsAvailable() {
+        requireTestDocker(available = true)
+    }
+
+    // 既定引数が実環境の判定を読むことを確認する。available を明示しない呼び出し側の挙動を固定する。
+    @Test
+    fun dockerGuardDefaultsToObservedDaemonAvailability() {
+        val available = isTestDockerAvailable()
+
+        if (available) {
+            requireTestDocker()
+            return
+        }
+
+        assertFailsWith<AssumptionViolatedException> { requireTestDocker() }
+    }
+
+    @Test
+    fun queryParameterOverrideReplacesTimeoutsWithoutBreakingUrlStructure() {
+        val url = "jdbc:postgresql://localhost:5432/test" +
+            "?connectTimeout=10&loginTimeout=30&socketTimeout=300&applicationName=fukurou%20test"
+
+        val overridden = url.withJdbcQueryParameters(
+            mapOf(
+                TEST_POSTGRES_CONNECT_TIMEOUT_KEY to "2",
+                TEST_POSTGRES_SOCKET_TIMEOUT_KEY to "2",
+            ),
+        )
+
+        assertEquals(1, overridden.count { character -> character == '?' })
+        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("connectTimeout=2") })
+        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("socketTimeout=2") })
+        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("loginTimeout=30") })
+        assertEquals(true, overridden.endsWith("applicationName=fukurou%20test"))
     }
 
     @Test

@@ -11,7 +11,7 @@ import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
-import org.testcontainers.DockerClientFactory
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
@@ -40,7 +40,7 @@ class DatabaseRecoveryPoolCompositionTest {
 
     @Test
     fun exhaustedApplicationPoolFailsTickWithinBudgetAndSameServiceRetryConverges() = runBlocking {
-        if (!isDockerAvailable()) return@runBlocking
+        requireTestDocker()
 
         ProductionPoolPostgresContainer().use { container ->
             container.start()
@@ -108,10 +108,6 @@ private fun recoveryReservationRequest(reservedAt: Instant): LlmLaunchReservatio
 
 private fun holdEveryPoolConnection(poolSize: Int, acquire: () -> Connection): List<Connection> {
     return List(poolSize) { acquire() }
-}
-
-private fun isDockerAvailable(): Boolean {
-    return runCatching { DockerClientFactory.instance().isDockerAvailable }.getOrDefault(false)
 }
 
 private class ProductionPoolPostgresContainer : BoundedTestPostgresContainer<ProductionPoolPostgresContainer>(

@@ -6,10 +6,10 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import org.testcontainers.DockerClientFactory
 import java.sql.DriverManager
 import java.time.Clock
 import java.time.Instant
@@ -23,7 +23,7 @@ import kotlin.test.assertTrue
 class PidRegistrationReceiptPersistenceTest {
     @Test
     fun finalEightArgumentReceiptActivatesExactProviderAndMcpThenFinishesWithActiveZero() = runBlocking {
-        if (!receiptDockerAvailable()) return@runBlocking
+        requireTestDocker()
         val container = ReceiptPostgresContainer().also { it.start() }
         try {
             val database = Database.connect(container.jdbcUrl, "org.postgresql.Driver", container.username, container.password)
@@ -112,8 +112,3 @@ private class ReceiptPostgresContainer :
 private fun JdbcTransaction.jdbcConnection(): java.sql.Connection {
     return connection.connection as java.sql.Connection
 }
-
-private fun receiptDockerAvailable(): Boolean = runCatching {
-    DockerClientFactory.instance().client().pingCmd().exec()
-    true
-}.getOrDefault(false)

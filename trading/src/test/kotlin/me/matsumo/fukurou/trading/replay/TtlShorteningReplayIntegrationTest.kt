@@ -7,9 +7,9 @@ import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.jdbcConnection
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
-import org.testcontainers.DockerClientFactory
 import java.sql.PreparedStatement
 import java.time.Clock
 import java.time.Instant
@@ -329,10 +329,7 @@ class TtlShorteningReplayIntegrationTest {
     }
 
     private fun runReplayTest(block: (ExposedDatabase) -> Unit) = runBlocking {
-        if (!isDockerAvailable()) {
-            println("Skipping TTL replay integration test because Docker is unavailable.")
-            return@runBlocking
-        }
+        requireTestDocker()
 
         val container = ReplayPostgresContainer()
         container.start()
@@ -358,10 +355,6 @@ class TtlShorteningReplayIntegrationTest {
                 maximumPoolSize = 4
             },
         )
-    }
-
-    private fun isDockerAvailable(): Boolean {
-        return runCatching { DockerClientFactory.instance().isDockerAvailable }.getOrDefault(false)
     }
 
     private companion object {

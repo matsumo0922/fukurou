@@ -6,7 +6,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
-import org.testcontainers.DockerClientFactory
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketAddress
@@ -35,7 +35,7 @@ class DatabaseColdStartTest {
 
     @Test
     fun coldPoolStartsProductionApplicationAndBootstrapsRuntimeAndTradingSchemas() {
-        if (!DockerClientFactory.instance().isDockerAvailable) return
+        requireTestDocker()
 
         ColdStartSocketFactory.reset()
         ColdStartPostgresContainer().use { container ->
