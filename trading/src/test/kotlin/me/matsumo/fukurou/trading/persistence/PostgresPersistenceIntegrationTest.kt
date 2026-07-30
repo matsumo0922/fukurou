@@ -973,6 +973,7 @@ class PostgresPersistenceIntegrationTest {
 
         assertEquals(request.decision, repository.recordFalsifierPolicyDecision(request).getOrThrow())
         assertEquals(request.decision, repository.recordFalsifierPolicyDecision(request).getOrThrow())
+        assertEquals(request.decision, repository.findFalsifierPolicyDecision(request.decision.intentId).getOrThrow())
         exposedTransaction(database) {
             assertSqlCount("SELECT COUNT(*) FROM falsifier_policy_decisions", 1)
             assertSqlCount("SELECT COUNT(*) FROM command_event_log WHERE event_type='FALSIFIER_POLICY_EVALUATED'", 1)
@@ -14872,6 +14873,7 @@ private fun FalsifierPolicyDecision.withRequired(required: Boolean): FalsifierPo
     )
 
 private fun falsifierPolicyDecisionAttributes(): FalsifierPolicyDecisionAttributes = FalsifierPolicyDecisionAttributes(
+    action = DecisionAction.ENTER,
     policy = FalsifierPolicy.ALWAYS_ON_V1,
     required = true,
     reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),

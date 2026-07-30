@@ -26,7 +26,7 @@ runner は entry intent ごとに active process の policy と runtime config i
 
 ### Requirement: retry は既存 policy attribution を変更しない
 
-runner は同じ intent の既存 policy decision を exact readback し、policy、required、reasonCodes と runtime config identity が canonical attributes と全て一致する場合だけ再利用しなければならない（MUST）。
+runner は同じ intent の既存 policy decision を exact readback し、action、policy、required、reasonCodes と runtime config identity が canonical attributes と全て一致する場合だけ再利用しなければならない（MUST）。
 
 #### Scenario: 同一 snapshot の再実行
 
@@ -40,7 +40,7 @@ runner は同じ intent の既存 policy decision を exact readback し、polic
 
 #### Scenario: canonical attributes が不一致
 
-- **WHEN** policy と config identity は一致するが required または reasonCodes が canonical 組合せと異なる
+- **WHEN** policy と config identity は一致するが action、required、または reasonCodes が canonical 組合せと異なる
 - **THEN** runner は既存 decision を再利用せず entry を no-trade にする
 
 ### Requirement: config identity は typed config と一致する

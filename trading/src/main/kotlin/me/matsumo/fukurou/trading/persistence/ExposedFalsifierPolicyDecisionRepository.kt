@@ -5,6 +5,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.config.FalsifierPolicy
+import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.FALSIFIER_POLICY_EVENT_TOOL_NAME
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecision
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionAttributes
@@ -115,17 +116,18 @@ class ExposedFalsifierPolicyDecisionRepository(
     private fun JdbcTransaction.insertDecision(decision: FalsifierPolicyDecision) {
         jdbcConnection().prepareStatement(
             """INSERT INTO falsifier_policy_decisions
-                (id, intent_id, policy, required, reason_codes, runtime_config_version_id, runtime_config_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id, intent_id, action, policy, required, reason_codes, runtime_config_version_id, runtime_config_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         ).use { statement ->
             statement.setObject(1, decision.decisionId)
             statement.setObject(2, decision.intentId)
-            statement.setString(3, decision.policy.name)
-            statement.setBoolean(4, decision.required)
-            statement.setString(5, decision.reasonCodes.sortedBy(FalsifierPolicyReasonCode::name).joinToString(",") { it.name })
-            statement.setString(6, decision.runtimeConfigVersionId)
-            statement.setString(7, decision.runtimeConfigHash)
-            statement.setLong(8, decision.createdAt.toEpochMilli())
+            statement.setString(3, decision.attributes.action.name)
+            statement.setString(4, decision.policy.name)
+            statement.setBoolean(5, decision.required)
+            statement.setString(6, decision.reasonCodes.sortedBy(FalsifierPolicyReasonCode::name).joinToString(",") { it.name })
+            statement.setString(7, decision.runtimeConfigVersionId)
+            statement.setString(8, decision.runtimeConfigHash)
+            statement.setLong(9, decision.createdAt.toEpochMilli())
             check(statement.executeUpdate() == 1) { "policy decision insert did not affect exactly one row." }
         }
     }
@@ -207,6 +209,7 @@ private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision {
         decisionId = getObject("id", UUID::class.java),
         intentId = getObject("intent_id", UUID::class.java),
         attributes = FalsifierPolicyDecisionAttributes(
+            action = DecisionAction.valueOf(getString("action")),
             policy = FalsifierPolicy.valueOf(getString("policy")),
             required = getBoolean("required"),
             reasonCodes = getString("reason_codes")

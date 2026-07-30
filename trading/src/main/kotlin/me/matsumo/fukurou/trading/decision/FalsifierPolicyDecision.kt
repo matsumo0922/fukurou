@@ -18,6 +18,8 @@ import java.util.UUID
 enum class FalsifierPolicyReasonCode {
     ALWAYS_ON,
     POLICY_OFF,
+    ADD_LONG_REQUIRES_FALSIFIER,
+    CONDITIONAL_NOT_APPLIED,
     RISK_THRESHOLD,
     REGIME_UNKNOWN,
     REGIME_UNFAVORABLE,
@@ -47,6 +49,7 @@ class FalsifierPolicyDecision private constructor(
     fun canonicalPayload(): String = buildJsonObject {
         put("decisionId", decisionId.toString())
         put("intentId", intentId.toString())
+        put("action", attributes.action.name)
         put("policy", policy.name)
         put("required", required)
         put(
@@ -93,6 +96,8 @@ class FalsifierPolicyDecision private constructor(
 
 /** policy decision の mutable でない business payload。 */
 data class FalsifierPolicyDecisionAttributes(
+    /** decision を発行した entry action。 */
+    val action: DecisionAction = DecisionAction.ENTER,
     val policy: FalsifierPolicy,
     val required: Boolean,
     val reasonCodes: Set<FalsifierPolicyReasonCode>,

@@ -23,7 +23,9 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigResolution
 import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.decision.DecisionRepository
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
+import me.matsumo.fukurou.trading.decision.InMemoryFalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.decision.identity.DecisionMaterialStateRepository
 import me.matsumo.fukurou.trading.decision.identity.DecisionAccountSnapshotReader
 import me.matsumo.fukurou.trading.decision.identity.ExposedDecisionAccountSnapshotReader
@@ -45,6 +47,7 @@ import me.matsumo.fukurou.trading.persistence.ExposedDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedDecisionRunProjectionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEquitySnapshotRepository
 import me.matsumo.fukurou.trading.persistence.ExposedEvaluationRepository
+import me.matsumo.fukurou.trading.persistence.ExposedFalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmRunRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.persistence.ExposedLlmInputManifestRepository
@@ -148,6 +151,8 @@ data class TradingRuntime(
     val equitySnapshotRepository: EquitySnapshotRepository,
     val evaluationRepository: EvaluationRepository,
     val decisionRepository: DecisionRepository,
+    val falsifierPolicyDecisionRepository: FalsifierPolicyDecisionRepository =
+        InMemoryFalsifierPolicyDecisionRepository(),
     val safetyViolationRepository: SafetyViolationRepository,
     val safetyDenialReader: DecisionRunSafetyDenialReader,
     val broker: Broker,
@@ -284,6 +289,7 @@ object TradingRuntimeFactory {
             clock = clock,
             materialStateRepository = materialStateRepository,
         )
+        val falsifierPolicyDecisionRepository = InMemoryFalsifierPolicyDecisionRepository()
         val safetyViolationRepository = InMemorySafetyViolationRepository()
         val riskStateCommandService = InMemoryRiskStateCommandService(
             riskStateRepository = riskStateRepository,
@@ -329,6 +335,7 @@ object TradingRuntimeFactory {
             equitySnapshotRepository = ledgerRepository.equitySnapshotRepository,
             evaluationRepository = evaluationRepository,
             decisionRepository = decisionRepository,
+            falsifierPolicyDecisionRepository = falsifierPolicyDecisionRepository,
             decisionMaterialStateRepository = materialStateRepository,
             llmInputManifestRepository = inputManifestRepository,
             decisionAccountSnapshotReader = InMemoryDecisionAccountSnapshotReader(
@@ -480,6 +487,7 @@ object TradingRuntimeFactory {
                 equitySnapshotRepository = repositories.equitySnapshotRepository,
                 evaluationRepository = repositories.evaluationRepository,
                 decisionRepository = repositories.decisionRepository,
+                falsifierPolicyDecisionRepository = repositories.falsifierPolicyDecisionRepository,
                 decisionMaterialStateRepository = repositories.decisionMaterialStateRepository,
                 llmInputManifestRepository = repositories.llmInputManifestRepository,
                 decisionAccountSnapshotReader = repositories.decisionAccountSnapshotReader,
@@ -569,6 +577,7 @@ private fun createPostgresRepositories(
         equitySnapshotRepository = ExposedEquitySnapshotRepository(connection.database),
         evaluationRepository = ExposedEvaluationRepository(connection.database),
         decisionRepository = ExposedDecisionRepository(connection.database, context.clock),
+        falsifierPolicyDecisionRepository = ExposedFalsifierPolicyDecisionRepository(connection.database),
         decisionMaterialStateRepository = ExposedDecisionMaterialStateRepository(connection.database),
         llmInputManifestRepository = ExposedLlmInputManifestRepository(connection.database),
         decisionAccountSnapshotReader = ExposedDecisionAccountSnapshotReader(connection.database),
@@ -702,6 +711,7 @@ private data class PostgresRuntimeRepositories(
     val equitySnapshotRepository: ExposedEquitySnapshotRepository,
     val evaluationRepository: ExposedEvaluationRepository,
     val decisionRepository: ExposedDecisionRepository,
+    val falsifierPolicyDecisionRepository: FalsifierPolicyDecisionRepository,
     val decisionMaterialStateRepository: ExposedDecisionMaterialStateRepository,
     val llmInputManifestRepository: ExposedLlmInputManifestRepository,
     val decisionAccountSnapshotReader: ExposedDecisionAccountSnapshotReader,

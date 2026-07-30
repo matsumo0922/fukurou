@@ -1674,6 +1674,7 @@ object FalsificationsTable : Table("falsifications") {
 object FalsifierPolicyDecisionsTable : Table("falsifier_policy_decisions") {
     val id = uuid("id")
     val intentId = uuid("intent_id").uniqueIndex()
+    val action = varchar("action", length = 32).default("ENTER")
     val policy = varchar("policy", length = 32)
     val required = bool("required")
     val reasonCodes = text("reason_codes")

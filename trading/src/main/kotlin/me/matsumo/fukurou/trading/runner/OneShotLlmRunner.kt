@@ -60,6 +60,8 @@ import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionSubmissionResult
 import me.matsumo.fukurou.trading.decision.FalsificationRecord
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecision
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRequest
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
 import me.matsumo.fukurou.trading.decision.identity.DecisionIdentityGenerator
@@ -318,6 +320,12 @@ data class OneShotRunnerResult(
     val intent: TradeIntentRecord?,
     val tradeResult: PaperTradeResult?,
     val terminalCause: LlmRunTerminalCause = classifyOneShotTerminalCause(status, tradeResult),
+)
+
+/** entry flow が durable に固定した policy attribution。 */
+private data class FalsifierPolicyFoundation(
+    val decision: FalsifierPolicyDecision,
+    val permit: FalsifierPolicyPermit?,
 )
 
 /**
@@ -1446,6 +1454,26 @@ class OneShotLlmRunner(
         val intent = requireNotNull(decision.tradeIntent) {
             "${decision.decision.submission.action.name} decision did not create trade intent."
         }
+        val policyFoundation = establishFalsifierPolicyFoundation(
+            context = proposerContext,
+            intent = intent,
+            action = decision.decision.submission.action,
+        )
+        if (policyFoundation.isFailure) {
+            runAuditRecorder.recordNoTrade(
+                context = proposerContext,
+                reason = "falsifier_policy_decision_unavailable",
+                cause = policyFoundation.exceptionOrNull(),
+            ).getOrThrow()
+
+            return entryFlowResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = intent,
+                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+                terminalCause = terminalCauseForNoTrade(policyFoundation.exceptionOrNull()),
+            )
+        }
         val falsifierContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
             provider = request.effectiveFalsifierAssignment().provider,
@@ -1524,6 +1552,58 @@ class OneShotLlmRunner(
         }
 
         return entryFlowResult(invocationId, decision, intent, finalStatus, placed)
+    }
+
+    private suspend fun establishFalsifierPolicyFoundation(
+        context: DecisionRunContext,
+        intent: TradeIntentRecord,
+        action: DecisionAction,
+    ): Result<FalsifierPolicyFoundation> = runCatching {
+        val attributes = FalsifierPolicyAttributesResolver.resolve(
+            tradingConfig = tradingConfig,
+            snapshot = runtimeConfigSnapshot,
+            action = action,
+        )
+        val repository = tradingRuntime.falsifierPolicyDecisionRepository
+        val existing = repository.findFalsifierPolicyDecision(intent.intentId).getOrThrow()
+        val decision = existing ?: FalsifierPolicyDecision.create(
+            decisionId = idGenerator(),
+            intentId = intent.intentId,
+            attributes = attributes,
+            createdAt = clock.instant(),
+        ).let { requested ->
+            repository.recordFalsifierPolicyDecision(
+                FalsifierPolicyDecisionRequest(
+                    decision = requested,
+                    decisionRunContext = context.copy(
+                        runtimeConfigVersionId = attributes.runtimeConfigVersionId,
+                        runtimeConfigHash = attributes.runtimeConfigHash,
+                    ),
+                ),
+            ).getOrThrow()
+        }
+        check(decision.attributes == attributes) { "existing policy decision attributes do not match current intent." }
+
+        val permit = FalsifierPolicyPermit.from(decision)
+        runAuditRecorder.appendRunnerPhase(
+            context = context.copy(
+                runtimeConfigVersionId = attributes.runtimeConfigVersionId,
+                runtimeConfigHash = attributes.runtimeConfigHash,
+            ),
+            phase = "falsifier_policy_foundation",
+            duration = Duration.ZERO,
+            details = buildJsonObject {
+                put("decisionId", decision.decisionId.toString())
+                put("intentId", decision.intentId.toString())
+                put("action", decision.attributes.action.name)
+                put("policy", decision.policy.name)
+                put("required", decision.required)
+                put("reasonCodes", decision.reasonCodes.sortedBy { reason -> reason.name }.joinToString(",") { reason -> reason.name })
+                put("offPermitCreated", permit != null)
+            },
+        ).getOrThrow()
+
+        FalsifierPolicyFoundation(decision, permit)
     }
 
     private fun entryFlowResult(
