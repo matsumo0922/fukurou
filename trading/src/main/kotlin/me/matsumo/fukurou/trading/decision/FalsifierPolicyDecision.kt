@@ -2,9 +2,9 @@ package me.matsumo.fukurou.trading.decision
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
@@ -29,39 +29,18 @@ enum class FalsifierPolicyReasonCode {
 class FalsifierPolicyDecision private constructor(
     val decisionId: UUID,
     val intentId: UUID,
-    val policy: FalsifierPolicy,
-    val required: Boolean,
-    val reasonCodes: Set<FalsifierPolicyReasonCode>,
-    val runtimeConfigVersionId: String,
-    val runtimeConfigHash: String,
+    val attributes: FalsifierPolicyDecisionAttributes,
     val createdAt: Instant,
 ) {
+    val policy: FalsifierPolicy get() = attributes.policy
+    val required: Boolean get() = attributes.required
+    val reasonCodes: Set<FalsifierPolicyReasonCode> get() = attributes.reasonCodes
+    val runtimeConfigVersionId: String get() = attributes.runtimeConfigVersionId
+    val runtimeConfigHash: String get() = attributes.runtimeConfigHash
+
     init {
         require(runtimeConfigVersionId.isNotBlank()) { "runtimeConfigVersionId must not be blank." }
         require(runtimeConfigHash.isNotBlank()) { "runtimeConfigHash must not be blank." }
-    }
-
-    companion object {
-        /** DB / audit canonicalization と同じ millisecond precision で decision を作る。 */
-        fun create(
-            decisionId: UUID,
-            intentId: UUID,
-            policy: FalsifierPolicy,
-            required: Boolean,
-            reasonCodes: Set<FalsifierPolicyReasonCode>,
-            runtimeConfigVersionId: String,
-            runtimeConfigHash: String,
-            createdAt: Instant,
-        ): FalsifierPolicyDecision = FalsifierPolicyDecision(
-            decisionId = decisionId,
-            intentId = intentId,
-            policy = policy,
-            required = required,
-            reasonCodes = reasonCodes,
-            runtimeConfigVersionId = runtimeConfigVersionId,
-            runtimeConfigHash = runtimeConfigHash,
-            createdAt = createdAt.truncatedTo(ChronoUnit.MILLIS),
-        )
     }
 
     /** audit event に保存する canonical projection。 */
@@ -70,9 +49,14 @@ class FalsifierPolicyDecision private constructor(
         put("intentId", intentId.toString())
         put("policy", policy.name)
         put("required", required)
-        put("reasonCodes", buildJsonArray {
-            reasonCodes.sortedBy(FalsifierPolicyReasonCode::name).forEach { reason -> add(JsonPrimitive(reason.name)) }
-        })
+        put(
+            "reasonCodes",
+            buildJsonArray {
+                reasonCodes.sortedBy(FalsifierPolicyReasonCode::name).forEach { reason ->
+                    add(JsonPrimitive(reason.name))
+                }
+            },
+        )
         put("runtimeConfigVersionId", runtimeConfigVersionId)
         put("runtimeConfigHash", runtimeConfigHash)
         put("createdAt", createdAt.toString())
@@ -81,23 +65,44 @@ class FalsifierPolicyDecision private constructor(
     override fun equals(other: Any?): Boolean = other is FalsifierPolicyDecision &&
         decisionId == other.decisionId &&
         intentId == other.intentId &&
-        policy == other.policy &&
-        required == other.required &&
-        reasonCodes == other.reasonCodes &&
-        runtimeConfigVersionId == other.runtimeConfigVersionId &&
-        runtimeConfigHash == other.runtimeConfigHash &&
+        attributes == other.attributes &&
         createdAt == other.createdAt
 
     override fun hashCode(): Int = listOf(
         decisionId,
         intentId,
-        policy,
-        required,
-        reasonCodes,
-        runtimeConfigVersionId,
-        runtimeConfigHash,
+        attributes,
         createdAt,
     ).hashCode()
+
+    companion object {
+        /** DB / audit canonicalization と同じ millisecond precision で decision を作る。 */
+        fun create(
+            decisionId: UUID,
+            intentId: UUID,
+            attributes: FalsifierPolicyDecisionAttributes,
+            createdAt: Instant,
+        ): FalsifierPolicyDecision = FalsifierPolicyDecision(
+            decisionId = decisionId,
+            intentId = intentId,
+            attributes = attributes,
+            createdAt = createdAt.truncatedTo(ChronoUnit.MILLIS),
+        )
+    }
+}
+
+/** policy decision の mutable でない business payload。 */
+data class FalsifierPolicyDecisionAttributes(
+    val policy: FalsifierPolicy,
+    val required: Boolean,
+    val reasonCodes: Set<FalsifierPolicyReasonCode>,
+    val runtimeConfigVersionId: String,
+    val runtimeConfigHash: String,
+) {
+    init {
+        require(runtimeConfigVersionId.isNotBlank()) { "runtimeConfigVersionId must not be blank." }
+        require(runtimeConfigHash.isNotBlank()) { "runtimeConfigHash must not be blank." }
+    }
 }
 
 /** policy decision 保存要求。payload は repository が canonical projection だけから生成する。 */
@@ -122,7 +127,9 @@ class InMemoryFalsifierPolicyDecisionRepository : FalsifierPolicyDecisionReposit
     private val decisionsByIntent = mutableMapOf<UUID, FalsifierPolicyDecision>()
     private val eventsById = mutableMapOf<UUID, CommandEvent>()
 
-    override suspend fun recordFalsifierPolicyDecision(request: FalsifierPolicyDecisionRequest): Result<FalsifierPolicyDecision> = runCatching {
+    override suspend fun recordFalsifierPolicyDecision(
+        request: FalsifierPolicyDecisionRequest,
+    ): Result<FalsifierPolicyDecision> = runCatching {
         mutex.withLock {
             val decision = request.decision
             val existingByIntent = decisionsByIntent[decision.intentId]

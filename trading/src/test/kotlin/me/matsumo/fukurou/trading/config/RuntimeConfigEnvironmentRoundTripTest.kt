@@ -50,6 +50,7 @@ class RuntimeConfigEnvironmentRoundTripTest {
         assertEquals("240", environment.getValue("FUKUROU_LLM_RUN_TIMEOUT_SECONDS"))
         assertEquals("11", environment.getValue("FUKUROU_LLM_PROCESS_TERMINATION_GRACE_SECONDS"))
         assertEquals("12", environment.getValue("FUKUROU_LLM_PERSISTENCE_TERMINAL_TIMEOUT_SECONDS"))
+        assertEquals("OFF_V1", environment.getValue("FUKUROU_FALSIFIER_POLICY"))
         assertEquals("claude-runtime-test", environment.getValue("FUKUROU_CLAUDE_MODEL"))
         assertEquals("codex-runtime-test", environment.getValue("FUKUROU_CODEX_MODEL"))
         assertEquals("CODEX", environment.getValue("FUKUROU_PROPOSER_PROVIDER"))
@@ -132,6 +133,7 @@ private fun nonDefaultRuntimeConfig(): TradingBotConfig {
         decisionProtocol = config.decisionProtocol.copy(
             falsificationFreshnessWindow = Duration.ofSeconds(90),
             restingEntryOrderTtl = Duration.ofSeconds(1200),
+            falsifierPolicy = FalsifierPolicy.OFF_V1,
         ),
         runner = config.runner.copy(
             maxToolCallsPerRun = 24,

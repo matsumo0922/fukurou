@@ -2224,6 +2224,7 @@ private fun OpsActivitySource.toActivitySourceDefinition(): OpsActivityCatalogIt
 @Suppress("CyclomaticComplexMethod")
 private fun CommandEventType.toActivityAuditEventDefinition(): OpsActivityCatalogItemResponse {
     val keySuffix = when (this) {
+        CommandEventType.FALSIFIER_POLICY_EVALUATED -> "falsifierPolicyEvaluated"
         CommandEventType.GMO_PUBLIC_REST_REQUEST_COMPLETED -> "gmoPublicRestRequestCompleted"
         CommandEventType.TOOL_CALL_COMPLETED -> "toolCallCompleted"
         CommandEventType.TOOL_CALL_REJECTED_BY_HARD_HALT -> "toolCallRejectedByHardHalt"

@@ -110,6 +110,7 @@ import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecision
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionAttributes
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionConflictException
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRequest
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyReasonCode
@@ -979,16 +980,7 @@ class PostgresPersistenceIntegrationTest {
 
         assertFailsWith<FalsifierPolicyDecisionConflictException> {
             repository.recordFalsifierPolicyDecision(
-                request.copy(decision = FalsifierPolicyDecision.create(
-                    decisionId = request.decision.decisionId,
-                    intentId = request.decision.intentId,
-                    policy = request.decision.policy,
-                    required = false,
-                    reasonCodes = request.decision.reasonCodes,
-                    runtimeConfigVersionId = request.decision.runtimeConfigVersionId,
-                    runtimeConfigHash = request.decision.runtimeConfigHash,
-                    createdAt = request.decision.createdAt,
-                )),
+                request.copy(decision = request.decision.withRequired(false)),
             ).getOrThrow()
         }
 
@@ -14866,13 +14858,25 @@ private fun falsifierPolicyDecisionRequest(): FalsifierPolicyDecisionRequest = F
     decision = FalsifierPolicyDecision.create(
         decisionId = UUID.randomUUID(),
         intentId = UUID.randomUUID(),
-        policy = FalsifierPolicy.ALWAYS_ON_V1,
-        required = true,
-        reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),
-        runtimeConfigVersionId = "runtime-v1",
-        runtimeConfigHash = "a".repeat(64),
+        attributes = falsifierPolicyDecisionAttributes(),
         createdAt = fixedInstant().plusNanos(999_999),
     ),
+)
+
+private fun FalsifierPolicyDecision.withRequired(required: Boolean): FalsifierPolicyDecision =
+    FalsifierPolicyDecision.create(
+        decisionId = decisionId,
+        intentId = intentId,
+        attributes = attributes.copy(required = required),
+        createdAt = createdAt,
+    )
+
+private fun falsifierPolicyDecisionAttributes(): FalsifierPolicyDecisionAttributes = FalsifierPolicyDecisionAttributes(
+    policy = FalsifierPolicy.ALWAYS_ON_V1,
+    required = true,
+    reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),
+    runtimeConfigVersionId = "runtime-v1",
+    runtimeConfigHash = "a".repeat(64),
 )
 
 private fun fixedInstant(): Instant {

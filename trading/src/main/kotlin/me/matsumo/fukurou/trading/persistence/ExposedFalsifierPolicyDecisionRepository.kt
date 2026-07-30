@@ -6,6 +6,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.config.FalsifierPolicy
 import me.matsumo.fukurou.trading.decision.FALSIFIER_POLICY_EVENT_TOOL_NAME
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecision
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionAttributes
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionConflictException
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRequest
@@ -21,7 +22,9 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 class ExposedFalsifierPolicyDecisionRepository(
     private val database: ExposedDatabase,
 ) : FalsifierPolicyDecisionRepository {
-    override suspend fun recordFalsifierPolicyDecision(request: FalsifierPolicyDecisionRequest): Result<FalsifierPolicyDecision> {
+    override suspend fun recordFalsifierPolicyDecision(
+        request: FalsifierPolicyDecisionRequest,
+    ): Result<FalsifierPolicyDecision> {
         return withContext(Dispatchers.IO) {
             runCatching {
                 try {
@@ -44,14 +47,16 @@ class ExposedFalsifierPolicyDecisionRepository(
         }
     }
 
-    override suspend fun findFalsifierPolicyDecision(intentId: UUID): Result<FalsifierPolicyDecision?> = withContext(Dispatchers.IO) {
-        runCatching {
-            exposedTransaction(database) {
-                val decision = selectDecisionByIntent(intentId) ?: return@exposedTransaction null
-                val byId = selectDecisionById(decision.decisionId)
-                val event = selectPolicyEvent(decision.decisionId)
+    override suspend fun findFalsifierPolicyDecision(intentId: UUID): Result<FalsifierPolicyDecision?> {
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    val decision = selectDecisionByIntent(intentId) ?: return@exposedTransaction null
+                    val byId = selectDecisionById(decision.decisionId)
+                    val event = selectPolicyEvent(decision.decisionId)
 
-                exactReadbackOrConflict(decision, decision, byId, event)
+                    exactReadbackOrConflict(decision, decision, byId, event)
+                }
             }
         }
     }
@@ -62,7 +67,8 @@ class ExposedFalsifierPolicyDecisionRepository(
         val byId = selectDecisionById(requested.decisionId)
         val event = selectPolicyEvent(requested.decisionId)
 
-        if (byIntent != null || byId != null || event != null) {
+        val hasPersistedPolicyState = byIntent != null || byId != null || event != null
+        if (hasPersistedPolicyState) {
             return exactReadbackOrConflict(requested, byIntent, byId, event)
         }
 
@@ -144,7 +150,13 @@ class ExposedFalsifierPolicyDecisionRepository(
     private fun JdbcTransaction.selectDecision(sql: String, id: UUID): FalsifierPolicyDecision? {
         return jdbcConnection().prepareStatement(sql).use { statement ->
             statement.setObject(1, id)
-            statement.executeQuery().use { results -> if (results.next()) results.toPolicyDecision() else null }
+            statement.executeQuery().use { results ->
+                if (results.next()) {
+                    results.toPolicyDecision()
+                } else {
+                    null
+                }
+            }
         }
     }
 
@@ -152,37 +164,46 @@ class ExposedFalsifierPolicyDecisionRepository(
         return jdbcConnection().prepareStatement("SELECT tool_name, event_type, payload FROM command_event_log WHERE id = ?").use { statement ->
             statement.setObject(1, id)
             statement.executeQuery().use { results ->
-                if (!results.next()) null else StoredPolicyEvent(
-                    toolName = results.getString("tool_name"),
-                    eventType = results.getString("event_type"),
-                    payload = results.getString("payload"),
-                )
+                if (!results.next()) {
+                    null
+                } else {
+                    StoredPolicyEvent(
+                        toolName = results.getString("tool_name"),
+                        eventType = results.getString("event_type"),
+                        payload = results.getString("payload"),
+                    )
+                }
             }
         }
     }
 }
 
 private data class StoredPolicyEvent(val toolName: String, val eventType: String, val payload: String) {
-    fun matches(decision: FalsifierPolicyDecision): Boolean =
-        toolName == FALSIFIER_POLICY_EVENT_TOOL_NAME &&
+    fun matches(decision: FalsifierPolicyDecision): Boolean {
+        return toolName == FALSIFIER_POLICY_EVENT_TOOL_NAME &&
             eventType == CommandEventType.FALSIFIER_POLICY_EVALUATED.name &&
             payload == decision.canonicalPayload()
+    }
 }
 
-private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision = FalsifierPolicyDecision.create(
-    decisionId = getObject("id", UUID::class.java),
-    intentId = getObject("intent_id", UUID::class.java),
-    policy = FalsifierPolicy.valueOf(getString("policy")),
-    required = getBoolean("required"),
-    reasonCodes = getString("reason_codes")
-        .split(',')
-        .filter(String::isNotBlank)
-        .map(FalsifierPolicyReasonCode::valueOf)
-        .toSet(),
-    runtimeConfigVersionId = getString("runtime_config_version_id"),
-    runtimeConfigHash = getString("runtime_config_hash"),
-    createdAt = java.time.Instant.ofEpochMilli(getLong("created_at")),
-)
+private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision {
+    return FalsifierPolicyDecision.create(
+        decisionId = getObject("id", UUID::class.java),
+        intentId = getObject("intent_id", UUID::class.java),
+        attributes = FalsifierPolicyDecisionAttributes(
+            policy = FalsifierPolicy.valueOf(getString("policy")),
+            required = getBoolean("required"),
+            reasonCodes = getString("reason_codes")
+                .split(',')
+                .filter(String::isNotBlank)
+                .map(FalsifierPolicyReasonCode::valueOf)
+                .toSet(),
+            runtimeConfigVersionId = getString("runtime_config_version_id"),
+            runtimeConfigHash = getString("runtime_config_hash"),
+        ),
+        createdAt = java.time.Instant.ofEpochMilli(getLong("created_at")),
+    )
+}
 
 private fun Throwable.isUniqueViolation(): Boolean = generateSequence(this) { throwable -> throwable.cause }
     .filterIsInstance<SQLException>()

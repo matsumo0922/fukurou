@@ -27,16 +27,7 @@ class FalsifierPolicyDecisionRepositoryTest {
 
         assertFailsWith<FalsifierPolicyDecisionConflictException> {
             repository.recordFalsifierPolicyDecision(
-                request.copy(decision = FalsifierPolicyDecision.create(
-                    decisionId = request.decision.decisionId,
-                    intentId = request.decision.intentId,
-                    policy = request.decision.policy,
-                    required = false,
-                    reasonCodes = request.decision.reasonCodes,
-                    runtimeConfigVersionId = request.decision.runtimeConfigVersionId,
-                    runtimeConfigHash = request.decision.runtimeConfigHash,
-                    createdAt = request.decision.createdAt,
-                )),
+                request.copy(decision = request.decision.withRequired(false)),
             ).getOrThrow()
         }
         Unit
@@ -61,12 +52,24 @@ class FalsifierPolicyDecisionRepositoryTest {
         decision = FalsifierPolicyDecision.create(
             decisionId = UUID.randomUUID(),
             intentId = UUID.randomUUID(),
-            policy = FalsifierPolicy.ALWAYS_ON_V1,
-            required = true,
-            reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),
-            runtimeConfigVersionId = "runtime-v1",
-            runtimeConfigHash = "a".repeat(64),
+            attributes = policyDecisionAttributes(),
             createdAt = Instant.parse("2026-07-31T00:00:00Z"),
         ),
+    )
+
+    private fun FalsifierPolicyDecision.withRequired(required: Boolean): FalsifierPolicyDecision =
+        FalsifierPolicyDecision.create(
+            decisionId = decisionId,
+            intentId = intentId,
+            attributes = attributes.copy(required = required),
+            createdAt = createdAt,
+        )
+
+    private fun policyDecisionAttributes(): FalsifierPolicyDecisionAttributes = FalsifierPolicyDecisionAttributes(
+        policy = FalsifierPolicy.ALWAYS_ON_V1,
+        required = true,
+        reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),
+        runtimeConfigVersionId = "runtime-v1",
+        runtimeConfigHash = "a".repeat(64),
     )
 }

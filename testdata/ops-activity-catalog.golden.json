@@ -23,6 +23,11 @@
   ],
   "auditEventTypes": [
     {
+      "value": "FALSIFIER_POLICY_EVALUATED",
+      "labelKey": "activity.catalog.audit.falsifierPolicyEvaluated.label",
+      "descriptionKey": "activity.catalog.audit.falsifierPolicyEvaluated.description"
+    },
+    {
       "value": "GMO_PUBLIC_REST_REQUEST_COMPLETED",
       "labelKey": "activity.catalog.audit.gmoPublicRestRequestCompleted.label",
       "descriptionKey": "activity.catalog.audit.gmoPublicRestRequestCompleted.description"
