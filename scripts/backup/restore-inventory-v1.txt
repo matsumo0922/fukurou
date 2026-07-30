@@ -16,6 +16,7 @@ table public evaluation_report_revisions
 table public evaluation_report_snapshots
 table public executions
 table public falsifications
+table public falsifier_policy_decisions
 table public gate_shadow_observations
 table public gate_shadow_resolutions
 # gate_shadow_scan_progress restores cursor, cumulative data_quality, and last_socket_observed_at together

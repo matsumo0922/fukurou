@@ -17,6 +17,7 @@ public decision_submission_authorities
 public trade_plans
 public trade_intents
 public falsifications
+public falsifier_policy_decisions
 public market_data_sessions
 public paper_market_event_receipts
 public market_data_gaps
