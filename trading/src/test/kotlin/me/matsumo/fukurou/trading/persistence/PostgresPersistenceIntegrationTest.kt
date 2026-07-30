@@ -204,10 +204,10 @@ import me.matsumo.fukurou.trading.shadow.GateShadowScanProgress
 import me.matsumo.fukurou.trading.shadow.InMemoryGateShadowRepository
 import me.matsumo.fukurou.trading.shadow.ShadowDataQuality
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.postgresql.ds.PGSimpleDataSource
-import org.testcontainers.DockerClientFactory
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.math.BigDecimal
@@ -13030,10 +13030,7 @@ private class FukurouPostgresContainer :
  * Docker が利用できる場合だけ Postgres integration test を実行する。
  */
 private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = runBlocking {
-    if (!isDockerAvailable()) {
-        println("Skipping Postgres integration test because Docker is unavailable.")
-        return@runBlocking
-    }
+    requireTestDocker()
 
     val container = FukurouPostgresContainer()
     container.start()
@@ -13265,11 +13262,6 @@ private fun selectOrderCancelReasonConstraintDefinition(database: ExposedDatabas
 /**
  * Docker daemon が利用可能かを返す。
  */
-private fun isDockerAvailable(): Boolean {
-    return runCatching {
-        DockerClientFactory.instance().isDockerAvailable
-    }.getOrDefault(false)
-}
 
 /**
  * test container 用 DataSource を作る。

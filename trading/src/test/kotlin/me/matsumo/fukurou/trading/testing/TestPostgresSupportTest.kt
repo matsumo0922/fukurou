@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.trading.testing
 
+import org.junit.Assume.assumeTrue
+import org.junit.AssumptionViolatedException
 import java.net.ConnectException
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -24,6 +26,29 @@ class TestPostgresSupportTest {
         assertEquals(TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_CONNECT_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_LOGIN_TIMEOUT_KEY])
         assertEquals(TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString(), parameters[TEST_POSTGRES_SOCKET_TIMEOUT_KEY])
+    }
+
+    // Docker 不在を success として集計させないための契約。silent pass（無条件 return）への回帰を防ぐ。
+    @Test
+    fun dockerGuardRaisesAssumptionFailureWhenDaemonIsUnavailable() {
+        val failure = assertFailsWith<AssumptionViolatedException> {
+            assumeTrue("Docker daemon is unavailable; skipping the Testcontainers test.", false)
+        }
+
+        assertTrue(failure.message.orEmpty().contains("Docker daemon is unavailable"))
+    }
+
+    // requireTestDocker() の分岐が isTestDockerAvailable() の結果に一致することを、実行環境の両側で確認する。
+    @Test
+    fun dockerGuardMatchesDaemonAvailability() {
+        val available = isTestDockerAvailable()
+
+        if (available) {
+            requireTestDocker()
+            return
+        }
+
+        assertFailsWith<AssumptionViolatedException> { requireTestDocker() }
     }
 
     @Test

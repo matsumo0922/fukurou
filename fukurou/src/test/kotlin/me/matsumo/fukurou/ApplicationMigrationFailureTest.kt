@@ -16,8 +16,8 @@ import me.matsumo.fukurou.trading.persistence.ExposedLlmLaunchReservationReposit
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.reconciler.MutableReconcilerStatus
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
-import org.testcontainers.DockerClientFactory
 import java.sql.Connection
 import java.time.Clock
 import java.time.Duration
@@ -56,10 +56,7 @@ class ApplicationMigrationFailureTest {
     }
 
     private fun assertEconomicEventMigrationFailure(fixture: EconomicEventMigrationFailureFixture) {
-        if (!applicationMigrationDockerAvailable()) {
-            println("Skipping migration failure application test because Docker is unavailable.")
-            return
-        }
+        requireTestDocker()
 
         val container = ApplicationMigrationPostgresContainer()
         container.start()
@@ -301,10 +298,3 @@ private fun countBackfilledAttemptKeys(database: ExposedDatabase): Int {
 /** application migration failure test 用 PostgreSQL container。 */
 private class ApplicationMigrationPostgresContainer :
     BoundedTestPostgresContainer<ApplicationMigrationPostgresContainer>("postgres:16-alpine")
-
-private fun applicationMigrationDockerAvailable(): Boolean {
-    return runCatching {
-        DockerClientFactory.instance().client().pingCmd().exec()
-        true
-    }.getOrDefault(false)
-}

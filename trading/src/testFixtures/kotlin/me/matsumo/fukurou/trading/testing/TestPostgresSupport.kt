@@ -1,5 +1,6 @@
 package me.matsumo.fukurou.trading.testing
 
+import org.junit.Assume.assumeTrue
 import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.net.ConnectException
@@ -29,6 +30,15 @@ abstract class BoundedTestPostgresContainer<SELF : BoundedTestPostgresContainer<
 /** Docker daemon が利用可能かを返す。 */
 fun isTestDockerAvailable(): Boolean {
     return runCatching { DockerClientFactory.instance().isDockerAvailable }.getOrDefault(false)
+}
+
+/**
+ * Docker daemon が無ければ test を skip として終了させる。
+ *
+ * skip は test report の skipped 件数に現れる。無条件 return で success として集計させないこと。
+ */
+fun requireTestDocker() {
+    assumeTrue("Docker daemon is unavailable; skipping the Testcontainers test.", isTestDockerAvailable())
 }
 
 /** test body 開始前の一時的な PostgreSQL 接続失敗だけを最大 2 回再試行する。 */

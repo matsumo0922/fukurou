@@ -27,13 +27,16 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 
 対応する受け入れ条件: 「Docker 不在時にテストが silent pass しない」「Docker 可用性の判定 helper が 1 箇所に集約され、ファイルごとの別名コピーが無い」
 
-- [ ] 9 個の別名 helper を PR1 の共有 helper に置き換える
-  - [ ] `fukurou`: `applicationMigrationDockerAvailable`（`ApplicationMigrationFailureTest.kt:304`）、`receiptDockerAvailable`（`PidRegistrationReceiptPersistenceTest.kt:115`）、`isDockerAvailable`（`DatabaseRecoveryPoolCompositionTest.kt:112`）、`reportDockerAvailable`（`EvaluationReportPersistenceTest.kt:130`）、`monitoringDockerAvailable`（`MonitoringRepositoryPostgresTest.kt:76`）、`isDockerAvailable`（`OpsRouteTest.kt:2323`）
-  - [ ] `trading`: `isDockerAvailable`（`PostgresPersistenceIntegrationTest.kt:13268`、`TtlShorteningReplayIntegrationTest.kt:363`、`TailFactSheetIntegrationTest.kt:389`）
-  - [ ] `DockerClientFactory` 直接参照（`DatabaseColdStartTest.kt:37`、`OneShotRunnerMainTest.kt:61`、`FukurouMcpServerTest.kt:1368,2323`）
-- [ ] `println` + `return` / `return@runBlocking` を `assumeTrue` に置き換える
-- [ ] Docker 不在環境で skip 件数が test report に出ることを確認する（Docker を停止して 1 回実行するか、判定を強制的に false にして確認する）
-- [ ] full validation を実行する
+- [x] 9 個の別名 helper を PR1 の共有 helper に置き換える
+  - [x] `fukurou`: `applicationMigrationDockerAvailable`（`ApplicationMigrationFailureTest.kt:304`）、`receiptDockerAvailable`（`PidRegistrationReceiptPersistenceTest.kt:115`）、`isDockerAvailable`（`DatabaseRecoveryPoolCompositionTest.kt:112`）、`reportDockerAvailable`（`EvaluationReportPersistenceTest.kt:130`）、`monitoringDockerAvailable`（`MonitoringRepositoryPostgresTest.kt:76`）、`isDockerAvailable`（`OpsRouteTest.kt:2323`）
+  - [x] `trading`: `isDockerAvailable`（`PostgresPersistenceIntegrationTest.kt:13268`、`TtlShorteningReplayIntegrationTest.kt:363`、`TailFactSheetIntegrationTest.kt:389`）
+  - [x] `DockerClientFactory` 直接参照（`DatabaseColdStartTest.kt:37`、`OneShotRunnerMainTest.kt:61`、`FukurouMcpServerTest.kt:1368,2323`）
+- [x] 共有 fixture に `requireTestDocker()` を追加し、`assumeTrue` 呼び出しを 1 箇所に集約する
+- [x] `DockerClientFactory` の参照が共有 fixture 1 箇所だけになったことを確認する
+- [x] `println` + `return` / `return@runBlocking` を `assumeTrue` に置き換える
+- [x] Docker 不在環境で skip 件数が test report に出ることを確認する（一時 probe で `assumeTrue(false)` を通し、`skipped=1` を JUnit XML で確認。probe は削除済み）
+- [x] guard の契約テストを追加する（`dockerGuardRaisesAssumptionFailureWhenDaemonIsUnavailable` / `dockerGuardMatchesDaemonAvailability`）
+- [x] full validation を実行する
 
 ## PR3: PostgresPersistenceIntegrationTest の container 共有化
 

@@ -131,9 +131,9 @@ import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.safety.SafetyFloorRule
 import me.matsumo.fukurou.trading.safety.SafetyViolation
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import me.matsumo.fukurou.trading.tool.GuardedToolCall
 import me.matsumo.fukurou.trading.tool.ToolCallGuard
-import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.PostgreSQLContainer
 import java.math.BigDecimal
 import java.net.InetSocketAddress
@@ -1366,7 +1366,7 @@ class FukurouMcpServerTest {
 
     @Test
     fun knowledgeRecentLessonsTool_readsSafetyDenialThroughPostgresRuntime() = runBlocking {
-        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
+        requireTestDocker()
 
         val container = McpPostgresContainer()
         var runtime: me.matsumo.fukurou.trading.runtime.TradingRuntime? = null
@@ -2321,7 +2321,7 @@ private fun terminalEvidenceResult(response: JsonObject): CallToolResult = CallT
 class McpApplicationDatabaseRoleIntegrationTest {
     @Test
     fun applicationRole_supportsRequiredMatrixAndPersistsGatewaySubmissions() = runBlocking {
-        if (!DockerClientFactory.instance().isDockerAvailable) return@runBlocking
+        requireTestDocker()
 
         val container = McpPostgresContainer()
         container.start()
