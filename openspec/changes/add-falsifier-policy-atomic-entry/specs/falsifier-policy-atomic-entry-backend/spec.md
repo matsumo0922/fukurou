@@ -198,7 +198,11 @@ PostgreSQL mutation transactionとfresh readback transactionは`maxAttempts=1`�
 
 InMemory capabilityはexact replayが`Missing`でintent / flat検証を通過した後、mutation前に全mutable stateのbefore-imageを取得しなければならない（MUST）。
 restore対象はorders、positions、executions、account / accountUpdatedAt、decision / lineage auxiliary maps、market eligibility / queue / source maps、market session cursor、equity snapshots、intent consumptionsを含まなければならない（MUST）。
-ledger publish後・consumption append前を含むfailureでは、両lockを保持したままbefore-imageへ完全restoreしなければならない（MUST）。
+before-image取得からledger / equity publish、consumption append、成功returnまたはcomplete restoreまでは、decision mutex、ledger write lock、equity snapshot lockを連続して保持しなければならない（MUST）。
+ledger publish後・consumption append前を含むfailureでは、全3 lockを保持したままbefore-imageへ完全restoreしなければならない（MUST）。
+restoreは同時にcommit済みのequity snapshotを削除してはならず（MUST NOT）、全equity mutationが共有するequity snapshot lockで並行commitを除外しなければならない（MUST）。
+equity snapshot repositoryは同じprivate lock内でsnapshot / replaceを行うmodule-internalのnon-suspend exclusive transaction helperを提供しなければならない（MUST）。
+exclusive helperのcallbackは外部I/O、suspend call、account source、またはledger lockを新たに取得する処理を実行してはならない（MUST NOT）。
 
 #### Scenario: MARKET publish後のfault
 
@@ -213,11 +217,21 @@ ledger publish後・consumption append前を含むfailureでは、両lockを保�
 #### Scenario: restore中の可視性
 
 - **WHEN** fault restoreを実行する
-- **THEN** decision mutexとledger write lockはrestore完了まで解放されず、次のentry callはpartial stateを観測しない
+- **THEN** decision mutex、ledger write lock、equity snapshot lockはrestore完了まで解放されず、次のentry callはpartial stateを観測しない
+
+#### Scenario: DAILY snapshotとの交差
+
+- **GIVEN** `EquitySnapshotRecorder`がaccount sourceを完了してDAILY repository append直前のtest barrierで停止している
+- **AND** authorized MARKETがledgerとFILL equity snapshotをpublishした後、consumption append前のfault seamで全3 lockを保持して停止している
+- **WHEN** DAILY appendを開始してequity snapshot lockを待機させ、MARKET faultを発生させる
+- **THEN** DAILY appendはequity snapshot lockで待機するかrestore完了後にcommitし、そのDAILY snapshotは残る
+- **AND** failed MARKETのledger mutation、intent consumption、FILL equity snapshotは存在しない
+- **AND** 両処理はdeadlock、timeout、equity snapshot lockからledger lockへのreverse acquisitionなく完了する
 
 ### Requirement: backendごとの排他順序を固定する
 
-InMemory capabilityはdecision mutexからledger write lockの順に取得し、exact replay、intent検証、flat predicate、ledger mutation、consumption publishを両lockの内側で完了しなければならない（MUST）。
+InMemory capabilityは`decision mutex -> ledger write lock -> equity snapshot lock`の順に取得し、exact replay、intent検証、flat predicate、before-image取得、ledger / equity mutation、consumption publish、成功またはrestoreを全3 lockの内側で完了しなければならない（MUST）。
+equity snapshot lock保持中にledger lockを取得してはならず（MUST NOT）、`EquitySnapshotRecorder`はaccount sourceのledger read lockを解放してからDAILY appendのequity snapshot lockを取得しなければならない（MUST）。
 PostgreSQL MARKET capabilityは`risk_state -> paper_account -> OPEN positions -> OPEN / PENDING_CANCEL orders`の順にlockしなければならない（MUST）。
 realtime eligibility付きresting capabilityは`session advisory -> market_data_sessions row / verify -> risk_state -> paper_account -> positions -> orders`の順にlockし、ledger lock後にsession lockを取得してはならない（MUST NOT）。
 同じtransactionでexact replay、intent検証、flat predicate、mutation、consumptionを完了しなければならない（MUST）。
@@ -226,6 +240,11 @@ realtime eligibility付きresting capabilityは`session advisory -> market_data_
 
 - **WHEN** InMemory backendで同一request、同一intentの別request、別intentを反復して並行実行する
 - **THEN** deadlockせず各競合はexact / consumed / non-flatの契約どおり一意に収束する
+
+#### Scenario: InMemory equity lock graph
+
+- **WHEN** InMemory authorized entryと`EquitySnapshotRecorder`のDAILY appendを決定的barrier付きで交差実行する
+- **THEN** entryはdecision、ledger、equityの順を保ち、recorderはledger readを解放してからequityを取得し、reverse acquisitionなく完了する
 
 #### Scenario: PostgreSQL stress
 

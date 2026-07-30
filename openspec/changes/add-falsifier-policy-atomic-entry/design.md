@@ -4,7 +4,8 @@ A1 `add-falsifier-policy-authority-boundary` はdurable OFF authority、v2 finge
 exact resultがない場合は`AuthorizedNewMutationUnsupportedException`でfail closedとなり、production runnerは全entryでFalsifierとpublic broker pathを使う。
 
 現行public entryは、MARKET相当entryとresting entryの双方でledger mutationとintent consumptionをまとめる。
-InMemoryは`InMemoryDecisionRepository`のmutexからledger state write lockへ入り、PostgreSQLは`risk_state`、`paper_account`、OPEN position / orderをlockするtransactionで書き込む。
+InMemoryは`InMemoryDecisionRepository`のmutexからledger state write lockへ入り、FILL equity appendではさらに`InMemoryEquitySnapshotRepository`のprivate lockを取得する。
+PostgreSQLは`risk_state`、`paper_account`、OPEN position / orderをlockするtransactionで書き込む。
 ただしA1 authorized pathには、同じ原子境界でexact replay、consumed intent、flat predicateを解決して新規mutationするbackend capabilityがない。
 
 full A2はA1 boundary接続、SafetyFloor preparation、両backend capability、concurrency testまで含めると1,250〜1,500行規模となり、1 PRの目安1,000行を超える。
@@ -128,16 +129,19 @@ SafetyFloor snapshotだけでflatを判定する案は、snapshot取得後のrac
 ### 6. InMemoryはcomplete before-image restoreを採用する
 
 InMemory adapterは`InMemoryDecisionRepository`と`InMemoryPaperLedgerRepository`の組合せだけを受理する。
-lock順は既存public entryと同じ`decision mutex -> ledger state write lock`に固定する。
+lock順は`decision mutex -> ledger state write lock -> equity snapshot lock`に固定する。
 ledger write lock内でstrict replayとflat predicateを読み、decision mutex内のintent存在 / consumed stateを使う。
-MARKET / resting updateとconsumption appendが完了するまで両lockを解放しない。
+全3 lockを取得してからbefore-imageを取得し、MARKET / resting update、equity publish、consumption append、成功returnまたはcomplete restoreが完了するまで解放しない。
 
 既存`consumeIntentAfterLedgerWrite`はledger callbackより前にconsumedを拒否するため、そのまま使わない。
 新しいinternal helperはdecision mutex内でexact replay結果を優先できる非suspend commit callbackを提供する。
-callbackはledger write lock内で、intent未消費確認、ledger publish、consumption appendを一続きに実行する。
+`InMemoryEquitySnapshotRepository`には、private equity lockを取得してsnapshot stateを扱うmodule-internalのnon-suspend exclusive transaction helperを追加する。
+callbackはledger write lockからequity helperへ入り、intent未消費確認、before-image取得、ledger / equity publish、consumption append、成功またはrestoreを一続きに実行する。
+equity lock保持中のcallbackはsuspendせず、外部I/O、`EquitySnapshotRecorder`、account source、またはledger lockを新たに取得する処理を呼ばない。
+publicな`append`、`appendDailyIfAbsent`、`findAll`とinternal snapshot / replaceは同じprivate equity lockを共有する。
 
 既存locked writerは複数のmutable collectionをin-place更新するため、大きなstaged payloadへの全面置換ではなくcomplete before-image restoreを採用する。
-exact replayが`Missing`でintent / flat検証を通過した後、mutation前に次をsnapshotする。
+exact replayが`Missing`でintent / flat検証を通過した後、全3 lockを保持したmutation前に次をsnapshotする。
 
 - `orders`、`positions`、`executions`
 - `accountSnapshot`、`accountUpdatedAt`
@@ -153,11 +157,16 @@ exact replayが`Missing`でintent / flat検証を通過した後、mutation前�
 
 MARKET / resting updateは既存locked helperとdomain変換を再利用する。
 test-only fault seamをledger stateとequity snapshotのpublish完了後、intent consumption append直前に置く。
-このseamまたはそれ以降で例外が発生した場合、両lockを保持したままledger fields / collections、全auxiliary map、equity snapshots、intent consumptionsをbefore-imageへ完全復元してからfailureを返す。
+このseamまたはそれ以降で例外が発生した場合、全3 lockを保持したままledger fields / collections、全auxiliary map、equity snapshots、intent consumptionsをbefore-imageへ完全復元してからfailureを返す。
+equity lockはbefore-image取得前からrestore完了まで連続して保持されるため、restoreは同時にcommit済みのDAILY snapshotを消さない。
+競合するDAILY appendはequity lockで待機し、restore後にcommitして残る。
 restore APIはin-memory内部のsynchronous replace操作に限定し、restore中に外部I/Oや新しいfailure seamを作らない。
 testは全対象のbefore / after snapshot一致を比較し、orderだけ消してaccountやequityを残す不完全rollbackを許さない。
 
-ledger lockからdecision mutexを取る逆順案は、public entryとのdeadlockを作るため採用しない。
+現行`EquitySnapshotRecorder.recordDailyIfNeeded()`はaccount sourceでledger read lockを取得・解放してから`appendDailyIfAbsent`でequity lockを取るため、equity lockからledger lockへ戻るnested pathを持たない。
+現行`InMemoryEquitySnapshotRepository`のequity lock保持区間もsnapshot collectionのread / writeだけで、ledgerを呼ばない。
+新しいexclusive helperからaccount sourceやledger取得を呼ぶ経路は追加せず、この前提をcall graph確認とcross-testで固定する。
+ledger lockからdecision mutex、またはequity lockからledger lockを取る逆順案は、public entryとのdeadlockを作るため採用しない。
 ledgerとdecisionを別々にcommitして補償削除する案は、paper truthを書換えるため採用しない。
 staged stateのsingle reference publishへ全面refactorする案は、既存repository layoutに対してscopeが大きいため採用しない。
 
@@ -254,6 +263,7 @@ test matrixはMARKET / resting双方について次を固定する。
 - 同じv2 IDのclose / reduce SELLまたは複数BUY / ADD_LONG: `Ambiguous`
 - 同じtrade groupの別request ADD_LONG / close: original replay resultへ非集約
 - InMemory ledger publish後・consumption前failure: 全mutable stateを完全restore
+- InMemory failureと`EquitySnapshotRecorder` DAILY appendの交差: DAILYはequity lockで待機してrestore後にcommitし、failed FILLは残らない
 - PostgreSQL rollback確認済みpre-commit failure: `Unavailable`
 - PostgreSQL commit成功・ACK loss: fresh readbackで`Exact`
 - PostgreSQL readback unavailable / `Missing` / `Ambiguous`: `OutcomeIndeterminate`
@@ -261,6 +271,9 @@ test matrixはMARKET / resting双方について次を固定する。
 InMemoryはbounded coroutine stress、PostgreSQLは独立connection / transactionのintegration testを使う。
 反復回数はraceを観測できる小さな固定値とし、新しい汎用chaos frameworkは追加しない。
 eligibility付きauthorized restingと`applyMarketEvent`のcross-testは、test-only barrierで各lock到達点を固定し、両処理がtimeout / deadlockなく完了することとreverse acquisitionがないことを決定的に検証する。
+InMemoryのequity cross-testは、まず`EquitySnapshotRecorder`のaccount sourceを完了させてtest barrierでDAILY repository append直前に停止し、次にauthorized MARKETをledger / FILL equity publish後・consumption前のfault barrierで停止する。
+その後DAILY appendを開始してequity lock待機を確認し、faultを発生させてcomplete restoreを完了する。
+DAILY appendがrestore後にcommitして残ること、failed MARKETのledger / consumption / FILL equityが存在しないこと、timeout / deadlockとequityからledgerへのreverse acquisitionがないことを検証する。
 transaction wrapper testはattempt counterでmutation bodyとreadbackが各最大1回であることを検証する。
 
 ## Risks / Trade-offs
@@ -269,8 +282,9 @@ transaction wrapper testはattempt counterでmutation bodyとreadbackが各最�
 - [同一requestがconsumed / non-flatで拒否される] → lock / transaction内のstrict replayを最初に固定する
 - [zero-row predicateを2 transactionが通過する] → 全entry writerが取得するsingleton paper account rowで直列化する
 - [restingとmarket eventでdeadlockする] → advisory→session row→ledger rowsに固定し、reverse acquisitionなしのdeterministic cross-testを置く
-- [InMemoryのlock順が逆転する] → decision mutexからledger write lockだけを許可し、concurrency testでdeadlockを検出する
+- [InMemoryのlock順が逆転する] → decision mutex→ledger write lock→equity snapshot lockだけを許可し、call graph確認とconcurrency testでdeadlockを検出する
 - [InMemory failureがpartial stateを残す] → 全mutable stateのcomplete before-image restoreとpublish後/consumption前fault testを置く
+- [restoreが同時commit済みDAILY snapshotを消す] → equity lockをbefore-image取得からsuccess / restore完了まで連続保持し、DAILY appendとのdeterministic cross-testを置く
 - [trade groupの後続lifecycleをreplayへ混ぜる] → result membershipをrequest IDと直接linkに限定し、close / ADD_LONG fixturesを置く
 - [reserved prefix guardがrisk-reducing操作を止める] → close/update/cancelへblanket guardを追加せずnonprotective rowをAmbiguousにする
 - [capabilityがSafetyFloor bypassになる] → A2aをinactiveに保ち、A2bで既存preparation / SafetyFloor pathだけへ接続する

@@ -9,12 +9,13 @@
 ## 2. InMemory atomic backend
 
 - [ ] 2.1 `InMemoryDecisionRepository`へdecision mutex内でexact replayを優先できるnon-suspend internal commit helperを追加する
-- [ ] 2.2 decision mutexからledger write lockの順で、strict replay、Missing時のintent検証、flat predicateを実行するInMemory adapterを追加する
+- [ ] 2.2 `decision mutex -> ledger write lock -> equity snapshot lock`の順で、strict replay、Missing時のintent検証、flat predicateを実行するInMemory adapterを追加する
 - [ ] 2.3 `OPEN position == 0 AND BUY (OPEN / PENDING_CANCEL) order == 0`をlocked stateから判定し、protective SELLを除外する
 - [ ] 2.4 orders / positions / executions、account / updatedAt、decision / lineage auxiliary、eligibility / queue / source map、market cursorを含むledger before-imageを取得・完全restoreするinternal protocolを追加する
-- [ ] 2.5 `InMemoryEquitySnapshotRepository`とintent consumptionsを同じcritical sectionでsnapshot / replaceできるinternal before-image APIを追加する
-- [ ] 2.6 既存locked writer semanticsを再利用してMARKET相当entryまたはLIMIT / STOP resting entryをpublishし、その後にconsumptionをappendする
-- [ ] 2.7 ledger / equity publish後・consumption append前のtest fault seamを追加し、failure時に全before-imageを両lock内で完全restoreする
+- [ ] 2.5 `InMemoryEquitySnapshotRepository`へprivate equity lock内でsnapshot / replaceするmodule-internal non-suspend exclusive transaction helperを追加し、public append / DAILY append / readと同じlockを共有する
+- [ ] 2.6 equity lockをbefore-image取得からledger / equity publish、consumption append、成功returnまたはrestore完了まで連続保持し、保持中のcallbackから外部I/O、suspend call、account source、ledger lock取得を呼ばない
+- [ ] 2.7 既存locked writer semanticsを再利用してMARKET相当entryまたはLIMIT / STOP resting entryをpublishし、その後にconsumptionをappendする
+- [ ] 2.8 ledger / equity publish後・consumption append前のtest fault seamを追加し、failure時に全before-imageを全3 lock内で完全restoreする
 
 ## 3. PostgreSQL atomic backend
 
@@ -33,13 +34,15 @@
 - [ ] 4.3 InMemoryでMARKET / restingの新規`Created`、consumed / non-flatでも優先される`Exact`、intent missing / consumed、protective SELLのflat除外をtestする
 - [ ] 4.4 InMemoryで同一request、同一intentの別request、別intent、MARKET対restingをbounded並行実行し、1 mutation / 1 consumptionとtyped loser結果をtestする
 - [ ] 4.5 InMemoryのledger / equity publish後・consumption前faultで全ledger field、auxiliary map、market cursor、equity snapshot、consumptionがbefore-imageと一致することをtestする
-- [ ] 4.6 PostgreSQLでMARKET / restingの`Created` / `Exact`、intent / flat / write policy rejectionとtransaction rollbackをintegration testする
-- [ ] 4.7 PostgreSQLの独立connectionで同一request、同一intentの別request、別intent、MARKET対restingを並行実行し、paper account lockがzero-row raceを直列化することをtestする
-- [ ] 4.8 eligibility付きauthorized restingと`applyMarketEvent`をdeterministic barrierで交差させ、sessionからledgerの順でdeadlock / reverse acquisitionなく完了することをtestする
-- [ ] 4.9 pre-body / pre-commit rollbackをUnavailable、commit成功ACK lossとfresh readback成功を`Exact`、readback unavailable / `Missing` / `Ambiguous`をOutcomeIndeterminateとしてtestする
-- [ ] 4.10 attempt counterでmutation bodyとfresh readbackが各1回だけ実行され、whole-transaction自動retryがないことをtestする
-- [ ] 4.11 public close / update / cancelのreserved prefixがrisk-reducing availabilityを維持し、nonprotective same-ID rowがreplayを`Ambiguous`にすることをtestする
-- [ ] 4.12 public `Broker` / `PlaceOrderCommand` / MCP schema不変、A1 `Missing` fail-closed、production runnerがOFFでもFalsifierを起動する回帰testを維持する
+- [ ] 4.6 recorder account source完了後のDAILY append直前と、authorized MARKETのpost-ledger / pre-consumption fault seamをdeterministic barrierで交差させ、DAILYがequity lockを待ってrestore後に残り、failed FILL / ledger / consumptionがなく、deadlock / timeout / reverse acquisitionがないことをtestする
+- [ ] 4.7 `EquitySnapshotRecorder`がaccount sourceのledger readを解放してからequity lockを取得し、equity lock保持中のrepository pathがledgerを呼ばない現行call graphを確認する
+- [ ] 4.8 PostgreSQLでMARKET / restingの`Created` / `Exact`、intent / flat / write policy rejectionとtransaction rollbackをintegration testする
+- [ ] 4.9 PostgreSQLの独立connectionで同一request、同一intentの別request、別intent、MARKET対restingを並行実行し、paper account lockがzero-row raceを直列化することをtestする
+- [ ] 4.10 eligibility付きauthorized restingと`applyMarketEvent`をdeterministic barrierで交差させ、sessionからledgerの順でdeadlock / reverse acquisitionなく完了することをtestする
+- [ ] 4.11 pre-body / pre-commit rollbackをUnavailable、commit成功ACK lossとfresh readback成功を`Exact`、readback unavailable / `Missing` / `Ambiguous`をOutcomeIndeterminateとしてtestする
+- [ ] 4.12 attempt counterでmutation bodyとfresh readbackが各1回だけ実行され、whole-transaction自動retryがないことをtestする
+- [ ] 4.13 public close / update / cancelのreserved prefixがrisk-reducing availabilityを維持し、nonprotective same-ID rowがreplayを`Ambiguous`にすることをtestする
+- [ ] 4.14 public `Broker` / `PlaceOrderCommand` / MCP schema不変、A1 `Missing` fail-closed、production runnerがOFFでもFalsifierを起動する回帰testを維持する
 
 ## 5. Documentation and validation
 
