@@ -23,7 +23,9 @@ A1 `AuthorizedFalsifierPolicyBoundary`、public `Broker`、MCP、production runn
 ### Requirement: exact replay はatomic sectionの最初に解決する
 
 capabilityはbackendの排他境界を取得した後、intent consumption、flat predicate、新規mutationより先にv2 client request IDのauthorized exact replayを解決しなければならない（MUST）。
-BUY entryが厳密1件、intent ID一致、non-null trade group、同じclient request IDの全orderが同一trade groupの場合だけ`Exact`を返さなければならない（MUST）。
+同じclient request IDのBUY entryが厳密1件、intent ID一致、non-null trade groupの場合だけcandidateとしなければならない（MUST）。
+同じclient request IDのSELLは、BUY entryと同じtrade groupかつentry positionへ直接linkするprotective STOPだけを許可し、その他のSELLまたは2件目のBUYがあれば`Ambiguous`としなければならない（MUST）。
+resultは同じclient request IDのentry / protective STOP、それらを直接参照するposition / executionだけから復元し、同じtrade groupの別request rowを集約してはならない（MUST NOT）。
 
 #### Scenario: consumed intentとexact result
 
@@ -33,17 +35,37 @@ BUY entryが厳密1件、intent ID一致、non-null trade group、同じclient r
 #### Scenario: MARKET exact replay
 
 - **WHEN** v2 IDに1件のFILLED BUY entry、同一trade groupのprotective SELL、position、executionが存在する
-- **THEN** capabilityは関連するorder / position / executionを一つの`Exact` resultとして返す
+- **THEN** capabilityはrequest-scoped entry / protective STOPと直接linkするposition / executionだけを`Exact` resultとして返す
 
 #### Scenario: resting exact replay
 
 - **WHEN** v2 IDに1件のOPEN BUY resting entryが存在しintentとtrade groupが一致する
 - **THEN** capabilityはそのOPEN orderを`Exact` resultとして返す
 
-#### Scenario: ambiguous replay
+#### Scenario: 同じrequest IDのcloseまたはreduce
 
-- **WHEN** BUY entryが複数、intent不一致、trade group欠損、または別trade groupのrowが同じv2 IDに混在する
+- **WHEN** BUY entryと同じv2 IDにnon-protective close / reduce SELL orderが存在する
+- **THEN** capabilityはSELLをprotective STOPと誤認せずtyped replay-indeterminate failureを返す
+
+#### Scenario: 同じrequest IDのADD_LONG
+
+- **WHEN** 同じv2 IDに2件目のBUY / ADD_LONG orderが存在する
+- **THEN** capabilityはどちらかを選ばずtyped replay-indeterminate failureを返す
+
+#### Scenario: 別requestの同一trade group lifecycle
+
+- **WHEN** original entryと同じtrade groupに異なるclient request IDのADD_LONG、close、executionが存在する
+- **THEN** original replayはそれらをorder / position / execution resultへ集約しない
+
+#### Scenario: malformed protective row
+
+- **WHEN** request-scoped SELLがSTOP以外、position link欠損、entryと別position、または別trade groupである
 - **THEN** capabilityはtyped replay-indeterminate failureを返しintent、ledger、accountを変更しない
+
+#### Scenario: risk-reducing public command
+
+- **WHEN** public close / update protection / cancelがreserved v2 prefixをaudit client request IDに持つ
+- **THEN** systemはprefixだけを理由にrisk-reducing commandを拒否せず、非protective rowが同じIDへ作られた場合のentry replayを`Ambiguous`にする
 
 #### Scenario: concurrent同一request
 
@@ -140,26 +162,65 @@ A2a capabilityはprepared paper mutationだけを受け取るinternal storage pr
 
 predicate rejection、intent rejection、writer failureはtyped failureを返し、entryとconsumptionの片方だけを残してはならない（MUST NOT）。
 commit結果を確定できないstorage failureはtyped outcome-indeterminateとして扱い、result不存在、NO_TRADE、または安全なretry成功を断定してはならない（MUST NOT）。
+PostgreSQL mutation transactionとfresh readback transactionは`maxAttempts=1`で実行し、whole-transactionを自動再実行してはならない（MUST NOT）。
 
 #### Scenario: mutation前のfailure
 
-- **WHEN** replay / intent / predicate / write policy検証またはpre-commit writerが失敗する
-- **THEN** transactionまたはstaged in-memory updateはrollbackしentryとconsumptionを残さない
+- **WHEN** PostgreSQL transaction body開始前またはbody完了前に失敗しrollback完了を確認できる
+- **THEN** capabilityはtyped unavailable failureを返しentryとconsumptionを残さない
 
-#### Scenario: commit acknowledgement不明
+#### Scenario: body完了後のcommit acknowledgement不明
 
-- **WHEN** PostgreSQL commitの成否をcallerが確定できない
-- **THEN** capabilityはtyped outcome-indeterminate failureを返し、callerは同じv2 requestのexact replayでのみ結果を回復できる
+- **WHEN** 全body statement完了marker設定後にcommitまたはacknowledgementが失敗する
+- **THEN** capabilityはtransaction bodyを再実行せずtyped outcome-indeterminateとしてfresh exact readbackを一度だけ開始する
 
-#### Scenario: indeterminate retry
+#### Scenario: commit成功ACK lossのreadback
 
-- **WHEN** outcome-indeterminate後に同じv2 requestをretryしcommit済みrowが存在する
-- **THEN** capabilityは新規mutationより先に`Exact` resultを返す
+- **WHEN** commitは成功したがacknowledgementを失い、fresh readbackがsame v2 resultを`Exact`で復元する
+- **THEN** capabilityはmutationを再実行せず`Exact` successを返す
+
+#### Scenario: readback unavailable
+
+- **WHEN** outcome-indeterminate後のfresh exact readback自体が失敗する
+- **THEN** capabilityは元のtyped outcome-indeterminate failureを維持する
+
+#### Scenario: readback MissingまたはAmbiguous
+
+- **WHEN** outcome-indeterminate後のfresh exact readbackが`Missing`または`Ambiguous`である
+- **THEN** capabilityは未commitを断定せず元のtyped outcome-indeterminate failureを維持する
+
+#### Scenario: transaction attempt count
+
+- **WHEN** mutation bodyまたはfresh readbackがretry可能なDB errorを返す
+- **THEN** 各transaction bodyの実行回数は1回を超えない
+
+### Requirement: InMemory failure は全mutable stateをrestoreする
+
+InMemory capabilityはexact replayが`Missing`でintent / flat検証を通過した後、mutation前に全mutable stateのbefore-imageを取得しなければならない（MUST）。
+restore対象はorders、positions、executions、account / accountUpdatedAt、decision / lineage auxiliary maps、market eligibility / queue / source maps、market session cursor、equity snapshots、intent consumptionsを含まなければならない（MUST）。
+ledger publish後・consumption append前を含むfailureでは、両lockを保持したままbefore-imageへ完全restoreしなければならない（MUST）。
+
+#### Scenario: MARKET publish後のfault
+
+- **WHEN** MARKET entryのledger / account / equity publish後かつintent consumption append前のfault seamが失敗する
+- **THEN** orders、positions、executions、account、updatedAt、全auxiliary map、equity snapshots、consumptionsはcall前と完全一致する
+
+#### Scenario: resting publish後のfault
+
+- **WHEN** resting order / TTL / eligibility publish後かつintent consumption append前のfault seamが失敗する
+- **THEN** order、eligibility、queue、lineage auxiliary、equity snapshots、consumptionsを含む全mutable stateはcall前と完全一致する
+
+#### Scenario: restore中の可視性
+
+- **WHEN** fault restoreを実行する
+- **THEN** decision mutexとledger write lockはrestore完了まで解放されず、次のentry callはpartial stateを観測しない
 
 ### Requirement: backendごとの排他順序を固定する
 
-InMemory capabilityはdecision mutexからledger write lockの順に取得し、exact replay、intent検証、flat predicate、staged mutation、consumption publishを両lockの内側で完了しなければならない（MUST）。
-PostgreSQL capabilityは既存ledger mutation lock順を使用し、同じtransactionでexact replay、intent検証、flat predicate、mutation、consumptionを完了しなければならない（MUST）。
+InMemory capabilityはdecision mutexからledger write lockの順に取得し、exact replay、intent検証、flat predicate、ledger mutation、consumption publishを両lockの内側で完了しなければならない（MUST）。
+PostgreSQL MARKET capabilityは`risk_state -> paper_account -> OPEN positions -> OPEN / PENDING_CANCEL orders`の順にlockしなければならない（MUST）。
+realtime eligibility付きresting capabilityは`session advisory -> market_data_sessions row / verify -> risk_state -> paper_account -> positions -> orders`の順にlockし、ledger lock後にsession lockを取得してはならない（MUST NOT）。
+同じtransactionでexact replay、intent検証、flat predicate、mutation、consumptionを完了しなければならない（MUST）。
 
 #### Scenario: InMemory stress
 
@@ -170,6 +231,16 @@ PostgreSQL capabilityは既存ledger mutation lock順を使用し、同じtransa
 
 - **WHEN** 独立connectionのPostgreSQL transactionで同じ競合組合せを反復する
 - **THEN** zero-row predicateのphantom insertを許さず一件だけをcommitする
+
+#### Scenario: authorized restingとmarket event
+
+- **WHEN** realtime eligibility付きauthorized restingと同じsessionの`applyMarketEvent`を決定的barrier付きで交差実行する
+- **THEN** authorized restingはsessionからledgerの順、market eventはsession rowからledgerの順を保ち、reverse acquisition、deadlock、timeoutなく完了する
+
+#### Scenario: eligibilityなしresting
+
+- **WHEN** resting requestにrealtime market eligibilityがない
+- **THEN** capabilityはsession advisory / rowを取得せずMARKETと同じledger lock順を使う
 
 ### Requirement: schemaとproduction semanticsを移行しない
 

@@ -7,8 +7,9 @@ exact resultがない場合は`AuthorizedNewMutationUnsupportedException`でfail
 InMemoryは`InMemoryDecisionRepository`のmutexからledger state write lockへ入り、PostgreSQLは`risk_state`、`paper_account`、OPEN position / orderをlockするtransactionで書き込む。
 ただしA1 authorized pathには、同じ原子境界でexact replay、consumed intent、flat predicateを解決して新規mutationするbackend capabilityがない。
 
-full A2はA1 boundary接続、SafetyFloor preparation、両backend capability、concurrency testまで含めると1,250〜1,500行と見積もられ、1 PRの目安1,000行を超える。
+full A2はA1 boundary接続、SafetyFloor preparation、両backend capability、concurrency testまで含めると1,250〜1,500行規模となり、1 PRの目安1,000行を超える。
 このchangeはA2aとしてbackend capabilityとその直接testだけを扱う。
+blocker反映後のA2aは1,000行を実装gateとし、超える場合は同じcontractをbackend別stackへ分ける。
 A1 boundary / SafetyFloor接続はA2b、runtime activationはBに分ける。
 
 ## Goals / Non-Goals
@@ -84,7 +85,33 @@ A1 readerをlock外で一度呼んでからnew mutationだけtransactionへ渡�
 A2a capabilityはtransaction-local / lock-local replay helperを両backendに持つ。
 A1 boundaryへのreader registrationはA2aでは変更せず、A2bがconnection全体を設計する。
 
-### 4. flatはopen positionとfill可能なBUY orderの不存在で定義する
+### 4. exact replayはrequest-scoped row shapeだけを復元する
+
+replay helperは`client_request_id == requested v2 ID`のorderだけをrequest-scoped rowsとして読む。
+次を全て満たす場合だけ`Exact`を返す。
+
+- BUY entryが厳密1件でcommand intent IDと一致する
+- BUY entryのtrade group IDがnon-nullである
+- request-scoped SELLが存在する場合、全て`side=SELL / orderType=STOP / positionId non-null`のprotective STOPである
+- protective STOPはBUY entryと同じtrade groupに属し、MARKET entryが作ったpositionへ直接linkする
+- resting entryにはpositionがないためrequest-scoped SELLが存在しない
+
+request-scoped SELLがclose / reduce order、virtual take-profit、別positionのSTOP、またはlinkを証明できないrowなら`Ambiguous`とする。
+同じv2 IDのBUYが複数なら、ADD_LONGかcorrupt duplicateかを推測せず`Ambiguous`とする。
+
+resultのorder IDsはrequest-scoped entry / protective STOPだけに限定する。
+execution IDsはそのrequest-scoped order IDsを直接参照するexecutionだけ、position IDsはrequest-scoped entry / STOPが直接参照するpositionだけから復元する。
+同じtrade groupでも異なるclient request IDの後続ADD_LONG、close / reduce、protection update由来の別rowを走査・集約しない。
+
+trade group全体をresultへ集約する案は、初回entry後のlifecycle mutationをoriginal requestのresultへ混ぜるため採用しない。
+同一trade groupを正当性条件だけに使い、result membershipはclient request IDと直接linkで決める。
+
+public `close_position`、`update_protection`、`cancel_order`へreserved v2 prefixのblanket guardは追加しない。
+これらはrisk-reducing / protection availabilityを担うため、client request IDだけを理由に拒否しない。
+public risk-reducing callがentryと同じv2 IDでnon-protective rowを作った場合、後続replayは`Ambiguous`となり`Exact`を偽装しない。
+public `place_order` / previewの既存reserved prefix guardは維持する。
+
+### 5. flatはopen positionとfill可能なBUY orderの不存在で定義する
 
 flat predicateは次のANDで固定する。
 
@@ -98,7 +125,7 @@ exact replayはこのpredicateより先なので、replay対象自身が作っ�
 intent consumptionだけをsingle-entry gateにする案は、異なるintentの並行entryを防げないため採用しない。
 SafetyFloor snapshotだけでflatを判定する案は、snapshot取得後のraceを閉じないため採用しない。
 
-### 5. InMemoryはdecision mutexからledger write lockの順で一つのcommit sectionを作る
+### 6. InMemoryはcomplete before-image restoreを採用する
 
 InMemory adapterは`InMemoryDecisionRepository`と`InMemoryPaperLedgerRepository`の組合せだけを受理する。
 lock順は既存public entryと同じ`decision mutex -> ledger state write lock`に固定する。
@@ -107,24 +134,55 @@ MARKET / resting updateとconsumption appendが完了するまで両lockを解�
 
 既存`consumeIntentAfterLedgerWrite`はledger callbackより前にconsumedを拒否するため、そのまま使わない。
 新しいinternal helperはdecision mutex内でexact replay結果を優先できる非suspend commit callbackを提供する。
-callbackはledger write lock内で、intent未消費確認、staged ledger publish、consumption appendを一続きに実行する。
+callbackはledger write lock内で、intent未消費確認、ledger publish、consumption appendを一続きに実行する。
 
-MARKET updateは既存locked helperとdomain変換を再利用する。
-fallible validationとresult組立てをstate publishより前へ寄せ、test fault seamはpublish直前だけに置く。
-publish開始後に外部I/Oを行わず、entry rows、account projection、equity snapshot、consumptionを同じcritical sectionで追加する。
-unexpected failureではbefore-imageを復元し、entryまたはconsumption片側だけを残さない。
+既存locked writerは複数のmutable collectionをin-place更新するため、大きなstaged payloadへの全面置換ではなくcomplete before-image restoreを採用する。
+exact replayが`Missing`でintent / flat検証を通過した後、mutation前に次をsnapshotする。
+
+- `orders`、`positions`、`executions`
+- `accountSnapshot`、`accountUpdatedAt`
+- decision / lineage auxiliaryである`decisionRunIdsByPositionId`、`thesisCandidatesByIntentId`
+- `orderMarketEligibility`、`orderQueueConsumedBtc`、`positionMarketEligibility`
+- `executionMarketSources`
+- `marketSessionId`、`lastMarketSequence`
+- `InMemoryEquitySnapshotRepository`の全equity snapshots
+- `InMemoryDecisionRepository`の全intent consumptions
+
+`decisionContextsByRunId`はimmutable、`accountStateBoundary`のrisk stateはこのentry pathでread-onlyなのでrestore対象外である。
+それ以外のmutable fieldを暗黙に除外しない。
+
+MARKET / resting updateは既存locked helperとdomain変換を再利用する。
+test-only fault seamをledger stateとequity snapshotのpublish完了後、intent consumption append直前に置く。
+このseamまたはそれ以降で例外が発生した場合、両lockを保持したままledger fields / collections、全auxiliary map、equity snapshots、intent consumptionsをbefore-imageへ完全復元してからfailureを返す。
+restore APIはin-memory内部のsynchronous replace操作に限定し、restore中に外部I/Oや新しいfailure seamを作らない。
+testは全対象のbefore / after snapshot一致を比較し、orderだけ消してaccountやequityを残す不完全rollbackを許さない。
 
 ledger lockからdecision mutexを取る逆順案は、public entryとのdeadlockを作るため採用しない。
 ledgerとdecisionを別々にcommitして補償削除する案は、paper truthを書換えるため採用しない。
+staged stateのsingle reference publishへ全面refactorする案は、既存repository layoutに対してscopeが大きいため採用しない。
 
-### 6. PostgreSQLはpaper account rowをglobal entry serialization pointにする
+### 7. PostgreSQLはMARKETとrestingでlock graphを分ける
 
-Exposed backendは既存`lockPaperLedgerMutationRows()`のauthority順を維持する。
+MARKET相当entryとrealtime eligibilityを持たないresting entryは、既存ledger mutation lock順を使う。
 
 1. `risk_state`
 2. singleton `paper_account`
 3. OPEN positionsをID順
 4. OPEN / PENDING_CANCEL ordersをID順
+
+realtime eligibilityを持つresting entryは、既存`lockRestingOrderCreationRows()`と同じ順を使う。
+
+1. session-scoped PostgreSQL advisory transaction lock
+2. 対象`market_data_sessions` rowを`FOR UPDATE`でlockし、CONNECTED / sequenceを検証する
+3. `risk_state`
+4. singleton `paper_account`
+5. OPEN positionsをID順
+6. OPEN / PENDING_CANCEL ordersをID順
+7. global market admission boundaryを読む
+
+authorized restingだけがledger rowsを先に取り、後からsession advisory / rowを取る経路は作らない。
+`applyMarketEvent`は既存どおり`market_data_sessions` rowからledger mutation rowsへ進み、後からsession advisory lockを取得しない。
+したがってauthorized restingと`applyMarketEvent`の間にreverse acquisition cycleはない。
 
 zero-row predicateへの同時insertはposition / order row lockだけでは防げない。
 全risk-increasing entry writerが先にsingleton `paper_account`をlockする既存契約を使い、2つ目のtransactionを待機させる。
@@ -136,8 +194,9 @@ intent consumptionのunique indexを最後の防御として維持し、transact
 
 SERIALIZABLEへ全writerを変更する案は、既存transaction全体のretry semanticsを広げるため採用しない。
 advisory lockを新設する案は、既存paper account lockと二重のauthorityになるため採用しない。
+eligibility付きrestingでgeneric MARKET lock helperを先に呼ぶ案は、`applyMarketEvent`とのlock順を逆転させるため採用しない。
 
-### 7. capabilityは既存paper semanticsを再利用するがSafetyFloorの代替にしない
+### 8. capabilityは既存paper semanticsを再利用するがSafetyFloorの代替にしない
 
 MARKET相当requestは既存どおりFILLED BUY order、OPEN position、protective STOP、execution、account / equity snapshotを作る。
 crossing LIMITはA2bのpreparationでMARKET相当requestになり、non-crossing LIMITとSTOPはresting requestになる。
@@ -148,7 +207,7 @@ HARD_HALT、paper baseline、execution lineageはbackend write policyを再利�
 そのためA2aをpublic / runnerへ接続せず、A2bは既存SafetyFloorを通したprepared request以外を渡せない構造にする。
 新しい簡略SafetyFloorやOFF専用の例外規則は追加しない。
 
-### 8. failureはrejection、unavailable、outcome-indeterminateを分ける
+### 9. PostgreSQL transactionは一度だけ実行しcommit不明をfresh readbackする
 
 typed failureは少なくとも次を区別する。
 
@@ -159,15 +218,30 @@ typed failureは少なくとも次を区別する。
 - transaction開始前またはrollback確認済みstorage failure: `AuthorizedAtomicEntryUnavailableException`
 - commit acknowledgementを確定できないfailure: `AuthorizedAtomicEntryOutcomeIndeterminateException`
 
+authorized PostgreSQL mutationとcommit outcome確認用readbackは、どちらも`exposedTransaction(maxAttempts = 1)`を明示する。
+transaction bodyの外側に`bodyCompleted=false` markerを置き、全SQL mutationとconsumption insertが完了してlambdaがreturn可能になった時点だけtrueにする。
+Exposedまたはdriverによるwhole-transaction自動retryを許可しない。
+
+failure分類は次に固定する。
+
+- body開始前のfailure、または`bodyCompleted=false`でrollback完了を確認できるbody / pre-commit failureは`Unavailable`
+- `bodyCompleted=true`後のcommit / acknowledgement failure、またはrollbackを確認できないfailureは`OutcomeIndeterminate`
+
+`OutcomeIndeterminate`を捕捉したら、同じv2 ID / intentでfresh transactionのstrict exact readbackを直ちに一度だけ実行する。
+readbackも`maxAttempts=1`とする。
+`Exact`ならmutationを再実行せず`AuthorizedAtomicEntryResult.Exact`として回復する。
+readbackがunavailable、`Missing`、`Ambiguous`のいずれでも元の`OutcomeIndeterminate`を維持し、result不存在を断定しない。
+
 deterministic rejectionとrollback確認済みfailureはentry / consumptionを残さない。
-outcome-indeterminateはresult不存在またはNO_TRADEを意味せず、同じv2 requestのretryだけがexact replayで回復できる。
+outcome-indeterminateはresult不存在またはNO_TRADEを意味せず、fresh readbackまたは後続の同一v2 retryだけがexact replayで回復できる。
 A2aはこの型をrunner status / terminal causeへmappingしない。
 durable mappingと運用復旧はBで扱う。
 
 generic `IllegalStateException`だけを返す案は、consumed、non-flat、storage不明をcall側が文字列判定することになるため採用しない。
 commit不明を安全なfailureとして扱う案は、実際にはcommit済みのentryを見落とすため採用しない。
+commit不明時にtransaction bodyを自動再実行する案は、初回commit済みか不明な状態で二重mutationを試みるため採用しない。
 
-### 9. concurrency matrixを両backendで同じにする
+### 10. replay / lock / failure matrixを両backendで固定する
 
 test matrixはMARKET / resting双方について次を固定する。
 
@@ -176,22 +250,33 @@ test matrixはMARKET / resting双方について次を固定する。
 - 異なるintent / 異なるv2 ID: `Created` 1件 + account-not-flat 1件
 - MARKET対resting: `Created` 1件 + account-not-flat 1件
 - exact result + consumed + non-flat: `Exact`
-- pre-commit failure: entry 0件、consumption 0件
-- commit acknowledgement不明後の同一retry: commit済みなら`Exact`
+- request-scoped protective STOP: `Exact`
+- 同じv2 IDのclose / reduce SELLまたは複数BUY / ADD_LONG: `Ambiguous`
+- 同じtrade groupの別request ADD_LONG / close: original replay resultへ非集約
+- InMemory ledger publish後・consumption前failure: 全mutable stateを完全restore
+- PostgreSQL rollback確認済みpre-commit failure: `Unavailable`
+- PostgreSQL commit成功・ACK loss: fresh readbackで`Exact`
+- PostgreSQL readback unavailable / `Missing` / `Ambiguous`: `OutcomeIndeterminate`
 
 InMemoryはbounded coroutine stress、PostgreSQLは独立connection / transactionのintegration testを使う。
 反復回数はraceを観測できる小さな固定値とし、新しい汎用chaos frameworkは追加しない。
+eligibility付きauthorized restingと`applyMarketEvent`のcross-testは、test-only barrierで各lock到達点を固定し、両処理がtimeout / deadlockなく完了することとreverse acquisitionがないことを決定的に検証する。
+transaction wrapper testはattempt counterでmutation bodyとreadbackが各最大1回であることを検証する。
 
 ## Risks / Trade-offs
 
 - [A2a capabilityを誤ってproductionから呼ぶ] → A1 boundaryへ注入せず、runner / public call graph不変testを置く
 - [同一requestがconsumed / non-flatで拒否される] → lock / transaction内のstrict replayを最初に固定する
 - [zero-row predicateを2 transactionが通過する] → 全entry writerが取得するsingleton paper account rowで直列化する
+- [restingとmarket eventでdeadlockする] → advisory→session row→ledger rowsに固定し、reverse acquisitionなしのdeterministic cross-testを置く
 - [InMemoryのlock順が逆転する] → decision mutexからledger write lockだけを許可し、concurrency testでdeadlockを検出する
-- [InMemory failureがpartial stateを残す] → fallible処理をpublish前へ寄せ、before-image rollbackとpre-commit fault testを置く
+- [InMemory failureがpartial stateを残す] → 全mutable stateのcomplete before-image restoreとpublish後/consumption前fault testを置く
+- [trade groupの後続lifecycleをreplayへ混ぜる] → result membershipをrequest IDと直接linkに限定し、close / ADD_LONG fixturesを置く
+- [reserved prefix guardがrisk-reducing操作を止める] → close/update/cancelへblanket guardを追加せずnonprotective rowをAmbiguousにする
 - [capabilityがSafetyFloor bypassになる] → A2aをinactiveに保ち、A2bで既存preparation / SafetyFloor pathだけへ接続する
 - [PENDING_CANCELをflatと誤認する] → fill可能なBUYとしてpredicateに含める
-- [commit不明をNO_TRADE扱いする] → typed outcome-indeterminateに限定しrunner mappingをBへdeferする
+- [commit不明をretryして二重mutationする] → maxAttempts=1、bodyCompleted marker、fresh exact readbackだけに限定する
+- [readback Missingを未commitと誤認する] → Missing / Ambiguous / unavailableを全てoutcome-indeterminateに維持する
 - [diffが再び1,000行を超える] → A2aはbackend capability、direct test、inactive docsだけに限定しA2b要素を入れない
 
 ## Migration Plan

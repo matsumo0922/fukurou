@@ -1,14 +1,18 @@
 ## Why
 
 Issue #207 の OFF 実験を安全に進めるには、A1 の authority / exact replay 境界の先で、同時 entry が flat account を二重に通過しない backend 原子性が必要である。
-full A2 は human-authored diff が 1,250〜1,500 行と見込まれるため、本 change は 780〜930 行程度の A2a backend capability に分割し、production 接続を後続 A2b へ残す。
+full A2 は human-authored diff が 1,250〜1,500 行規模と見込まれるため、本 change は実装時に1,000行以内をgateとするA2a backend capabilityへ分割し、production 接続を後続 A2b へ残す。
 
 ## What Changes
 
 - module-internal の authorized atomic paper entry capability を InMemory と PostgreSQL backend に追加する
 - capability の同一 in-memory lock / PostgreSQL transaction 内で、exact replay を最初に判定し、`Missing` の場合だけ intent の存在・未消費を検証する
 - 同じ原子境界内で `open positions == 0 AND risk-increasing open entry orders == 0` を検証し、MARKET 相当の即時 entry または LIMIT / STOP の resting entry と intent consumption を一緒に保存する
+- PostgreSQL の lock 順を MARKET と realtime eligibility 付き resting に分け、resting は session advisory lock と `market_data_sessions` row を ledger mutation rows より先に取得する
+- InMemory は ledger publish 後・consumption 前の failure を含め、ledger、auxiliary map、equity snapshot、consumption の完全な before-image restore で partial state を残さない
+- exact replay は同じ client request ID の entry と正規 protective STOP だけを受理し、close / reduce / ADD_LONG や別 request ID の同一 trade group row を result へ集約しない
 - exact replay、ambiguous replay、consumed intent、non-flat conflict、storage / commit failure を typed result / failure で区別する
+- PostgreSQL transaction は `maxAttempts=1` とし、commit outcome 不明時は自動再実行せず fresh transaction の exact readback だけで回復する
 - 同一 request、別 request、別 intent、MARKET と resting の並行実行を InMemory / PostgreSQL の双方で回帰テストする
 - capability は既存 paper mutation request と write policy を再利用し、HARD_HALT、paper baseline、cash / protective STOP を含む既存 safety semantics を迂回する別経路を作らない
 - A1 `AuthorizedFalsifierPolicyBoundary` は capability を呼ばず、exact replay が `Missing` の場合は従来どおり fail closed にする
@@ -29,7 +33,8 @@ full A2 は human-authored diff が 1,250〜1,500 行と見込まれるため、
 
 - broker package の internal capability / typed result / failure
 - `InMemoryPaperLedgerRepository` と `InMemoryDecisionRepository` の共有 lock 順序
-- `ExposedPaperLedgerRepository` / `ExposedPaperLedgerWriter` の transaction 内 replay・predicate・intent consumption
+- `InMemoryEquitySnapshotRepository` の internal before-image restore
+- `ExposedPaperLedgerRepository` / `ExposedPaperLedgerWriter` の path 別 lock 順、transaction retry / commit readback、replay・predicate・intent consumption
 - InMemory unit test と PostgreSQL integration / concurrency test
 - `docs/mcp-runtime.md`
 
