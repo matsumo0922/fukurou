@@ -2,9 +2,9 @@ package me.matsumo.fukurou
 
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.requireTestDocker
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import org.testcontainers.DockerClientFactory
 import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -13,7 +13,7 @@ import kotlin.test.assertEquals
 class MonitoringRepositoryPostgresTest {
     @Test
     fun resolvedInfrastructureHistoryDoesNotConsumeUnresolvedBound() = runBlocking {
-        if (!monitoringDockerAvailable()) return@runBlocking
+        requireTestDocker()
         val container = MonitoringPostgresContainer().also { it.start() }
         try {
             val database = Database.connect(
@@ -73,10 +73,6 @@ private fun prepareGapTables(database: Database) {
         )
     }
 }
-
-private fun monitoringDockerAvailable(): Boolean = runCatching {
-    DockerClientFactory.instance().isDockerAvailable
-}.getOrDefault(false)
 
 private class MonitoringPostgresContainer : BoundedTestPostgresContainer<MonitoringPostgresContainer>(
     "postgres:16-alpine",

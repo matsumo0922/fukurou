@@ -18,6 +18,8 @@ dependencies {
     testFixturesImplementation(platform(libs.kotlin.bom))
     // BoundedTestPostgresContainer が PostgreSQLContainer を superclass に露出するため api で公開する。
     testFixturesApi(libs.testcontainers.postgresql)
+    // requireTestDocker() が org.junit.Assume を使う（kotlin("test") 経由で JUnit4 が入る）。
+    testFixturesImplementation(kotlin("test"))
 
     testImplementation(kotlin("test"))
     // test source も Testcontainers を直接 import するため、fixture 経由の推移解決に依存しない。
