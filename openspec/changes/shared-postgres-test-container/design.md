@@ -72,6 +72,12 @@ test database の破棄は `DROP DATABASE <name> WITH (FORCE)` で行う。Postg
 
 offset で過去ログを除外する現在の実装は serial 実行なら成立するが、instance 設定が他テストへ漏れる問題は残る。1 container の追加コストで両方を確実に回避できるため隔離を選ぶ。
 
+### D3b: JDBC 接続経路を差し替えるテストは専用 container に残す
+
+`OneShotRunnerMainTest` は共有化しない。JDBC URL に独自の `socketFactory` を注入して接続遅延を再現する cold-start test で、`RunnerColdStartSocketFactory` が process-global な遅延フラグを持つ（`trading/src/test/kotlin/me/matsumo/fukurou/trading/runner/OneShotRunnerMainTest.kt:260-261`）。共有 container に載せると、この差し替えが他 test の接続経路へ漏れうる。
+
+加えて container 起動は `@Test` 7 本のうち 1 本のみで、既に 1 回である。共有化による削減はゼロで、リスクだけが増える。D3 と同じ判断基準を適用する。
+
 ### D4: Docker 判定は `assumeTrue` に統一する
 
 `println` + `return` を `org.junit.Assume.assumeTrue` に置き換え、skip をテストレポートに出す。「Docker 必須にして失敗させる」案は却下する。ローカルで Docker を起動せずに unit テストだけ回す開発フローを壊すため。
@@ -100,7 +106,7 @@ stacked PR で 4 段に分ける。各 PR は独立して意味を持ち、前�
 1. **PR1（基盤）**: 共有 helper を `testFixtures` に集約。3 module の重複解消。挙動不変
 2. **PR2（silent pass 廃止）**: PR1 の helper を使い、Docker 判定を `assumeTrue` に統一
 3. **PR3（本命）**: `PostgresPersistenceIntegrationTest` を database per test 化。220 → 2 起動
-4. **PR4（横展開）**: replay 系 3 ファイルを同方式に統一。17 → 3 起動
+4. **PR4（横展開）**: replay 系 2 ファイルを同方式に統一（`OneShotRunnerMainTest` は D3b により除外）。11 → 3 起動
 
 PR4 は本 change の必須スコープとする。delta spec が replay 3 class の共有化を MUST として規定しており、これを満たさずに change を完了できない。replay 系は `PostgresPersistenceIntegrationTest` と同じ per-test container 構造の複製であり、放置すると「共有化済みと per-test が混在する」状態が固定化して、次に触る実装者がどちらに倣うべきか判断できなくなる。
 

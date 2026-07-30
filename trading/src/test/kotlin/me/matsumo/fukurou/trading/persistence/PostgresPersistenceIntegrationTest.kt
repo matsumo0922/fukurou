@@ -204,7 +204,8 @@ import me.matsumo.fukurou.trading.shadow.GateShadowScanProgress
 import me.matsumo.fukurou.trading.shadow.InMemoryGateShadowRepository
 import me.matsumo.fukurou.trading.shadow.ShadowDataQuality
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
-import me.matsumo.fukurou.trading.testing.SharedTestPostgres
+import me.matsumo.fukurou.trading.testing.LazySharedTestPostgres
+import me.matsumo.fukurou.trading.testing.TEST_POSTGRES_IMAGE
 import me.matsumo.fukurou.trading.testing.TestPostgresDatabase
 import me.matsumo.fukurou.trading.testing.requireTestDocker
 import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
@@ -249,7 +250,6 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransact
 /**
  * integration test 用 Postgres image。
  */
-private const val POSTGRES_IMAGE = "postgres:16-alpine"
 
 /**
  * integration test 用 Hikari pool size。
@@ -13029,7 +13029,7 @@ private fun applyRecoveryStatementFault(
 private enum class RecoveryFaultStatementKind { MUTATION, READBACK, SCAN, OTHER }
 
 private class FukurouPostgresContainer :
-    BoundedTestPostgresContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
+    BoundedTestPostgresContainer<FukurouPostgresContainer>(TEST_POSTGRES_IMAGE)
 
 /**
  * 共有 container 上の専用 database で Postgres integration test を実行する。
@@ -13040,17 +13040,19 @@ private class FukurouPostgresContainer :
 private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = runBlocking {
     requireTestDocker()
 
-    sharedPostgres().withDatabase { testDatabase ->
+    val shared = sharedPostgres.get()
+
+    shared.withDatabase { testDatabase ->
         retryTransientTestPostgresConnection { createDataSource(testDatabase) }.use { dataSource ->
             val database = ExposedDatabase.connect(dataSource)
             val context = PostgresTestContext(
                 testDatabase = testDatabase,
-                containerLogs = { sharedPostgres().logs },
+                containerLogs = { shared.logs },
                 dataSource = dataSource,
                 database = database,
             )
 
-            runBlocking { context.block() }
+            context.block()
         }
     }
 }
@@ -13086,33 +13088,8 @@ private fun runIsolatedPostgresTest(block: suspend PostgresTestContext.() -> Uni
     }
 }
 
-/**
- * このファイルの test 全体で 1 個だけ container を起動する。
- *
- * 停止は shutdown hook で行うため、生存範囲は test worker JVM の終了までとなる。
- * `PostgresPersistenceIntegrationTest` が終わっても `:trading:test` の最後まで container は残る。
- * class 終了時に停止するには `RunListener` か `@ClassRule` が必要で、既存 220 test の構造
- * （top-level の `runPostgresTest`）を変える必要があるため採らない。
- *
- * hook を使うのは、ryuk が無効な環境（`TESTCONTAINERS_RYUK_DISABLED=true`）でも container を残さないため。
- */
-private fun sharedPostgres(): SharedTestPostgres<FukurouPostgresContainer> {
-    sharedPostgresHolder?.let { holder -> return holder }
-
-    return synchronized(sharedPostgresLock) {
-        sharedPostgresHolder ?: run {
-            val container = FukurouPostgresContainer()
-            container.start()
-            Runtime.getRuntime().addShutdownHook(Thread { runCatching { container.stop() } })
-            SharedTestPostgres(container).also { holder -> sharedPostgresHolder = holder }
-        }
-    }
-}
-
-private val sharedPostgresLock = Any()
-
-@Volatile
-private var sharedPostgresHolder: SharedTestPostgres<FukurouPostgresContainer>? = null
+// このファイルの test 全体で 1 個だけ container を起動する。生存範囲は LazySharedTestPostgres の KDoc を参照。
+private val sharedPostgres = LazySharedTestPostgres()
 
 private fun JdbcTransaction.assertSqlCount(sql: String, expected: Int) {
     prepare(sql).use { statement ->
