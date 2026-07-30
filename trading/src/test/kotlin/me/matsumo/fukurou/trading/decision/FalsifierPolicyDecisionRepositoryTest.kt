@@ -1,0 +1,60 @@
+package me.matsumo.fukurou.trading.decision
+
+import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.config.FalsifierPolicy
+import java.time.Instant
+import java.util.UUID
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+
+class FalsifierPolicyDecisionRepositoryTest {
+    @Test
+    fun `same payload retry returns one durable decision and event`() = runBlocking {
+        val repository = InMemoryFalsifierPolicyDecisionRepository()
+        val request = request()
+
+        assertEquals(request.decision, repository.recordFalsifierPolicyDecision(request).getOrThrow())
+        assertEquals(request.decision, repository.recordFalsifierPolicyDecision(request).getOrThrow())
+        assertEquals(1, repository.events().size)
+    }
+
+    @Test
+    fun `different payload for same intent fails closed`() = runBlocking {
+        val repository = InMemoryFalsifierPolicyDecisionRepository()
+        val request = request()
+        repository.recordFalsifierPolicyDecision(request).getOrThrow()
+
+        assertFailsWith<FalsifierPolicyDecisionConflictException> {
+            repository.recordFalsifierPolicyDecision(
+                request.copy(decision = request.decision.copy(required = false)),
+            ).getOrThrow()
+        }
+        Unit
+    }
+
+    @Test
+    fun `missing event side fails closed`() = runBlocking {
+        val repository = InMemoryFalsifierPolicyDecisionRepository()
+        val request = request()
+        repository.seedDecisionWithoutEvent(request.decision)
+
+        assertFailsWith<FalsifierPolicyDecisionConflictException> {
+            repository.recordFalsifierPolicyDecision(request).getOrThrow()
+        }
+        Unit
+    }
+
+    private fun request(): FalsifierPolicyDecisionRequest = FalsifierPolicyDecisionRequest(
+        decision = FalsifierPolicyDecision(
+            decisionId = UUID.randomUUID(),
+            intentId = UUID.randomUUID(),
+            policy = FalsifierPolicy.ALWAYS_ON_V1,
+            required = true,
+            reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),
+            runtimeConfigVersionId = "runtime-v1",
+            runtimeConfigHash = "a".repeat(64),
+            createdAt = Instant.parse("2026-07-31T00:00:00Z"),
+        ),
+    )
+}

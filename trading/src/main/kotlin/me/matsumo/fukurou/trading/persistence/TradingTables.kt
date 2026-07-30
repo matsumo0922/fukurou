@@ -1670,6 +1670,20 @@ object FalsificationsTable : Table("falsifications") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** intent ごとに一意な Falsifier policy attribution。 */
+object FalsifierPolicyDecisionsTable : Table("falsifier_policy_decisions") {
+    val id = uuid("id")
+    val intentId = uuid("intent_id").uniqueIndex()
+    val policy = varchar("policy", length = 32)
+    val required = bool("required")
+    val reasonCodes = text("reason_codes")
+    val runtimeConfigVersionId = varchar("runtime_config_version_id", length = 64)
+    val runtimeConfigHash = varchar("runtime_config_hash", length = 64)
+    val createdAt = long("created_at")
+
+    override val primaryKey = PrimaryKey(id)
+}
+
 /**
  * trade intent の消費を append-only で保存する Exposed table。
  */

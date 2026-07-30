@@ -151,6 +151,23 @@ class RuntimeConfigResolverTest {
     }
 
     @Test
+    fun validate_falsifierPolicy_rejectsUnknownValue() {
+        val defaults = RuntimeConfigCatalog.runtimeDefaultValues()
+        val accepted = RuntimeConfigCandidateValidator.validate(
+            values = defaults + ("decision.falsifierPolicy" to FalsifierPolicy.OFF_V1.name),
+            environment = emptyMap(),
+        )
+        val rejected = RuntimeConfigCandidateValidator.validate(
+            values = defaults + ("decision.falsifierPolicy" to "OFF_V2"),
+            environment = emptyMap(),
+        )
+
+        assertTrue(accepted.validation.valid)
+        assertFalse(rejected.validation.valid)
+        assertTrue(rejected.validation.errors.any { error -> error.key == "decision.falsifierPolicy" })
+    }
+
+    @Test
     fun validate_maxDrawdownRatio_accepts_active_range_and_fails_closed_otherwise() {
         val defaults = RuntimeConfigCatalog.runtimeDefaultValues()
         val accepted = RuntimeConfigCandidateValidator.validate(

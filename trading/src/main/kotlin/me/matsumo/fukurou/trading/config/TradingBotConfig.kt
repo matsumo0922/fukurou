@@ -447,6 +447,7 @@ data class KillCriterionConfig(
 data class DecisionProtocolConfig(
     val falsificationFreshnessWindow: Duration = DEFAULT_FALSIFICATION_FRESHNESS_WINDOW,
     val restingEntryOrderTtl: Duration = DEFAULT_RESTING_ENTRY_ORDER_TTL,
+    val falsifierPolicy: FalsifierPolicy = FalsifierPolicy.ALWAYS_ON_V1,
 ) {
     init {
         val windowIsPositive = !falsificationFreshnessWindow.isNegative && !falsificationFreshnessWindow.isZero
@@ -461,6 +462,13 @@ data class DecisionProtocolConfig(
             "restingEntryOrderTtl must be greater than 0 and less than or equal to 1800 seconds."
         }
     }
+}
+
+/** Falsifier 起動方針の互換性を明示する version 付き policy。 */
+enum class FalsifierPolicy {
+    ALWAYS_ON_V1,
+    OFF_V1,
+    CONDITIONAL_V1,
 }
 
 /**
@@ -563,6 +571,9 @@ private const val FUKUROU_FALSIFICATION_FRESHNESS_SECONDS_ENV = "FUKUROU_FALSIFI
  * resting entry order を stale とみなす TTL 秒数の環境変数名。
  */
 private const val FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS_ENV = "FUKUROU_RESTING_ENTRY_ORDER_TTL_SECONDS"
+
+/** Falsifier policy の環境変数名。 */
+const val FUKUROU_FALSIFIER_POLICY_ENV = "FUKUROU_FALSIFIER_POLICY"
 
 /**
  * 1 MCP server instance あたりの総 tool call 上限の環境変数名。
@@ -1105,6 +1116,9 @@ private fun Map<String, String>.readDecisionProtocolConfig(): DecisionProtocolCo
                 ?.toLong()
                 ?: DEFAULT_RESTING_ENTRY_ORDER_TTL.seconds,
         ),
+        falsifierPolicy = readOptional(FUKUROU_FALSIFIER_POLICY_ENV)
+            ?.let(FalsifierPolicy::valueOf)
+            ?: FalsifierPolicy.ALWAYS_ON_V1,
     )
 }
 

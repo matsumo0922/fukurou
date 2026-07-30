@@ -1434,6 +1434,7 @@ class TradingPersistenceBootstrap(
                     TradePlansTable,
                     TradeIntentsTable,
                     FalsificationsTable,
+                    FalsifierPolicyDecisionsTable,
                     TradeIntentConsumptionsTable,
                     withLogs = false,
                 )

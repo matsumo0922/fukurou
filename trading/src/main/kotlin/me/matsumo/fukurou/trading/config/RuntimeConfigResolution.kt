@@ -445,6 +445,11 @@ private fun validateTypedConfigConstraints(
             min = 1,
             max = defaultLong(runtimeItemsByKey, "decision.restingEntryOrderTtl"),
         )
+        requireStringOneOf(
+            values = values,
+            key = "decision.falsifierPolicy",
+            allowedValues = FalsifierPolicy.entries.map { policy -> policy.name }.toSet(),
+        )
         requireIntBetweenInclusive(values, "runner.maxToolCallsPerRun", 1, defaultInt(runtimeItemsByKey, "runner.maxToolCallsPerRun"))
         requireIntBetweenInclusive(values, "runner.maxActToolCallsPerRun", 1, defaultInt(runtimeItemsByKey, "runner.maxActToolCallsPerRun"))
         requireLongBetweenInclusive(values, "runner.perRunTimeout", 1, defaultLong(runtimeItemsByKey, "runner.perRunTimeout"))

@@ -8,6 +8,9 @@ import java.util.UUID
  * command_event_log に保存するイベント種別。
  */
 enum class CommandEventType {
+    /** intent ごとの Falsifier policy decision を保存した。 */
+    FALSIFIER_POLICY_EVALUATED,
+
     /**
      * GMO Public REST の実 HTTP attempt が完了した。
      */

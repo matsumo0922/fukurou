@@ -276,6 +276,15 @@ object RuntimeConfigCatalog {
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
                 ),
                 runtimeItem(
+                    key = "decision.falsifierPolicy",
+                    legacyEnvName = FUKUROU_FALSIFIER_POLICY_ENV,
+                    valueType = RuntimeConfigValueType.ENUM,
+                    defaultValue = defaults.config.decisionProtocol.falsifierPolicy.name,
+                    effectiveValue = config.decisionProtocol.falsifierPolicy.name,
+                    unit = null,
+                    safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                ),
+                runtimeItem(
                     key = "runner.maxToolCallsPerRun",
                     legacyEnvName = FUKUROU_MCP_TOTAL_TOOL_CALL_LIMIT_ENV,
                     valueType = RuntimeConfigValueType.INT,

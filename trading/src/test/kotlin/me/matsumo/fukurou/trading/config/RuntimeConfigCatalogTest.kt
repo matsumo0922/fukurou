@@ -13,6 +13,16 @@ import kotlin.test.assertTrue
 class RuntimeConfigCatalogTest {
 
     @Test
+    fun falsifierPolicy_defaultsToAlwaysOnAndIsListedAsRuntimeConfig() {
+        val config = TradingBotConfig.fromEnvironment(emptyMap())
+        val item = RuntimeConfigCatalog.runtimeItems(config).single { runtimeItem -> runtimeItem.key == "decision.falsifierPolicy" }
+
+        assertEquals(FalsifierPolicy.ALWAYS_ON_V1, config.decisionProtocol.falsifierPolicy)
+        assertEquals("ALWAYS_ON_V1", item.defaultValue)
+        assertEquals(RuntimeConfigValueType.ENUM, item.valueType)
+    }
+
+    @Test
     fun snapshot_returnsRuntimeDeploymentAndSecretGroups() {
         val environment = mapOf(
             "FUKUROU_TRADING_SYMBOL" to "BTC",
