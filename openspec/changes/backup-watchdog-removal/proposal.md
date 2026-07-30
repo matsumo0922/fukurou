@@ -6,7 +6,7 @@ deploy-fukurou は既に `timeout 900` で backup 全体を外側から囲い、
 
 ## What Changes
 
-- `backup-fukurou` から watchdog 一式（backend PID 追跡、`pg_terminate_backend`、result file、deadline 検証、関連 helper と state）を削除し、時間制限を既存の外側 timeout（deploy の `timeout 900` / systemd の `TimeoutStartSec=20min`）に一本化する
+- `backup-fukurou` から watchdog 一式（backend PID 追跡、`pg_terminate_backend`、result file、deadline 検証、関連 helper と state）を削除する。dump producer は container 内側の `timeout`（TERM + KILL 追撃）で bound し、job 全体は既存の外側 timeout（deploy の `timeout 900` / systemd の `TimeoutStartSec=20min`）が囲う。host 側 exec client の死が container 内へ伝播しない問題（反証ゲートで実機確認）は container 内 timeout が構造的に閉じる
 - `restic_command()` と partial snapshot cleanup の `--no-cache` を撤去し、root の既定 cache を使う
 - pg_dump / restic パイプラインの stderr 破棄（`2>/dev/null`）を撤去し、stderr をそのまま流す
 - 上記に伴い不要になる result code（`WATCHDOG_TERMINATION_FAILED`）、selftest assertion、`docs/deploy.md` の記述を同じ変更で更新する
@@ -25,7 +25,7 @@ deploy-fukurou は既に `timeout 900` で backup 全体を外側から囲い、
 
 - `scripts/backup/backup-fukurou`（watchdog 一式の削除、`--no-cache` 撤去、stderr 破棄撤去）
 - `scripts/backup/backup-common`（watchdog 専用 helper が残れば削除）
-- `scripts/backup/backup-result-codes-v1.txt`（`WATCHDOG_TERMINATION_FAILED` の削除）
+- `WATCHDOG_TERMINATION_FAILED` の全参照: `scripts/backup/backup-result-codes-v1.txt` / `scripts/backup/publish-backup-monitoring` / `scripts/backup/backup-monitoring-projection.schema.json` / `scripts/backup/backup-status.schema.json` / `fukurou/src/main/kotlin/me/matsumo/fukurou/BackupMonitoringProjectionReader.kt`
 - `scripts/backup/backup-selftest`（watchdog 関連 assertion の削除）
 - `fukurou/src/test/kotlin/me/matsumo/fukurou/DatabaseBackupRestoreContractTest.kt`（watchdog 前提の assert があれば更新）
 - `docs/deploy.md`（backup 運用記述の現在形更新）

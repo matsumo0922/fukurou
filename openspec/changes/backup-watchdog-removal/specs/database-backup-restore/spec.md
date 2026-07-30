@@ -2,7 +2,7 @@
 
 ### Requirement: Production PostgreSQL receives scheduled encrypted logical backup attempts
 
-A root-owned timer MUST attempt a PostgreSQL 16 custom-format logical backup once per calendar day and store successful snapshots only in an encrypted same-NAS restic repository. It MUST reach the host-unpublished database through the fixed production container without placing the production database password in inspect output, dump arguments/environment, or host artifacts. After capturing the production PostgreSQL container ID, identity reads, database control, the dump producer, and the archive-list reader MUST execute in that captured container; a host-installed PostgreSQL client MUST NOT determine archive compatibility. Time-bounding of the backup job is owned by its invokers (the deploy executor's `timeout` wrapper and the systemd unit's `TimeoutStartSec`); the job itself MUST NOT terminate database backends. It MUST NOT persist a plaintext dump, database password, or repository password in a filesystem artifact, process argument, log, or status document; the restic local cache holds only encrypted repository data and is permitted. The cadence is an attempt schedule and MUST NOT be represented as guaranteed daily success.
+A root-owned timer MUST attempt a PostgreSQL 16 custom-format logical backup once per calendar day and store successful snapshots only in an encrypted same-NAS restic repository. It MUST reach the host-unpublished database through the fixed production container without placing the production database password in inspect output, dump arguments/environment, or host artifacts. After capturing the production PostgreSQL container ID, identity reads, database control, the dump producer, and the archive-list reader MUST execute in that captured container; a host-installed PostgreSQL client MUST NOT determine archive compatibility. The dump producer MUST be bounded by an in-container `timeout` wrapper (TERM with a KILL follow-up) so a stalled dump cannot outlive the attempt even when the host-side exec client dies without signal propagation; overall job lifetime remains bounded by its invokers (the deploy executor's `timeout` wrapper and the systemd unit's `TimeoutStartSec`). The job MUST NOT track backend PIDs or issue `pg_terminate_backend`. It MUST NOT persist a plaintext dump, database password, or repository password in a filesystem artifact, process argument, log, or status document; the restic local cache holds only encrypted repository data and is permitted. The cadence is an attempt schedule and MUST NOT be represented as guaranteed daily success.
 
 The Docker-backed integration contract MUST execute the production backup entrypoint itself against real PostgreSQL 16 and restic, MUST prove that host `pg_restore` absence or incompatibility cannot affect the entrypoint, and MUST cover its retention prune and redacted output rather than reproducing the orchestration as test-only commands.
 
@@ -39,7 +39,12 @@ The Docker-backed integration contract MUST execute the production backup entryp
 #### Scenario: Backup runs against an accumulated repository
 
 - **WHEN** the restic repository has accumulated snapshots from prior attempts
-- **THEN** the backup pipeline uses the restic local cache so that repository index reads do not stall stdin consumption, and the dump producer is not terminated by any component of the backup job itself
+- **THEN** the backup pipeline uses the restic local cache so that repository index reads do not stall stdin consumption, and no component of the backup job tracks or terminates database backends
+
+#### Scenario: Dump stalls beyond its in-container bound
+
+- **WHEN** the dump producer stalls (lock wait or pipe backpressure) beyond the in-container timeout bound
+- **THEN** the in-container `timeout` terminates `pg_dump` inside the container regardless of the host-side exec client's fate, the backend exits on connection loss, and the attempt records a producer failure without success evidence
 
 #### Scenario: Backup capacity floor is not met
 
@@ -48,7 +53,7 @@ The Docker-backed integration contract MUST execute the production backup entryp
 
 ### Requirement: Jobs fail closed on start-time contention
 
-Backup and restore jobs MUST share a non-blocking root lock and MUST probe the production deploy lock before database, repository, or Docker mutation. The contract SHALL cover start-time contention only and MUST NOT claim that a deploy starting after the probe is mutually excluded. A backup that overlaps a later deploy is bounded by its invoker's timeout; killing the host-side dump client closes its database connection, and the server terminates the corresponding backend on connection loss.
+Backup and restore jobs MUST share a non-blocking root lock and MUST probe the production deploy lock before database, repository, or Docker mutation. The contract SHALL cover start-time contention only and MUST NOT claim that a deploy starting after the probe is mutually excluded. A backup that overlaps a later deploy is bounded by the in-container dump timeout and its invoker's timeout; when the dump is terminated inside the container, the backend exits on connection loss.
 
 #### Scenario: Backup job is already running
 
@@ -63,7 +68,7 @@ Backup and restore jobs MUST share a non-blocking root lock and MUST probe the p
 #### Scenario: Deploy starts after the probe
 
 - **WHEN** the deploy lock was free at the probe and a deploy starts later
-- **THEN** the backup contract does not report full mutual exclusion, the backup job's lifetime remains bounded by its invoker's timeout, and any resulting partial snapshot or child failure remains failed evidence without destructive retention
+- **THEN** the backup contract does not report full mutual exclusion, the dump remains bounded by the in-container timeout and the job by its invoker's timeout, and any resulting partial snapshot or child failure remains failed evidence without destructive retention
 
 ## REMOVED Requirements
 

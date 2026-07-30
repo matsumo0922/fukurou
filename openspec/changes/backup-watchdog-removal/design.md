@@ -21,14 +21,24 @@
 
 ## Decisions
 
-### Decision 1: watchdog を撤去し、外側 timeout に一本化する（帰属: ユーザー確認済み — issue #336 の方針）
+### Decision 1: watchdog を撤去し、container 内側の `timeout` で dump を bound する（帰属: ユーザー確認済み — issue #336 の方針。bound の配置は反証ゲートの blocking 反例を受けた設計修正）
 
-watchdog が守っていた唯一の実質的リスクは「pg_dump backend が table lock 待ちで stdout を出さないまま残留し、DB のロックを保持し続ける」ことである。これは watchdog なしでも次の 2 層で閉じる。
+watchdog が守っていた実質的リスクは「pg_dump backend が lock 待ちまたはパイプ背圧で stall したまま残留し、DB のロックを保持し続ける」ことである。
 
-1. **呼び出し側 timeout が dump client を kill する**: deploy 経由は `timeout 900`、systemd 経由は `TimeoutStartSec=20min`（SIGTERM → 追撃 SIGKILL は systemd の既定動作）。host 側の `docker exec` client が死ぬと backend への接続が切れ、PostgreSQL はクエリ実行中でも接続喪失を検知した時点で backend を終了させる。`pg_terminate_backend` による能動的終了と結果は同じで、正確な PID 追跡・application_name 照合・再確認ループという複雑性が丸ごと不要になる。
-2. **`--lock-wait-timeout` は導入しない**: pg_dump には lock 待ちを自己制限するオプションが存在する（container 内 pg_dump で利用可能なことを確認済み）が、追加の時間パラメータを 1 つ持ち込むこと自体が新たな調整点になる。外側 timeout だけで backend 解放は保証されるため、最小構成としては不要。将来 lock 待ちが実際に問題になった場合の選択肢として Next steps に残す。
+初版設計は「呼び出し側の外側 timeout（deploy の `timeout 900` / systemd の `TimeoutStartSec=20min`）が dump client を kill すれば、接続喪失で backend も終了する」としていたが、独立反証で実機検証により反証された（blocking 反例）: **docker exec の host 側 client を SIGKILL しても container 内のプロセスには伝播せず、孤児として残留する**。SIGTERM は docker exec が proxy するため伝播するが、SIGKILL は proxy 不能であり、TERM に応答しない stall こそが問題のケースである。deploy 経由の `timeout 900` は TERM のみ（`--kill-after` なし）、systemd の `KillMode=control-group` も host 側プロセスの掃討しか保証しない。
 
-トレードオフ: watchdog は「deadline 内に確実に」backend を終了させたが、外側 timeout 方式では終了が invoker の timeout 満了（deploy 900 秒 / systemd 20 分）まで遅れうる。single-owner の paper trading DB では、この遅延で失われるものはない（daemon は deploy 中 pause 済み、backup は日次 1 回）。
+修正後の設計: **dump の bound を container 内側に置く**。
+
+```
+docker exec ... "${PRODUCTION_CONTAINER_ID}" timeout --signal=TERM --kill-after=10 840 pg_dump ...
+```
+
+- container 内の `timeout` は host 側 client の生死と無関係に pg_dump を終了させられるため、孤児化が構造的に不可能になる。TERM で pg_dump が接続を閉じれば backend も終了し、TERM 不応答でも `--kill-after` の SIGKILL は同一 PID namespace 内なので必ず届く
+- pg_dump プロセス自身が死ねば backend は接続喪失で終了する（PostgreSQL の保証）。`pg_terminate_backend` による能動的終了・PID 追跡・application_name 照合・再確認ループ・result file という watchdog の複雑性は丸ごと不要のまま
+- bound 値は 840 秒とする。restic 側の背圧を含むパイプライン全体の実測（9.3 秒）に対して 90 倍の余裕があり、deploy の外側 `timeout 900` より内側で先に発火する。旧 watchdog の 60 秒のような「実行時間の予測」に基づくタイトな値を避け、「無限 stall の防止」だけを目的とする
+- `--lock-wait-timeout` は導入しない: lock 待ちは閉じるがパイプ背圧 stall は閉じないため、対策として不完全。container 内 timeout が両方を一様に閉じる
+
+トレードオフ: 旧 watchdog は 60 秒で backend を終了させたが、新設計では stall 時の解放が最大 840 秒まで遅れうる。single-owner の paper trading DB では、この遅延で失われるものはない（daemon は deploy 中 pause 済み、backup は日次 1 回）。
 
 ### Decision 2: `--no-cache` を撤去する（帰属: agent 仮決め — 根拠は issue #336 の実測）
 
@@ -54,5 +64,5 @@ pg_dump の `2>/dev/null` と restic の `2>/dev/null` を削除し、stderr を
 
 ## Next steps（この change に含めない）
 
-- pg_dump `--lock-wait-timeout` の導入（lock 待ちが実際に問題化した場合）
+- restore 側（`restore-fukurou` / `restore-selftest`）の `--no-cache` 方針の見直し（restore drill は使い捨て環境での読み取りで背圧問題が存在しないため、本 change では現状維持とした）
 - restic 装置全体の `pg_dump | zstd > file` 方式への置き換え評価（issue #336 の Scope 外として記録済み）
