@@ -17,7 +17,7 @@
 - [x] 3.2 runner の policy decision persistence、OFF permit foundation、persistence failure の回帰テストを追加する
 - [x] 3.3 PostgreSQL runtime wiring と durable readback の integration test を更新する
 - [x] 3.4 `docs/mcp-runtime.md` を policy attribution/permit foundation と既存 gate 維持の現在形へ更新する
-- [ ] 3.5 関連 docs grep、OpenSpec strict validation、関連 test、detekt、build を実行する
+- [x] 3.5 関連 docs grep、OpenSpec strict validation、関連 test、detekt、build を実行する
 
 ## Deferred
 
