@@ -48,14 +48,28 @@ BはA2b完了後にだけrunnerを接続する。
 full A2を一つのchangeにする案は、backend concurrencyとrunner-facing failure semanticsを同時にreviewするdiffが1,000行を超えるため採用しない。
 A2aでA1 boundaryの`Missing`だけをcapabilityへ接続する案も、SafetyFloorを通さない一時的なproduction-reachable経路を作るため採用しない。
 
-### 2. capabilityはprepared mutation requestとtyped outcomeだけを扱う
+### 2. capabilityはstable replay identityとcreation proposalを分離する
 
-broker packageにmodule-internal `AuthorizedAtomicPaperEntryBackend`を置き、既存の次のrequestを包むsealed inputを受ける。
+broker packageにmodule-internal `AuthorizedAtomicPaperEntryBackend`を置き、stable replay identityと、既存requestを包むsealed creation proposalを受ける。
+
+stable replay identityはA2bがvolatileなmarket preparationより前のauthorized commandから作り、少なくとも次を保持する。
+
+- reserved v2 client request ID
+- command intent ID
+- fingerprintに束縛されたsymbol、BUY side、order type、size / price、protection条件
+- commandが明示していたnullable trade group ID
+- paper mode
+
+creation proposalは次のどちらかである。
 
 - `IntentConsumingMarketEntryFillRequest`
 - `IntentConsumingRestingEntryOrderRequest`
 
-各requestのcommandはnon-null intent ID、reserved `runner-place-v2-` client request ID、consumptionと一致するintent IDを必須とする。
+`preparePlaceOrder()`が生成するresolved trade group、MARKET entry orderに使うcommand ID、resting order ID、position ID、stop order ID、fill execution ID、MARKET / resting subtype、fill / TTL / eligibilityはattempt-localなcreation proposalである。
+これらは`Missing`後の新規作成にだけ使い、exact replay identityまたはpersisted resultとの一致条件にしない。
+同じv2 requestの並行callでfresh IDやmarket crossing判定が異なっても、先行commit後のpersisted lifecycleを後続callが`Exact`として返せる。
+
+`Missing`後に使う各proposalのcommandはnon-null intent ID、stable identityと同じreserved `runner-place-v2-` client request ID / business fields、consumptionと一致するintent IDを必須とする。
 capabilityはpermitを受け取らずauthorityを再検証しない。
 permit / durable decisionの検証責務はA1 boundaryに残し、A2bが検証済みrequestだけを渡す。
 
@@ -65,59 +79,77 @@ capability未実装backendはA1と同じくproduction接続されず、A2bで明
 
 public `PaperLedgerRepository`へmethodを追加する案は、authorized storage primitiveを通常broker surfaceへ広げるため採用しない。
 permitをbackend requestへ含める案は、storage layerにpolicy repository責務を重複させるため採用しない。
+creation proposal全体をreplay keyにする案は、random IDとmarket dataで正規retryが`Ambiguous`になるため採用しない。
 
 ### 3. atomic section内はexact replayを必ず最初に解決する
 
 backendは排他境界を取得した後、次の順序で処理する。
 
-1. command / consumptionの構造identityを検証する
-2. v2 client request IDのstrict authorized replayを同じlock / transactionから読む
-3. `Exact`ならconsumed intentとflat stateを見ずに返す
+1. stable replay identityのv2 prefix、intent、business fieldsを検証する
+2. stable identityだけでstrict authorized replayを同じlock / transactionから読む
+3. `Exact`ならcreation proposal、consumed intent、flat stateを見ずにpersisted resultを返す
 4. `Ambiguous`ならtyped replay-indeterminateでrollbackする
-5. `Missing`の場合だけintentの存在と未消費を検証する
-6. flat predicateを検証する
-7. existing paper write policyを検証する
-8. MARKETまたはresting mutationとintent consumptionをcommitする
+5. `Missing`の場合だけcreation proposalのcommand / consumption identityとfresh IDを検証する
+6. intentの存在と未消費を検証する
+7. flat predicateを検証する
+8. existing paper write policyを検証する
+9. proposalのMARKETまたはresting mutationとintent consumptionをcommitする
 
-構造identityは副作用前に確認するが、ledger上のreplay判定よりconsumed / flat判定を前へ出さない。
+stable identityは副作用前に確認するが、volatile proposal validation、consumed / flat判定をledger上のreplay判定より前へ出さない。
 同一requestの初回成功後はintentがconsumedでaccountもnon-flatになるため、replayが後だと正規retryを拒否してしまう。
 
 A1 readerをlock外で一度呼んでからnew mutationだけtransactionへ渡す案は、並行callが双方`Missing`を観測できるため採用しない。
 A2a capabilityはtransaction-local / lock-local replay helperを両backendに持つ。
 A1 boundaryへのreader registrationはA2aでは変更せず、A2bがconnection全体を設計する。
 
-### 4. exact replayはrequest subtypeごとの完全なdirect-link shapeだけを復元する
+### 4. exact replayはstable identityとpersisted lifecycle shapeだけから復元する
 
-replay helperはsealed request subtypeとprepared IDを受け取り、`client_request_id == requested v2 ID`のBUY entryをanchorとして読む。
-requested v2 ID、prepared entry / position / stop / execution ID、trade groupのいずれにもrequest-correlated artifactがない場合だけ`Missing`である。
-BUY entryが欠けてもprepared IDまたはdirect linkで他artifactが見つかる場合、same-ID rowが存在するのにBUY entryがない場合、BUY entryが複数の場合、または唯一のentryがrequestのintent ID、trade group ID、entry order ID、symbol / modeと一致しない場合は`Ambiguous`とする。
-一部artifactが欠けた状態をnew mutation可能な`Missing`へ落とさない。
+replay helperはcreation proposalを受け取らず、stable replay identityの`client_request_id == requested v2 ID`でBUY entryをanchorする。
+entryはcommand intent IDと、fingerprint-bound business identityであるsymbol、paper mode、BUY side、order type、size / price、protection条件に一致しなければならない。
+authorized commandがtrade group IDを明示していた場合はpersisted entryも同じgroupでなければならない。
+commandのtrade group IDがnullでpreparationがgroupを生成した場合は、persisted entryのnon-null groupをbundle anchorとして採用し、retryで新しく生成されたgroupとは比較しない。
+same v2 IDでもstable business identityが一致しないrowは`Ambiguous`である。
 
-`IntentConsumingMarketEntryFillRequest`の`Exact`は、既存writerがflat accountから作る次の完全bundleに固定する。
+persisted entryのstatusとartifactだけでlifecycle shapeを選ぶ。
 
-- requestと一致するFILLED BUY entryが厳密1件
-- entryの`positionId`とrequestのposition IDに一致し、同じtrade groupに属するpositionが厳密1件
+- `status == FILLED`: entry、position、protective STOP、BUY executionが各1件のcomplete FILLED bundle
+- `status in (OPEN, PENDING_CANCEL, CANCELED, REJECTED)`: LIMIT / STOP entry、`positionId == null`、fill artifactなしのnon-filled resting shape
+
+MARKET / LIMIT / STOPの別はpersisted entry order typeで検証する。
+現在のmarket dataから再計算したcrossing判定とprepared MARKET / resting subtypeはshape選択に使わない。
+同じLIMIT requestの一方がcrossing MARKET proposal、他方がresting proposalになっても、先行callが保存したFILLEDまたはnon-filled shapeを後続callが`Exact`として返す。
+persisted MARKET orderがnon-filled statusである、またはnon-filled entryにposition / STOP / executionがあるなど、writerが作らない組合せは`Ambiguous`とする。
+
+complete FILLED bundleは次を全て満たす。
+
+- stable identityと一致するFILLED BUY entryが厳密1件
+- entryのpersisted `positionId`と同じIDかつ同じtrade groupに属するpositionが厳密1件
 - そのposition IDとtrade groupへ直接linkする`side=SELL / orderType=STOP`のprotective STOPが厳密1件
 - entry order IDとposition IDへ直接linkするBUY executionが厳密1件
-- requestが持つentry / position / stop / execution IDと保存IDが一致する
 
+entry order ID、position ID、stop order ID、execution IDはpersisted bundleから返す。
+retry側のfresh command / resting order / position / stop / execution IDとは比較しない。
 entry、position、protective STOP、executionの欠損、duplicate entry / STOP / execution、intent / trade group / order / position link不一致は全て`Ambiguous`であり、`Missing`または部分的な`Exact`にしない。
-MARKET相当requestにはcrossing LIMITをprepared fillへ変換した入力も含まれるため、`orderType == MARKET`ではなくsealed request subtypeと`status == FILLED`でshapeを選ぶ。
 
 protective STOPのclient request IDはbackend間で同じではない。
 InMemoryの`toProtectiveStopOrder()`はentryと同じclient request IDを保存するが、PostgreSQLの`insertProtectiveStopOrder()`は`orders.client_request_id`のpartial unique indexに合わせてNULLを保存する。
 そのためSTOPをsame-ID SELLとして探索せず、entryから確定したposition IDとtrade group、SELL / STOP roleで一意に探索する。
 InMemoryではsame-IDであることも整合条件として検証できるが、PostgreSQLではNULLであることを正常shapeとする。
 
-`IntentConsumingRestingEntryOrderRequest`はrequest subtype、expected order ID、LIMIT / STOP order typeによりMARKET相当requestと区別する。
-OPEN restingの`Exact`は、requestと一致するOPEN BUY entryが厳密1件、`positionId == null`、direct-linked position / protective STOP / executionが0件である単一order shapeとする。
-PENDING_CANCEL / CANCELED / REJECTEDへ進んだ未約定restingも、同じentry anchorにfill artifactがない場合は現在statusの単一order resultとして復元する。
-resting entryがmarket eventでFILLEDへ進んでいる場合はMARKET requestへ読み替えず、resting requestのentry ID / intent / trade group / order typeを維持したまま、position、protective STOP、BUY executionが各1件のcomplete FILLED bundleを要求する。
-resting requestはfill時に生成されるstop / execution IDを入力に持たないため、それらはdirect linkと一意性で確定する。
-
 FILLED resultのorder IDsはanchor entryと一意なdirect-linked protective STOP、position IDsは一意なdirect-linked position、execution IDsはentry / positionへ一意にdirect-linkするexecutionだけに限定する。
 未約定resting resultはanchor entryだけを含む。
 同じtrade groupでも異なるclient request IDの後続ADD_LONG、close / reduce、protection update、またはそれらのexecutionを走査・集約しない。
+
+`Missing`はfresh prepared IDではなく、backendで実際に読めるstable correlationから判定する。
+same v2 client request IDのorder、明示されたstable trade groupのorder / positionとそのexecution chain、またはstorage上でsame v2 audit identityを持つexecutionが全て存在しない場合だけ`Missing`である。
+intent-correlated artifactはsame v2 audit identityまたは明示stable groupとのlinkも証明できる場合だけcorruption evidenceにする。
+intent consumption単独は別v2 requestによる正規消費と区別できないためreplay identityにせず、`Missing`後のintent-consumed判定へ渡す。
+entryが欠けてもこれらのstable-correlated artifactが1件以上あれば`Ambiguous`とし、orphan state上へnew mutationを作らない。
+特にPostgreSQLのNULL-ID STOPとpositionは、明示されたstable trade groupから辿れる場合にcorruption evidenceとする。
+
+commandのtrade group IDがnullだったattemptで生成されたfresh groupはretry identityではないため、entryもconsumptionも失われた後にそのgroupだけが残ってもrequestへ確実に帰属できない。
+この場合はfresh groupでcorrelateしたと主張せず、same v2 audit evidenceがあれば`Ambiguous`、なければ通常のintent-consumed / flat predicateが消費済みintentまたはactive OPEN riskを拒否する。
+stable linkを全て失ったclosed orphan artifactは当該requestへ帰属不能であり、A2aはそれを`Exact`へ採用しない。
 
 backend-neutralなinternal classifierへrow collectionを渡すunit testでは、same-ID close / reduce / ADD_LONG、duplicate BUY / STOP / execution、missing artifact、link mismatchをsyntheticに作る。
 PostgreSQLは`WHERE client_request_id IS NOT NULL`のunique indexによりentryと同じnon-null IDの2件目を保存できないため、同じmalformed rowをintegration fixtureで無理に作らない。
@@ -282,8 +314,12 @@ test matrixはMARKET / resting双方について次を固定する。
 - 異なるintent / 異なるv2 ID: `Created` 1件 + account-not-flat 1件
 - MARKET対resting: `Created` 1件 + account-not-flat 1件
 - exact result + consumed + non-flat: `Exact`
+- 同じv2 ID / stable business identity、異なるfresh entry / position / STOP / execution ID: `Created` 1件 + persisted IDsの`Exact` 1件
+- 同じLIMIT requestでattempt間のcrossing判定がMARKET / restingに変化: 先行persisted shapeの`Created` 1件 + `Exact` 1件
+- 同じv2 IDでintent / stable business identity不一致: `Ambiguous`
 - MARKET/FILLEDのentry / position / direct-linked protective STOP / direct-linked execution各1件: `Exact`
-- OPEN restingの単一entry、および後からFILLEDへ進んだrestingのcomplete bundle: subtypeに対応する`Exact`
+- persisted OPEN / non-filled restingの単一entry、およびFILLEDへ進んだcomplete bundle: lifecycle shapeに対応する`Exact`
+- entry欠損かつstable trade group-linked position / STOP / executionまたはsame v2 audit-linked intent artifactあり: `Ambiguous`
 - position / STOP / executionの欠損、重複、intent / trade group / direct-link不一致: `Ambiguous`
 - synthetic classifier上の同じv2 IDのclose / reduce SELLまたは複数BUY / ADD_LONG: `Ambiguous`
 - PostgreSQLの2件目のnon-null same-ID order: unique violation
@@ -312,6 +348,10 @@ transaction wrapper testはattempt counterでmutation bodyとreadbackが各最�
 - [InMemoryのlock順が逆転する] → decision mutex→ledger write lock→equity snapshot lockだけを許可し、call graph確認とconcurrency testでdeadlockを検出する
 - [InMemory failureがpartial stateを残す] → 全mutable stateのcomplete before-image restoreとpublish後/consumption前fault testを置く
 - [restoreが同時commit済みDAILY snapshotを消す] → equity lockをbefore-image取得からsuccess / restore完了まで連続保持し、DAILY appendとのdeterministic cross-testを置く
+- [retryのfresh ID / subtypeをidentityにして正規replayを拒否する] → stable identityだけを先に読み、creation proposalはMissing後まで参照しない
+- [LIMIT crossing判定の変化で別mutationを作る] → current preparationではなくpersisted entry status / artifactsからExact shapeを選ぶ
+- [entry欠損をfresh random IDで探索して誤判定する] → v2 / intent / consumption / 明示stable group / persisted auditだけをcorruption evidenceに使う
+- [generated groupだけ残るcorruptionをrequestへ誤帰属する] → fresh groupをidentityにせず、帰属不能な限界とflat predicateによるactive risk拒否を明記する
 - [FILLED BUYだけを成功済みrequestと誤認する] → position / STOP / executionを各1件要求し、欠損・重複・link不一致をAmbiguousにする
 - [PostgreSQLのSTOPをsame-IDで探索して欠損扱いする] → backend固有client request IDではなくposition ID・trade group・STOP roleのdirect linkで特定する
 - [DB uniqueで作れないmalformed fixtureに依存する] → synthetic classifier testとreachable PostgreSQL integration corruptionを分ける

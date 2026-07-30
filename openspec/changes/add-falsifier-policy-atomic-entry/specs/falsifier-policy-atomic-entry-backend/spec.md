@@ -23,19 +23,47 @@ A1 `AuthorizedFalsifierPolicyBoundary`、public `Broker`、MCP、production runn
 ### Requirement: exact replay はatomic sectionの最初に解決する
 
 capabilityはbackendの排他境界を取得した後、intent consumption、flat predicate、新規mutationより先にv2 client request IDのauthorized exact replayを解決しなければならない（MUST）。
-replay helperはsealed request subtypeとprepared IDを使い、requested v2 ID、prepared entry / position / stop / execution ID、trade groupのいずれにもrequest-correlated artifactがない場合だけ`Missing`としなければならない（MUST）。
-BUY entryが欠けても他のrequest-correlated artifactが存在する場合、same-ID rowが存在するのにrequestと一致するBUY entryを一意に確定できない場合、またはentryのintent ID、trade group ID、entry order ID、symbol / modeがrequestと一致しない場合は`Ambiguous`としなければならない（MUST）。
-MARKET相当requestまたはFILLEDへ進んだresting requestの`Exact`は、FILLED BUY entry、entryへ直接linkするposition、そのposition IDとtrade groupへ直接linkするprotective STOP、entry order IDとposition IDへ直接linkするBUY executionが各1件のcomplete bundleでなければならない（MUST）。
+replay helperはstable v2 client request ID、command intent ID、fingerprint-bound business identityだけを入力とし、attempt-localなprepared ID、resolved trade group、MARKET / resting creation subtypeを参照してはならない（MUST NOT）。
+business identityはpersisted symbol、paper mode、BUY side、order type、size / price、protection条件と、authorized commandが明示したnullable trade group IDを検証しなければならない（MUST）。
+commandのtrade group IDがnullでcreation時にgroupを生成した場合、persisted entryのnon-null groupをbundle linkに使い、retryで新しく生成したgroupと比較してはならない（MUST NOT）。
+replay helperはpersisted entryのstatusとartifactからnon-filled restingまたはcomplete FILLED lifecycle shapeを選ばなければならず（MUST）、現在のmarket crossing判定またはprepared subtypeからshapeを選んではならない（MUST NOT）。
+FILLED lifecycleの`Exact`は、FILLED BUY entry、entryへ直接linkするposition、そのposition IDとtrade groupへ直接linkするprotective STOP、entry order IDとposition IDへ直接linkするBUY executionが各1件のcomplete bundleでなければならない（MUST）。
 complete bundleのentry、position、protective STOP、executionが欠損、重複、またはlink不一致の場合は`Ambiguous`とし、`Missing`または部分的な`Exact`にしてはならない（MUST NOT）。
 InMemory protective STOPはentryとsame client request IDであることを検証し、PostgreSQL protective STOPはNULL client request IDを正常とし、両backendともposition ID、trade group、`side=SELL / orderType=STOP` roleで一意に特定しなければならない（MUST）。
-OPEN resting requestの`Exact`はrequestと一致するOPEN BUY entryが1件、position linkがなく、direct-linked position / protective STOP / executionが0件の単一order shapeでなければならない（MUST）。
+OPEN resting lifecycleの`Exact`はstable identityと一致するOPEN LIMIT / STOP BUY entryが1件、position linkがなく、direct-linked position / protective STOP / executionが0件の単一order shapeでなければならない（MUST）。
 PENDING_CANCEL / CANCELED / REJECTEDへ進んだ未約定resting entryも、同じentry identityを保ちfill artifactがない場合は現在statusの単一order `Exact`として扱わなければならない（MUST）。
 resultはrequest-scoped BUY entry anchor、一意なdirect-linked protective STOP / position / executionだけから復元し、同じtrade groupの別request rowを集約してはならない（MUST NOT）。
+entry order ID、position ID、stop order ID、execution IDはpersisted resultから返し、retry側のfresh prepared IDと一致することを要求してはならない（MUST NOT）。
+same v2 client request IDのorder、明示されたstable trade groupのorder / positionとexecution chain、またはstorage上のsame v2 audit evidenceが全て存在しない場合だけ`Missing`としなければならない（MUST）。
+intent-correlated artifactはsame v2 audit identityまたは明示stable groupとのlinkも証明できる場合だけcorruption evidenceとし、intent consumption単独はreplay identityにせず`Missing`後のintent-consumed判定へ渡さなければならない（MUST）。
+entryが欠けてもこれらのstable-correlated artifactが存在する場合は`Ambiguous`としなければならない（MUST）。
+commandのtrade group IDがnullのattemptで生成されたfresh groupだけをrequest correlationに使ってはならず（MUST NOT）、stable evidenceがないactive OPEN riskは通常のflat predicateで拒否しなければならない（MUST）。
+creation proposalのID、resolved group、MARKET / resting subtype、fill / TTL / eligibilityはatomic replayが`Missing`を返した後の新規作成だけに使い（MUST）、proposal commandのv2 ID、intent、business fieldsはstable replay identityと一致しなければならない（MUST）。
 
 #### Scenario: consumed intentとexact result
 
 - **WHEN** exact result、consumed intent、open positionまたはopen resting entryが存在する同じrequestを再実行する
 - **THEN** capabilityはintentとflat stateを拒否理由にせず`Exact` resultを返しmutationを行わない
+
+#### Scenario: same requestと異なるfresh ID
+
+- **WHEN** 同じv2 client request ID、intent、stable business identityの2 callが異なるentry / position / STOP / execution prepared IDで並行する
+- **THEN** 片方だけがproposalのIDで`Created`となり、他方はfresh IDを比較せずpersisted IDを持つ`Exact`を返す
+
+#### Scenario: LIMIT crossing判定の変化
+
+- **WHEN** 同じLIMIT requestが一方のattemptではcrossing MARKET proposal、他方ではresting proposalとして準備される
+- **THEN** 後続callはcurrent proposal subtypeを無視し、先行commitのpersisted FILLEDまたはnon-filled shapeを`Exact`として返す
+
+#### Scenario: stable business identity mismatch
+
+- **WHEN** same v2 IDのpersisted entryがcommand intent、symbol、mode、side、order type、またはfingerprint-bound business fieldと一致しない
+- **THEN** capabilityはfresh proposalにかかわらずtyped replay-indeterminate failureを返す
+
+#### Scenario: creation proposalはMissing後だけ使う
+
+- **WHEN** atomic replayが`Exact`または`Ambiguous`を返す
+- **THEN** capabilityはprepared ID、resolved trade group、MARKET / resting subtype、fill / TTL / eligibilityを検証または使用しない
 
 #### Scenario: A1 FILLED BUY-only fixture
 
@@ -44,18 +72,18 @@ resultはrequest-scoped BUY entry anchor、一意なdirect-linked protective STO
 
 #### Scenario: MARKET exact replay
 
-- **WHEN** MARKET相当requestに一致するFILLED BUY entry、直接linkするposition、protective STOP、BUY executionが各1件存在する
+- **WHEN** stable identityに一致するFILLED BUY entry、直接linkするposition、protective STOP、BUY executionが各1件persistしている
 - **THEN** capabilityはentry / protective STOP、position、executionを各request resultへ1件ずつ含む`Exact`を返す
 
 #### Scenario: resting exact replay
 
-- **WHEN** resting requestに一致するOPEN BUY entryが1件存在し、position / protective STOP / executionが存在しない
+- **WHEN** stable identityに一致するOPEN LIMIT / STOP BUY entryが1件persistし、position / protective STOP / executionが存在しない
 - **THEN** capabilityはそのOPEN orderだけを含む`Exact` resultを返しMARKET/FILLED shapeとして扱わない
 
 #### Scenario: FILLEDへ進んだresting replay
 
-- **WHEN** resting requestのentryがmarket eventでFILLEDへ進み、直接linkするposition、protective STOP、BUY executionが各1件存在する
-- **THEN** capabilityはrequest subtypeをrestingのまま維持しcomplete FILLED bundleを`Exact` resultとして返す
+- **WHEN** persisted LIMIT / STOP entryがmarket eventでFILLEDへ進み、直接linkするposition、protective STOP、BUY executionが各1件存在する
+- **THEN** capabilityはcurrent prepared subtypeではなくpersisted FILLED lifecycleからcomplete bundleを`Exact` resultとして返す
 
 #### Scenario: FILLED component missing
 
@@ -69,8 +97,23 @@ resultはrequest-scoped BUY entry anchor、一意なdirect-linked protective STO
 
 #### Scenario: FILLED link mismatch
 
-- **WHEN** entryのintent / trade group、またはposition、protective STOP、executionのtrade group / order ID / position ID linkがrequestと一致しない
+- **WHEN** entryのintent / stable business identity、またはposition、protective STOP、executionのtrade group / order ID / position ID linkがpersisted entryと一致しない
 - **THEN** capabilityはtyped replay-indeterminate failureを返しintent、ledger、accountを変更しない
+
+#### Scenario: entry欠損とstable group artifact
+
+- **WHEN** BUY entryが欠けているが、authorized commandが明示したstable trade groupにposition、NULL-ID protective STOP、またはそのpositionのexecutionが残っている
+- **THEN** capabilityは`Missing`ではなくtyped replay-indeterminate failureを返しorphan state上へnew mutationを作らない
+
+#### Scenario: entry欠損とintent evidence
+
+- **WHEN** BUY entryが欠けているが、same intent artifactがsame v2 audit identityまたは明示stable groupにもlinkしている
+- **THEN** capabilityは`Missing`ではなくtyped replay-indeterminate failureを返す
+
+#### Scenario: generated trade groupのcorrelation限界
+
+- **WHEN** authorized commandのtrade group IDがnullで、retryがfresh groupを生成する
+- **THEN** capabilityはfresh groupをprior artifactのcorrelationに使わず、stable evidenceがないactive OPEN riskはflat predicateで拒否する
 
 #### Scenario: backend固有protective STOP identity
 
@@ -115,8 +158,8 @@ resultはrequest-scoped BUY entry anchor、一意なdirect-linked protective STO
 
 #### Scenario: concurrent同一request
 
-- **WHEN** 同じintent、command、v2 client request IDの2 callが並行する
-- **THEN** 片方だけが`Created`となり他方はcommit後のstateを`Exact`として返し、entryとconsumptionは各1件だけ存在する
+- **WHEN** 同じintent、stable business identity、v2 client request IDの2 callが異なるfresh IDまたはprepared subtypeで並行する
+- **THEN** 片方だけが`Created`となり他方はcommit後のpersisted stateを`Exact`として返し、entryとconsumptionは各1件だけ存在する
 
 ### Requirement: Missing後だけintentを検証する
 
