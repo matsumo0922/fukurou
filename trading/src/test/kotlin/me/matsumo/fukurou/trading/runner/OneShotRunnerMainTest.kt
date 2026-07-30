@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.invoker.classifyLlmFailure
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.runtime.TradingRuntimeFactory
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.TEST_POSTGRES_IMAGE
 import me.matsumo.fukurou.trading.testing.requireTestDocker
 import java.net.InetAddress
 import java.net.Socket
@@ -315,7 +316,7 @@ private fun String.withSocketFactory(factoryName: String): String {
 
 /** runner cold-start test 用 PostgreSQL container。 */
 private class RunnerColdStartPostgresContainer :
-    BoundedTestPostgresContainer<RunnerColdStartPostgresContainer>("postgres:16-alpine")
+    BoundedTestPostgresContainer<RunnerColdStartPostgresContainer>(TEST_POSTGRES_IMAGE)
 
 private const val RUNNER_COLD_CONNECT_DELAY_MILLIS = 750L
 

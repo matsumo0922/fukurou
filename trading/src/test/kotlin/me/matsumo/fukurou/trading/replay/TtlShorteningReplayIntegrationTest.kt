@@ -6,7 +6,8 @@ import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.domain.EvaluationCohort
 import me.matsumo.fukurou.trading.persistence.TradingPersistenceBootstrap
 import me.matsumo.fukurou.trading.persistence.jdbcConnection
-import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.LazySharedTestPostgres
+import me.matsumo.fukurou.trading.testing.TestPostgresDatabase
 import me.matsumo.fukurou.trading.testing.requireTestDocker
 import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -331,38 +332,33 @@ class TtlShorteningReplayIntegrationTest {
     private fun runReplayTest(block: (ExposedDatabase) -> Unit) = runBlocking {
         requireTestDocker()
 
-        val container = ReplayPostgresContainer()
-        container.start()
-        try {
-            retryTransientTestPostgresConnection { dataSource(container) }.use { dataSource ->
+        ttlReplayPostgres.get().withDatabase { testDatabase ->
+            retryTransientTestPostgresConnection { dataSource(testDatabase) }.use { dataSource ->
                 val database = ExposedDatabase.connect(dataSource)
                 TradingPersistenceBootstrap(database, Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC))
                     .ensureSchema()
                     .getOrThrow()
                 block(database)
             }
-        } finally {
-            container.stop()
         }
     }
 
-    private fun dataSource(container: ReplayPostgresContainer): HikariDataSource {
+    private fun dataSource(testDatabase: TestPostgresDatabase): HikariDataSource {
         return HikariDataSource(
             HikariConfig().apply {
-                jdbcUrl = container.jdbcUrl
-                username = container.username
-                password = container.password
+                jdbcUrl = testDatabase.jdbcUrl
+                username = testDatabase.username
+                password = testDatabase.password
                 maximumPoolSize = 4
             },
         )
     }
 
     private companion object {
-        const val POSTGRES_IMAGE = "postgres:16-alpine"
         val COUNTED_TABLES =
             listOf("orders", "executions", "positions", "paper_market_event_receipts", "market_data_gaps")
     }
-
-    private class ReplayPostgresContainer :
-        BoundedTestPostgresContainer<ReplayPostgresContainer>(POSTGRES_IMAGE)
 }
+
+// このファイルの test 全体で 1 個だけ container を起動する。
+private val ttlReplayPostgres = LazySharedTestPostgres()

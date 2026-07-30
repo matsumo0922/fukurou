@@ -120,10 +120,15 @@ Testcontainers を起動する test は、Docker が利用できない場合に 
 
 ### Requirement: Replay integration tests share one container per class
 
-`TtlShorteningReplayIntegrationTest` / `TailFactSheetIntegrationTest` / `OneShotRunnerMainTest` は container を test class 単位で MUST 共有し、test method ごとに専用 database を作成・破棄する。
+複数の test method が container を起動する replay integration test は、container を test class 単位で MUST 共有し、test method ごとに専用 database を作成・破棄する。container を 1 回しか起動しない test は共有対象としない。
 
 #### Scenario: Replay test methods run against the shared container
 
-- **WHEN** replay integration test の test method を実行する
+- **WHEN** `TtlShorteningReplayIntegrationTest` または `TailFactSheetIntegrationTest` の test method を実行する
 - **THEN** container は test class 全体で 1 個だけ起動し、method ごとに新しい database を作成する
 - **AND** method 終了時にその database を破棄する
+
+#### Scenario: A test already starts only one container
+
+- **WHEN** test class 全体で container を 1 回しか起動しない test を共有化するか判断する
+- **THEN** 起動回数が減らず共有 container の生存期間だけが延びるため、その test は専用 container のまま維持する

@@ -16,8 +16,8 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * @param container 共有する container。起動と停止は呼び出し側が管理する
  */
-class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
-    private val container: BoundedTestPostgresContainer<SELF>,
+class SharedTestPostgres(
+    private val container: BoundedTestPostgresContainer<*>,
 ) {
     private val databaseCounter = AtomicLong()
 
@@ -36,7 +36,7 @@ class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
      * test が閉じ忘れた接続や production factory が内部で持つ pool が残っていても失敗しない。
      * 破棄自体が失敗した場合は [block] の例外を優先し、破棄の失敗は suppressed として付ける。
      */
-    fun <T> withDatabase(block: (TestPostgresDatabase) -> T): T {
+    suspend fun <T> withDatabase(block: suspend (TestPostgresDatabase) -> T): T {
         val databaseName = nextDatabaseName()
 
         executeOnAdminDatabase("CREATE DATABASE \"$databaseName\" TEMPLATE template0")
@@ -75,21 +75,12 @@ class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
         leaseFailure.addSuppressed(dropFailure)
     }
 
+    // timeout などの query parameter は container 生成時に設定されるため、lease URL へそのまま引き継ぐ。
     private fun jdbcUrlFor(databaseName: String): String {
         val base = adminJdbcUrl.substringBefore('?').replaceAfterLast('/', databaseName)
-        val parameters = adminQueryParameters()
+        val parameters = adminJdbcUrl.jdbcQueryParameters().mapValues { (_, values) -> values.last() }
 
-        return if (parameters.isEmpty()) base else base.withJdbcQueryParameters(parameters)
-    }
-
-    // timeout などの query parameter は container 生成時に設定されるため、lease URL へそのまま引き継ぐ。
-    private fun adminQueryParameters(): Map<String, String> {
-        return adminJdbcUrl.substringAfter('?', missingDelimiterValue = "")
-            .split('&')
-            .filter(String::isNotBlank)
-            .associate { parameter ->
-                parameter.substringBefore('=') to parameter.substringAfter('=', missingDelimiterValue = "")
-            }
+        return base.withJdbcQueryParameters(parameters)
     }
 
     // CREATE / DROP DATABASE は transaction 内で実行できないため、admin database へ別接続を張って autocommit で流す。
@@ -100,6 +91,38 @@ class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
         }
     }
 }
+
+/**
+ * test class 単位で共有する [SharedTestPostgres] を遅延生成して保持する。
+ *
+ * container の停止は shutdown hook で行うため、生存範囲は test worker JVM の終了までとなる。
+ * class 終了時に停止するには `RunListener` か `@ClassRule` が必要で、既存 test の構造を変える必要があるため採らない。
+ * hook を使うのは、ryuk が無効な環境（`TESTCONTAINERS_RYUK_DISABLED=true`）でも container を残さないため。
+ */
+class LazySharedTestPostgres {
+    private val lock = Any()
+
+    @Volatile
+    private var holder: SharedTestPostgres? = null
+
+    /** 共有 container を必要なら起動して返す。 */
+    fun get(): SharedTestPostgres {
+        holder?.let { started -> return started }
+
+        return synchronized(lock) {
+            holder ?: run {
+                val container = SharedPostgresContainer()
+                container.start()
+                Runtime.getRuntime().addShutdownHook(Thread { runCatching { container.stop() } })
+                SharedTestPostgres(container).also { started -> holder = started }
+            }
+        }
+    }
+}
+
+/** 共有 test PostgreSQL container。 */
+private class SharedPostgresContainer :
+    BoundedTestPostgresContainer<SharedPostgresContainer>(TEST_POSTGRES_IMAGE)
 
 /**
  * test method が借りた専用 database の接続情報。
