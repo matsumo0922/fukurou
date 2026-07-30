@@ -328,6 +328,12 @@ private data class FalsifierPolicyFoundation(
     val permit: FalsifierPolicyPermit?,
 )
 
+/** entry intent と policy attribution の保存結果。 */
+private data class EntryPolicyFoundation(
+    val intent: TradeIntentRecord,
+    val foundation: Result<FalsifierPolicyFoundation>,
+)
+
 /**
  * LLM 起動から Falsifier と deterministic paper entry までを 1 回だけ進める runner。
  *
@@ -1325,40 +1331,38 @@ class OneShotLlmRunner(
             )
         }
 
-        if (decision.decision.submission.action.requiresEntryIntent() && proposerResult.failure != null) {
-            runAuditRecorder.recordNoTrade(
-                context = proposerContext,
-                reason = "provider_failure_entry_rejected",
-                cause = proposerResult.failure,
-            ).getOrThrow()
-
-            return OneShotRunnerResult(
-                invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                decision = decision,
-                intent = decision.tradeIntent,
-                tradeResult = null,
-                terminalCause = terminalCauseForNoTrade(proposerResult.failure),
-            )
-        }
-
         if (!decision.decision.submission.action.requiresEntryIntent()) {
             return handleNonEnterDecision(input, decision, proposerResult.attributionIncomplete)
         }
 
-        if (proposerResult.attributionIncomplete || hasDecisionAttributionGap(invocationId)) {
-            runAuditRecorder.recordNoTrade(
-                context = proposerContext,
-                reason = "phase_observation_missing_entry_rejected",
-                cause = proposerResult.observationAppendFailure,
-            ).getOrThrow()
-
-            return OneShotRunnerResult(
+        val entryPolicy = establishEntryPolicyFoundation(proposerContext, decision)
+        if (entryPolicy.foundation.isFailure) {
+            return policyFoundationFailureResult(
                 invocationId = invocationId,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
                 decision = decision,
-                intent = decision.tradeIntent,
-                tradeResult = null,
+                intent = entryPolicy.intent,
+                context = proposerContext,
+                cause = entryPolicy.foundation.exceptionOrNull(),
+            )
+        }
+
+        if (proposerResult.failure != null) {
+            return providerFailureEntryResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = entryPolicy.intent,
+                context = proposerContext,
+                cause = proposerResult.failure,
+            )
+        }
+
+        if (proposerResult.attributionIncomplete || hasDecisionAttributionGap(invocationId)) {
+            return proposerAttributionFailureEntryResult(
+                invocationId = invocationId,
+                decision = decision,
+                intent = entryPolicy.intent,
+                context = proposerContext,
+                cause = proposerResult.observationAppendFailure,
             )
         }
 
@@ -1454,26 +1458,6 @@ class OneShotLlmRunner(
         val intent = requireNotNull(decision.tradeIntent) {
             "${decision.decision.submission.action.name} decision did not create trade intent."
         }
-        val policyFoundation = establishFalsifierPolicyFoundation(
-            context = proposerContext,
-            intent = intent,
-            action = decision.decision.submission.action,
-        )
-        if (policyFoundation.isFailure) {
-            runAuditRecorder.recordNoTrade(
-                context = proposerContext,
-                reason = "falsifier_policy_decision_unavailable",
-                cause = policyFoundation.exceptionOrNull(),
-            ).getOrThrow()
-
-            return entryFlowResult(
-                invocationId = invocationId,
-                decision = decision,
-                intent = intent,
-                status = OneShotRunnerStatus.NO_TRADE_AUDITED,
-                terminalCause = terminalCauseForNoTrade(policyFoundation.exceptionOrNull()),
-            )
-        }
         val falsifierContext = requestFactory.decisionRunContext(
             invocationId = invocationId,
             provider = request.effectiveFalsifierAssignment().provider,
@@ -1552,6 +1536,91 @@ class OneShotLlmRunner(
         }
 
         return entryFlowResult(invocationId, decision, intent, finalStatus, placed)
+    }
+
+    private suspend fun policyFoundationFailureResult(
+        invocationId: String,
+        decision: DecisionSubmissionResult,
+        intent: TradeIntentRecord,
+        context: DecisionRunContext,
+        cause: Throwable?,
+    ): OneShotRunnerResult {
+        runAuditRecorder.recordNoTrade(
+            context = context,
+            reason = "falsifier_policy_decision_unavailable",
+            cause = cause,
+        ).getOrThrow()
+
+        return entryFlowResult(
+            invocationId = invocationId,
+            decision = decision,
+            intent = intent,
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            terminalCause = terminalCauseForNoTrade(cause),
+        )
+    }
+
+    private suspend fun establishEntryPolicyFoundation(
+        context: DecisionRunContext,
+        decision: DecisionSubmissionResult,
+    ): EntryPolicyFoundation {
+        val intent = requireNotNull(decision.tradeIntent) {
+            "${decision.decision.submission.action.name} decision did not create trade intent."
+        }
+
+        return EntryPolicyFoundation(
+            intent = intent,
+            foundation = establishFalsifierPolicyFoundation(
+                context = context,
+                intent = intent,
+                action = decision.decision.submission.action,
+            ),
+        )
+    }
+
+    private suspend fun providerFailureEntryResult(
+        invocationId: String,
+        decision: DecisionSubmissionResult,
+        intent: TradeIntentRecord,
+        context: DecisionRunContext,
+        cause: Throwable,
+    ): OneShotRunnerResult {
+        runAuditRecorder.recordNoTrade(
+            context = context,
+            reason = "provider_failure_entry_rejected",
+            cause = cause,
+        ).getOrThrow()
+
+        return OneShotRunnerResult(
+            invocationId = invocationId,
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            decision = decision,
+            intent = intent,
+            tradeResult = null,
+            terminalCause = terminalCauseForNoTrade(cause),
+        )
+    }
+
+    private suspend fun proposerAttributionFailureEntryResult(
+        invocationId: String,
+        decision: DecisionSubmissionResult,
+        intent: TradeIntentRecord,
+        context: DecisionRunContext,
+        cause: Throwable?,
+    ): OneShotRunnerResult {
+        runAuditRecorder.recordNoTrade(
+            context = context,
+            reason = "phase_observation_missing_entry_rejected",
+            cause = cause,
+        ).getOrThrow()
+
+        return OneShotRunnerResult(
+            invocationId = invocationId,
+            status = OneShotRunnerStatus.NO_TRADE_AUDITED,
+            decision = decision,
+            intent = intent,
+            tradeResult = null,
+        )
     }
 
     private suspend fun establishFalsifierPolicyFoundation(

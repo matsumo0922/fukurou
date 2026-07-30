@@ -71,6 +71,7 @@ import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecision
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRequest
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyReasonCode
+import me.matsumo.fukurou.trading.decision.InMemoryFalsifierPolicyDecisionRepository
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SystemPromptV1
 import me.matsumo.fukurou.trading.decision.TradeIntentRecord
@@ -912,6 +913,8 @@ class OneShotLlmRunnerTest {
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, result.status)
         assertTrue(fixture.runtime.broker.getPositions().getOrThrow().isEmpty())
         assertTrue(fixture.eventLog.events().containsNoTradeReason("phase_observation_missing_entry_rejected"))
+        assertPersistedFalsifierPolicyFoundation(fixture, requireNotNull(result.intent).intentId)
+        assertEquals(1, fixture.processRunner.launches.size)
     }
 
     @Test
@@ -1680,6 +1683,7 @@ class OneShotLlmRunnerTest {
         assertEquals(OneShotRunnerStatus.NO_TRADE_AUDITED, entryResult.status)
         assertTrue(entryFixture.eventLog.events().containsNoTradeReason("provider_failure_entry_rejected"))
         assertEquals(1, entryFixture.processRunner.launches.size)
+        assertPersistedFalsifierPolicyFoundation(entryFixture, requireNotNull(entryResult.intent).intentId)
 
         val exitFixture = runnerFixture { command ->
             submitDecision(fixtureRepository, command, DecisionAction.EXIT).getOrThrow()
@@ -3086,6 +3090,13 @@ private object FailingFalsifierPolicyDecisionRepository : FalsifierPolicyDecisio
     override suspend fun findFalsifierPolicyDecision(intentId: UUID): Result<FalsifierPolicyDecision?> {
         return Result.failure(IllegalStateException("policy repository unavailable"))
     }
+}
+
+private suspend fun assertPersistedFalsifierPolicyFoundation(fixture: RunnerFixture, intentId: UUID) {
+    val repository = fixture.runtime.falsifierPolicyDecisionRepository as InMemoryFalsifierPolicyDecisionRepository
+
+    assertNotNull(repository.findFalsifierPolicyDecision(intentId).getOrThrow())
+    assertEquals(CommandEventType.FALSIFIER_POLICY_EVALUATED, repository.events().single().eventType)
 }
 
 private suspend fun RequestCapturingRunnerFixture.runOneShot(
