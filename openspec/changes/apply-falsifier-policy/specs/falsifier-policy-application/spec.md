@@ -11,8 +11,13 @@ runner は entry intent ごとに active process の policy と runtime config i
 
 #### Scenario: OFF decision を保存する
 
-- **WHEN** `OFF_V1` で entry intent を処理する
+- **WHEN** `OFF_V1` で `ENTER` intent を処理する
 - **THEN** runner は `required=false` と `POLICY_OFF` reason を保存してから Falsifier を省略する
+
+#### Scenario: ADD_LONG は OFF でも Falsifier を要求する
+
+- **WHEN** `OFF_V1` で `ADD_LONG` intent を処理する
+- **THEN** runner は `required=true` と `ADD_LONG_REQUIRES_FALSIFIER` reason を保存して Falsifier を必須にする
 
 #### Scenario: CONDITIONAL は未適用として閉じる
 
@@ -21,7 +26,7 @@ runner は entry intent ごとに active process の policy と runtime config i
 
 ### Requirement: retry は既存 policy attribution を変更しない
 
-runner は同じ intent の既存 policy decision を exact readback し、現在の policy と runtime config identity が一致する場合だけ再利用しなければならない（MUST）。
+runner は同じ intent の既存 policy decision を exact readback し、現在の policy/action から導出した policy、required、reasonCodes と runtime config identity が全て一致する場合だけ再利用しなければならない（MUST）。
 
 #### Scenario: 同一 snapshot の再実行
 
@@ -33,14 +38,38 @@ runner は同じ intent の既存 policy decision を exact readback し、現�
 - **WHEN** intent に保存済みの policy decision と現在の policy または runtime config identity が異なる
 - **THEN** runner は既存 decision を上書きせず entry を no-trade にする
 
-#### Scenario: policy persistence failure
+#### Scenario: canonical attributes が不一致
 
-- **WHEN** policy decision の保存または exact readback が失敗する
+- **WHEN** policy と config identity は一致するが required または reasonCodes が canonical 組合せと異なる
+- **THEN** runner は既存 decision を再利用せず entry を no-trade にする
+
+#### Scenario: 新規 entry 前の policy persistence failure
+
+- **WHEN** 新規 entry の policy decision 保存または exact readback が失敗する
 - **THEN** runner は Falsifier と paper entry を開始せず no-trade にする
+
+### Requirement: config identity は typed config と一致する
+
+runner は typed `TradingBotConfig` の canonical runtime key/value hash を再計算し、注入された runtime config snapshot hash と一致する場合だけ policy decision に使用しなければならない（MUST）。
+
+#### Scenario: production snapshot が一致する
+
+- **WHEN** snapshot hash と typed config の canonical hash が一致する
+- **THEN** runner は snapshot version ID / hash を policy decision に保存する
+
+#### Scenario: production snapshot が不一致
+
+- **WHEN** snapshot hash と typed config の canonical hash が一致しない
+- **THEN** runner は policy decision と Falsifier と paper entry を作らず no-trade にする
+
+#### Scenario: direct runner に snapshot がない
+
+- **WHEN** direct/test runner が snapshot なしで起動する
+- **THEN** runner は固定 namespace の version ID と canonical typed config hash を使用する
 
 ### Requirement: OFF bypass は runner permit と durable decision に束縛する
 
-SafetyFloor は fresh `APPROVED` がない entry を、wire から設定できない internal permit と durable `OFF_V1` decision の identity が完全一致する場合だけ許可しなければならない（MUST）。
+SafetyFloor は fresh `APPROVED` がない `ENTER` を、wire から設定できない internal permit と canonical durable `OFF_V1 / required=false / POLICY_OFF` decision の identity が完全一致する場合だけ許可しなければならない（MUST）。
 
 #### Scenario: 正規の OFF entry
 
@@ -54,13 +83,37 @@ SafetyFloor は fresh `APPROVED` がない entry を、wire から設定でき�
 
 #### Scenario: permit と durable decision が不一致
 
-- **WHEN** decision ID、intent ID、policy、runtime config version/hash、required のいずれかが一致しない
+- **WHEN** decision ID、intent ID、policy、runtime config version/hash、required、reasonCodes のいずれかが一致しない
 - **THEN** SafetyFloor は entry を拒否する
 
-#### Scenario: durable decision を読めない
+#### Scenario: 新規 entry で durable decision を読めない
 
-- **WHEN** broker が policy decision を読めない、または監査片側欠損を検出する
+- **WHEN** 新規 preview/place で broker が policy decision を読めない、または監査片側欠損を検出する
 - **THEN** preview/place は失敗し、entry 副作用を作らない
+
+#### Scenario: ADD_LONG に OFF permit を渡す
+
+- **WHEN** fresh `APPROVED` のない `ADD_LONG` に OFF permit を渡す
+- **THEN** SafetyFloor は entry を拒否する
+
+### Requirement: commit 済み client request は paper truth を replay する
+
+broker は deterministic client request の ledger result が既に durable な場合、新しい mutation と policy authority 判定を行わず既存結果を replay しなければならない（MUST）。
+
+#### Scenario: commit 後 ACK loss と policy repository outage
+
+- **WHEN** 初回 OFF order が commit 済みだが応答を失い、同じ client request を policy repository outage 中に retry する
+- **THEN** broker は既存 result を mutation なしで返し、runner は実在 order を no-trade として扱わない
+
+#### Scenario: durable result がない policy repository outage
+
+- **WHEN** 同じ client request の durable result がなく policy decision を読めない
+- **THEN** broker は fail closed し、order を作らない
+
+#### Scenario: authority recovery
+
+- **WHEN** commit 後の retry を監査する
+- **THEN** mutation 前 request audit から元の policy decision ID と canonical authority を特定できる
 
 ### Requirement: ALWAYS_ON の既存 gate を維持する
 

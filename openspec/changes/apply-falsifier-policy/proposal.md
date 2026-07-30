@@ -7,9 +7,11 @@ Falsifier を省略しても intent integrity と資金保護を維持し、poli
 
 - entry intent ごとに active runtime config から `ALWAYS_ON_V1` / `OFF_V1` の policy decision を作り、Falsifier 起動前に durable 保存する
 - `ALWAYS_ON_V1` は従来どおり Falsifier の fresh `APPROVED` を必須とする
-- `OFF_V1` は durable decision と active runtime config identity が一致する場合だけ Falsifier を省略する
+- `OFF_V1` は `ENTER` に限り、durable decision と active runtime config identity が一致する場合だけ Falsifier を省略する
+- `ADD_LONG` は action/group identity の後続修正まで policy にかかわらず Falsifier を必須とする
 - SafetyFloor は runner 内の分岐だけを信用せず、同じ durable decision を読み直して bypass authority を検証する
-- policy decision の保存・読取・identity 照合が失敗または不一致なら entry を fail closed にする
+- 新規副作用前の policy decision 保存・読取・identity 照合が失敗または不一致なら entry を fail closed にする
+- ledger commit 済みの同一 client request retry は policy read failure 時も mutation なしで既存結果を replay する
 - `CONDITIONAL_V1` はこの変更では適用せず、選択された場合は Falsifier 必須として扱う
 - runtime docs と回帰テストを同じ変更で更新する
 
