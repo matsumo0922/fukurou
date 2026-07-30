@@ -1,20 +1,22 @@
 ## Why
 
-Issue #207 Phase 2 では、Falsifier の常時起動に downside 防御としての価値があるかを、別々の production paper 期間で比較する。
-現在は entry intent ごとに Falsifier を必ず起動するため、Falsifier OFF と条件起動を同じ Proposer / model / prompt / SafetyFloor の下で切り替え、各 run を policy version へ帰属させる手段がない。
+Issue #207 Phase 2 は Falsifier の常時 ON / OFF / 条件起動を別期間で比較する。
+挙動を切り替える前に、実効 policy を intent 単位で一意に保存し、偽の falsification を作らず後続 PR が安全に参照できる durable boundary が必要になる。
 
 ## What Changes
 
-- Falsifier policy を `ALWAYS_ON_V1` / `OFF_V1` / `CONDITIONAL_V1` の version 付き runtime config として追加する
-- 条件起動では、大口リスク、不利または不明な market regime、current cohort の直近 2 連敗のいずれかで Falsifier を起動する
-- policy 判定を intent に一意な durable record と command event に記録する
-- Falsifier を起動しない entry でも、偽の falsification を作らず、persisted intent の一致・未消費と SafetyFloor の全資金保護ルールを維持する
+- `ALWAYS_ON_V1` / `OFF_V1` / `CONDITIONAL_V1` を version 付き runtime config enum として追加する
+- intent ごとの Falsifier policy decision を append-only に保存する
+- policy decision と bounded audit event を同じ transaction で保存し、lost ACK retry を idempotent に収束させる
+- in-memory / PostgreSQL repository と bootstrap schema の回帰テストを追加する
+
+この PR は foundation のみで、runner / SafetyFloor の挙動を変更しない。
 
 ## Capabilities
 
 ### New Capabilities
 
-- `falsifier-policy-experiment`: version 付き Falsifier policy の選択、監査、期間比較を定める
+- `falsifier-policy-foundation`: version 付き policy と intent 単位 durable decision の保存契約
 
 ### Modified Capabilities
 
@@ -22,17 +24,15 @@ Issue #207 Phase 2 では、Falsifier の常時起動に downside 防御とし�
 
 ## Impact
 
-- `TradingBotConfig` / runtime config catalog と validation
-- one-shot entry flow、`PlaceOrderCommand`、SafetyFloor の Falsifier gate
-- current cohort の直近 closed trade 読み取り
-- policy decision persistence、command event audit、runner / SafetyFloor の回帰テスト
-- `docs/design.md`、`docs/mcp-runtime.md`、`docs/deploy.md`
+- typed config / runtime config catalog / validation
+- decision domain / repository
+- PostgreSQL bootstrap schema と persistence
+- config / persistence docs
 
 ## Out of Scope
 
-- 8-arm ablation
-- blind scorer や provider architecture の変更
-- 実資金取引
-- production runtime config の activation
-- 比較期間が終わる前の優劣判定
-- rejected-intent shadow と descriptive comparison（次の stacked change）
+- Falsifier の起動 / 省略
+- SafetyFloor permit
+- conditional predicate
+- rejected-intent shadow と期間比較
+- production runtime config activation

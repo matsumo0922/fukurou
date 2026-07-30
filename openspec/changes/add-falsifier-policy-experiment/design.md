@@ -1,28 +1,24 @@
 ## Context
 
-Issue #207 は Falsifier の correctness fix と strategy experiment を別 rollback 単位に分けている。
-Phase 1 の stacked parent PR は Falsifier を read-only にし、deterministic preview を runner 所有へ戻す。
-Phase 2 は同じ execution path のまま Falsifier 起動 policy だけを期間ごとに切り替える。
-
-既存の `llm_runs`、phase manifest、command event は runtime config version ID / hash を記録する。
-一方、active snapshot のどの値が Falsifier policy かを直接集計できず、OFF を表すために偽の `APPROVED` falsification を保存すると paper truth を歪める。
+Phase 2 の policy 適用は runtime config、runner、SafetyFloor、evaluation を横断する。
+1 PR 1,000 行の目安を守り、最初の rollback 単位は config と durable attribution foundation に限定する。
+後続 PR はこの foundation の reviewer `APPROVED` 後に着手する。
 
 ## Goals / Non-Goals
 
 **Goals**
 
-- 常時 ON、OFF、条件起動を version 付き policy として next-restart で切り替える
-- 同じ run 内で policy 判定を一度だけ行い、Falsifier 起動と SafetyFloor gate を一致させる
-- OFF / 条件非該当を falsification verdict と混同せず監査する
-- 後続の期間比較が policy decision を intent 単位で一意に参照できる
+- version 付き Falsifier policy を typed runtime config へ追加する
+- intent ごとに一つの policy decision を append-only に保存する
+- decision と audit event の atomicity / idempotency を保証する
+- 後続 runner が durable decision を exact readback できる
 
 **Non-Goals**
 
-- runtime activation の自動化
-- 期間の途中での adaptive threshold 変更
-- Falsifier の model / prompt / provider の変更
-- shadow 結果から paper fill を遡及生成すること
-- rejected-intent shadow と descriptive comparison。reviewer APPROVED 後の次の stacked change で扱う
+- runner / SafetyFloor の挙動変更
+- conditional policy の評価
+- production activation
+- descriptive comparison
 
 ## Decisions
 
@@ -34,77 +30,48 @@ runtime key `decisionProtocol.falsifierPolicy` は次の enum だけを受け入
 - `OFF_V1`
 - `CONDITIONAL_V1`
 
-default は既存挙動を維持する `ALWAYS_ON_V1`。
-閾値や入力意味を変える場合は既存名を再利用せず、新しい version を追加する。
-run は既存の runtime config version ID / hash を保持し、entry policy 判定 event は enum 名を保持する。
+default は既存挙動を表す `ALWAYS_ON_V1`。
+この foundation では値を解決・監査可能にするだけで、runner は従来どおり全 entry で Falsifier を必須とする。
 
-### 2. CONDITIONAL_V1 は三つの deterministic predicate の OR
+### 2. Durable decision は intent ID を unique key にする
 
-entry intent 保存後、runner は一度だけ次を評価する。
-
-1. planned risk が SafetyFloor の最大 1 trade risk の 50% 以上
-2. TradePlan setup tag が `regime:trend_up` 以外、または regime tag が欠ける
-3. current cohort の直近 2 closed trade がともに post-cost loss
-
-一つでも該当すれば Falsifier を起動する。
-active account epoch / current cohort の最新 2 closed position を `closed_at DESC, position_id DESC` で先に固定する。
-2 件未満、attribution missing、infrastructure / market-data gap、execution semantics 不一致、または読み取り失敗が一つでもあれば `RECENT_OUTCOME_UNKNOWN` として Falsifier を起動する。
-unknown row を飛ばして古い eligible trade へ遡ってはならない。
-regime は `regime:trend_up` / `regime:trend_down` / `regime:range` / `regime:unknown` の exact tag を prompt で一つだけ要求する。
-recognized `regime:` tag が 0 件、2 件以上、未知、または競合する場合は `REGIME_UNKNOWN` として起動側に倒す。
-
-planned risk は、同じ order command と `SafetyFloorContext` に対して `SafetyFloorRiskCalculator.placeOrderRiskDetails` が返す `groupRiskAfterOrderJpy / maxRiskPerTradeJpy` を使う。
-これにより MARKET の ask、slippage、volatility、cost reserve と ADD_LONG の merge 後 group risk を SafetyFloor と一致させる。
-runner は取引 mutation を行わない internal risk-assessment path からこの snapshot を取得する。
-risk assessment、recent outcome の取得失敗は Falsifier 起動側に倒す。
-
-### 3. Policy decision は falsification と分離して durable に保存する
-
-runner は intent ID を unique key にする `falsifier_policy_decisions` へ次を保存する。
+`falsifier_policy_decisions` は次を保持する。
 
 - policy decision ID
+- intent ID（unique）
 - policy version
-- `required`
-- reason code の集合
-- intent ID
+- required
+- sorted bounded reason codes
 - runtime config version ID / hash
+- created at
 
-reason code は bounded enum とし、raw prompt、自由文、価格、secret を保存しない。
-同じ intent / 同じ payload の retry は既存 record を返し、異なる payload は conflict として fail closed する。
-durable record の commit 後に、同じ ID を持つ `FALSIFIER_POLICY_EVALUATED` command event を append する。
-policy event append は decision ID と canonical payload に対して idempotent とする。
-同じ ID / 同じ payload の既存 event は成功扱い、異なる payload は conflict として fail closed にする。
-event append に失敗または応答を失った場合は entry を行わず、同じ policy decision ID / event ID で exact readback 後に retry できる。
-Falsifier を起動しない場合も falsifications row を作らない。
+reason code は後続 policy 適用で使う bounded enum を先に定義する。
+raw prompt、自由文、価格、secret は保存しない。
 
-### 4. SafetyFloor bypass は runner 内部の型だけで表す
+### 3. Decision と audit event は同じ transaction で保存する
 
-`PlaceOrderCommand` に、MCP wire schema から設定できない sealed な Falsifier policy permit を追加する。
-permit は policy decision ID、intent ID、policy version、runtime config hash を保持する。
-既定は permit なしの `REQUIRED` とし、runner が durable decision と event append 成功を確認した command だけが `NOT_REQUIRED_BY_POLICY` permit を持つ。
+repository の `recordFalsifierPolicyDecision` は policy decision row と `FALSIFIER_POLICY_EVALUATED` command event を同じ transaction で insert する。
+event payload は policy decision の canonical projection から生成し、caller から任意 JSON を受け取らない。
 
-SafetyFloor snapshot は durable policy decision を含む。
-SafetyFloor は permit の全 identity が command intent と snapshot の durable decision に一致することを検証する。
-どちらでも persisted intent の存在、未消費、command との完全一致を検証する。
-`REQUIRED` の場合だけ fresh `APPROVED` を追加で要求する。
-OFF / 条件非該当でも最大損失、損切り、ナンピン、drawdown、exposure、EV、cost など他の SafetyFloor rule は変えない。
+同じ intent / decision ID / canonical payload の retry は既存 decision と event を exact readback して成功する。
+同じ intent または decision ID の異なる payload、decision と event の片側欠損、event payload 不一致は conflict として fail closed にする。
+transaction commit 後の ACK loss でも retry は重複 row を作らない。
 
-### 5. 期間 attribution は observed policy decision を正本にする
+in-memory repository も同じ atomic contract を模倣する。
 
-runtime activation は next restart の予定境界であり、実効 policy の証拠には使わない。
-後続比較は各 intent の durable policy decision と、その runtime config version ID / hash を正本にする。
-activation から新 policy decision が初めて観測されるまでの run、policy decision 欠損、run と decision の config identity 不一致は `UNKNOWN` とする。
-daemon と manual trigger の config 解決経路が異なっても、active version の時刻から policy を推測しない。
+### 4. 実効期間はまだ開始しない
+
+runtime config activation は next restart で反映されるが、この foundation だけでは runner behavior を切り替えない。
+運用 docs は policy key を「foundation のみ・activation 禁止」と明記する。
+後続 policy-application PR が merge / deploy されるまで `OFF_V1` / `CONDITIONAL_V1` を production で active 化しない。
 
 ## Risks / Trade-offs
 
-- [OFF が Falsifier gate を弱める] → paper mode の strategy experiment に限定し、他の SafetyFloor rule と intent integrity を維持する。production activation はこの PR に含めない
-- [setup tag が欠けて条件起動が常時化する] → prompt に bounded regime tag を要求し、欠損は監査 reason として起動側へ倒す
-- [recent outcome query failure が launch cost を増やす] → fail-safe で Falsifier を起動し、policy event に unknown reason を残す
-- [durable decision 後に event append が失敗する] → mutation を行わず、同じ decision ID の idempotent retry だけを許可する
+- [config 値だけが先に見える] → docs で activation 禁止を明記し、runner behavior は常時 ON のまま維持する
+- [lost ACK で retry が conflict する] → decision と canonical event を同一 transaction に置き、exact readback で同一 retry を成功扱いにする
+- [片側 legacy row] → 自動修復せず conflict として fail closed にする
 
 ## Rollback Plan
 
-runtime config を `ALWAYS_ON_V1` の version へ戻して process を restart する。
-既存 falsification、policy decision、policy event、runtime version は append-only の監査として残す。
-schema destructive rollback や既存履歴の書き換えは行わない。
+code default は `ALWAYS_ON_V1` のため、foundation を rollback しても runner behavior は変わらない。
+作成済み policy decision / event は監査 row として残し、destructive rollback は行わない。

@@ -1,23 +1,20 @@
 ## 1. Runtime policy
 
-- [ ] 1.1 version 付き Falsifier policy を typed config、runtime catalog、validation に追加する
-- [ ] 1.2 SafetyFloor と同じ risk calculator を使う conditional evaluator を追加する
-- [ ] 1.3 active epoch / current cohort の最新 2 closed position を unknown を含めて読む query を追加する
+- [ ] 1.1 version 付き Falsifier policy enum を typed config に追加する
+- [ ] 1.2 runtime catalog / candidate validation / config tests を更新する
 
-## 2. Runner and SafetyFloor
+## 2. Durable policy decision
 
-- [ ] 2.1 intent ごとに idempotent な durable policy decision と bounded command event を記録する
-- [ ] 2.2 policy に従って Falsifier を起動または省略し、偽の falsification を作らない
-- [ ] 2.3 durable decision に identity-bound な code-owned permit を SafetyFloor へ渡し、intent integrity と他の rule を維持する
+- [ ] 2.1 policy decision domain model と repository contract を追加する
+- [ ] 2.2 PostgreSQL table / bootstrap と Exposed repository の atomic idempotent save / read を追加する
+- [ ] 2.3 in-memory repository に同じ contract を追加する
 
 ## 3. Regression evidence
 
-- [ ] 3.1 ALWAYS_ON / OFF / CONDITIONAL、regime tag 競合、failure fail-safe の runner test を追加する
-- [ ] 3.2 OFF でも permit mismatch / intent mismatch / consumed / stop loss を拒否し、MCP caller が bypass できない test を追加する
-- [ ] 3.3 policy decision idempotency / conflict、policy event lost-ACK exact retry、production recent outcome query を test する
+- [ ] 3.1 same-payload retry / different-payload conflict / missing-side conflict を unit / integration test する
+- [ ] 3.2 unknown runtime policy rejection と default behavior 不変を test する
 
 ## 4. Documentation and validation
 
-- [ ] 4.1 prompt と設計・runtime・deploy docs を現在形で更新する
-- [ ] 4.2 activation 時刻ではなく durable policy decision を実効 attribution とする運用記述を追加する
-- [ ] 4.3 OpenSpec validation、targeted test、full test / detekt / build を実行する
+- [ ] 4.1 config / persistence docs に foundation と activation 禁止を現在形で追記する
+- [ ] 4.2 OpenSpec validation、targeted test、full test / detekt / build を実行する
