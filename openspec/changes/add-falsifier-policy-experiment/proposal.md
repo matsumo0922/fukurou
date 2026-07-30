@@ -7,9 +7,8 @@ Issue #207 Phase 2 では、Falsifier の常時起動に downside 防御とし�
 
 - Falsifier policy を `ALWAYS_ON_V1` / `OFF_V1` / `CONDITIONAL_V1` の version 付き runtime config として追加する
 - 条件起動では、大口リスク、不利または不明な market regime、current cohort の直近 2 連敗のいずれかで Falsifier を起動する
-- policy 判定を command event に記録し、既存の runtime config version / hash と組み合わせて期間比較できるようにする
+- policy 判定を intent に一意な durable record と command event に記録する
 - Falsifier を起動しない entry でも、偽の falsification を作らず、persisted intent の一致・未消費と SafetyFloor の全資金保護ルールを維持する
-- production paper の期間比較と descriptive comparison を実施する SQL / 運用手順を追加する
 
 ## Capabilities
 
@@ -26,7 +25,7 @@ Issue #207 Phase 2 では、Falsifier の常時起動に downside 防御とし�
 - `TradingBotConfig` / runtime config catalog と validation
 - one-shot entry flow、`PlaceOrderCommand`、SafetyFloor の Falsifier gate
 - current cohort の直近 closed trade 読み取り
-- command event audit、runner / SafetyFloor / persistence の回帰テスト
+- policy decision persistence、command event audit、runner / SafetyFloor の回帰テスト
 - `docs/design.md`、`docs/mcp-runtime.md`、`docs/deploy.md`
 
 ## Out of Scope
@@ -36,3 +35,4 @@ Issue #207 Phase 2 では、Falsifier の常時起動に downside 防御とし�
 - 実資金取引
 - production runtime config の activation
 - 比較期間が終わる前の優劣判定
+- rejected-intent shadow と descriptive comparison（次の stacked change）
