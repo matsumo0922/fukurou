@@ -337,6 +337,7 @@ drain_launches() {
     sleep 5
   done
 
+  bind_image_reference
   timeout 45 docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" stop -t 30 ktor
   assert_application_pid_zero
   timeout 30 "${DB_HELPER}" interrupt-active-launches "${MARKER_INCIDENT_DEPLOYMENT_ID}"

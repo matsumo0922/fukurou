@@ -73,6 +73,29 @@ class ReleaseDeployFoundationContractTest {
     }
 
     @Test
+    fun `forced drain path binds the image reference immediately before every compose invocation`() {
+        val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
+        val drainLaunches = extractFunctionBody(executor, "drain_launches() {", "\n}\n\ngap_event_payload_hash")
+        val composeCutover = extractFunctionBody(executor, "compose_cutover() {", "\n}\n\nresume_launches_idempotently")
+
+        assertBindImmediatelyPrecedesSoleComposeInvocation(drainLaunches, "drain_launches")
+        assertBindImmediatelyPrecedesSoleComposeInvocation(composeCutover, "compose_cutover")
+
+        assertEquals(
+            2,
+            composeInvocationIndices(executableLines(executor)).size,
+            "executor must call docker compose from exactly drain_launches and compose_cutover",
+        )
+
+        val pidZeroIndex = drainLaunches.indexOf("assert_application_pid_zero")
+        val interruptIndex = drainLaunches.indexOf("interrupt-active-launches")
+        val drainLoopIndex = drainLaunches.indexOf("LLM_DRAIN_TIMEOUT")
+        assertTrue(pidZeroIndex >= 0 && interruptIndex >= 0 && drainLoopIndex >= 0)
+        assertTrue(pidZeroIndex < interruptIndex)
+        assertTrue(interruptIndex < drainLoopIndex)
+    }
+
+    @Test
     fun `paused state preserves one maintenance incident until gap close`() {
         val executor = Files.readString(root.resolve("scripts/deploy/deploy-fukurou"))
         val startPause = executor.substringAfter("start_new_pause() {").substringBefore("\n}\n\nadopt_acknowledged_pause")
@@ -248,6 +271,60 @@ class ReleaseDeployFoundationContractTest {
         ).forEach { path -> assertFalse(Files.exists(root.resolve(path)), path) }
         assertTrue(Files.exists(root.resolve("scripts/runtime/fukurou-cli-canary-mcp.mjs")))
     }
+}
+
+private val COMPOSE_INVOCATION = Regex("""^timeout \d+ docker compose(?=\s|$)""")
+private val LINE_CONTINUATION = Regex("""(&&|\|\|?|\|&|\\)\s*(#.*)?$""")
+
+private fun uniqueLineStart(source: String, exactLine: String): Int {
+    val matches = Regex("(?m)^${Regex.escape(exactLine)}$").findAll(source).toList()
+    assertEquals(1, matches.size, "expected exactly one line \"$exactLine\", found ${matches.size}")
+    return matches.single().range.first
+}
+
+private fun extractFunctionBody(
+    executor: String,
+    startMarker: String,
+    endMarker: String,
+): String {
+    val bodyStart = uniqueLineStart(executor, startMarker) + startMarker.length
+    val bodyEnd = executor.indexOf(endMarker, bodyStart)
+    assertTrue(bodyEnd >= 0, "end marker not found after $startMarker: $endMarker")
+    return executor.substring(bodyStart, bodyEnd)
+}
+
+private fun executableLines(body: String): List<String> = body
+    .lineSequence()
+    .map(String::trim)
+    .filter { it.isNotEmpty() && !it.startsWith("#") }
+    .toList()
+
+private fun bindCallIndex(lines: List<String>): Int = lines.indexOf("bind_image_reference")
+
+private fun composeInvocationIndices(lines: List<String>): List<Int> =
+    lines.indices.filter { COMPOSE_INVOCATION.containsMatchIn(lines[it]) }
+
+private fun bindIsUnconditional(lines: List<String>, bindIndex: Int): Boolean {
+    val previousLine = lines.getOrNull(bindIndex - 1) ?: return true
+    return !LINE_CONTINUATION.containsMatchIn(previousLine)
+}
+
+private fun assertBindImmediatelyPrecedesSoleComposeInvocation(body: String, functionName: String) {
+    val lines = executableLines(body)
+    val composeIndices = composeInvocationIndices(lines)
+    assertEquals(1, composeIndices.size, "$functionName must contain exactly one docker compose invocation")
+
+    val bindIndex = bindCallIndex(lines)
+    assertTrue(bindIndex >= 0, "$functionName must call bind_image_reference")
+    assertEquals(
+        composeIndices.single(),
+        bindIndex + 1,
+        "$functionName must call bind_image_reference immediately before its docker compose invocation",
+    )
+    assertTrue(
+        bindIsUnconditional(lines, bindIndex),
+        "$functionName's bind_image_reference call must not be conditioned by a preceding && / || / | / \\ continuation",
+    )
 }
 
 private fun shellManifestPaths(source: String): Set<String> = source
