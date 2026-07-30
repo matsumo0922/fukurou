@@ -1,6 +1,7 @@
 package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.config.FalsifierPolicy
@@ -34,14 +35,7 @@ class ExposedFalsifierPolicyDecisionRepository(
                 } catch (failure: Throwable) {
                     if (!failure.isUniqueViolation()) throw failure
 
-                    exposedTransaction(database) {
-                        val requested = request.decision
-                        val byIntent = selectDecisionByIntent(requested.intentId)
-                        val byId = selectDecisionById(requested.decisionId)
-                        val event = selectPolicyEvent(requested.decisionId)
-
-                        exactReadbackOrConflict(requested, byIntent, byId, event)
-                    }
+                    readbackAfterUniqueViolation(request)
                 }
             }
         }
@@ -76,6 +70,28 @@ class ExposedFalsifierPolicyDecisionRepository(
         insertEvent(request)
 
         return requested
+    }
+
+    private suspend fun readbackAfterUniqueViolation(
+        request: FalsifierPolicyDecisionRequest,
+    ): FalsifierPolicyDecision {
+        repeat(UNIQUE_VIOLATION_READBACK_ATTEMPTS) { attempt ->
+            val decision = exposedTransaction(database) {
+                val requested = request.decision
+                val byIntent = selectDecisionByIntent(requested.intentId)
+                val byId = selectDecisionById(requested.decisionId)
+                val event = selectPolicyEvent(requested.decisionId)
+                val isReadbackPending = byIntent == null && byId == null && event == null
+
+                if (isReadbackPending) null else exactReadbackOrConflict(requested, byIntent, byId, event)
+            }
+            if (decision != null) return decision
+            if (attempt < UNIQUE_VIOLATION_READBACK_ATTEMPTS - 1) {
+                delay(UNIQUE_VIOLATION_READBACK_DELAY_MILLIS)
+            }
+        }
+
+        throw FalsifierPolicyDecisionConflictException("unique policy decision conflict has no durable readback.")
     }
 
     private fun JdbcTransaction.exactReadbackOrConflict(
@@ -208,3 +224,6 @@ private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision {
 private fun Throwable.isUniqueViolation(): Boolean = generateSequence(this) { throwable -> throwable.cause }
     .filterIsInstance<SQLException>()
     .any { exception -> exception.sqlState == "23505" }
+
+private const val UNIQUE_VIOLATION_READBACK_ATTEMPTS = 3
+private const val UNIQUE_VIOLATION_READBACK_DELAY_MILLIS = 10L
