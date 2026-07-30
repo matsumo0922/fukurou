@@ -50,7 +50,7 @@ class ExposedFalsifierPolicyDecisionRepository(
                     val byId = selectDecisionById(decision.decisionId)
                     val event = selectPolicyEvent(decision.decisionId)
 
-                    exactReadbackOrConflict(decision, decision, byId, event)
+                    exactReadbackOrConflict(decision, PolicyDecisionReadback(decision, byId, event))
                 }
             }
         }
@@ -58,13 +58,11 @@ class ExposedFalsifierPolicyDecisionRepository(
 
     private fun JdbcTransaction.recordOrReadback(request: FalsifierPolicyDecisionRequest): FalsifierPolicyDecision {
         val requested = request.decision
-        val byIntent = selectDecisionByIntent(requested.intentId)
-        val byId = selectDecisionById(requested.decisionId)
-        val event = selectPolicyEvent(requested.decisionId)
+        val readback = readPolicyDecisionState(requested)
 
-        val hasPersistedPolicyState = byIntent != null || byId != null || event != null
+        val hasPersistedPolicyState = readback.hasPersistedState
         if (hasPersistedPolicyState) {
-            return exactReadbackOrConflict(requested, byIntent, byId, event)
+            return exactReadbackOrConflict(requested, refreshPolicyDecisionStateIfTransient(requested, readback))
         }
 
         insertDecision(requested)
@@ -84,7 +82,14 @@ class ExposedFalsifierPolicyDecisionRepository(
                 val event = selectPolicyEvent(requested.decisionId)
                 val isReadbackPending = byIntent == null && byId == null && event == null
 
-                if (isReadbackPending) null else exactReadbackOrConflict(requested, byIntent, byId, event)
+                if (isReadbackPending) {
+                    null
+                } else {
+                    exactReadbackOrConflict(
+                        requested,
+                        PolicyDecisionReadback(byIntent, byId, event),
+                    )
+                }
             }
             if (decision != null) return decision
             if (attempt < UNIQUE_VIOLATION_READBACK_ATTEMPTS - 1) {
@@ -97,27 +102,39 @@ class ExposedFalsifierPolicyDecisionRepository(
 
     private fun JdbcTransaction.exactReadbackOrConflict(
         requested: FalsifierPolicyDecision,
-        byIntent: FalsifierPolicyDecision?,
-        byId: FalsifierPolicyDecision?,
-        event: StoredPolicyEvent?,
+        readback: PolicyDecisionReadback,
     ): FalsifierPolicyDecision {
-        val hasTransientReadCommittedGap = byIntent == null && byId == requested && event?.matches(requested) == true
-        if (hasTransientReadCommittedGap) {
-            val refreshedByIntent = selectDecisionByIntent(requested.intentId)
-            if (refreshedByIntent != null) {
-                return exactReadbackOrConflict(requested, refreshedByIntent, byId, event)
-            }
-        }
-        val existing = byIntent ?: throw FalsifierPolicyDecisionConflictException("policy decision ID exists without matching intent.")
-        if (byId != existing || existing != requested) {
+        val existing = readback.byIntent ?: throw FalsifierPolicyDecisionConflictException("policy decision ID exists without matching intent.")
+        if (readback.byId != existing || existing != requested) {
             throw FalsifierPolicyDecisionConflictException("policy decision payload conflicts with existing row.")
         }
-        val storedEvent = event ?: throw FalsifierPolicyDecisionConflictException("policy decision exists without canonical event.")
+        val storedEvent = readback.event ?: throw FalsifierPolicyDecisionConflictException("policy decision exists without canonical event.")
         if (!storedEvent.matches(existing)) {
             throw FalsifierPolicyDecisionConflictException("policy decision event payload conflicts.")
         }
 
         return existing
+    }
+
+    private fun JdbcTransaction.readPolicyDecisionState(requested: FalsifierPolicyDecision): PolicyDecisionReadback {
+        return PolicyDecisionReadback(
+            byIntent = selectDecisionByIntent(requested.intentId),
+            byId = selectDecisionById(requested.decisionId),
+            event = selectPolicyEvent(requested.decisionId),
+        )
+    }
+
+    private fun JdbcTransaction.refreshPolicyDecisionState(requested: FalsifierPolicyDecision): PolicyDecisionReadback {
+        return readPolicyDecisionState(requested)
+    }
+
+    private fun JdbcTransaction.refreshPolicyDecisionStateIfTransient(
+        requested: FalsifierPolicyDecision,
+        initial: PolicyDecisionReadback,
+    ): PolicyDecisionReadback {
+        if (!initial.canBeTransientReadCommittedGap(requested)) return initial
+
+        return refreshPolicyDecisionState(requested)
     }
 
     private fun JdbcTransaction.insertDecision(decision: FalsifierPolicyDecision) {
@@ -208,6 +225,24 @@ private data class StoredPolicyEvent(val toolName: String, val eventType: String
         return toolName == FALSIFIER_POLICY_EVENT_TOOL_NAME &&
             eventType == CommandEventType.FALSIFIER_POLICY_EVALUATED.name &&
             payload == decision.canonicalPayload()
+    }
+}
+
+private data class PolicyDecisionReadback(
+    val byIntent: FalsifierPolicyDecision?,
+    val byId: FalsifierPolicyDecision?,
+    val event: StoredPolicyEvent?,
+) {
+    val hasPersistedState: Boolean get() = byIntent != null || byId != null || event != null
+
+    fun canBeTransientReadCommittedGap(requested: FalsifierPolicyDecision): Boolean {
+        val hasOnlyExactComponents = listOfNotNull(
+            byIntent?.let { it == requested },
+            byId?.let { it == requested },
+            event?.let { it.matches(requested) },
+        ).all { it }
+
+        return hasPersistedState && hasOnlyExactComponents
     }
 }
 
