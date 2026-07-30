@@ -10,8 +10,8 @@ import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.FalsifierPolicy
-import java.time.Clock
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 /** Falsifier policy decision に保存する、自由文を含まない理由。 */
@@ -26,7 +26,7 @@ enum class FalsifierPolicyReasonCode {
 }
 
 /** intent ごとに一意な、後続 policy application の監査正本。 */
-data class FalsifierPolicyDecision(
+class FalsifierPolicyDecision private constructor(
     val decisionId: UUID,
     val intentId: UUID,
     val policy: FalsifierPolicy,
@@ -39,6 +39,29 @@ data class FalsifierPolicyDecision(
     init {
         require(runtimeConfigVersionId.isNotBlank()) { "runtimeConfigVersionId must not be blank." }
         require(runtimeConfigHash.isNotBlank()) { "runtimeConfigHash must not be blank." }
+    }
+
+    companion object {
+        /** DB / audit canonicalization と同じ millisecond precision で decision を作る。 */
+        fun create(
+            decisionId: UUID,
+            intentId: UUID,
+            policy: FalsifierPolicy,
+            required: Boolean,
+            reasonCodes: Set<FalsifierPolicyReasonCode>,
+            runtimeConfigVersionId: String,
+            runtimeConfigHash: String,
+            createdAt: Instant,
+        ): FalsifierPolicyDecision = FalsifierPolicyDecision(
+            decisionId = decisionId,
+            intentId = intentId,
+            policy = policy,
+            required = required,
+            reasonCodes = reasonCodes,
+            runtimeConfigVersionId = runtimeConfigVersionId,
+            runtimeConfigHash = runtimeConfigHash,
+            createdAt = createdAt.truncatedTo(ChronoUnit.MILLIS),
+        )
     }
 
     /** audit event に保存する canonical projection。 */
@@ -54,6 +77,27 @@ data class FalsifierPolicyDecision(
         put("runtimeConfigHash", runtimeConfigHash)
         put("createdAt", createdAt.toString())
     }.toString()
+
+    override fun equals(other: Any?): Boolean = other is FalsifierPolicyDecision &&
+        decisionId == other.decisionId &&
+        intentId == other.intentId &&
+        policy == other.policy &&
+        required == other.required &&
+        reasonCodes == other.reasonCodes &&
+        runtimeConfigVersionId == other.runtimeConfigVersionId &&
+        runtimeConfigHash == other.runtimeConfigHash &&
+        createdAt == other.createdAt
+
+    override fun hashCode(): Int = listOf(
+        decisionId,
+        intentId,
+        policy,
+        required,
+        reasonCodes,
+        runtimeConfigVersionId,
+        runtimeConfigHash,
+        createdAt,
+    ).hashCode()
 }
 
 /** policy decision 保存要求。payload は repository が canonical projection だけから生成する。 */
@@ -73,9 +117,7 @@ interface FalsifierPolicyDecisionRepository {
 class FalsifierPolicyDecisionConflictException(message: String) : IllegalStateException(message)
 
 /** unit test と DB 未構成 runtime 用の atomic contract 実装。 */
-class InMemoryFalsifierPolicyDecisionRepository(
-    private val clock: Clock = Clock.systemUTC(),
-) : FalsifierPolicyDecisionRepository {
+class InMemoryFalsifierPolicyDecisionRepository : FalsifierPolicyDecisionRepository {
     private val mutex = Mutex()
     private val decisionsByIntent = mutableMapOf<UUID, FalsifierPolicyDecision>()
     private val eventsById = mutableMapOf<UUID, CommandEvent>()

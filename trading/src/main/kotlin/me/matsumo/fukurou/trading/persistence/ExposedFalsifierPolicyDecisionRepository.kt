@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRequest
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyReasonCode
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import java.sql.ResultSet
+import java.sql.SQLException
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
@@ -23,19 +24,21 @@ class ExposedFalsifierPolicyDecisionRepository(
     override suspend fun recordFalsifierPolicyDecision(request: FalsifierPolicyDecisionRequest): Result<FalsifierPolicyDecision> {
         return withContext(Dispatchers.IO) {
             runCatching {
-                exposedTransaction(database) {
-                    val requested = request.decision
-                    val byIntent = selectDecisionByIntent(requested.intentId)
-                    val byId = selectDecisionById(requested.decisionId)
-                    val event = selectPolicyEvent(requested.decisionId)
-
-                    if (byIntent != null || byId != null || event != null) {
-                        return@exposedTransaction exactReadbackOrConflict(requested, byIntent, byId, event)
+                try {
+                    exposedTransaction(database) {
+                        recordOrReadback(request)
                     }
+                } catch (failure: Throwable) {
+                    if (!failure.isUniqueViolation()) throw failure
 
-                    insertDecision(requested)
-                    insertEvent(request)
-                    requested
+                    exposedTransaction(database) {
+                        val requested = request.decision
+                        val byIntent = selectDecisionByIntent(requested.intentId)
+                        val byId = selectDecisionById(requested.decisionId)
+                        val event = selectPolicyEvent(requested.decisionId)
+
+                        exactReadbackOrConflict(requested, byIntent, byId, event)
+                    }
                 }
             }
         }
@@ -43,6 +46,22 @@ class ExposedFalsifierPolicyDecisionRepository(
 
     override suspend fun findFalsifierPolicyDecision(intentId: UUID): Result<FalsifierPolicyDecision?> = withContext(Dispatchers.IO) {
         runCatching { exposedTransaction(database) { selectDecisionByIntent(intentId) } }
+    }
+
+    private fun JdbcTransaction.recordOrReadback(request: FalsifierPolicyDecisionRequest): FalsifierPolicyDecision {
+        val requested = request.decision
+        val byIntent = selectDecisionByIntent(requested.intentId)
+        val byId = selectDecisionById(requested.decisionId)
+        val event = selectPolicyEvent(requested.decisionId)
+
+        if (byIntent != null || byId != null || event != null) {
+            return exactReadbackOrConflict(requested, byIntent, byId, event)
+        }
+
+        insertDecision(requested)
+        insertEvent(request)
+
+        return requested
     }
 
     private fun JdbcTransaction.exactReadbackOrConflict(
@@ -142,7 +161,7 @@ private data class StoredPolicyEvent(val toolName: String, val eventType: String
             payload == decision.canonicalPayload()
 }
 
-private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision = FalsifierPolicyDecision(
+private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision = FalsifierPolicyDecision.create(
     decisionId = getObject("id", UUID::class.java),
     intentId = getObject("intent_id", UUID::class.java),
     policy = FalsifierPolicy.valueOf(getString("policy")),
@@ -156,3 +175,7 @@ private fun ResultSet.toPolicyDecision(): FalsifierPolicyDecision = FalsifierPol
     runtimeConfigHash = getString("runtime_config_hash"),
     createdAt = java.time.Instant.ofEpochMilli(getLong("created_at")),
 )
+
+private fun Throwable.isUniqueViolation(): Boolean = generateSequence(this) { throwable -> throwable.cause }
+    .filterIsInstance<SQLException>()
+    .any { exception -> exception.sqlState == "23505" }

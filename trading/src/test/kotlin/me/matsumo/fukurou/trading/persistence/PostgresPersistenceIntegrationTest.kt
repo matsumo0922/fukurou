@@ -61,6 +61,7 @@ import me.matsumo.fukurou.trading.broker.SimulatedFill
 import me.matsumo.fukurou.trading.broker.TradeIntentConsumptionRequest
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
+import me.matsumo.fukurou.trading.config.FalsifierPolicy
 import me.matsumo.fukurou.trading.config.KillCriterionConfig
 import me.matsumo.fukurou.trading.config.LlmDaemonConfig
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
@@ -108,6 +109,10 @@ import me.matsumo.fukurou.trading.decision.DecisionSubmissionUnknownException
 import me.matsumo.fukurou.trading.decision.EntryIntentDraft
 import me.matsumo.fukurou.trading.decision.FalsificationSubmission
 import me.matsumo.fukurou.trading.decision.FalsificationVerdict
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecision
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionConflictException
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRequest
+import me.matsumo.fukurou.trading.decision.FalsifierPolicyReasonCode
 import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
@@ -957,6 +962,74 @@ class PostgresPersistenceIntegrationTest {
         }
         assertEquals(fixedInstant(), activatedAt)
         assertEquals(activatedAt, selectEvidenceActivationBoundary(database))
+    }
+
+    @Test
+    fun falsifierPolicyDecision_persistsAtomicIdempotentReadbackAndFailsClosedOnConflict() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedFalsifierPolicyDecisionRepository(database)
+        val request = falsifierPolicyDecisionRequest()
+
+        assertEquals(request.decision, repository.recordFalsifierPolicyDecision(request).getOrThrow())
+        assertEquals(request.decision, repository.recordFalsifierPolicyDecision(request).getOrThrow())
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM falsifier_policy_decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM command_event_log WHERE event_type='FALSIFIER_POLICY_EVALUATED'", 1)
+        }
+
+        assertFailsWith<FalsifierPolicyDecisionConflictException> {
+            repository.recordFalsifierPolicyDecision(
+                request.copy(decision = FalsifierPolicyDecision.create(
+                    decisionId = request.decision.decisionId,
+                    intentId = request.decision.intentId,
+                    policy = request.decision.policy,
+                    required = false,
+                    reasonCodes = request.decision.reasonCodes,
+                    runtimeConfigVersionId = request.decision.runtimeConfigVersionId,
+                    runtimeConfigHash = request.decision.runtimeConfigHash,
+                    createdAt = request.decision.createdAt,
+                )),
+            ).getOrThrow()
+        }
+
+        val missingSide = falsifierPolicyDecisionRequest()
+        exposedTransaction(database) {
+            jdbcConnection().prepareStatement(
+                """INSERT INTO falsifier_policy_decisions
+                    (id, intent_id, policy, required, reason_codes, runtime_config_version_id, runtime_config_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ).use { statement ->
+                statement.setObject(1, missingSide.decision.decisionId)
+                statement.setObject(2, missingSide.decision.intentId)
+                statement.setString(3, missingSide.decision.policy.name)
+                statement.setBoolean(4, missingSide.decision.required)
+                statement.setString(5, "ALWAYS_ON")
+                statement.setString(6, missingSide.decision.runtimeConfigVersionId)
+                statement.setString(7, missingSide.decision.runtimeConfigHash)
+                statement.setLong(8, missingSide.decision.createdAt.toEpochMilli())
+                check(statement.executeUpdate() == 1)
+            }
+        }
+        assertFailsWith<FalsifierPolicyDecisionConflictException> {
+            repository.recordFalsifierPolicyDecision(missingSide).getOrThrow()
+        }
+    }
+
+    @Test
+    fun falsifierPolicyDecision_parallelSamePayloadRetryConvergesToOneRecord() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val repository = ExposedFalsifierPolicyDecisionRepository(database)
+        val request = falsifierPolicyDecisionRequest()
+
+        coroutineScope {
+            List(2) {
+                async { repository.recordFalsifierPolicyDecision(request).getOrThrow() }
+            }.awaitAll().forEach { result -> assertEquals(request.decision, result) }
+        }
+        exposedTransaction(database) {
+            assertSqlCount("SELECT COUNT(*) FROM falsifier_policy_decisions", 1)
+            assertSqlCount("SELECT COUNT(*) FROM command_event_log WHERE event_type='FALSIFIER_POLICY_EVALUATED'", 1)
+        }
     }
 
     @Test
@@ -14786,6 +14859,19 @@ private fun gateShadowObservationFixture(): GateShadowObservation {
 /**
  * Postgres integration test 用の固定時刻を返す。
  */
+private fun falsifierPolicyDecisionRequest(): FalsifierPolicyDecisionRequest = FalsifierPolicyDecisionRequest(
+    decision = FalsifierPolicyDecision.create(
+        decisionId = UUID.randomUUID(),
+        intentId = UUID.randomUUID(),
+        policy = FalsifierPolicy.ALWAYS_ON_V1,
+        required = true,
+        reasonCodes = setOf(FalsifierPolicyReasonCode.ALWAYS_ON),
+        runtimeConfigVersionId = "runtime-v1",
+        runtimeConfigHash = "a".repeat(64),
+        createdAt = fixedInstant().plusNanos(999_999),
+    ),
+)
+
 private fun fixedInstant(): Instant {
     return Instant.parse("2026-07-02T00:00:00Z")
 }

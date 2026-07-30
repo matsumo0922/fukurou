@@ -27,7 +27,16 @@ class FalsifierPolicyDecisionRepositoryTest {
 
         assertFailsWith<FalsifierPolicyDecisionConflictException> {
             repository.recordFalsifierPolicyDecision(
-                request.copy(decision = request.decision.copy(required = false)),
+                request.copy(decision = FalsifierPolicyDecision.create(
+                    decisionId = request.decision.decisionId,
+                    intentId = request.decision.intentId,
+                    policy = request.decision.policy,
+                    required = false,
+                    reasonCodes = request.decision.reasonCodes,
+                    runtimeConfigVersionId = request.decision.runtimeConfigVersionId,
+                    runtimeConfigHash = request.decision.runtimeConfigHash,
+                    createdAt = request.decision.createdAt,
+                )),
             ).getOrThrow()
         }
         Unit
@@ -46,7 +55,7 @@ class FalsifierPolicyDecisionRepositoryTest {
     }
 
     private fun request(): FalsifierPolicyDecisionRequest = FalsifierPolicyDecisionRequest(
-        decision = FalsifierPolicyDecision(
+        decision = FalsifierPolicyDecision.create(
             decisionId = UUID.randomUUID(),
             intentId = UUID.randomUUID(),
             policy = FalsifierPolicy.ALWAYS_ON_V1,
