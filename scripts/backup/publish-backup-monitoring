@@ -98,7 +98,7 @@ validate_projection() {
             "PARTIAL_SNAPSHOT_FORGET_FAILED", "REPOSITORY_FAILED", "RESTORE_CLEANUP_FAILED",
             "RESTORE_PROFILE_FAILED", "RESTORE_SIGNALLED", "RESTORE_SNAPSHOT_FAILED", "RESTORE_START_FAILED",
             "RESTORE_TIMEOUT", "RETENTION_FAILED", "SNAPSHOT_IDENTITY_FAILED", "STATUS_PUBLICATION_FAILED",
-            "SUCCESS", "WATCHDOG_TERMINATION_FAILED"
+            "SUCCESS"
           )) and
           (.invocationId | invocation) and (.bootId | boot)
         );

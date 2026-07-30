@@ -40,8 +40,7 @@
         "RETENTION_FAILED",
         "SNAPSHOT_IDENTITY_FAILED",
         "STATUS_PUBLICATION_FAILED",
-        "SUCCESS",
-        "WATCHDOG_TERMINATION_FAILED"
+        "SUCCESS"
       ]
     },
     "attempt": {

@@ -22,8 +22,10 @@ source "${SCRIPT_DIRECTORY}/backup-common"
 readonly PRODUCTION_CONTAINER="${FUKUROU_POSTGRES_CONTAINER:-fukurou-postgres}"
 readonly APPLICATION_CONTAINER="${FUKUROU_APPLICATION_CONTAINER:-fukurou-ktor}"
 readonly BACKUP_RESERVE_BYTES="${FUKUROU_BACKUP_RESERVE_BYTES:-5368709120}"
-readonly DUMP_DEADLINE_SECONDS="${FUKUROU_BACKUP_DUMP_DEADLINE_SECONDS:-60}"
-readonly WATCHDOG_TERMINATION_GRACE_SECONDS=5
+# 無限 stall（lock 待ち・パイプ背圧）の防止だけが目的の緩い bound。実行時間の予測に
+# 基づくタイトな値にすると、restic の repo index 読み込み由来の背圧で健全な dump を
+# 誤終了させる（issue #336）。deploy の外側 timeout 900 秒より内側で先に発火させる。
+readonly DUMP_TIMEOUT_SECONDS=840
 readonly POSTGRES_CONTROL_TIMEOUT_SECONDS=5
 
 BACKUP_INVOKED_BY_DEPLOY=false
@@ -38,15 +40,10 @@ PRODUCTION_CONTAINER_ID=""
 APPLICATION_CONTAINER_ID=""
 INTERRUPTED_CANDIDATE_COUNT=null
 REPOSITORY_READ_READY=false
-WATCHDOG_PID=""
-WATCHDOG_DEADLINE_EPOCH=""
 WORK_DIRECTORY=""
 CURRENT_PARTIAL_SNAPSHOT=""
 
 cleanup() {
-  if [[ -n "${WATCHDOG_PID}" ]]; then
-    cancel_and_reap_dump_watchdog
-  fi
   if [[ -n "${WORK_DIRECTORY}" ]]; then
     rm -rf -- "${WORK_DIRECTORY}"
     WORK_DIRECTORY=""
@@ -56,10 +53,9 @@ cleanup() {
 handle_signal() {
   local exit_code="$1"
   trap - TERM INT HUP
-  cancel_and_reap_dump_watchdog
   if [[ -n "${CURRENT_PARTIAL_SNAPSHOT}" && "${REPOSITORY_READ_READY}" == "true" ]]; then
     timeout --signal=KILL --kill-after=1 10 \
-      env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --no-cache --compression auto \
+      env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --compression auto \
         -r "${RESTIC_REPOSITORY}" forget "${CURRENT_PARTIAL_SNAPSHOT}" >/dev/null 2>&1 || true
   fi
   REPOSITORY_READ_READY=false
@@ -74,7 +70,7 @@ trap 'handle_signal 130' INT
 trap 'handle_signal 129' HUP
 
 restic_command() {
-  env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --no-cache --compression auto -r "${RESTIC_REPOSITORY}" "$@"
+  env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --compression auto -r "${RESTIC_REPOSITORY}" "$@"
 }
 
 publish_backup_attempt() {
@@ -175,69 +171,7 @@ postgres_scalar_bounded() {
 }
 
 postgres_scalar() {
-  local timeout_seconds="${POSTGRES_CONTROL_TIMEOUT_SECONDS}" remaining
-  if [[ "${WATCHDOG_DEADLINE_EPOCH}" =~ ^[0-9]+$ ]]; then
-    remaining=$(( WATCHDOG_DEADLINE_EPOCH - $(backup_epoch) ))
-    (( remaining > 0 )) || return 1
-    (( remaining < timeout_seconds )) && timeout_seconds="${remaining}"
-  fi
-  postgres_scalar_bounded "${timeout_seconds}" "$1"
-}
-
-dump_backend_count() {
-  local count
-  count="$(postgres_scalar "SELECT count(*) FROM pg_stat_activity WHERE datname = '${DATABASE_NAME}' AND application_name = '${APPLICATION_NAME}';")" || return 1
-  [[ "${count}" =~ ^[0-9]+$ ]] || return 1
-  printf '%s\n' "${count}"
-}
-
-dump_watchdog_is_running() {
-  [[ -n "${WATCHDOG_PID}" ]] && jobs -pr | grep -Fx -- "${WATCHDOG_PID}" >/dev/null 2>&1
-}
-
-watchdog_has_time_remaining() {
-  [[ "${WATCHDOG_DEADLINE_EPOCH}" =~ ^[0-9]+$ ]] &&
-    (( $(backup_epoch) < WATCHDOG_DEADLINE_EPOCH ))
-}
-
-cancel_and_reap_dump_watchdog() {
-  [[ -n "${WATCHDOG_PID}" ]] || return 0
-  kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
-  while dump_watchdog_is_running && watchdog_has_time_remaining; do sleep 0.1; done
-  if dump_watchdog_is_running; then kill -KILL "${WATCHDOG_PID}" 2>/dev/null || true; fi
-  wait "${WATCHDOG_PID}" 2>/dev/null || true
-  WATCHDOG_PID=""
-}
-
-wait_for_dump_watchdog() {
-  [[ -n "${WATCHDOG_PID}" ]] || return 0
-  while dump_watchdog_is_running && watchdog_has_time_remaining; do sleep 0.1; done
-  if dump_watchdog_is_running; then kill -KILL "${WATCHDOG_PID}" 2>/dev/null || true; fi
-  wait "${WATCHDOG_PID}" 2>/dev/null || true
-  WATCHDOG_PID=""
-}
-
-settle_watchdog_after_pipeline_failure() {
-  local result_file="$1" backend_count
-  if ! dump_watchdog_is_running; then
-    wait_for_dump_watchdog
-    return 0
-  fi
-
-  backend_count="$(dump_backend_count 2>/dev/null || true)"
-  case "${backend_count}" in
-    0)
-      cancel_and_reap_dump_watchdog
-      ;;
-    1)
-      wait_for_dump_watchdog
-      ;;
-    *)
-      cancel_and_reap_dump_watchdog
-      printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
-      return 1
-      ;;
-  esac
+  postgres_scalar_bounded "${POSTGRES_CONTROL_TIMEOUT_SECONDS}" "$1"
 }
 
 validate_capacity_floor() {
@@ -250,67 +184,6 @@ validate_capacity_floor() {
   available_bytes="$(df -B1 --output=avail "${repository_parent}" | tail -n 1 | tr -d ' ')" || return 1
   [[ "${available_bytes}" =~ ^[0-9]+$ ]] || return 1
   (( available_bytes >= database_bytes + BACKUP_RESERVE_BYTES ))
-}
-
-terminate_or_observe_dump_backend() {
-  local expected_pid="$1" result_file="$2" hard_deadline="$3" termination disappeared remaining
-  remaining=$(( hard_deadline - $(backup_epoch) ))
-  (( remaining > 0 )) || {
-    printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
-    return 1
-  }
-  (( remaining > POSTGRES_CONTROL_TIMEOUT_SECONDS )) && remaining="${POSTGRES_CONTROL_TIMEOUT_SECONDS}"
-  termination="$(postgres_scalar_bounded "${remaining}" "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = ${expected_pid} AND application_name = '${APPLICATION_NAME}') THEN CASE WHEN pg_terminate_backend(${expected_pid}) THEN 'terminated' ELSE 'failed' END WHEN EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = ${expected_pid}) THEN 'mismatch' ELSE 'gone' END;")" || true
-  if [[ "${termination}" == "gone" ]]; then
-    return 0
-  fi
-  [[ "${termination}" == "terminated" ]] || {
-    printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
-    return 1
-  }
-  while (( $(backup_epoch) < hard_deadline )); do
-    remaining=$(( hard_deadline - $(backup_epoch) ))
-    (( remaining > POSTGRES_CONTROL_TIMEOUT_SECONDS )) && remaining="${POSTGRES_CONTROL_TIMEOUT_SECONDS}"
-    disappeared="$(postgres_scalar_bounded "${remaining}" "SELECT count(*) FROM pg_stat_activity WHERE pid = ${expected_pid} AND application_name = '${APPLICATION_NAME}';")" || true
-    if [[ "${disappeared}" == "0" ]]; then
-      printf 'TERMINATED\n' >"${result_file}"
-      return 0
-    fi
-    sleep 1
-  done
-  printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
-  return 1
-}
-
-watch_dump_backend() {
-  local result_file="$1" hard_deadline termination_deadline pid_rows expected_pid
-  trap 'exit 0' TERM INT HUP
-  hard_deadline="${WATCHDOG_DEADLINE_EPOCH}"
-  termination_deadline=$(( hard_deadline - WATCHDOG_TERMINATION_GRACE_SECONDS ))
-  expected_pid=""
-  while (( $(backup_epoch) < termination_deadline )); do
-    pid_rows="$(postgres_scalar "SELECT pid FROM pg_stat_activity WHERE datname = '${DATABASE_NAME}' AND application_name = '${APPLICATION_NAME}' ORDER BY pid;")" || {
-      printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
-      return 1
-    }
-    if [[ -z "${pid_rows}" ]]; then
-      sleep 1
-      continue
-    fi
-    [[ "${pid_rows}" =~ ^[0-9]+$ ]] || {
-      printf 'WATCHDOG_TERMINATION_FAILED\n' >"${result_file}"
-      return 1
-    }
-    expected_pid="${pid_rows}"
-    break
-  done
-  [[ -n "${expected_pid}" ]] || {
-    printf 'WATCHDOG_BACKEND_NOT_OBSERVED\n' >"${result_file}"
-    return 1
-  }
-
-  while (( $(backup_epoch) < termination_deadline )); do sleep 1; done
-  terminate_or_observe_dump_backend "${expected_pid}" "${result_file}" "${hard_deadline}"
 }
 
 snapshot_from_backup_summary() {
@@ -355,7 +228,7 @@ resolve_authoritative_snapshot() {
 }
 
 run_backup() {
-  local candidate_snapshot authoritative_snapshot producer_status restic_status watchdog_result
+  local candidate_snapshot authoritative_snapshot producer_status restic_status
   if [[ "${1:-}" == "--invoked-by-deploy" ]]; then
     BACKUP_INVOKED_BY_DEPLOY=true
     shift
@@ -367,10 +240,6 @@ run_backup() {
   ATTEMPT_TAG="${ATTEMPT_TAG/Z/}"
   APPLICATION_NAME="fukurou_backup_$$_${RANDOM}"
   WORK_DIRECTORY="$(mktemp -d)" || { fail_attempt INVALID_CONFIGURATION; return 1; }
-
-  [[ "${DUMP_DEADLINE_SECONDS}" =~ ^[0-9]+$ ]] &&
-    (( DUMP_DEADLINE_SECONDS > WATCHDOG_TERMINATION_GRACE_SECONDS && DUMP_DEADLINE_SECONDS <= 60 )) ||
-    { fail_attempt INVALID_CONFIGURATION; return 1; }
 
   if [[ "${FUKUROU_BACKUP_ALLOW_NON_ROOT_TEST:-0}" != "1" ]] && ! backup_require_root; then fail_attempt INVALID_CONFIGURATION; return 1; fi
   for command_name in docker restic jq flock timeout stat df sync; do
@@ -389,17 +258,16 @@ run_backup() {
   restic_command check >/dev/null 2>&1 || { fail_attempt REPOSITORY_FAILED; return 1; }
   REPOSITORY_READ_READY=true
 
-  WATCHDOG_DEADLINE_EPOCH=$(( $(backup_epoch) + DUMP_DEADLINE_SECONDS ))
-  watch_dump_backend "${WORK_DIRECTORY}/watchdog-result" &
-  WATCHDOG_PID="$!"
+  # dump の bound は container 内側の timeout に置く。host 側 exec client が signal を
+  # proxy できずに死んでも（SIGKILL は伝播しない）、container 内 timeout は同一 PID
+  # namespace から pg_dump を確実に終了させ、backend は接続喪失で終了する（issue #336）。
   set +e
-  timeout --signal=TERM --kill-after="${WATCHDOG_TERMINATION_GRACE_SECONDS}" \
-    "$((DUMP_DEADLINE_SECONDS - WATCHDOG_TERMINATION_GRACE_SECONDS))" \
-    docker exec -e "PGAPPNAME=${APPLICATION_NAME}" -i "${PRODUCTION_CONTAINER_ID}" \
-      pg_dump --format=custom --compress=0 -U "${DATABASE_USER}" -d "${DATABASE_NAME}" 2>/dev/null |
+  docker exec -e "PGAPPNAME=${APPLICATION_NAME}" -i "${PRODUCTION_CONTAINER_ID}" \
+    timeout --signal=TERM --kill-after=10 "${DUMP_TIMEOUT_SECONDS}" \
+      pg_dump --format=custom --compress=0 -U "${DATABASE_USER}" -d "${DATABASE_NAME}" |
     restic_command backup --json --stdin --stdin-filename "${BACKUP_STDIN_PATH#/}" \
       --host "${BACKUP_HOST}" --tag fukurou-postgres --tag "${ATTEMPT_TAG}" \
-      >"${WORK_DIRECTORY}/backup-summary.jsonl" 2>/dev/null
+      >"${WORK_DIRECTORY}/backup-summary.jsonl"
   local pipeline_statuses=("${PIPESTATUS[@]}")
   set -e
   producer_status="${pipeline_statuses[0]}"
@@ -408,24 +276,12 @@ run_backup() {
   CURRENT_PARTIAL_SNAPSHOT="${candidate_snapshot}"
 
   if (( producer_status == 0 && restic_status == 0 )); then
-    cancel_and_reap_dump_watchdog
-    if [[ -e "${WORK_DIRECTORY}/watchdog-result" ]]; then
-      fail_attempt WATCHDOG_TERMINATION_FAILED "${candidate_snapshot}"
-      return 1
-    fi
     production_identity_is_unchanged || { fail_attempt SNAPSHOT_IDENTITY_FAILED "${candidate_snapshot}"; return 1; }
   else
-    settle_watchdog_after_pipeline_failure "${WORK_DIRECTORY}/watchdog-result" || true
-    watchdog_result=""
-    if [[ -f "${WORK_DIRECTORY}/watchdog-result" ]]; then
-      watchdog_result="$(<"${WORK_DIRECTORY}/watchdog-result")"
-    fi
     if [[ -n "${candidate_snapshot}" ]]; then
       forget_current_partial "${candidate_snapshot}" || { fail_attempt PARTIAL_SNAPSHOT_FORGET_FAILED "${candidate_snapshot}"; return 1; }
     fi
-    if [[ "${watchdog_result}" == "WATCHDOG_TERMINATION_FAILED" ]]; then
-      fail_attempt WATCHDOG_TERMINATION_FAILED
-    elif (( producer_status != 0 )); then
+    if (( producer_status != 0 )); then
       fail_attempt DUMP_FAILED
     else
       fail_attempt REPOSITORY_FAILED

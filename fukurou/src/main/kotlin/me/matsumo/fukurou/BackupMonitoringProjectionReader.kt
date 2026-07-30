@@ -38,7 +38,6 @@ internal val BackupResultCodes = setOf(
     "SNAPSHOT_IDENTITY_FAILED",
     "STATUS_PUBLICATION_FAILED",
     "SUCCESS",
-    "WATCHDOG_TERMINATION_FAILED",
 )
 private val BackupProjectionJson = Json {
     ignoreUnknownKeys = false
