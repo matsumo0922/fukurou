@@ -24,7 +24,7 @@ Phase 2 の policy 適用は runtime config、runner、SafetyFloor、evaluation 
 
 ### 1. Policy 名が semantic version を兼ねる
 
-runtime key `decisionProtocol.falsifierPolicy` は次の enum だけを受け入れる。
+runtime key `decision.falsifierPolicy` は次の enum だけを受け入れる。
 
 - `ALWAYS_ON_V1`
 - `OFF_V1`

@@ -20,6 +20,7 @@ class RuntimeConfigCatalogTest {
         assertEquals(FalsifierPolicy.ALWAYS_ON_V1, config.decisionProtocol.falsifierPolicy)
         assertEquals("ALWAYS_ON_V1", item.defaultValue)
         assertEquals(RuntimeConfigValueType.ENUM, item.valueType)
+        assertEquals(FalsifierPolicy.entries.map { policy -> policy.name }, item.enumValues)
     }
 
     @Test

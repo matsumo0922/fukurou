@@ -283,6 +283,7 @@ object RuntimeConfigCatalog {
                     effectiveValue = config.decisionProtocol.falsifierPolicy.name,
                     unit = null,
                     safetyTier = RuntimeConfigSafetyTier.GUARDED,
+                    enumValues = FalsifierPolicy.entries.map { policy -> policy.name },
                 ),
                 runtimeItem(
                     key = "runner.maxToolCallsPerRun",
