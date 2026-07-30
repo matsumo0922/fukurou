@@ -1,9 +1,7 @@
 ## Purpose
 
 Main へマージされたコミットは、追加の承認ゲートなしで NAS へデプロイされる。NAS 側 executor は署名検証・capability catalog・schema-sensitive 分類・revision monotonicity・journal ベースの recovery state machine・CLI acceptance preflight を持たず、pull → migration → compose up → health 確認という直線的な流れで動作する。automatic push には NAS executor 側での revision 逆行防止、DB helper/SQL のバージョン整合、immutable image digest の pull/検証、migration・compose cutover 中の launch maintenance/drain を残す。
-
 ## Requirements
-
 ### Requirement: Main merge deploys without re-running quality gates
 A push to `main` MUST resolve the pushed commit SHA and proceed directly to image build and NAS deploy without re-running JVM tests, static analysis, or any deploy-time approval gate. A `workflow_dispatch` invocation MUST accept an explicit target SHA that exists on `main`'s history and deploy it the same way.
 
@@ -168,3 +166,23 @@ The `github-runner` account MUST retain sudo access only to `/usr/local/sbin/dep
 #### Scenario: Sudoers configuration is inspected
 - **WHEN** the NAS sudoers configuration for `github-runner` is reviewed
 - **THEN** it permits `sudo` execution of `/usr/local/sbin/deploy-fukurou` only, with no other command or NOPASSWD Docker/root grant
+
+### Requirement: Compose invocations are preceded by an image reference bind
+
+Every `docker compose` invocation the executor performs against the production compose file MUST occur after the candidate's immutable image reference has been exported as `FUKUROU_IMAGE_REFERENCE`, because the compose file declares that variable as required and interpolates it on every subcommand — not only on `up`. The exported value MUST be `<image repository>@<candidate digest>` derived from the paused-state marker's expected digest, so a bind that runs earlier does not weaken the digest pinning verified after cutover.
+
+#### Scenario: Forced stop during drain interpolates the compose file successfully
+
+- **WHEN** in-flight launches do not reach zero within the natural drain deadline and the executor falls back to stopping the application with `docker compose stop`
+- **THEN** `FUKUROU_IMAGE_REFERENCE` is already exported at that point, so compose file interpolation succeeds and the stop is not rejected with a missing-variable error
+
+#### Scenario: Forced stop keeps the established drain order
+
+- **WHEN** the executor takes the forced stop path during drain
+- **THEN** it still stops the application, proves the application PID is zero, interrupts remaining active launches, and only then waits for the drain to complete — the added bind does not reorder, skip, or replace any of these steps
+
+#### Scenario: Bound reference matches the candidate digest at cutover
+
+- **WHEN** the executor reaches compose cutover after any drain path, forced or natural
+- **THEN** the image reference passed to compose equals `<image repository>@<expected digest>` recorded in the paused-state marker, and the post-cutover running-digest verification compares against that same value
+
