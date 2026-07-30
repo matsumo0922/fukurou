@@ -13260,10 +13260,6 @@ private fun selectOrderCancelReasonConstraintDefinition(database: ExposedDatabas
 }
 
 /**
- * Docker daemon が利用可能かを返す。
- */
-
-/**
  * test container 用 DataSource を作る。
  */
 private fun createDataSource(

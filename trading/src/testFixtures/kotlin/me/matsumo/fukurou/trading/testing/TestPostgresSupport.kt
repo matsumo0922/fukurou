@@ -36,9 +36,12 @@ fun isTestDockerAvailable(): Boolean {
  * Docker daemon が無ければ test を skip として終了させる。
  *
  * skip は test report の skipped 件数に現れる。無条件 return で success として集計させないこと。
+ *
+ * [available] は判定を注入する seam で、既定値は実環境の Docker 可用性。
+ * 契約テストが実行環境の Docker 有無に関わらず不在側の分岐を検証するために使う。
  */
-fun requireTestDocker() {
-    assumeTrue("Docker daemon is unavailable; skipping the Testcontainers test.", isTestDockerAvailable())
+fun requireTestDocker(available: Boolean = isTestDockerAvailable()) {
+    assumeTrue(TEST_DOCKER_UNAVAILABLE_MESSAGE, available)
 }
 
 /** test body 開始前の一時的な PostgreSQL 接続失敗だけを最大 2 回再試行する。 */
@@ -89,6 +92,7 @@ private fun String.decodeQueryComponent(): String = URLDecoder.decode(this, Stan
 
 private fun String.encodeQueryComponent(): String = URLEncoder.encode(this, StandardCharsets.UTF_8).replace("+", "%20")
 
+const val TEST_DOCKER_UNAVAILABLE_MESSAGE = "Docker daemon is unavailable; skipping the Testcontainers test."
 const val TEST_POSTGRES_CONNECT_TIMEOUT_KEY = "connectTimeout"
 const val TEST_POSTGRES_LOGIN_TIMEOUT_KEY = "loginTimeout"
 const val TEST_POSTGRES_SOCKET_TIMEOUT_KEY = "socketTimeout"

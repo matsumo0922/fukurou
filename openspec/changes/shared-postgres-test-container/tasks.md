@@ -35,8 +35,10 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 - [x] `DockerClientFactory` の参照が共有 fixture 1 箇所だけになったことを確認する
 - [x] `println` + `return` / `return@runBlocking` を `assumeTrue` に置き換える
 - [x] Docker 不在環境で skip 件数が test report に出ることを確認する（一時 probe で `assumeTrue(false)` を通し、`skipped=1` を JUnit XML で確認。probe は削除済み）
-- [x] guard の契約テストを追加する（`dockerGuardRaisesAssumptionFailureWhenDaemonIsUnavailable` / `dockerGuardMatchesDaemonAvailability`）
-- [x] full validation を実行する
+- [x] guard の契約テストを追加する（`dockerGuardRaisesAssumptionFailureWhenDockerIsUnavailable` / `dockerGuardProceedsWhenDockerIsAvailable` / `dockerGuardDefaultsToObservedDaemonAvailability`）
+  - [x] `requireTestDocker(available)` の seam で、実行環境の Docker 有無に関わらず不在側分岐を検証する
+  - [x] 契約テストが回帰を検出することを実証する（fixture を silent `return` に一時改変すると fail、確認後に復元）
+- [x] full validation を実行する（`PostgresPersistenceIntegrationTest.paper_execution_reconcilesRestingLimitByBestAskInPostgresPath` が container 資源枯渇で 1 件 flaky failure。単独実行では pass。PR3 で解消する対象）
 
 ## PR3: PostgresPersistenceIntegrationTest の container 共有化
 
