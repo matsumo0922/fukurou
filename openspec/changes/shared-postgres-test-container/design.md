@@ -72,11 +72,13 @@ test database の破棄は `DROP DATABASE <name> WITH (FORCE)` で行う。Postg
 
 offset で過去ログを除外する現在の実装は serial 実行なら成立するが、instance 設定が他テストへ漏れる問題は残る。1 container の追加コストで両方を確実に回避できるため隔離を選ぶ。
 
-### D3b: JDBC 接続経路を差し替えるテストは専用 container に残す
+### D3b: container を 1 回しか起動しないテストは共有化しない
 
-`OneShotRunnerMainTest` は共有化しない。JDBC URL に独自の `socketFactory` を注入して接続遅延を再現する cold-start test で、`RunnerColdStartSocketFactory` が process-global な遅延フラグを持つ（`trading/src/test/kotlin/me/matsumo/fukurou/trading/runner/OneShotRunnerMainTest.kt:260-261`）。共有 container に載せると、この差し替えが他 test の接続経路へ漏れうる。
+`OneShotRunnerMainTest` は共有化しない。container 起動は `@Test` 7 本のうち 1 本のみ（`trading/src/test/kotlin/me/matsumo/fukurou/trading/runner/OneShotRunnerMainTest.kt:64-65`）で、既に 1 回である。共有化しても起動回数は減らない。
 
-加えて container 起動は `@Test` 7 本のうち 1 本のみで、既に 1 回である。共有化による削減はゼロで、リスクだけが増える。D3 と同じ判断基準を適用する。
+一方で失うものがある。現在は `use {}` で test method 終了時に container を停止するが、共有化すると `LazySharedTestPostgres` の shutdown hook 方式になり、**生存期間が test worker JVM の終了まで延びる**。削減ゼロで常駐時間だけが増える純損になる。
+
+なおこの判断の根拠として当初「`socketFactory` の差し替えが他 test へ漏れる」を挙げたが、それは誤りだった。`socketFactory` は JDBC URL の connection property で、`withSocketFactory()`（`:311-314`）が付与するのはこの test が組む `DB_URL` だけである（`:74`）。他 test が受け取る URL は `SharedTestPostgres.jdbcUrlFor()` が生成し `socketFactory` を含まない。`RunnerColdStartSocketFactory` の参照は同一ファイル内の 3 箇所のみで、共有 container であることと socketFactory の伝播は独立している。
 
 ### D4: Docker 判定は `assumeTrue` に統一する
 
@@ -97,6 +99,7 @@ skip 件数がレポートに出れば「CI で Docker が壊れても緑」は�
 - **[観測系は database 境界で隔離されない]** → `pg_current_wal_insert_lsn()`（`:9316-9338`）は cluster 全体の WAL 末尾を返し、`pg_locks`（`:13975-13988`, `:14061-14076`, `:15027-15067`）は cluster-global view で database OID による絞り込みが無い。serial 実行かつ各テストが接続を残さない前提では実害が出ないが、この 2 点は database per test では守られない。将来テストを並列化する場合は先にここを直す必要がある。helper のドキュメントコメントに明記する
 - **[共有 container の serial 前提]** → 現在 `trading` の `test` タスクは `maxParallelForks` 未指定（Gradle 既定 1）で serial（`trading/build.gradle.kts:33-35`）。将来並列化すると `container.logs` と WAL 観測（`:9316-9338`）が壊れうる。helper のドキュメントコメントに serial 前提を明記する
 - **[`ensureSchema()` の非冪等パスの発見]** → 220 テストのうち一部が「fresh container だから通っていた」可能性は残る。database per test は fresh database を与えるため大半は影響しないが、実行して初めて分かる。PR3 の検証で全 220 テストの pass を確認する
+- **[常駐 container 数の増加]** → 起動回数は減るが、`LazySharedTestPostgres` は shutdown hook で停止するため生存期間が test worker JVM の終了まで延びる。`:trading:test` は 1 JVM（`forkEvery` 未指定）なので、共有 container 3 個 + isolated 1 個が同時常駐する。per-test 起動は 1 個ずつ都度停止していたため、同時常駐数は増える方向。worktree 2 並列では倍になる。実測では両 worktree が完走したが、これ以上 `LazySharedTestPostgres` を増やす場合は同時常駐数を先に見積もる
 - **[所要時間の改善が見込みより小さい]** → container 起動が支配的という推定が外れた場合。変更前後を計測して記録し、効果が出なければ PR4 以降の判断材料にする
 
 ## Migration Plan
@@ -108,7 +111,7 @@ stacked PR で 4 段に分ける。各 PR は独立して意味を持ち、前�
 3. **PR3（本命）**: `PostgresPersistenceIntegrationTest` を database per test 化。220 → 2 起動
 4. **PR4（横展開）**: replay 系 2 ファイルを同方式に統一（`OneShotRunnerMainTest` は D3b により除外）。11 → 3 起動
 
-PR4 は本 change の必須スコープとする。delta spec が replay 3 class の共有化を MUST として規定しており、これを満たさずに change を完了できない。replay 系は `PostgresPersistenceIntegrationTest` と同じ per-test container 構造の複製であり、放置すると「共有化済みと per-test が混在する」状態が固定化して、次に触る実装者がどちらに倣うべきか判断できなくなる。
+PR4 は本 change の必須スコープとする。delta spec が replay integration test の共有化を MUST として規定しており、これを満たさずに change を完了できない。replay 系は `PostgresPersistenceIntegrationTest` と同じ per-test container 構造の複製であり、放置すると「共有化済みと per-test が混在する」状態が固定化して、次に触る実装者がどちらに倣うべきか判断できなくなる。
 
 PR1 と PR2 を分ける理由は、PR2 が 12 ファイルに触れる機械的置換で、基盤の設計レビューと混ぜると diff が読みにくくなるため。
 

@@ -80,14 +80,14 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 - [x] `withDatabase` を suspend 化し、`runPostgresTest` の二重 `runBlocking` を解消する（PR3 レビュー F8）
 - [x] JDBC URL の query parse を共有 helper 1 箇所に集約する（PR3 レビュー NEW-3。現在 `TestPostgresSupport` / `SharedTestPostgres` / `SharedTestPostgresTest` の 3 箇所）
 - [x] `adminQueryParameters()` の値を decode してから `withJdbcQueryParameters` へ渡す（PR3 レビュー NEW-1。percent-encoded な値で二重 encode になる。現状は到達不能）
-- [x] `POSTGRES_IMAGE` の重複を共有 fixture の定数へ集約する（現在 5 箇所）
+- [x] `POSTGRES_IMAGE` の重複を共有 fixture の定数へ集約する（`trading` 内 6 箇所 → 定義 1 箇所。`fukurou` / `mcp` の 8 箇所は本 change の diff 外のため follow-up）
 - [x] `SharedTestPostgres` の型パラメータ `SELF` を除去する（どのメンバも露出しておらず `BoundedTestPostgresContainer<*>` で足りる）
 
 ### replay 系の載せ替え
 
 - [x] `TtlShorteningReplayIntegrationTest`（`runReplayTest`、`:331-349`）を database per test に変える
 - [x] `TailFactSheetIntegrationTest` を同様に変える
-- [x] `OneShotRunnerMainTest` は共有化せず専用 container のままとする（D3b。JDBC URL に独自 `socketFactory` を注入する cold-start test で、process-global な遅延フラグが他 test の接続経路へ漏れうる。かつ起動は既に 1 回で削減効果ゼロ）
+- [x] `OneShotRunnerMainTest` は共有化せず専用 container のままとする（D3b。起動が既に 1 回で削減効果ゼロ。共有化すると `use {}` の即時停止から shutdown hook 方式になり生存期間が延びる純損）
 - [x] delta spec と design.md を実態に合わせる（D3b を追加、replay requirement の対象を 2 class に限定）
 - [x] container 起動回数が 11 → 3 になったことを確認する（`docker events` 実測。`:trading:test` 全体では 14 → 6）
 - [x] full validation を実行する

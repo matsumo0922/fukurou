@@ -248,10 +248,6 @@ import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 /**
- * integration test 用 Postgres image。
- */
-
-/**
  * integration test 用 Hikari pool size。
  */
 private const val HIKARI_POOL_SIZE = 4

@@ -168,7 +168,7 @@ class TestPostgresSupportTest {
 
 /** URL parameter を container 起動なしで観測する test double。 */
 private class InspectablePostgresContainer :
-    BoundedTestPostgresContainer<InspectablePostgresContainer>("postgres:16-alpine") {
+    BoundedTestPostgresContainer<InspectablePostgresContainer>(TEST_POSTGRES_IMAGE) {
     fun configuredUrlParameters(): Map<String, String> = urlParameters.toMap()
 }
 

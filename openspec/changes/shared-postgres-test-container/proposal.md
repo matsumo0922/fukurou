@@ -10,7 +10,7 @@
 - Docker 不在時の silent pass を廃止し、`assumeTrue` による skip 報告に統一する。9 個の別名 helper を共有 helper 1 個に置き換える
 - `PostgresPersistenceIntegrationTest` の container ライフサイクルを per-test から **class 単位の共有 container + database per test** に変更する。テストごとに `CREATE DATABASE` して繋ぎ替え、終了時に `DROP DATABASE` する
 - `ALTER SYSTEM` と `container.logs` に依存する 1 テストのみ、per-test container を維持する
-- replay 系 3 ファイル（`TtlShorteningReplayIntegrationTest` / `TailFactSheetIntegrationTest` / `OneShotRunnerMainTest`）も同じ database per test 方式へ統一する
+- replay 系のうち複数 test method が container を起動する 2 ファイル（`TtlShorteningReplayIntegrationTest` / `TailFactSheetIntegrationTest`）も同じ database per test 方式へ統一する。`OneShotRunnerMainTest` は起動が既に 1 回で削減効果が無いため対象外とする（design.md D3b）
 
 **BREAKING** なし（test source のみの変更。production コードと production の JDBC configuration には触れない）。
 
@@ -33,7 +33,7 @@
 - `mcp/build.gradle.kts` — `testImplementation(testFixtures(project(":trading")))` の追加
 - Testcontainers を起動する test 12 ファイル — Docker 判定の置換
 - `trading/src/test/.../PostgresPersistenceIntegrationTest.kt` — container ライフサイクルと `PostgresTestContext` の接続経路
-- replay 系 3 ファイル — 同上
+- replay 系 2 ファイル — 同上
 
 ### 変更しないもの
 

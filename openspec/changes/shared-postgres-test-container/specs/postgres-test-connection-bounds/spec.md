@@ -120,7 +120,7 @@ Testcontainers を起動する test は、Docker が利用できない場合に 
 
 ### Requirement: Replay integration tests share one container per class
 
-複数の test method が container を起動する replay integration test は、container を test class 単位で MUST 共有し、test method ごとに専用 database を作成・破棄する。JDBC の接続経路そのものを差し替える test は、その差し替えが他 test へ漏れないよう専用 container で実行する。
+複数の test method が container を起動する replay integration test は、container を test class 単位で MUST 共有し、test method ごとに専用 database を作成・破棄する。container を 1 回しか起動しない test は共有対象としない。
 
 #### Scenario: Replay test methods run against the shared container
 
@@ -128,7 +128,7 @@ Testcontainers を起動する test は、Docker が利用できない場合に 
 - **THEN** container は test class 全体で 1 個だけ起動し、method ごとに新しい database を作成する
 - **AND** method 終了時にその database を破棄する
 
-#### Scenario: A test replaces the JDBC socket factory
+#### Scenario: A test already starts only one container
 
-- **WHEN** test が JDBC URL に独自の `socketFactory` を注入して接続遅延を再現する
-- **THEN** その test は共有 container ではなく専用 container で実行し、接続経路の差し替えが他 test に影響しない
+- **WHEN** test class 全体で container を 1 回しか起動しない test を共有化するか判断する
+- **THEN** 起動回数が減らず共有 container の生存期間だけが延びるため、その test は専用 container のまま維持する
