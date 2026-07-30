@@ -204,6 +204,8 @@ import me.matsumo.fukurou.trading.shadow.GateShadowScanProgress
 import me.matsumo.fukurou.trading.shadow.InMemoryGateShadowRepository
 import me.matsumo.fukurou.trading.shadow.ShadowDataQuality
 import me.matsumo.fukurou.trading.testing.BoundedTestPostgresContainer
+import me.matsumo.fukurou.trading.testing.SharedTestPostgres
+import me.matsumo.fukurou.trading.testing.TestPostgresDatabase
 import me.matsumo.fukurou.trading.testing.requireTestDocker
 import me.matsumo.fukurou.trading.testing.retryTransientTestPostgresConnection
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -5226,8 +5228,9 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(winningReason, selectReservationReason(database, "terminal-race"))
     }
 
+    // ALTER SYSTEM で instance 設定を変え、container log から DDL 文を数えるため専用 container で実行する。
     @Test
-    fun bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite() = runPostgresTest {
+    fun bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite() = runIsolatedPostgresTest {
         exposedTransaction(database) {
             executeUpdate(
                 """
@@ -11405,19 +11408,20 @@ private fun selectCommandEventCountByType(database: ExposedDatabase, type: Comma
  * @param database Exposed database
  */
 private class PostgresTestContext(
-    private val container: FukurouPostgresContainer,
+    private val testDatabase: TestPostgresDatabase,
+    private val containerLogs: () -> String,
     val dataSource: HikariDataSource,
     val database: ExposedDatabase,
 ) {
-    fun postgresLogs(): String = container.logs
+    fun postgresLogs(): String = containerLogs()
 
     fun createDataSource(connectionInitSql: String): HikariDataSource {
-        return createDataSource(container, connectionInitSql)
+        return createDataSource(testDatabase, connectionInitSql)
     }
 
     fun createDeadlineDataSource(): HikariDataSource {
         return createDataSource(
-            container = container,
+            testDatabase = testDatabase,
             maximumPoolSize = 1,
             connectionTimeoutMillis = 500L,
         )
@@ -11426,9 +11430,9 @@ private class PostgresTestContext(
     fun createRecoveryCommitFaultDataSource(): Pair<HikariDataSource, RecoveryCommitFaultController> {
         val controller = RecoveryCommitFaultController()
         val postgresDataSource = PGSimpleDataSource().apply {
-            setURL(container.jdbcUrl)
-            user = container.username
-            password = container.password
+            setURL(testDatabase.jdbcUrl)
+            user = testDatabase.username
+            password = testDatabase.password
         }
         val faultDataSource = RecoveryCommitFaultDataSource(postgresDataSource, controller)
         val hikariDataSource = HikariDataSource(
@@ -11447,9 +11451,9 @@ private class PostgresTestContext(
      */
     fun tradingDatabaseConfig(): TradingDatabaseConfig {
         return TradingDatabaseConfig(
-            url = container.jdbcUrl,
-            user = container.username,
-            password = container.password,
+            url = testDatabase.jdbcUrl,
+            user = testDatabase.username,
+            password = testDatabase.password,
         )
     }
 }
@@ -13027,19 +13031,49 @@ private class FukurouPostgresContainer :
     BoundedTestPostgresContainer<FukurouPostgresContainer>(POSTGRES_IMAGE)
 
 /**
- * Docker が利用できる場合だけ Postgres integration test を実行する。
+ * 共有 container 上の専用 database で Postgres integration test を実行する。
+ *
+ * container は class 全体で 1 個だけ起動し、test method ごとに空の database を貸す。
+ * schema を破壊する test や migration 前の状態を要求する test も互いに影響しない。
  */
 private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = runBlocking {
+    requireTestDocker()
+
+    sharedPostgres().withDatabase { testDatabase ->
+        retryTransientTestPostgresConnection { createDataSource(testDatabase) }.use { dataSource ->
+            val database = ExposedDatabase.connect(dataSource)
+            val context = PostgresTestContext(
+                testDatabase = testDatabase,
+                containerLogs = { sharedPostgres().logs },
+                dataSource = dataSource,
+                database = database,
+            )
+
+            runBlocking { context.block() }
+        }
+    }
+}
+
+/**
+ * `ALTER SYSTEM` と container log に依存する test を専用 container で実行する。
+ *
+ * instance 全体の設定変更は database 単位では隔離されず、共有 container の log には
+ * 他 database の DDL が混ざるため、この経路だけ container を独立させる。
+ */
+private fun runIsolatedPostgresTest(block: suspend PostgresTestContext.() -> Unit) = runBlocking {
     requireTestDocker()
 
     val container = FukurouPostgresContainer()
     container.start()
 
     try {
-        retryTransientTestPostgresConnection { createDataSource(container) }.use { dataSource ->
+        val testDatabase = TestPostgresDatabase(container.jdbcUrl, container.username, container.password)
+
+        retryTransientTestPostgresConnection { createDataSource(testDatabase) }.use { dataSource ->
             val database = ExposedDatabase.connect(dataSource)
             val context = PostgresTestContext(
-                container = container,
+                testDatabase = testDatabase,
+                containerLogs = { container.logs },
                 dataSource = dataSource,
                 database = database,
             )
@@ -13050,6 +13084,30 @@ private fun runPostgresTest(block: suspend PostgresTestContext.() -> Unit) = run
         container.stop()
     }
 }
+
+/**
+ * class 全体で 1 個だけ container を起動する。
+ *
+ * 停止は shutdown hook で行い、ryuk が無効な環境（`TESTCONTAINERS_RYUK_DISABLED=true`）でも
+ * container が残らないようにする。
+ */
+private fun sharedPostgres(): SharedTestPostgres<FukurouPostgresContainer> {
+    sharedPostgresHolder?.let { holder -> return holder }
+
+    return synchronized(sharedPostgresLock) {
+        sharedPostgresHolder ?: run {
+            val container = FukurouPostgresContainer()
+            container.start()
+            Runtime.getRuntime().addShutdownHook(Thread { runCatching { container.stop() } })
+            SharedTestPostgres(container).also { holder -> sharedPostgresHolder = holder }
+        }
+    }
+}
+
+private val sharedPostgresLock = Any()
+
+@Volatile
+private var sharedPostgresHolder: SharedTestPostgres<FukurouPostgresContainer>? = null
 
 private fun JdbcTransaction.assertSqlCount(sql: String, expected: Int) {
     prepare(sql).use { statement ->
@@ -13263,15 +13321,15 @@ private fun selectOrderCancelReasonConstraintDefinition(database: ExposedDatabas
  * test container 用 DataSource を作る。
  */
 private fun createDataSource(
-    container: FukurouPostgresContainer,
+    testDatabase: TestPostgresDatabase,
     connectionInitSql: String? = null,
     maximumPoolSize: Int = HIKARI_POOL_SIZE,
     connectionTimeoutMillis: Long? = null,
 ): HikariDataSource {
     val hikariConfig = HikariConfig().apply {
-        jdbcUrl = container.jdbcUrl
-        username = container.username
-        password = container.password
+        jdbcUrl = testDatabase.jdbcUrl
+        username = testDatabase.username
+        password = testDatabase.password
         this.maximumPoolSize = maximumPoolSize
         this.connectionInitSql = connectionInitSql
         connectionTimeoutMillis?.let { timeout -> connectionTimeout = timeout }
