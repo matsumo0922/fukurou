@@ -15,10 +15,16 @@ import me.matsumo.fukurou.trading.decision.InMemoryFalsifierPolicyDecisionReposi
 import me.matsumo.fukurou.trading.decision.TradePlanDraft
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationPredicate
 import me.matsumo.fukurou.trading.decision.TradePlanInvalidationType
+import me.matsumo.fukurou.trading.domain.Execution
+import me.matsumo.fukurou.trading.domain.ExecutionLiquidity
 import me.matsumo.fukurou.trading.domain.Order
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderStatus
 import me.matsumo.fukurou.trading.domain.OrderType
+import me.matsumo.fukurou.trading.domain.Position
+import me.matsumo.fukurou.trading.domain.PositionSide
+import me.matsumo.fukurou.trading.domain.PositionStatus
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.domain.TradingSymbol
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.FalsifierPolicyPermit
@@ -145,9 +151,14 @@ class AuthorizedFalsifierPolicyBoundaryTest {
         val command = command(decision.intentId).let { value ->
             value.copy(auditContext = value.auditContext.copy(clientRequestId = value.authorizedFingerprint(permit)))
         }
-        val exactBroker = brokerWith(decision, orderRows(command, includeProtectiveSell = true))
+        val exactBroker = brokerWith(decision, completeOrders(command), completePositions(), completeExecutions())
 
         assertTrue(exactBroker.placeAuthorizedOrder(AuthorizedPlaceOrder(command, permit)).isSuccess)
+
+        val buyOnlyFailure = brokerWith(decision, orderRows(command))
+            .placeAuthorizedOrder(AuthorizedPlaceOrder(command, permit))
+            .exceptionOrNull()
+        assertTrue(buyOnlyFailure is AuthorizedAuthorityIndeterminateException)
 
         val ambiguousBroker = brokerWith(decision, orderRows(command) + entryOrder(command, "entry-2"))
         val failure = ambiguousBroker.placeAuthorizedOrder(AuthorizedPlaceOrder(command, permit)).exceptionOrNull()
@@ -258,7 +269,11 @@ class AuthorizedFalsifierPolicyBoundaryTest {
             value.copy(auditContext = value.auditContext.copy(clientRequestId = value.authorizedFingerprint(permit)))
         }
         val broker = PaperBroker(
-            ledgerRepository = InMemoryPaperLedgerRepository(openOrders = orderRows(authorized)),
+            ledgerRepository = InMemoryPaperLedgerRepository(
+                openOrders = completeOrders(authorized),
+                positions = completePositions(),
+                executions = completeExecutions(),
+            ),
             riskStateRepository = InMemoryRiskStateRepository(),
             decisionRepository = decisions,
             falsifierPolicyDecisionRepository = policyRepositoryFor(decision),
@@ -310,9 +325,14 @@ class AuthorizedFalsifierPolicyBoundaryTest {
         )
     }
 
-    private suspend fun brokerWith(decision: FalsifierPolicyDecision, orders: List<Order>): PaperBroker {
+    private suspend fun brokerWith(
+        decision: FalsifierPolicyDecision,
+        orders: List<Order>,
+        positions: List<Position> = emptyList(),
+        executions: List<Execution> = emptyList(),
+    ): PaperBroker {
         return PaperBroker(
-            ledgerRepository = InMemoryPaperLedgerRepository(openOrders = orders),
+            ledgerRepository = InMemoryPaperLedgerRepository(openOrders = orders, positions = positions, executions = executions),
             riskStateRepository = InMemoryRiskStateRepository(),
             falsifierPolicyDecisionRepository = policyRepositoryFor(decision),
         )
@@ -332,6 +352,30 @@ class AuthorizedFalsifierPolicyBoundaryTest {
 
         return listOf(entry, entry.copy(orderId = "stop-1", side = OrderSide.SELL, orderType = OrderType.STOP))
     }
+
+    private fun completeOrders(command: PlaceOrderCommand): List<Order> {
+        val entry = entryOrder(command, "entry-1").copy(positionId = "position-1")
+        val stop = entry.copy(
+            orderId = "stop-1",
+            intentId = null,
+            side = OrderSide.SELL,
+            orderType = OrderType.STOP,
+            limitPriceJpy = null,
+            triggerPriceJpy = "100",
+            protectiveStopPriceJpy = null,
+            takeProfitPriceJpy = null,
+            estimatedWinProbability = null,
+        )
+        return listOf(entry, stop)
+    }
+
+    private fun completePositions(): List<Position> = listOf(
+        Position("position-1", "00000000-0000-0000-0000-000000000001", "BTC", TradingMode.PAPER, PositionSide.LONG, PositionStatus.OPEN, "2026-07-31T00:00:00Z", null, "0.01", "100", "100", "100", null, "0", "0", 0, "100", "100"),
+    )
+
+    private fun completeExecutions(): List<Execution> = listOf(
+        Execution("execution-1", "entry-1", "position-1", "BTC", TradingMode.PAPER, OrderSide.BUY, "100", "0.01", "0", "0", ExecutionLiquidity.TAKER, "2026-07-31T00:00:00Z"),
+    )
 
     private fun entryOrder(command: PlaceOrderCommand, orderId: String): Order {
         return Order(

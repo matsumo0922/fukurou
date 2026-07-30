@@ -208,8 +208,7 @@ interface PaperLedgerHistoryRepository {
 /** internal authorized path だけが使う、厳密な client request replay 読み取り。 */
 internal interface AuthorizedPlaceOrderReplayReader {
     suspend fun findAuthorizedPlaceOrderReplay(
-        clientRequestId: String,
-        intentId: UUID,
+        identity: AuthorizedAtomicEntryIdentity,
     ): Result<AuthorizedPlaceOrderReplay>
 }
 

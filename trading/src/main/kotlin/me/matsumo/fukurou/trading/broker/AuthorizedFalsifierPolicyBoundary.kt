@@ -8,6 +8,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionConflictException
 import me.matsumo.fukurou.trading.decision.FalsifierPolicyDecisionRepository
+import me.matsumo.fukurou.trading.domain.TradingMode
 import me.matsumo.fukurou.trading.runner.FalsifierPolicyPermit
 import java.math.BigDecimal
 import java.security.MessageDigest
@@ -41,10 +42,10 @@ internal class AuthorizedFalsifierPolicyBoundary(
 
         val replayReader = replayReader
             ?: throw AuthorizedReplayUnsupportedException()
-        val replay = replayReader.findAuthorizedPlaceOrderReplay(
-            clientRequestId = requireNotNull(request.command.auditContext.clientRequestId),
-            intentId = request.command.intentId ?: throw AuthorizedAuthorityIndeterminateException(),
-        ).getOrElse { throw AuthorizedAuthorityIndeterminateException(it) }
+        val identity = runCatching { AuthorizedAtomicEntryIdentity.from(request.command, TradingMode.PAPER) }
+            .getOrElse { throw AuthorizedAuthorityIndeterminateException(it) }
+        val replay = replayReader.findAuthorizedPlaceOrderReplay(identity)
+            .getOrElse { throw AuthorizedAuthorityIndeterminateException(it) }
 
         when (replay) {
             is AuthorizedPlaceOrderReplay.Exact -> replay.result
@@ -77,10 +78,9 @@ internal fun PaperLedgerRepository.authorizedReplayReaderOrNull(): AuthorizedPla
 
     return object : AuthorizedPlaceOrderReplayReader {
         override suspend fun findAuthorizedPlaceOrderReplay(
-            clientRequestId: String,
-            intentId: java.util.UUID,
+            identity: AuthorizedAtomicEntryIdentity,
         ): Result<AuthorizedPlaceOrderReplay> {
-            return inMemory.findAuthorizedPlaceOrderReplay(clientRequestId, intentId)
+            return inMemory.findAuthorizedPlaceOrderReplay(identity)
         }
     }
 }

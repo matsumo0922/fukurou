@@ -1,11 +1,11 @@
 ## 1. Internal capability contract
 
 - [ ] 1.1 module-internal `AuthorizedAtomicPaperEntryBackend`へstable replay identityとsealed MARKET / resting creation proposal、`Exact` / `Created` resultを追加し、public repository / broker contractへ露出しない
-- [ ] 1.2 stable identityのv2 prefix、non-null command intent、fingerprint-bound symbol / mode / side / order type / business fields、明示nullable trade groupを副作用前に検証する
-- [ ] 1.3 creation proposalを参照しないinternal replay classifierを追加し、persisted FILLED lifecycleはentry・position・direct-linked STOP・direct-linked execution各1件、non-filled resting lifecycleは単一entryの場合だけ`Exact`にする
+- [x] 1.2 stable identityのv2 prefix、non-null command intent、fingerprint-bound symbol / mode / side / order type / business fields、明示nullable trade groupを副作用前に検証する
+- [x] 1.3 creation proposalを参照しないinternal replay classifierを追加し、persisted FILLED lifecycleはentry・position・direct-linked STOP・direct-linked execution各1件、non-filled resting lifecycleは単一entryの場合だけ`Exact`にする
 - [ ] 1.4 same v2 / 明示stable group / v2 audit-linked intent artifactが全てない場合だけ`Missing`とし、entry / position / STOP / executionの欠損、duplicate entry / STOP / execution、stable identity / direct-link不一致を`Ambiguous`にする
 - [ ] 1.5 fresh command / resting order / position / STOP / execution ID、resolved group、prepared subtype、fill / TTL / eligibilityを`Missing`後のcreateだけで検証・使用する
-- [ ] 1.6 A1 InMemory replay readerへauthorized command由来のstable business identityを渡してcomplete-bundle shape rulesへ寄せ、FILLED BUY-onlyを`Ambiguous`、完全fixtureを`Exact`としてfail closedを強化する
+- [x] 1.6 A1 InMemory replay readerへauthorized command由来のstable business identityを渡してcomplete-bundle shape rulesへ寄せ、FILLED BUY-onlyを`Ambiguous`、完全fixtureを`Exact`としてfail closedを強化する
 - [ ] 1.7 replay-indeterminate、intent-missing、intent-consumed、account-not-flat、backend-unavailable、outcome-indeterminateをtyped failureとして追加する
 - [ ] 1.8 A1 `AuthorizedFalsifierPolicyBoundary`へcapabilityを注入せず、`Missing` fail-closedとpublic place / previewのv2 guardを維持し、close / update / cancelへblanket prefix guardを追加しない
 
@@ -32,16 +32,16 @@
 
 ## 4. Replay, failure, and concurrency tests
 
-- [ ] 4.1 internal classifierでpersisted FILLED BUY entry、position、backend固有IDのdirect-linked protective STOP、direct-linked BUY execution各1件だけがcomplete `Exact`となることをtestする
-- [ ] 4.2 internal classifierでentry / position / STOP / execution各欠損、duplicate entry / direct-linked STOP / direct-linked execution、stable business identity / trade group / order / position link mismatchが全て`Ambiguous`となることをtestする
-- [ ] 4.3 persisted OPEN / non-filled restingの単一order shapeと、FILLEDへ進んだcomplete bundleをcurrent prepared subtypeに依存しない`Exact`としてtestする
+- [x] 4.1 internal classifierでpersisted FILLED BUY entry、position、backend固有IDのdirect-linked protective STOP、direct-linked BUY execution各1件だけがcomplete `Exact`となることをtestする
+- [x] 4.2 internal classifierでentry / position / STOP / execution各欠損、duplicate entry / direct-linked STOP / direct-linked execution、stable business identity / trade group / order / position link mismatchが全て`Ambiguous`となることをtestする
+- [x] 4.3 persisted OPEN / non-filled restingの単一order shapeと、FILLEDへ進んだcomplete bundleをcurrent prepared subtypeに依存しない`Exact`としてtestする
 - [ ] 4.4 同じv2 / intent / stable business identityへ異なるfresh entry / position / STOP / execution IDを渡し、1件が`Created`、他方がpersisted IDの`Exact`へ収束することを両backendでtestする
 - [ ] 4.5 同じLIMIT requestのcrossing判定をattempt間でMARKET / restingに変え、current proposalではなく先行persisted lifecycle shapeが`Exact`になることを両backendでtestする
 - [ ] 4.6 BUY entryを欠損させ、明示stable trade group-linked position / NULL-ID STOP / executionまたはsame v2 audit-linked intent artifactが残るfixtureを`Ambiguous`としてtestする
 - [ ] 4.7 replayが`Exact` / `Ambiguous`のときfresh prepared ID、resolved group、subtypeを参照せず、`Missing`後のnew createだけがproposal IDを保存することをtestする
-- [ ] 4.8 same v2 IDでintent、symbol / mode / side / order type、またはfingerprint-bound business identityが異なるrowを`Ambiguous`としてtestする
+- [x] 4.8 same v2 IDでintent、symbol / mode / side / order type、またはfingerprint-bound business identityが異なるrowを`Ambiguous`としてtestする
 - [ ] 4.9 同一trade groupの別request ADD_LONG / close / executionをoriginal replay resultへ集約しないことを両backendでtestする
-- [ ] 4.10 A1 InMemory readerでFILLED BUY-only fixtureが`Ambiguous`、entry / position / STOP / executionをseedしたfixtureが`Exact`となるよう既存boundary testをtightenする
+- [x] 4.10 A1 InMemory readerでFILLED BUY-only fixtureが`Ambiguous`、entry / position / STOP / executionをseedしたfixtureが`Exact`となるよう既存boundary testをtightenする
 - [ ] 4.11 InMemoryでMARKET / restingの新規`Created`、consumed / non-flatでも優先される`Exact`、intent missing / consumed、protective SELLのflat除外をtestする
 - [ ] 4.12 InMemoryで同一request、同一intentの別request、別intent、MARKET対restingをbounded並行実行し、1 mutation / 1 consumptionとtyped loser結果をtestする
 - [ ] 4.13 InMemoryのledger / equity publish後・consumption前faultで全ledger field、auxiliary map、market cursor、equity snapshot、consumptionがbefore-imageと一致することをtestする
