@@ -11403,7 +11403,8 @@ private fun selectCommandEventCountByType(database: ExposedDatabase, type: Comma
 /**
  * Postgres integration test の共有 context。
  *
- * @param container Testcontainers Postgres
+ * @param testDatabase この test method が借りた専用 database の接続情報
+ * @param containerLogs container の全ログを返す。共有 container では他 database の分も混ざる
  * @param dataSource Postgres DataSource
  * @param database Exposed database
  */
@@ -13086,10 +13087,14 @@ private fun runIsolatedPostgresTest(block: suspend PostgresTestContext.() -> Uni
 }
 
 /**
- * class 全体で 1 個だけ container を起動する。
+ * このファイルの test 全体で 1 個だけ container を起動する。
  *
- * 停止は shutdown hook で行い、ryuk が無効な環境（`TESTCONTAINERS_RYUK_DISABLED=true`）でも
- * container が残らないようにする。
+ * 停止は shutdown hook で行うため、生存範囲は test worker JVM の終了までとなる。
+ * `PostgresPersistenceIntegrationTest` が終わっても `:trading:test` の最後まで container は残る。
+ * class 終了時に停止するには `RunListener` か `@ClassRule` が必要で、既存 220 test の構造
+ * （top-level の `runPostgresTest`）を変える必要があるため採らない。
+ *
+ * hook を使うのは、ryuk が無効な環境（`TESTCONTAINERS_RYUK_DISABLED=true`）でも container を残さないため。
  */
 private fun sharedPostgres(): SharedTestPostgres<FukurouPostgresContainer> {
     sharedPostgresHolder?.let { holder -> return holder }

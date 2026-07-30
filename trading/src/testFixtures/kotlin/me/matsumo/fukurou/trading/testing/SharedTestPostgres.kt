@@ -21,33 +21,35 @@ class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
 ) {
     private val databaseCounter = AtomicLong()
 
-    /** container の administrative database を指す JDBC URL。 */
-    val adminJdbcUrl: String get() = container.jdbcUrl
-
-    /** container の接続 user。 */
-    val username: String get() = container.username
-
-    /** container の接続 password。 */
-    val password: String get() = container.password
-
     /** container が出力した全ログ。共有 container では他 database の分も混ざる。 */
     val logs: String get() = container.logs
+
+    // 共有 container の default database を指す。lease へは渡さない（データ漏れの経路になるため private に閉じる）。
+    private val adminJdbcUrl: String get() = container.jdbcUrl
+    private val username: String get() = container.username
+    private val password: String get() = container.password
 
     /**
      * 専用 database を作り、[block] に貸してから破棄する。
      *
      * [block] が例外を投げても database は破棄される。破棄には `WITH (FORCE)` を使うため、
      * test が閉じ忘れた接続や production factory が内部で持つ pool が残っていても失敗しない。
+     * 破棄自体が失敗した場合は [block] の例外を優先し、破棄の失敗は suppressed として付ける。
      */
     fun <T> withDatabase(block: (TestPostgresDatabase) -> T): T {
         val databaseName = nextDatabaseName()
 
-        executeOnAdminDatabase("CREATE DATABASE \"$databaseName\"")
+        executeOnAdminDatabase("CREATE DATABASE \"$databaseName\" TEMPLATE template0")
+
+        var leaseFailure: Throwable? = null
 
         return try {
             block(TestPostgresDatabase(jdbcUrlFor(databaseName), username, password))
+        } catch (failure: Throwable) {
+            leaseFailure = failure
+            throw failure
         } finally {
-            executeOnAdminDatabase("DROP DATABASE IF EXISTS \"$databaseName\" WITH (FORCE)")
+            dropDatabase(databaseName, leaseFailure)
         }
     }
 
@@ -62,12 +64,32 @@ class SharedTestPostgres<SELF : BoundedTestPostgresContainer<SELF>>(
 
     private fun nextDatabaseName(): String = "$DATABASE_NAME_PREFIX${databaseCounter.incrementAndGet()}"
 
-    private fun jdbcUrlFor(databaseName: String): String {
-        val base = adminJdbcUrl.substringBefore('?')
-        val query = adminJdbcUrl.substringAfter('?', missingDelimiterValue = "")
-        val rebased = base.replaceAfterLast('/', databaseName)
+    // test 本体の失敗が cleanup の失敗に置き換わると、落ちた assertion が分からなくなる。
+    private fun dropDatabase(databaseName: String, leaseFailure: Throwable?) {
+        val dropFailure = runCatching {
+            executeOnAdminDatabase("DROP DATABASE IF EXISTS \"$databaseName\" WITH (FORCE)")
+        }.exceptionOrNull() ?: return
 
-        return if (query.isEmpty()) rebased else "$rebased?$query"
+        if (leaseFailure == null) throw dropFailure
+
+        leaseFailure.addSuppressed(dropFailure)
+    }
+
+    private fun jdbcUrlFor(databaseName: String): String {
+        val base = adminJdbcUrl.substringBefore('?').replaceAfterLast('/', databaseName)
+        val parameters = adminQueryParameters()
+
+        return if (parameters.isEmpty()) base else base.withJdbcQueryParameters(parameters)
+    }
+
+    // timeout などの query parameter は container 生成時に設定されるため、lease URL へそのまま引き継ぐ。
+    private fun adminQueryParameters(): Map<String, String> {
+        return adminJdbcUrl.substringAfter('?', missingDelimiterValue = "")
+            .split('&')
+            .filter(String::isNotBlank)
+            .associate { parameter ->
+                parameter.substringBefore('=') to parameter.substringAfter('=', missingDelimiterValue = "")
+            }
     }
 
     // CREATE / DROP DATABASE は transaction 内で実行できないため、admin database へ別接続を張って autocommit で流す。

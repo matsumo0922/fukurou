@@ -1,8 +1,8 @@
 package me.matsumo.fukurou.trading.testing
 
+import org.junit.AfterClass
+import org.junit.BeforeClass
 import java.sql.DriverManager
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -11,21 +11,8 @@ import kotlin.test.assertTrue
 
 /** 共有 container + database per test の貸し出しと破棄の契約。 */
 class SharedTestPostgresTest {
-    private lateinit var container: SharedTestPostgresProbeContainer
-    private lateinit var shared: SharedTestPostgres<SharedTestPostgresProbeContainer>
-
-    @BeforeTest
-    fun startSharedContainer() {
-        requireTestDocker()
-        container = SharedTestPostgresProbeContainer()
-        container.start()
-        shared = SharedTestPostgres(container)
-    }
-
-    @AfterTest
-    fun stopSharedContainer() {
-        if (::container.isInitialized) container.stop()
-    }
+    private val shared: SharedTestPostgres<SharedTestPostgresProbeContainer>
+        get() = checkNotNull(sharedOrNull) { "shared container was not started." }
 
     @Test
     fun eachLeaseGetsAnEmptyDatabaseThatDoesNotSeePriorWrites() {
@@ -93,12 +80,31 @@ class SharedTestPostgresTest {
         )
     }
 
+    // spec は「正の整数値をそれぞれちょうど 1 個含む」を要求する。存在確認だけでは重複や値の逸脱を見逃す。
     @Test
-    fun leasedUrlKeepsTheBoundedTimeoutParameters() {
+    fun leasedUrlKeepsExactlyOneBoundedValuePerTimeoutParameter() {
         shared.withDatabase { database ->
-            assertTrue(database.jdbcUrl.contains("$TEST_POSTGRES_CONNECT_TIMEOUT_KEY="))
-            assertTrue(database.jdbcUrl.contains("$TEST_POSTGRES_LOGIN_TIMEOUT_KEY="))
-            assertTrue(database.jdbcUrl.contains("$TEST_POSTGRES_SOCKET_TIMEOUT_KEY="))
+            val parameters = queryParametersOf(database.jdbcUrl)
+
+            assertEquals(
+                listOf(TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS.toString()),
+                parameters[TEST_POSTGRES_CONNECT_TIMEOUT_KEY],
+            )
+            assertEquals(
+                listOf(TEST_POSTGRES_LOGIN_TIMEOUT_SECONDS.toString()),
+                parameters[TEST_POSTGRES_LOGIN_TIMEOUT_KEY],
+            )
+            assertEquals(
+                listOf(TEST_POSTGRES_SOCKET_TIMEOUT_SECONDS.toString()),
+                parameters[TEST_POSTGRES_SOCKET_TIMEOUT_KEY],
+            )
+        }
+    }
+
+    @Test
+    fun leasedUrlKeepsASingleQuerySeparator() {
+        shared.withDatabase { database ->
+            assertEquals(1, database.jdbcUrl.count { character -> character == '?' })
         }
     }
 
@@ -121,6 +127,42 @@ class SharedTestPostgresTest {
 
     private fun databaseNameOf(jdbcUrl: String): String {
         return jdbcUrl.substringBefore('?').substringAfterLast('/')
+    }
+
+    // 同じ key が複数回現れた場合を検出するため、値を list として集める。
+    private fun queryParametersOf(jdbcUrl: String): Map<String, List<String>> {
+        return jdbcUrl.substringAfter('?', missingDelimiterValue = "")
+            .split('&')
+            .filter(String::isNotBlank)
+            .groupBy(
+                keySelector = { parameter -> parameter.substringBefore('=') },
+                valueTransform = { parameter -> parameter.substringAfter('=', missingDelimiterValue = "") },
+            )
+    }
+
+    // container は class 単位で 1 個だけ起動する。test method ごとに起動すると、
+    // 起動回数削減を検証する test 自身が起動回数を増やしてしまう。
+    companion object {
+        private var container: SharedTestPostgresProbeContainer? = null
+        private var sharedOrNull: SharedTestPostgres<SharedTestPostgresProbeContainer>? = null
+
+        @BeforeClass
+        @JvmStatic
+        fun startSharedContainer() {
+            requireTestDocker()
+            container = SharedTestPostgresProbeContainer().also { probe ->
+                probe.start()
+                sharedOrNull = SharedTestPostgres(probe)
+            }
+        }
+
+        @AfterClass
+        @JvmStatic
+        fun stopSharedContainer() {
+            container?.stop()
+            container = null
+            sharedOrNull = null
+        }
     }
 }
 
