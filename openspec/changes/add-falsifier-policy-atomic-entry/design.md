@@ -86,30 +86,53 @@ A1 readerをlock外で一度呼んでからnew mutationだけtransactionへ渡�
 A2a capabilityはtransaction-local / lock-local replay helperを両backendに持つ。
 A1 boundaryへのreader registrationはA2aでは変更せず、A2bがconnection全体を設計する。
 
-### 4. exact replayはrequest-scoped row shapeだけを復元する
+### 4. exact replayはrequest subtypeごとの完全なdirect-link shapeだけを復元する
 
-replay helperは`client_request_id == requested v2 ID`のorderだけをrequest-scoped rowsとして読む。
-次を全て満たす場合だけ`Exact`を返す。
+replay helperはsealed request subtypeとprepared IDを受け取り、`client_request_id == requested v2 ID`のBUY entryをanchorとして読む。
+requested v2 ID、prepared entry / position / stop / execution ID、trade groupのいずれにもrequest-correlated artifactがない場合だけ`Missing`である。
+BUY entryが欠けてもprepared IDまたはdirect linkで他artifactが見つかる場合、same-ID rowが存在するのにBUY entryがない場合、BUY entryが複数の場合、または唯一のentryがrequestのintent ID、trade group ID、entry order ID、symbol / modeと一致しない場合は`Ambiguous`とする。
+一部artifactが欠けた状態をnew mutation可能な`Missing`へ落とさない。
 
-- BUY entryが厳密1件でcommand intent IDと一致する
-- BUY entryのtrade group IDがnon-nullである
-- request-scoped SELLが存在する場合、全て`side=SELL / orderType=STOP / positionId non-null`のprotective STOPである
-- protective STOPはBUY entryと同じtrade groupに属し、MARKET entryが作ったpositionへ直接linkする
-- resting entryにはpositionがないためrequest-scoped SELLが存在しない
+`IntentConsumingMarketEntryFillRequest`の`Exact`は、既存writerがflat accountから作る次の完全bundleに固定する。
 
-request-scoped SELLがclose / reduce order、virtual take-profit、別positionのSTOP、またはlinkを証明できないrowなら`Ambiguous`とする。
-同じv2 IDのBUYが複数なら、ADD_LONGかcorrupt duplicateかを推測せず`Ambiguous`とする。
+- requestと一致するFILLED BUY entryが厳密1件
+- entryの`positionId`とrequestのposition IDに一致し、同じtrade groupに属するpositionが厳密1件
+- そのposition IDとtrade groupへ直接linkする`side=SELL / orderType=STOP`のprotective STOPが厳密1件
+- entry order IDとposition IDへ直接linkするBUY executionが厳密1件
+- requestが持つentry / position / stop / execution IDと保存IDが一致する
 
-resultのorder IDsはrequest-scoped entry / protective STOPだけに限定する。
-execution IDsはそのrequest-scoped order IDsを直接参照するexecutionだけ、position IDsはrequest-scoped entry / STOPが直接参照するpositionだけから復元する。
-同じtrade groupでも異なるclient request IDの後続ADD_LONG、close / reduce、protection update由来の別rowを走査・集約しない。
+entry、position、protective STOP、executionの欠損、duplicate entry / STOP / execution、intent / trade group / order / position link不一致は全て`Ambiguous`であり、`Missing`または部分的な`Exact`にしない。
+MARKET相当requestにはcrossing LIMITをprepared fillへ変換した入力も含まれるため、`orderType == MARKET`ではなくsealed request subtypeと`status == FILLED`でshapeを選ぶ。
+
+protective STOPのclient request IDはbackend間で同じではない。
+InMemoryの`toProtectiveStopOrder()`はentryと同じclient request IDを保存するが、PostgreSQLの`insertProtectiveStopOrder()`は`orders.client_request_id`のpartial unique indexに合わせてNULLを保存する。
+そのためSTOPをsame-ID SELLとして探索せず、entryから確定したposition IDとtrade group、SELL / STOP roleで一意に探索する。
+InMemoryではsame-IDであることも整合条件として検証できるが、PostgreSQLではNULLであることを正常shapeとする。
+
+`IntentConsumingRestingEntryOrderRequest`はrequest subtype、expected order ID、LIMIT / STOP order typeによりMARKET相当requestと区別する。
+OPEN restingの`Exact`は、requestと一致するOPEN BUY entryが厳密1件、`positionId == null`、direct-linked position / protective STOP / executionが0件である単一order shapeとする。
+PENDING_CANCEL / CANCELED / REJECTEDへ進んだ未約定restingも、同じentry anchorにfill artifactがない場合は現在statusの単一order resultとして復元する。
+resting entryがmarket eventでFILLEDへ進んでいる場合はMARKET requestへ読み替えず、resting requestのentry ID / intent / trade group / order typeを維持したまま、position、protective STOP、BUY executionが各1件のcomplete FILLED bundleを要求する。
+resting requestはfill時に生成されるstop / execution IDを入力に持たないため、それらはdirect linkと一意性で確定する。
+
+FILLED resultのorder IDsはanchor entryと一意なdirect-linked protective STOP、position IDsは一意なdirect-linked position、execution IDsはentry / positionへ一意にdirect-linkするexecutionだけに限定する。
+未約定resting resultはanchor entryだけを含む。
+同じtrade groupでも異なるclient request IDの後続ADD_LONG、close / reduce、protection update、またはそれらのexecutionを走査・集約しない。
+
+backend-neutralなinternal classifierへrow collectionを渡すunit testでは、same-ID close / reduce / ADD_LONG、duplicate BUY / STOP / execution、missing artifact、link mismatchをsyntheticに作る。
+PostgreSQLは`WHERE client_request_id IS NOT NULL`のunique indexによりentryと同じnon-null IDの2件目を保存できないため、同じmalformed rowをintegration fixtureで無理に作らない。
+PostgreSQL integrationでは2件目のnon-null same-ID insertがunique violationになることを確認し、NULL client request IDのduplicate direct-linked STOP、duplicate execution、欠損artifact、different-ID / direct-link mismatchなどDB上でreachableなcorruptionを検証する。
+
+A1のInMemory replay readerも、A1 commandと保存rowから検証できる同じcomplete-bundle shape rulesへ寄せる。
+A2aはA1 boundaryをcapabilityへ接続しないが、FILLED BUYだけのfixtureを`Exact`にせず`Ambiguous`としてfail closedにする。
+A1の正規FILLED replay fixtureはentry、position、protective STOP、executionを全てseedし、既存のvalid exact replayだけを維持する。
 
 trade group全体をresultへ集約する案は、初回entry後のlifecycle mutationをoriginal requestのresultへ混ぜるため採用しない。
-同一trade groupを正当性条件だけに使い、result membershipはclient request IDと直接linkで決める。
+same client request IDだけでprotective STOPを特定する案はPostgreSQLのNULL identityと矛盾するため採用しない。
 
 public `close_position`、`update_protection`、`cancel_order`へreserved v2 prefixのblanket guardは追加しない。
 これらはrisk-reducing / protection availabilityを担うため、client request IDだけを理由に拒否しない。
-public risk-reducing callがentryと同じv2 IDでnon-protective rowを作った場合、後続replayは`Ambiguous`となり`Exact`を偽装しない。
+synthetic classifierでentryと同じv2 IDのnon-protective rowを受けた場合は`Ambiguous`となり、reachableなPostgreSQL public pathではpartial unique indexが2件目のnon-null IDを拒否する。
 public `place_order` / previewの既存reserved prefix guardは維持する。
 
 ### 5. flatはopen positionとfill可能なBUY orderの不存在で定義する
@@ -259,8 +282,12 @@ test matrixはMARKET / resting双方について次を固定する。
 - 異なるintent / 異なるv2 ID: `Created` 1件 + account-not-flat 1件
 - MARKET対resting: `Created` 1件 + account-not-flat 1件
 - exact result + consumed + non-flat: `Exact`
-- request-scoped protective STOP: `Exact`
-- 同じv2 IDのclose / reduce SELLまたは複数BUY / ADD_LONG: `Ambiguous`
+- MARKET/FILLEDのentry / position / direct-linked protective STOP / direct-linked execution各1件: `Exact`
+- OPEN restingの単一entry、および後からFILLEDへ進んだrestingのcomplete bundle: subtypeに対応する`Exact`
+- position / STOP / executionの欠損、重複、intent / trade group / direct-link不一致: `Ambiguous`
+- synthetic classifier上の同じv2 IDのclose / reduce SELLまたは複数BUY / ADD_LONG: `Ambiguous`
+- PostgreSQLの2件目のnon-null same-ID order: unique violation
+- PostgreSQLのNULL-ID duplicate STOP、duplicate execution、different-ID / direct-link corruption: `Ambiguous`
 - 同じtrade groupの別request ADD_LONG / close: original replay resultへ非集約
 - InMemory ledger publish後・consumption前failure: 全mutable stateを完全restore
 - InMemory failureと`EquitySnapshotRecorder` DAILY appendの交差: DAILYはequity lockで待機してrestore後にcommitし、failed FILLは残らない
@@ -285,8 +312,11 @@ transaction wrapper testはattempt counterでmutation bodyとreadbackが各最�
 - [InMemoryのlock順が逆転する] → decision mutex→ledger write lock→equity snapshot lockだけを許可し、call graph確認とconcurrency testでdeadlockを検出する
 - [InMemory failureがpartial stateを残す] → 全mutable stateのcomplete before-image restoreとpublish後/consumption前fault testを置く
 - [restoreが同時commit済みDAILY snapshotを消す] → equity lockをbefore-image取得からsuccess / restore完了まで連続保持し、DAILY appendとのdeterministic cross-testを置く
-- [trade groupの後続lifecycleをreplayへ混ぜる] → result membershipをrequest IDと直接linkに限定し、close / ADD_LONG fixturesを置く
-- [reserved prefix guardがrisk-reducing操作を止める] → close/update/cancelへblanket guardを追加せずnonprotective rowをAmbiguousにする
+- [FILLED BUYだけを成功済みrequestと誤認する] → position / STOP / executionを各1件要求し、欠損・重複・link不一致をAmbiguousにする
+- [PostgreSQLのSTOPをsame-IDで探索して欠損扱いする] → backend固有client request IDではなくposition ID・trade group・STOP roleのdirect linkで特定する
+- [DB uniqueで作れないmalformed fixtureに依存する] → synthetic classifier testとreachable PostgreSQL integration corruptionを分ける
+- [trade groupの後続lifecycleをreplayへ混ぜる] → result membershipをrequest-scoped entry anchorとdirect linkに限定し、close / ADD_LONG fixturesを置く
+- [reserved prefix guardがrisk-reducing操作を止める] → close/update/cancelへblanket guardを追加せず、same-ID malformed shapeはclassifierでAmbiguous、PostgreSQL duplicate non-null IDはunique violationにする
 - [capabilityがSafetyFloor bypassになる] → A2aをinactiveに保ち、A2bで既存preparation / SafetyFloor pathだけへ接続する
 - [PENDING_CANCELをflatと誤認する] → fill可能なBUYとしてpredicateに含める
 - [commit不明をretryして二重mutationする] → maxAttempts=1、bodyCompleted marker、fresh exact readbackだけに限定する

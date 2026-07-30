@@ -23,34 +23,79 @@ A1 `AuthorizedFalsifierPolicyBoundary`、public `Broker`、MCP、production runn
 ### Requirement: exact replay はatomic sectionの最初に解決する
 
 capabilityはbackendの排他境界を取得した後、intent consumption、flat predicate、新規mutationより先にv2 client request IDのauthorized exact replayを解決しなければならない（MUST）。
-同じclient request IDのBUY entryが厳密1件、intent ID一致、non-null trade groupの場合だけcandidateとしなければならない（MUST）。
-同じclient request IDのSELLは、BUY entryと同じtrade groupかつentry positionへ直接linkするprotective STOPだけを許可し、その他のSELLまたは2件目のBUYがあれば`Ambiguous`としなければならない（MUST）。
-resultは同じclient request IDのentry / protective STOP、それらを直接参照するposition / executionだけから復元し、同じtrade groupの別request rowを集約してはならない（MUST NOT）。
+replay helperはsealed request subtypeとprepared IDを使い、requested v2 ID、prepared entry / position / stop / execution ID、trade groupのいずれにもrequest-correlated artifactがない場合だけ`Missing`としなければならない（MUST）。
+BUY entryが欠けても他のrequest-correlated artifactが存在する場合、same-ID rowが存在するのにrequestと一致するBUY entryを一意に確定できない場合、またはentryのintent ID、trade group ID、entry order ID、symbol / modeがrequestと一致しない場合は`Ambiguous`としなければならない（MUST）。
+MARKET相当requestまたはFILLEDへ進んだresting requestの`Exact`は、FILLED BUY entry、entryへ直接linkするposition、そのposition IDとtrade groupへ直接linkするprotective STOP、entry order IDとposition IDへ直接linkするBUY executionが各1件のcomplete bundleでなければならない（MUST）。
+complete bundleのentry、position、protective STOP、executionが欠損、重複、またはlink不一致の場合は`Ambiguous`とし、`Missing`または部分的な`Exact`にしてはならない（MUST NOT）。
+InMemory protective STOPはentryとsame client request IDであることを検証し、PostgreSQL protective STOPはNULL client request IDを正常とし、両backendともposition ID、trade group、`side=SELL / orderType=STOP` roleで一意に特定しなければならない（MUST）。
+OPEN resting requestの`Exact`はrequestと一致するOPEN BUY entryが1件、position linkがなく、direct-linked position / protective STOP / executionが0件の単一order shapeでなければならない（MUST）。
+PENDING_CANCEL / CANCELED / REJECTEDへ進んだ未約定resting entryも、同じentry identityを保ちfill artifactがない場合は現在statusの単一order `Exact`として扱わなければならない（MUST）。
+resultはrequest-scoped BUY entry anchor、一意なdirect-linked protective STOP / position / executionだけから復元し、同じtrade groupの別request rowを集約してはならない（MUST NOT）。
 
 #### Scenario: consumed intentとexact result
 
 - **WHEN** exact result、consumed intent、open positionまたはopen resting entryが存在する同じrequestを再実行する
 - **THEN** capabilityはintentとflat stateを拒否理由にせず`Exact` resultを返しmutationを行わない
 
+#### Scenario: A1 FILLED BUY-only fixture
+
+- **WHEN** A1 InMemory replay readerがFILLED BUY entryだけを持ちposition、protective STOP、executionを持たないfixtureを読む
+- **THEN** readerは`Exact`または`Missing`ではなく`Ambiguous`を返し、A1 boundaryはfail closedを維持する
+
 #### Scenario: MARKET exact replay
 
-- **WHEN** v2 IDに1件のFILLED BUY entry、同一trade groupのprotective SELL、position、executionが存在する
-- **THEN** capabilityはrequest-scoped entry / protective STOPと直接linkするposition / executionだけを`Exact` resultとして返す
+- **WHEN** MARKET相当requestに一致するFILLED BUY entry、直接linkするposition、protective STOP、BUY executionが各1件存在する
+- **THEN** capabilityはentry / protective STOP、position、executionを各request resultへ1件ずつ含む`Exact`を返す
 
 #### Scenario: resting exact replay
 
-- **WHEN** v2 IDに1件のOPEN BUY resting entryが存在しintentとtrade groupが一致する
-- **THEN** capabilityはそのOPEN orderを`Exact` resultとして返す
+- **WHEN** resting requestに一致するOPEN BUY entryが1件存在し、position / protective STOP / executionが存在しない
+- **THEN** capabilityはそのOPEN orderだけを含む`Exact` resultを返しMARKET/FILLED shapeとして扱わない
+
+#### Scenario: FILLEDへ進んだresting replay
+
+- **WHEN** resting requestのentryがmarket eventでFILLEDへ進み、直接linkするposition、protective STOP、BUY executionが各1件存在する
+- **THEN** capabilityはrequest subtypeをrestingのまま維持しcomplete FILLED bundleを`Exact` resultとして返す
+
+#### Scenario: FILLED component missing
+
+- **WHEN** entry、position、protective STOP、executionのいずれかが欠ける一方で他のrequest-correlated artifactが存在する
+- **THEN** capabilityは`Missing`または部分的な`Exact`ではなくtyped replay-indeterminate failureを返す
+
+#### Scenario: FILLED component duplicate
+
+- **WHEN** BUY entry、直接linkするprotective STOP、または直接linkするexecutionが複数存在する
+- **THEN** capabilityはどれかを選ばずtyped replay-indeterminate failureを返す
+
+#### Scenario: FILLED link mismatch
+
+- **WHEN** entryのintent / trade group、またはposition、protective STOP、executionのtrade group / order ID / position ID linkがrequestと一致しない
+- **THEN** capabilityはtyped replay-indeterminate failureを返しintent、ledger、accountを変更しない
+
+#### Scenario: backend固有protective STOP identity
+
+- **WHEN** InMemoryではsame-ID、PostgreSQLではNULL client request IDのprotective STOPがposition ID、trade group、SELL / STOP roleでentryへ一意にdirect-linkする
+- **THEN** capabilityはbackend固有client request ID表現にかかわらずそのSTOPをcomplete bundleへ含める
 
 #### Scenario: 同じrequest IDのcloseまたはreduce
 
-- **WHEN** BUY entryと同じv2 IDにnon-protective close / reduce SELL orderが存在する
+- **WHEN** internal classifierへBUY entryと同じv2 IDのnon-protective close / reduce SELL orderを含むsynthetic rowsを渡す
 - **THEN** capabilityはSELLをprotective STOPと誤認せずtyped replay-indeterminate failureを返す
 
 #### Scenario: 同じrequest IDのADD_LONG
 
-- **WHEN** 同じv2 IDに2件目のBUY / ADD_LONG orderが存在する
+- **WHEN** internal classifierへ同じv2 IDの2件目のBUY / ADD_LONG orderを含むsynthetic rowsを渡す
 - **THEN** capabilityはどちらかを選ばずtyped replay-indeterminate failureを返す
+
+#### Scenario: PostgreSQL same-ID unique
+
+- **WHEN** PostgreSQLでentryと同じnon-null client request IDのclose / reduce / ADD_LONG orderを追加しようとする
+- **THEN** partial unique indexは2件目を拒否し、integration testはDB上で到達不能なduplicate same-ID fixtureを前提にしない
+
+#### Scenario: PostgreSQL reachable corruption
+
+- **WHEN** PostgreSQLにNULL client request IDのduplicate direct-linked STOP、duplicate execution、またはdifferent-ID / direct-link mismatchが存在する
+- **THEN** capabilityはreachableなcorrupt bundleをtyped replay-indeterminate failureにする
 
 #### Scenario: 別requestの同一trade group lifecycle
 
@@ -59,13 +104,14 @@ resultは同じclient request IDのentry / protective STOP、それらを直接�
 
 #### Scenario: malformed protective row
 
-- **WHEN** request-scoped SELLがSTOP以外、position link欠損、entryと別position、または別trade groupである
+- **WHEN** protective candidateがSTOP以外、position link欠損、entryと別position、または別trade groupである
 - **THEN** capabilityはtyped replay-indeterminate failureを返しintent、ledger、accountを変更しない
 
 #### Scenario: risk-reducing public command
 
 - **WHEN** public close / update protection / cancelがreserved v2 prefixをaudit client request IDに持つ
-- **THEN** systemはprefixだけを理由にrisk-reducing commandを拒否せず、非protective rowが同じIDへ作られた場合のentry replayを`Ambiguous`にする
+- **THEN** systemはprefixだけを理由にrisk-reducing commandを拒否しない
+- **AND** same-ID malformed rowsはinternal classifierで`Ambiguous`、PostgreSQLの2件目のnon-null same-ID rowはpartial unique indexで拒否される
 
 #### Scenario: concurrent同一request
 

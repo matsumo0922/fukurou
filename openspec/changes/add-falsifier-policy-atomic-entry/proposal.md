@@ -10,7 +10,9 @@ full A2 は human-authored diff が 1,250〜1,500 行規模と見込まれるた
 - 同じ原子境界内で `open positions == 0 AND risk-increasing open entry orders == 0` を検証し、MARKET 相当の即時 entry または LIMIT / STOP の resting entry と intent consumption を一緒に保存する
 - PostgreSQL の lock 順を MARKET と realtime eligibility 付き resting に分け、resting は session advisory lock と `market_data_sessions` row を ledger mutation rows より先に取得する
 - InMemory は `decision mutex -> ledger write lock -> equity snapshot lock` の順で直列化し、equity lock を before-image 取得から成功または完全 restore まで保持することで、ledger publish 後・consumption 前の failure にも partial state を残さない
-- exact replay は同じ client request ID の entry と正規 protective STOP だけを受理し、close / reduce / ADD_LONG や別 request ID の同一 trade group row を result へ集約しない
+- exact replay はrequest subtypeごとのrow shapeを検証し、FILLED entryはBUY entry、position、protective STOP、executionが各1件で直接linkする完全bundleだけを受理する
+- InMemoryのprotective STOPはentryとclient request IDを共有し、PostgreSQLのSTOPはpartial unique indexに合わせてclient request IDを持たないため、共通のposition ID・trade group・STOP roleで一意に特定する
+- missing / duplicate / link mismatch、close / reduce / ADD_LONGはambiguous replayとし、別request IDの同一trade group lifecycle rowをresultへ集約しない
 - exact replay、ambiguous replay、consumed intent、non-flat conflict、storage / commit failure を typed result / failure で区別する
 - PostgreSQL transaction は `maxAttempts=1` とし、commit outcome 不明時は自動再実行せず fresh transaction の exact readback だけで回復する
 - 同一 request、別 request、別 intent、MARKET と resting の並行実行を InMemory / PostgreSQL の双方で回帰テストする
@@ -35,6 +37,8 @@ full A2 は human-authored diff が 1,250〜1,500 行規模と見込まれるた
 - `InMemoryDecisionRepository`、`InMemoryPaperLedgerRepository`、`InMemoryEquitySnapshotRepository` の共有 lock 順序
 - `InMemoryEquitySnapshotRepository` の non-suspend exclusive snapshot transactionとinternal before-image restore
 - `ExposedPaperLedgerRepository` / `ExposedPaperLedgerWriter` の path 別 lock 順、transaction retry / commit readback、replay・predicate・intent consumption
+- A1 InMemory replay reader / fixtureのFILLED complete-bundle fail-closed化
+- backend-neutral classifier unit testとPostgreSQLのreachable corruption / unique-index integration test
 - InMemory unit test と PostgreSQL integration / concurrency test
 - `docs/mcp-runtime.md`
 
