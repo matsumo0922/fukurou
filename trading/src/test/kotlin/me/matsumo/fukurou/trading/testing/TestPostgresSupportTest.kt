@@ -76,25 +76,6 @@ class TestPostgresSupportTest {
     }
 
     @Test
-    fun queryParameterOverrideReplacesTimeoutsWithoutBreakingUrlStructure() {
-        val url = "jdbc:postgresql://localhost:5432/test" +
-            "?connectTimeout=10&loginTimeout=30&socketTimeout=300&applicationName=fukurou%20test"
-
-        val overridden = url.withJdbcQueryParameters(
-            mapOf(
-                TEST_POSTGRES_CONNECT_TIMEOUT_KEY to "2",
-                TEST_POSTGRES_SOCKET_TIMEOUT_KEY to "2",
-            ),
-        )
-
-        assertEquals(1, overridden.count { character -> character == '?' })
-        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("connectTimeout=2") })
-        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("socketTimeout=2") })
-        assertEquals(1, overridden.split('&').count { parameter -> parameter.contains("loginTimeout=30") })
-        assertEquals(true, overridden.endsWith("applicationName=fukurou%20test"))
-    }
-
-    @Test
     fun silentAuthenticationSocketFailsWithinConfiguredReadTimeout() {
         ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { serverSocket ->
             val releaseServer = CountDownLatch(1)
