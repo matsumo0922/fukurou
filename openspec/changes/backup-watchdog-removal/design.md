@@ -40,9 +40,11 @@ docker exec ... "${PRODUCTION_CONTAINER_ID}" timeout --signal=TERM --kill-after=
 
 トレードオフ: 旧 watchdog は 60 秒で backend を終了させたが、新設計では stall 時の解放が最大 840 秒まで遅れうる。single-owner の paper trading DB では、この遅延で失われるものはない（daemon は deploy 中 pause 済み、backup は日次 1 回）。
 
-### Decision 2: `--no-cache` を撤去する（帰属: agent 仮決め — 根拠は issue #336 の実測）
+### Decision 2: `--no-cache` を撤去し、cache の場所を `/var/cache/fukurou-restic` に固定する（帰属: agent 仮決め — 根拠は issue #336 の実測。cache 場所はレビュー指摘 F1 対応）
 
-`--no-cache` の選択根拠は docs / openspec / コミット履歴のいずれにも記録されていない。restic の local cache（root 実行なので `/root/.cache/restic`）は暗号化 repo のデータの複製であり、平文の dump・DB パスワード・repo パスワードのいずれも含まないため、既存 Requirement の secret 非永続化条項に抵触しない。cache が壊れた場合 restic は自動で repo から再構築する（cache は正本ではない）。
+`--no-cache` の選択根拠は docs / openspec / コミット履歴のいずれにも記録されていない。restic の local cache は暗号化 repo のデータの複製であり、平文の dump・DB パスワード・repo パスワードのいずれも含まないため、既存 Requirement の secret 非永続化条項に抵触しない。cache が壊れた場合 restic は自動で repo から再構築する（cache は正本ではない）。
+
+cache の場所: restic の既定（`$HOME/.cache/restic` = root では `/root/.cache/restic`）は、backup unit の `ProtectHome=yes` が `/root` を不可視化するため systemd 経由では書けない（レビューで検出。restic は cache 作成失敗時に cache なしへ fallback するため機能は壊れないが、背圧解消という本 change の目的が本番経路で達成されない）。unit に `CacheDirectory=fukurou-restic` を追加して `/var/cache/fukurou-restic` を割り当て、`RESTIC_CACHE_DIR` で明示する。`backup-fukurou` 側も同じパスを既定にし、deploy 経由（unit 外）でも同一 cache を共有する。`/var/cache` は `ProtectSystem=strict` 下でも `CacheDirectory` 指定で書き込み可能になる。
 
 ### Decision 3: stderr は「破棄をやめる」だけにする（帰属: ユーザー確認済み — issue #336 の Scope 外に記録機構新設を明記）
 

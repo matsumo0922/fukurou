@@ -26,6 +26,9 @@ readonly BACKUP_RESERVE_BYTES="${FUKUROU_BACKUP_RESERVE_BYTES:-5368709120}"
 # 基づくタイトな値にすると、restic の repo index 読み込み由来の背圧で健全な dump を
 # 誤終了させる（issue #336）。deploy の外側 timeout 900 秒より内側で先に発火させる。
 readonly DUMP_TIMEOUT_SECONDS=840
+# unit 経由（ProtectHome=yes で /root 不可視）と deploy 経由（unit 外）の両方で
+# 同じ cache を使うため、既定を systemd CacheDirectory と同じ場所に固定する。
+readonly RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/var/cache/fukurou-restic}"
 readonly POSTGRES_CONTROL_TIMEOUT_SECONDS=5
 
 BACKUP_INVOKED_BY_DEPLOY=false
@@ -55,7 +58,8 @@ handle_signal() {
   trap - TERM INT HUP
   if [[ -n "${CURRENT_PARTIAL_SNAPSHOT}" && "${REPOSITORY_READ_READY}" == "true" ]]; then
     timeout --signal=KILL --kill-after=1 10 \
-      env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --compression auto \
+      env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR}" \
+        restic --compression auto \
         -r "${RESTIC_REPOSITORY}" forget "${CURRENT_PARTIAL_SNAPSHOT}" >/dev/null 2>&1 || true
   fi
   REPOSITORY_READ_READY=false
@@ -70,7 +74,8 @@ trap 'handle_signal 130' INT
 trap 'handle_signal 129' HUP
 
 restic_command() {
-  env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" restic --compression auto -r "${RESTIC_REPOSITORY}" "$@"
+  env RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE}" RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR}" \
+    restic --compression auto -r "${RESTIC_REPOSITORY}" "$@"
 }
 
 publish_backup_attempt() {
