@@ -15,7 +15,7 @@ authorized new mutation は常に fail closed とし、backend atomic entry は 
 - permit と durable decision/event の全 identity を result lookup より前に検証する
 - v2 fingerprint を normalized command と authority に束縛する
 - public/MCP caller による未使用・既存 v2 ID の spoof を result lookup 前に拒否する
-- exact authorized replay を consumed intent より優先して返す
+- authorized replay 専用 reader で厳密に復元した exact result を consumed intent より優先して返す
 - authorityを確認できない状態と、新規mutation未対応をtyped failureで区別する
 
 **Non-Goals:**
@@ -55,17 +55,30 @@ preview/placeの双方でこの検証を行う。
 
 durable decisionだけからpermitを再発行する案は、intent IDを知るcallerへauthorityを与えるため採用しない。
 
-### 3. v2 fingerprint をcommandとpermitへcanonicalに束縛する
+### 3. v2 fingerprint はversion付きcanonical JSONのUTF-8 bytesへ固定する
 
-authorized placeはnormalized command business fieldsとpermit全identityのcanonical projectionをSHA-256にし、`runner-place-v2-<hash>`をclient request IDとする。
-projectionはintent ID、symbol、side/order type、size、price、trade group、protective STOP、TP、estimated win probability、time stop、canonical thesis IDとpermit全identityを含む。
-数値/nullは既存preview normalized contentと同じbusiness表現を使い、自由文reasonとtool/audit metadataは除外する。
+authorized placeはnormalized command business fieldsとpermit全identityを、`schemaVersion="falsifier-authority-v1"`のcanonical JSONへ符号化する。
+JSON objectは次のinsertion orderを固定し、serializerのmap iterationや文字列連結へ依存しない。
+
+1. `schemaVersion`
+2. `command`: intent ID、symbol、side、order type、size、price、trade group、protective STOP、TP、estimated win probability、time stop、canonical thesis ID
+3. `authority`: decision ID、intent ID、action、policy、required、reason codes、runtime config version ID/hash
+
+各nested objectも上記のfield orderで構築する。
+nullable fieldは省略や文字列化をせず`JsonNull`、string/UUID/enum/Instantは`JsonPrimitive`としてJSON escapeする。
+BigDecimalは既存normalized contentと同じ`toPlainString`のcanonical decimal stringを`JsonPrimitive`にする。
+reason codesはenum name順のJSON array、`required`はJSON booleanとする。
+これによりnullと文字列`"null"`、改行やquote/backslash、field separatorに見える文字列を別のJSON value/fieldと区別する。
+自由文reasonとtool/audit metadataはauthorityを変えないため含めない。
+
+whitespaceを追加しないcanonical JSON serializationのUTF-8 bytesをSHA-256へ渡し、小文字hexを`runner-place-v2-<hash>`とする。
+schema versionなしのdelimiter連結、nullableの文字列`"null"`化、platform default charsetは衝突または環境差を生むため採用しない。
 
 internal place boundaryの順序は次に固定する。
 
 1. durable authorityの全identityを検証する
 2. commandからfingerprintを再計算し、v2 client request IDと完全一致することを検証する
-3. ledgerのexisting resultをclient request IDでlookupする
+3. authorized replay専用readerでclient request IDに対応するexisting rowsを検証する
 4. exact resultがあれば返す
 5. resultがなければtyped `authorized new mutation unsupported` failureを返す
 
@@ -81,15 +94,34 @@ placeでは既存 result lookup より前に拒否するため、permitのない
 
 public pathでresult lookup後にprefixを検証する案は、既存resultをauthorityなしで返すため採用しない。
 
-### 5. exact replay はintent consumptionより優先する
+### 5. replay専用internal readerだけがExactを判定する
+
+既存public repository lookupの意味は変更せず、authorized boundary専用のinternal reader/capabilityを追加する。
+readerは同じclient request IDに関連するorder/execution/position rowsを読み、次を全て満たす場合だけ`Exact(PaperTradeResult)`を返す。
+
+- BUY entry candidateが厳密に1件
+- candidateのintent IDがcommand intent IDと一致する
+- candidateのtrade group IDがnon-null
+- 同じclient request IDの関連rowsが全てcandidateと同じtrade groupに属する
+
+正常なmarket entryでBUY orderとprotective SELLが同じclient request IDに同居することは許可する。
+SELL rowの存在自体はambiguous条件にせず、別trade groupに属する場合だけ拒否する。
+
+BUY candidateが0件なら`Missing`とする。
+BUY candidateが複数、candidate intent/group不一致、trade group欠損、別groupのrelated rowがある場合は`Ambiguous`とし、typed indeterminate failureへ変換する。
+reader capabilityを実装しないbackendもtyped unsupported/fail-closedとし、public lookupへfallbackしない。
+この専用readerにより、public lookup contractを広げずにprotective order同居とcorrupt replayを区別する。
+
+### 6. exact replay はintent consumptionより優先する
 
 authority/fingerprintがexactなら、existing result lookupをintent consumed判定より先に置く。
 初回成功はintentを消費するため、consumed判定を先にすると正規retryが失敗するからである。
 
 A1は新規mutationを行わないが、test fixtureでseedしたexact v2 resultとconsumed intentを使って順序を固定する。
-resultが一意に復元できない、lookup自体が失敗する、またはcommand/authorityが異なる場合はexact replayとして返さない。
+readerが`Missing`ならtyped `authorized new mutation unsupported`、`Ambiguous`またはlookup failureならtyped indeterminate failureを返す。
+command/authorityが異なる場合はreaderを呼ぶ前に拒否する。
 
-### 6. A1はproduction semanticsを変えない
+### 7. A1はproduction semanticsを変えない
 
 production runnerはinternal boundaryに未接続であり、OFF foundation permitがあってもFalsifierを起動する。
 runner status、terminal cause、completion event、no-trade/outcome mappingは変更しない。
@@ -102,13 +134,16 @@ runner status、terminal cause、completion event、no-trade/outcome mappingは�
 
 - [internal boundaryが誤ってproductionから呼ばれる] → runner wiringを追加せず、OFFでもFalsifierが起動する回帰testを置く
 - [repository停止時に既存resultがある] → pre-lookupでtyped unavailableを返し、result不存在やno-tradeを断定しない
+- [nullableまたは特殊文字がfingerprintで衝突する] → schema versionとfield orderを固定したcanonical JSONをUTF-8でhashする
+- [protective SELLを複数entryと誤認する] → replay readerはBUY entry candidateだけを数え、同一trade groupのSELL同居を許可する
+- [同じclient request IDにcorrupt rowsが混ざる] → BUY複数、intent/group不一致、別group rowをAmbiguousとして返す
 - [consumed intentがexact retryを阻害する] → authority/fingerprint検証後、existing result lookupをconsumptionより先に固定する
 - [public callerがv2 IDを観測する] → public preview/placeはresult lookup前にreserved prefixを拒否する
 - [A1が不完全なnew mutationを許す] → exact resultがなければ専用typed failureで必ずfail closedにする
 
 ## Migration Plan
 
-1. internal envelope、authority validator、fingerprint、public v2 guard、exact replay-only pathをdeployする。
+1. internal envelope、authority validator、version付きcanonical JSON fingerprint、public v2 guard、replay専用readerをdeployする。
 2. public/MCP schemaとrunner Falsifier behaviorが不変であることを確認する。
 3. A2がatomic backend capabilityを実装するまでauthorized new mutationは常にfail closedにする。
 4. Bがactivation/outcome mappingを実装するまでrunnerをinternal boundaryへ接続しない。

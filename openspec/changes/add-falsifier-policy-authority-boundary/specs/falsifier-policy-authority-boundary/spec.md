@@ -67,7 +67,9 @@ internal boundaryはintent IDでdurable decision/eventを読み、decision ID、
 
 ### Requirement: v2 fingerprint はcommandとauthorityへcanonicalに束縛する
 
-authorized placeはnormalized command business fieldsとpermit全identityのcanonical SHA-256を`runner-place-v2-<hash>`として使用しなければならない（MUST）。
+authorized placeはnormalized command business fieldsとpermit全identityを、`schemaVersion="falsifier-authority-v1"`とfield insertion orderを固定したcanonical JSONへ符号化しなければならない（MUST）。
+nullableは`JsonNull`、stringはJSON escapeされた`JsonPrimitive`、BigDecimalはnormalized `toPlainString`のcanonical string `JsonPrimitive`として表現しなければならない（MUST）。
+whitespaceなしJSON serializationのUTF-8 bytesのSHA-256を`runner-place-v2-<hash>`として使用しなければならない（MUST）。
 authority検証後、existing result lookup前にfingerprintを再計算してclient request IDと完全一致することを要求しなければならない（MUST）。
 
 #### Scenario: exact fingerprint
@@ -85,6 +87,26 @@ authority検証後、existing result lookup前にfingerprintを再計算してcl
 - **WHEN** decision ID、policy attributes、またはruntime config identityがfingerprintと異なる
 - **THEN** systemはexisting resultを返さずmutationも行わない
 
+#### Scenario: nullと文字列null
+
+- **WHEN** nullable fieldがJSON nullのcommandと、同じfieldが文字列`"null"`のcommandを符号化する
+- **THEN** canonical JSONとv2 fingerprintは異なる
+
+#### Scenario: 改行とJSON metacharacter
+
+- **WHEN** string fieldが改行、quote、backslash、brace、comma、colonを含む
+- **THEN** `JsonPrimitive`のJSON escapeによりfield boundaryを変えず一意に符号化される
+
+#### Scenario: canonical decimal
+
+- **WHEN** BigDecimal business fieldを符号化する
+- **THEN** 既存normalized contentと同じ`toPlainString`のcanonical decimal stringがJSON string valueとして使われる
+
+#### Scenario: schemaまたはfield orderが異なる
+
+- **WHEN** schema versionまたはobject field insertion orderが`falsifier-authority-v1`契約と異なる
+- **THEN** authorized boundaryはそのserializationをv1 fingerprintとして扱わない
+
 ### Requirement: public v2 spoof はpre-lookupで拒否する
 
 public preview/place pathは`runner-place-v2-` namespaceをinternal authorized path専用として扱い、existing result lookup、preview、mutationより前に拒否しなければならない（MUST）。
@@ -99,9 +121,49 @@ public preview/place pathは`runner-place-v2-` namespaceをinternal authorized p
 - **WHEN** public/MCP callerが正しい既存v2 IDをpermitなしで送る
 - **THEN** systemはexisting result lookup前に拒否しresultを返さない
 
+### Requirement: authorized replay reader はExactを厳密に復元する
+
+systemは既存public repository lookup semanticsを変更せず、authorized replay専用internal reader/capabilityを使用しなければならない（MUST）。
+readerは同じclient request IDのBUY entry candidateが厳密1件、candidate intent IDがcommand intent IDと一致、candidate trade group IDがnon-null、全related rowsが同一trade groupに属する場合だけ`Exact`を返さなければならない（MUST）。
+
+#### Scenario: BUY entryとprotective SELL
+
+- **WHEN** 同じclient request IDに1件のBUY entryと同じtrade groupのprotective SELLが存在する
+- **THEN** readerはprotective SELLの同居を許可してExact resultを返す
+
+#### Scenario: BUY candidateなし
+
+- **WHEN** 同じclient request IDにBUY entry candidateが存在しない
+- **THEN** readerは`Missing`を返す
+
+#### Scenario: BUY candidate複数
+
+- **WHEN** 同じclient request IDにBUY entry candidateが複数存在する
+- **THEN** readerは`Ambiguous`を返す
+
+#### Scenario: wrong intent
+
+- **WHEN** 唯一のBUY candidateのintent IDがcommand intent IDと異なる
+- **THEN** readerは`Ambiguous`を返す
+
+#### Scenario: trade group欠損または不一致
+
+- **WHEN** BUY candidateのtrade group IDがnull
+- **THEN** readerは`Ambiguous`を返す
+
+#### Scenario: 別groupのrelated row
+
+- **WHEN** 同じclient request IDのrelated rowにBUY candidateとは別のtrade groupが含まれる
+- **THEN** readerは`Ambiguous`を返す
+
+#### Scenario: unsupported reader
+
+- **WHEN** ledger backendがauthorized replay reader capabilityを実装していない
+- **THEN** internal boundaryはpublic lookupへfallbackせずtyped fail-closedを返す
+
 ### Requirement: exact replay はconsumed intentより優先する
 
-authorized placeはauthority/fingerprint検証後にexisting resultを検索し、exact resultがあればintent consumed状態にかかわらず返さなければならない（MUST）。
+authorized placeはauthority/fingerprint検証後にinternal readerを呼び、`Exact` resultがあればintent consumed状態にかかわらず返さなければならない（MUST）。
 
 #### Scenario: seeded exact replay
 
@@ -110,7 +172,7 @@ authorized placeはauthority/fingerprint検証後にexisting resultを検索し�
 
 #### Scenario: replay lookup failure
 
-- **WHEN** existing result lookupが失敗する、またはresultを一意に復元できない
+- **WHEN** internal readerが失敗する、`Ambiguous`を返す、またはresultを一意に復元できない
 - **THEN** systemはexact replayとみなさずtyped indeterminate failureを返す
 
 #### Scenario: non-exact retry
@@ -122,9 +184,9 @@ authorized placeはauthority/fingerprint検証後にexisting resultを検索し�
 
 authorized placeはauthority/fingerprint検証後にexact existing resultがない場合、backend capability未実装のtyped failureを返し、新規order、position、execution、intent consumptionを作ってはならない（MUST NOT）。
 
-#### Scenario: valid authorityだがresultなし
+#### Scenario: replay readerがMissing
 
-- **WHEN** authorityとfingerprintはvalidだがexisting resultがない
+- **WHEN** authorityとfingerprintはvalidだがauthorized replay readerが`Missing`を返す
 - **THEN** systemはtyped `authorized new mutation unsupported` failureを返しledgerを変更しない
 
 #### Scenario: unconsumed intent

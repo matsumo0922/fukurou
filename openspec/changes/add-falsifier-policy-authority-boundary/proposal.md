@@ -7,9 +7,10 @@ backend の新規 mutation と runner activation は後続 PR へ分け、この
 
 - public `PlaceOrderCommand`、preview/place `Broker` interface、MCP wire schema を変えず、broker package 内に authorized preview/place envelope と internal boundary を追加する
 - foundation permit と durable policy decision/event の全 identity を internal boundary で検証する
-- normalized command と authority から canonical `runner-place-v2-<sha256>` fingerprint を作る
+- schema version と insertion order を固定した canonical JSON で normalized command と authority を符号化し、`runner-place-v2-<sha256>` fingerprint を作る
 - public/MCP path の未使用・既存 v2 ID を、既存 result lookup より前に拒否する
-- authorized path は authority/fingerprint 検証後に exact existing result を lookup し、intent consumption より優先して replay する
+- authorized replay 専用の internal reader を追加し、1 件の BUY entry と同一 trade group に限定して exact result を復元する
+- authorized path は authority/fingerprint 検証後に internal reader で exact existing result を lookup し、intent consumption より優先して replay する
 - authority を確立できない場合は、result の有無を断定しない typed authority-unavailable/indeterminate failure を返す
 - exact result がない authorized request は backend capability 未実装として必ず typed fail-closed にする
 - production runner は internal boundary へ接続せず、Falsifier behavior、status、outcome mapping を変更しない
@@ -29,6 +30,7 @@ backend の新規 mutation と runner activation は後続 PR へ分け、この
 
 - broker package 内の authorized envelope / internal boundary
 - `PaperBroker` の public v2 namespace guard と authorized replay path
+- ledger の authorized replay 専用 internal reader/capability
 - policy decision repository の broker wiring
 - broker、runner、MCP contract の unit/integration test
 - `docs/mcp-runtime.md`
