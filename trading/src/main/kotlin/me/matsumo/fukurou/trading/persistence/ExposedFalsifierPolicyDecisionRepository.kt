@@ -101,6 +101,13 @@ class ExposedFalsifierPolicyDecisionRepository(
         byId: FalsifierPolicyDecision?,
         event: StoredPolicyEvent?,
     ): FalsifierPolicyDecision {
+        val hasTransientReadCommittedGap = byIntent == null && byId == requested && event?.matches(requested) == true
+        if (hasTransientReadCommittedGap) {
+            val refreshedByIntent = selectDecisionByIntent(requested.intentId)
+            if (refreshedByIntent != null) {
+                return exactReadbackOrConflict(requested, refreshedByIntent, byId, event)
+            }
+        }
         val existing = byIntent ?: throw FalsifierPolicyDecisionConflictException("policy decision ID exists without matching intent.")
         if (byId != existing || existing != requested) {
             throw FalsifierPolicyDecisionConflictException("policy decision payload conflicts with existing row.")
