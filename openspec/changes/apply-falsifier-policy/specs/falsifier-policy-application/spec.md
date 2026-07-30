@@ -103,7 +103,7 @@ SafetyFloor は fresh `APPROVED` がない `ENTER` を、wire から設定でき
 
 ### Requirement: runner replay identity は command と authority に一致する
 
-runner は normalized order business fields と policy authority の canonical SHA-256 fingerprint を client request ID に使用し、broker は同じ internal permit から fingerprint を再計算できる場合だけ既存結果を replay しなければならない（MUST）。
+OFF ENTER runner は normalized order business fields と policy authority の canonical SHA-256 fingerprint を予約済み client request namespace に使用し、broker は既存 result lookup より前に同じ internal permit から fingerprint を再計算できる場合だけ新規作成または既存 replay を許可しなければならない（MUST）。
 
 #### Scenario: exact internal retry
 
@@ -115,6 +115,11 @@ runner は normalized order business fields と policy authority の canonical S
 - **WHEN** internal permit を持たない MCP caller が既存 `runner-place-v2-` client request ID を別 intent または payload で送る
 - **THEN** broker は既存 accepted result を返さず拒否する
 
+#### Scenario: wire caller が未使用 runner ID を送る
+
+- **WHEN** internal permit を持たない MCP caller が fresh `APPROVED` と正しい未使用 `runner-place-v2-` client request ID を送る
+- **THEN** broker は既存 lookup より前に拒否し、新規 order を作らない
+
 #### Scenario: internal retry の payload が違う
 
 - **WHEN** permit は同じでも数量、価格、STOP/TP、time stop その他の normalized business field が異なる
@@ -123,7 +128,7 @@ runner は normalized order business fields と policy authority の canonical S
 #### Scenario: authority recovery
 
 - **WHEN** commit 後の retry を監査する
-- **THEN** durable order の intent ID、fingerprinted client request ID、policy decision/event から元 authority を特定できる
+- **THEN** durable order の intent ID、permit 専用 fingerprinted client request ID、policy decision/event から元 authority を特定できる
 
 #### Scenario: commit の可能性がある recovery failure
 

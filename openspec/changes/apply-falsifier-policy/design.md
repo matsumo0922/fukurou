@@ -85,8 +85,11 @@ Falsifier を実行していない entry に「Falsifier APPROVED」と記録し
 ### 6. runner replay identity を command と authority に束縛する
 
 新しい preview/place 副作用の前に policy repository を読めない場合は fail closed にする。
-runner の place `clientRequestId` は、normalized `PlaceOrderCommand` business fields と policy permit 全 identity の canonical projection を SHA-256 で hash し、`runner-place-v2-<hash>` とする。
-broker はこの namespace の既存 result を、permit が存在し、現在 command から再計算した ID と一致する場合だけ mutation なしで replay する。
+OFF ENTER runner の place `clientRequestId` は、normalized `PlaceOrderCommand` business fields と policy permit 全 identity の canonical projection を SHA-256 で hash し、`runner-place-v2-<hash>` とする。
+`runner-place-v2-` namespace は OFF internal permit 専用に予約する。
+broker は既存 result lookup より前に、permit が存在し、現在 command から再計算した ID と一致することを検証する。
+この検証は新規 mutation と既存 replay の両方に必須とする。
+ALWAYS_ON / CONDITIONAL の fresh approval 経路は既存 client request namespace を使い、v2 authority envelope を作らない。
 permit を wire schema に持たない MCP caller、別 intent、別数量・価格・STOP/TP・time stop、別 policy authority は同じ ID を replay できない。
 
 ToolCallGuard に新しい pre-mutation event は追加しない。
@@ -108,7 +111,7 @@ runner phase audit は machine-readable に `policy`, `required`, `reasonCodes`,
 - [MCP caller が OFF decision を発見する] → wire command から internal permit を設定できず、SafetyFloor で拒否する
 - [新規 side effect 前に policy repository read が停止する] → preview/place を実行せず no-trade にする
 - [commit 後 ACK loss の retry 時に policy repository が停止する] → commit の可能性があれば outcome unknown とし、authority を再構築できる retry だけ fingerprint 一致で replay する
-- [MCP caller が runner client request ID を衝突させる] → runner v2 namespace は internal permit と canonical command fingerprint の再計算を必須にする
+- [MCP caller が runner client request ID を新規作成または replay に使う] → OFF 専用 v2 namespace は既存 lookup より前に internal permit と canonical command fingerprint の再計算を必須にする
 - [ADD_LONG が preview/place 間に ENTER へ化ける] → OFF bypass を ENTER に限定し、ADD_LONG は後続の action/group binding まで Falsifier 必須にする
 - [ENTER が preview/place 間に ADD_LONG へ化ける] → OFF ENTER は place lock 内で open position 0 件を再検証する
 - [`CONDITIONAL_V1` が誤って activate される] → Falsifier 必須へ倒し、conditional 実験としては使用禁止を docs に残す
