@@ -1,9 +1,7 @@
-# postgres-test-connection-bounds Specification
+# postgres-test-connection-bounds Delta Specification
 
-## Purpose
+## MODIFIED Requirements
 
-Testcontainers PostgreSQL fixture の接続停止を有限時間で失敗させ、production の接続 semantics を変えずに test suite の完走性を保つ。
-## Requirements
 ### Requirement: Testcontainers PostgreSQL connections are time bounded
 
 Issue #245 の受け入れ条件として、repository の Testcontainers PostgreSQL fixture は共有 test fixture が提供する bounded base container を MUST 継承し、生成する全 JDBC URL に connection establishment と socket read の有限 timeout を設定する。large population test は socket timeout を test oracle にせず、同じ period に1件 scoped + 20,001件 scope外を作り、normal scoped aggregation と global oversized rejection を別々の assertion で bounded time に検証しなければならない。
@@ -49,14 +47,7 @@ Issue #245 の受け入れ条件として、repository の Testcontainers Postgr
 - **THEN** scoped trade query は1件だけを返し、prior PnL aggregation は正常に成功する
 - **AND** 同じ20,002件の global population に対する別の assertion は JDBC socket timeout 前に `EVALUATION_POPULATION_UNAVAILABLE:ENTITY_LIMIT` を返す
 
-### Requirement: Production connection semantics remain unchanged
-
-Issue #245 の non-goal として、変更は test source の Testcontainers fixture に限定し、production の JDBC configuration と retry semantics を MUST 変更しない。
-
-#### Scenario: Production application is built
-
-- **WHEN** application または trading runtime の production DataSource を構築する
-- **THEN** 本 change による timeout parameter や retry は追加されない
+## ADDED Requirements
 
 ### Requirement: Testcontainers PostgreSQL helpers live in one shared fixture
 
@@ -141,4 +132,3 @@ Testcontainers を起動する test は、Docker が利用できない場合に 
 
 - **WHEN** test class 全体で container を 1 回しか起動しない test を共有化するか判断する
 - **THEN** 起動回数が減らず共有 container の生存期間だけが延びるため、その test は専用 container のまま維持する
-

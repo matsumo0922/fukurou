@@ -57,19 +57,36 @@ fun <T> retryTransientTestPostgresConnection(connect: () -> T): T {
     return connect()
 }
 
-/** JDBC URL の query parameter を key 単位で上書きする。 */
-fun String.withJdbcQueryParameters(overrides: Map<String, String>): String {
-    val baseUrl = substringBefore('?')
-    val parameters = substringAfter('?', missingDelimiterValue = "")
+/**
+ * JDBC URL の query parameter を decode して key ごとに集める。
+ *
+ * 同じ key が複数回現れた場合を検出できるよう値を list で返す。
+ */
+fun String.jdbcQueryParameters(): Map<String, List<String>> {
+    return substringAfter('?', missingDelimiterValue = "")
         .split('&')
         .filter(String::isNotBlank)
-        .associateTo(linkedMapOf()) { parameter ->
-            val key = parameter.substringBefore('=').decodeQueryComponent()
-            val value = parameter.substringAfter('=', missingDelimiterValue = "").decodeQueryComponent()
-            key to value
-        }
+        .groupBy(
+            keySelector = { parameter -> parameter.substringBefore('=').decodeQueryComponent() },
+            valueTransform = { parameter ->
+                parameter.substringAfter('=', missingDelimiterValue = "").decodeQueryComponent()
+            },
+        )
+}
+
+/**
+ * JDBC URL の query parameter を key 単位で上書きする。
+ *
+ * [overrides] の値は decode 済みとして扱う（encode は本関数が行う）。
+ */
+fun String.withJdbcQueryParameters(overrides: Map<String, String>): String {
+    val baseUrl = substringBefore('?')
+    val parameters = jdbcQueryParameters()
+        .mapValuesTo(linkedMapOf()) { (_, values) -> values.last() }
 
     parameters.putAll(overrides)
+
+    if (parameters.isEmpty()) return baseUrl
 
     return parameters.entries.joinToString(
         prefix = "$baseUrl?",
@@ -92,6 +109,8 @@ private fun String.decodeQueryComponent(): String = URLDecoder.decode(this, Stan
 
 private fun String.encodeQueryComponent(): String = URLEncoder.encode(this, StandardCharsets.UTF_8).replace("+", "%20")
 
+/** test 用 PostgreSQL container の image。production の PostgreSQL 16 に合わせる。 */
+const val TEST_POSTGRES_IMAGE = "postgres:16-alpine"
 const val TEST_DOCKER_UNAVAILABLE_MESSAGE = "Docker daemon is unavailable; skipping the Testcontainers test."
 const val TEST_POSTGRES_CONNECT_TIMEOUT_KEY = "connectTimeout"
 const val TEST_POSTGRES_LOGIN_TIMEOUT_KEY = "loginTimeout"
