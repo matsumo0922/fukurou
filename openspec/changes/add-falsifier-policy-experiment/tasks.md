@@ -17,4 +17,4 @@
 ## 4. Documentation and validation
 
 - [x] 4.1 config / persistence docs に foundation と activation 禁止を現在形で追記する
-- [ ] 4.2 OpenSpec validation、targeted test、full test / detekt / build を実行する
+- [x] 4.2 OpenSpec validation、targeted test、full test / detekt / build を実行する
