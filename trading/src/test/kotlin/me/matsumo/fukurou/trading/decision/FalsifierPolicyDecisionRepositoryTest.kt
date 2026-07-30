@@ -51,6 +51,9 @@ class FalsifierPolicyDecisionRepositoryTest {
         assertFailsWith<FalsifierPolicyDecisionConflictException> {
             repository.recordFalsifierPolicyDecision(request).getOrThrow()
         }
+        assertFailsWith<FalsifierPolicyDecisionConflictException> {
+            repository.findFalsifierPolicyDecision(request.decision.intentId).getOrThrow()
+        }
         Unit
     }
 

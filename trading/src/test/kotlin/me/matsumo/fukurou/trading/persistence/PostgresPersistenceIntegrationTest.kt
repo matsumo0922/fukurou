@@ -1013,6 +1013,9 @@ class PostgresPersistenceIntegrationTest {
         assertFailsWith<FalsifierPolicyDecisionConflictException> {
             repository.recordFalsifierPolicyDecision(missingSide).getOrThrow()
         }
+        assertFailsWith<FalsifierPolicyDecisionConflictException> {
+            repository.findFalsifierPolicyDecision(missingSide.decision.intentId).getOrThrow()
+        }
     }
 
     @Test

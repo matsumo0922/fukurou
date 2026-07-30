@@ -140,7 +140,12 @@ class InMemoryFalsifierPolicyDecisionRepository : FalsifierPolicyDecisionReposit
     }
 
     override suspend fun findFalsifierPolicyDecision(intentId: UUID): Result<FalsifierPolicyDecision?> = runCatching {
-        mutex.withLock { decisionsByIntent[intentId] }
+        mutex.withLock {
+            val decision = decisionsByIntent[intentId] ?: return@withLock null
+            val event = eventsById[decision.decisionId]
+
+            readExistingOrConflict(decision, decision, event)
+        }
     }
 
     /** test 用の片側 legacy state を投入する。 */

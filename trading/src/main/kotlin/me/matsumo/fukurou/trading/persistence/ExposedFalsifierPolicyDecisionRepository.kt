@@ -45,7 +45,15 @@ class ExposedFalsifierPolicyDecisionRepository(
     }
 
     override suspend fun findFalsifierPolicyDecision(intentId: UUID): Result<FalsifierPolicyDecision?> = withContext(Dispatchers.IO) {
-        runCatching { exposedTransaction(database) { selectDecisionByIntent(intentId) } }
+        runCatching {
+            exposedTransaction(database) {
+                val decision = selectDecisionByIntent(intentId) ?: return@exposedTransaction null
+                val byId = selectDecisionById(decision.decisionId)
+                val event = selectPolicyEvent(decision.decisionId)
+
+                exactReadbackOrConflict(decision, decision, byId, event)
+            }
+        }
     }
 
     private fun JdbcTransaction.recordOrReadback(request: FalsifierPolicyDecisionRequest): FalsifierPolicyDecision {
