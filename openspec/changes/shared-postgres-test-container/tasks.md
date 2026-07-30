@@ -44,28 +44,30 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 
 対応する受け入れ条件: 「container 起動回数が per-test から共有に変わり、220 回から大幅に減っている」「共有化後も 220 テストが個別に pass し、テスト間でデータが漏れないことを確認できる」「`make test` の所要時間を変更前後で計測し、記録する」
 
-- [ ] 変更前の `make test` 所要時間を計測して記録する
-- [ ] container を test class 単位で 1 個共有する構造に変える
-- [ ] `runPostgresTest` を database per test に変える
-  - [ ] test ごとに一意名の database を `CREATE DATABASE` する
-  - [ ] その database を指す JDBC URL で base DataSource を作る
-  - [ ] test 終了時に `DROP DATABASE <name> WITH (FORCE)` で破棄する（残存接続を強制切断する。`TradingRuntimeFactory.postgres()` が所有する pool は test から close できず、`runtime.close()` が `finally` 外にある箇所が 7 件あるため）
-  - [ ] `DROP DATABASE` を実行する admin 接続は対象 database 以外へ接続し、autocommit で実行する
-- [ ] `PostgresTestContext` に test database の JDBC URL を保持させ、補助 factory を全て切り替える（**最重要チェックポイント**）
-  - [ ] `createDataSource(connectionInitSql)`（`:11414-11416`）
-  - [ ] `createDeadlineDataSource()`（`:11418-11424`）
-  - [ ] `createRecoveryCommitFaultDataSource()`（`:11426-11442`）
-  - [ ] `tradingDatabaseConfig()`（`:11448-11453`）
-  - [ ] test 本体に `container.jdbcUrl` の直接参照が残っていないことを grep で確認する
-- [ ] `bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite`（`:5230`）を専用 container で実行する経路に分離する（`ALTER SYSTEM` と `container.logs` 依存のため）
-- [ ] 220 テスト全件の pass を確認する
-- [ ] cleanup が実際に行われたことを確認する（「220 個の database を作って 1 つも DROP しない」実装でも全件 pass するため、pass だけでは cleanup の証拠にならない）
-  - [ ] class 終了時点で container 上に test database が残っていないことを確認する
-  - [ ] `DROP DATABASE` が例外を投げずに完了することを確認する
-  - [ ] テストが例外で中断した場合も database が破棄されることを確認する（意図的に失敗させる一時テストか、helper の単体検証で確認する）
-- [ ] 変更後の `make test` 所要時間を計測し、変更前と比較して記録する
-- [ ] container 起動回数が 220 → 2 になったことを確認する
-- [ ] full validation を実行する
+- [x] 変更前の `make test` 所要時間を計測して記録する（CI `Verify JVM tests`: PR1 14m2s / PR2 14m16s。ローカル full validation 5m35s）
+- [x] container を test class 単位で 1 個共有する構造に変える
+- [x] `runPostgresTest` を database per test に変える
+  - [x] test ごとに一意名の database を `CREATE DATABASE` する
+  - [x] その database を指す JDBC URL で base DataSource を作る
+  - [x] test 終了時に `DROP DATABASE <name> WITH (FORCE)` で破棄する（残存接続を強制切断する。`TradingRuntimeFactory.postgres()` が所有する pool は test から close できず、`runtime.close()` が `finally` 外にある箇所が 7 件あるため）
+  - [x] `DROP DATABASE` を実行する admin 接続は対象 database 以外へ接続し、autocommit で実行する
+- [x] `PostgresTestContext` に test database の JDBC URL を保持させ、補助 factory を全て切り替える（**最重要チェックポイント**）
+  - [x] `createDataSource(connectionInitSql)`（`:11414-11416`）
+  - [x] `createDeadlineDataSource()`（`:11418-11424`）
+  - [x] `createRecoveryCommitFaultDataSource()`（`:11426-11442`）
+  - [x] `tradingDatabaseConfig()`（`:11448-11453`）
+  - [x] test 本体に `container.jdbcUrl` の直接参照が残っていないことを grep で確認する
+- [x] `bootstrap_addsNullableClaimColumnsWithoutBackfillOrTableRewrite`（`:5230`）を専用 container で実行する経路に分離する（`ALTER SYSTEM` と `container.logs` 依存のため）
+- [x] 220 テスト全件の pass を確認する
+- [x] cleanup が実際に行われたことを確認する（「220 個の database を作って 1 つも DROP しない」実装でも全件 pass するため、pass だけでは cleanup の証拠にならない）
+  - [x] class 終了時点で container 上に test database が残っていないことを確認する（`listTestDatabases()` で検証）
+  - [x] `DROP DATABASE` が例外を投げずに完了することを確認する
+  - [x] テストが例外で中断した場合も database が破棄されることを確認する（`SharedTestPostgresTest` の `databaseIsDroppedEvenWhenTheLeaseBodyThrows` / `databaseIsDroppedWhileAConnectionIsStillOpen`）
+- [x] 共有 container を shutdown hook で停止する（ryuk 無効環境で container が残らないようにする）
+- [x] 共有 container 基盤の契約テストを追加する（`SharedTestPostgresTest` 6 本）
+- [x] 変更後の `make test` 所要時間を計測し、変更前と比較して記録する（ローカル full validation 5m35s → 2m27s。CI は PR 作成後に計測）
+- [x] container 起動回数が 220 → 2 になったことを確認する（`docker events` で create を直接計数: postgres:16-alpine 2 件 + ryuk 1 件）
+- [x] full validation を実行する
 
 ## PR4: replay 系 3 ファイルの container 共有化
 
@@ -81,6 +83,6 @@ stacked PR で 4 段に分ける。各段は前段の reviewer approve を待っ
 
 ## 全 PR 共通の確認
 
-- [ ] `admissionHealthIsolationRegressionTest` 2 タスクが従来どおり pass する
-- [ ] production コード（`src/main` 配下）に変更が無い
-- [ ] worktree を 2 つ以上並べて同時に `make test` を実行し、Docker 資源競合で落ちないことを確認する（PR3 完了後）
+- [x] `admissionHealthIsolationRegressionTest` 2 タスクが従来どおり pass する
+- [x] production コード（`src/main` 配下）に変更が無い
+- [x] worktree を 2 つ以上並べて同時に `make test` を実行し、Docker 資源競合で落ちないことを確認する（両 worktree で BUILD SUCCESSFUL / 1,596 tests / failures 0。所要 4m23s と 4m18s。lease による直列化を意図的に外して実行）
