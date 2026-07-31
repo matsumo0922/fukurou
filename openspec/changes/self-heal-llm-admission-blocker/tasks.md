@@ -16,7 +16,7 @@
 - [ ] 3.1 `LlmExecutionRecoveryService.tick()` 冒頭に bounded batch + cursor の自動解除 step を実装する（monotonic quiet period 判定、`Resolved` のときだけ in-memory 解除）
 - [ ] 3.2 tick deadline から handoff reserve を引いた sub-deadline を作り、候補の repository call へはそれを渡す。件数上限と sub-deadline 枯渇の両方で正常打ち切りする（打ち切りは failure にしない）
 - [ ] 3.3 cursor を候補ごとに前進させる（失敗した候補も含む）
-- [ ] 3.4 解除 step の候補失敗と deadline 超過を tick の failure として伝播させる
+- [ ] 3.4 failure を分類する: sub-deadline 由来の時間切れは正常 handoff（cursor 前進 + scan へ進む）、budget が残る状態での lookup / audit / identity 不一致は cursor 前進のうえ tick failure として伝播
 
 ## 4. 回帰テスト
 
@@ -27,7 +27,7 @@
 - [ ] 4.5 unit テスト: batch limit を超える retained blocker があっても後続の解除可能 blocker が有限 tick 数で解除される
 - [ ] 4.6 unit テスト: audit commit 済みで caller が failure を観測した後、次 tick が readback で `Resolved` に到達し audit が重複しない
 - [ ] 4.7 unit テスト: 先頭候補が毎回失敗しても cursor が前進し、後続の解除可能 blocker が有限 tick 数で解除される
-- [ ] 4.8 unit テスト: 候補評価が遅い場合、sub-deadline で正常打ち切りして stale-claim scan が start reserve 内で開始できる（候補の DB call が sub-deadline で bound される）
+- [ ] 4.8 unit テスト: 候補評価が遅い場合、sub-deadline 到達で正常 handoff して同じ tick で stale-claim scan が start reserve 内に開始でき、tick が failure にならない
 - [ ] 4.9 unit テスト: 同一 invocationId で claimant token 違いの blocker が 2 つあるとき、片方の audit を他方が自分のものと誤認せず failure になる
 - [ ] 4.10 production call path テスト: `LlmExecutionRecoveryWorker` を application と同じ配線で起動し、blocker 登録 → 終端 → 自動解除 → readiness 復帰を確認する
 

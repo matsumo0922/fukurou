@@ -80,13 +80,18 @@ tick 先頭に置く理由は、既存の scan 本体が例外を投げた場合
 - 評価済みの候補数が `ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT`（既定 20）に達した
 - sub-deadline の残りが候補 1 件を開始するための reserve を下回った
 
-打ち切りは failure ではない。sub-deadline 到達による打ち切りは正常 handoff として扱い、lookup / audit の failure とは区別する。
+打ち切りは failure ではない。sub-deadline 由来の時間切れは正常 handoff として扱い、それ以外の failure とは区別する。分類は次のとおり。
+
+- **正常 handoff**（tick を failure にしない）: 次候補を開始する前に sub-deadline の reserve が尽きている場合と、進行中の候補が sub-deadline 由来の時間切れ（`LlmExecutionRecoveryDeadlineExceededException`、sub-deadline から算出した statement / network timeout）で終わった場合。cursor をその候補まで進め、残しておいた handoff reserve を使って stale-claim scan へ進む
+- **tick failure**（伝播させる）: sub-deadline に余裕がある状態で起きた lookup 失敗、audit 失敗、readback の identity 不一致。cursor を進めたうえで failure を伝播する
+
+この区別が要る理由は、sub-deadline を設けた目的が「候補評価が遅くても同じ tick で scan を走らせる」ことだからである。sub-deadline 到達を tick failure にしてしまうと、reserve を残した意味がなくなり、遅い候補があるたびに scan が skip されて `recoveryScanHealthy` が復帰しない。
 
 件数だけを上限にすると、1 候補あたりの DB 応答が遅い環境（20 件 × 225 ms ≒ 4.5 秒）で scan 本体の start reserve を食い潰し、stale-claim scan が永久に成功しなくなる。これは #350 と同型の恒久 fail-closed である。
 
 さらに、開始前の残時間チェックだけでも足りない。`prepareRecoveryStatement` は渡された deadline の残りいっぱいまで statement / network timeout を張るので、tick deadline をそのまま渡すと「残り 2,501 ms で候補を開始 → その候補が 2,000 ms 消費 → 残り 501 ms で handoff → scan の 750 ms start reserve を満たせず失敗」という系列が成立してしまう。sub-deadline を渡して statement 側の上限そのものを handoff 境界で切ることで、進行中の候補が reserve を侵食できないようにする。
 
-個々の候補の failure（deadline 超過、audit 失敗、lookup 失敗）は tick 全体の failure として伝播させる。部分成功を隠さない。次 tick が新しい budget で再試行する。
+上の分類で tick failure に当たるものは伝播させる。部分成功を隠さない。次 tick が新しい budget で再試行する。
 
 ### D4b: cursor は候補ごとに前進させる
 

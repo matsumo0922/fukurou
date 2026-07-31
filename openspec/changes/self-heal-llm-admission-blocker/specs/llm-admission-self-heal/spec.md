@@ -51,7 +51,7 @@ The quiet period SHALL be measured from a monotonic clock reading captured when 
 ### Requirement: Blocker evaluation is bounded and starvation-free
 **Trace:** Issue #350 受け入れ条件「回帰テスト 1 本」（自己回復が実際に完了すること）
 
-Each tick SHALL stop evaluating blockers when either a fixed candidate count is reached or a dedicated evaluation sub-deadline is exhausted, whichever comes first. The sub-deadline SHALL end earlier than the tick deadline by at least the reserve the stale-claim scan needs to start, and every database call made while evaluating a candidate SHALL be bounded by that sub-deadline rather than the tick deadline, so that an in-progress candidate cannot consume the scan's reserve. Reaching either limit SHALL be a normal handoff to the stale-claim scan, not a tick failure, and SHALL be distinguishable from a lookup or audit failure. A count limit alone SHALL NOT be treated as sufficient, because slow per-candidate database responses would otherwise consume the scan's budget.
+Each tick SHALL stop evaluating blockers when either a fixed candidate count is reached or a dedicated evaluation sub-deadline is exhausted, whichever comes first. The sub-deadline SHALL end earlier than the tick deadline by at least the reserve the stale-claim scan needs to start, and every database call made while evaluating a candidate SHALL be bounded by that sub-deadline rather than the tick deadline, so that an in-progress candidate cannot consume the scan's reserve. Reaching either limit SHALL be a normal handoff to the stale-claim scan, not a tick failure. A candidate that ends because the evaluation sub-deadline expired SHALL also be treated as a normal handoff, whereas a lookup failure, an audit failure, or an identity mismatch occurring while sub-deadline budget remained SHALL be propagated as a tick failure. In both cases the cursor SHALL advance past the candidate. A count limit alone SHALL NOT be treated as sufficient, because slow per-candidate database responses would otherwise consume the scan's budget.
 
 Evaluation SHALL advance through the registry in a stable order using a cursor that resumes from the previous tick's position. The cursor SHALL advance past each evaluated candidate, including candidates whose evaluation failed, so that a repeatedly failing candidate cannot prevent later candidates from ever being evaluated.
 
@@ -73,6 +73,14 @@ Evaluation SHALL advance through the registry in a stable order using a cursor t
 - **GIVEN** a candidate whose database call does not return before the evaluation sub-deadline
 - **WHEN** the call is bounded by that sub-deadline
 - **THEN** the remaining tick budget still covers the stale-claim scan's start reserve
+- **AND** the tick proceeds to the stale-claim scan in the same tick rather than failing
+
+#### Scenario: A candidate fails while budget remained
+
+- **GIVEN** a candidate whose lookup, audit, or identity readback fails while evaluation sub-deadline budget remained
+- **WHEN** the tick evaluates it
+- **THEN** the cursor advances past the candidate
+- **AND** the tick reports the failure
 
 #### Scenario: A candidate fails on every evaluation
 
