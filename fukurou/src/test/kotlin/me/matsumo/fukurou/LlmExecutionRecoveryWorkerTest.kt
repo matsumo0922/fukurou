@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -14,10 +15,20 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
 import me.matsumo.fukurou.trading.risk.InMemoryRiskStateRepository
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import java.time.Clock
 import java.time.Duration
+import java.time.Instant
+import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertFailsWith
@@ -26,6 +37,16 @@ import kotlin.test.assertTrue
 
 /** startup recovery audit の secret-free policy snapshot を検証する。 */
 class LlmExecutionRecoveryWorkerTest {
+    @BeforeTest
+    fun setUp() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDown() {
+        resetAdmissionHealthForTest()
+    }
+
     @Test
     fun close_waitsForInFlightAuditCancellation() = runBlocking {
         val appendEntered = CompletableDeferred<Unit>()
@@ -86,6 +107,65 @@ class LlmExecutionRecoveryWorkerTest {
         assertContains(payload, "\"persistenceTerminalTimeoutSeconds\":10")
         assertFalse(payload.contains("password", ignoreCase = true))
         assertFalse(payload.contains("token", ignoreCase = true))
+    }
+
+    @Test
+    fun start_clearsTerminalConfirmedBlockerThroughTheProductionWorkerPath() = runBlocking {
+        val policy = OneShotExecutionPolicy.from(LlmRunnerConfig())
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val reservedAt = Instant.parse("2026-01-01T00:00:00Z")
+        val invocationId = "worker-path-terminal"
+        val claimantToken = "worker-path-token"
+
+        repository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                triggerKey = invocationId,
+                reservedAt = reservedAt,
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofDays(1),
+                activeReservationStaleAfter = Duration.ofMinutes(10),
+            ),
+        ).getOrThrow()
+        repository.claimForExecution(
+            LlmExecutionClaimRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                claimantToken = claimantToken,
+                claimedAt = reservedAt,
+            ),
+        )
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = invocationId,
+                status = LlmLaunchReservationStatus.FAILED,
+                reason = "worker_path_uncertain_terminal",
+                finishedAt = reservedAt,
+                claimantToken = claimantToken,
+            ),
+        ).getOrThrow()
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+
+        val observedAt = reservedAt.plus(policy.hardTimeout).plus(policy.processTerminationGrace).plusSeconds(1)
+        val worker = LlmExecutionRecoveryWorker(
+            repository = repository,
+            commandEventLog = InMemoryCommandEventLog(),
+            policy = policy,
+            clock = Clock.fixed(observedAt, ZoneOffset.UTC),
+            interval = Duration.ofMillis(10),
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        ).start()
+
+        try {
+            withTimeout(5_000) {
+                while (!LlmExecutionAdmissionHealth.isHealthy()) delay(10)
+            }
+        } finally {
+            worker.close()
+        }
     }
 }
 

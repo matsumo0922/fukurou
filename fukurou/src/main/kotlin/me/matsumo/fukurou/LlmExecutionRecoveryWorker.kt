@@ -22,6 +22,7 @@ import me.matsumo.fukurou.trading.audit.CommandEventLog
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.runner.EXECUTION_RECOVERY_TOOL_NAME
 import me.matsumo.fukurou.trading.runner.LlmExecutionRecoveryService
 import me.matsumo.fukurou.trading.runner.OneShotExecutionPolicy
 import java.time.Clock
@@ -44,6 +45,7 @@ class LlmExecutionRecoveryWorker(
         repository = repository,
         policy = policy,
         clock = clock,
+        commandEventLog = commandEventLog,
         availableStaleAfter = availableStaleAfter,
     )
     private var job: Job? = null
@@ -99,7 +101,7 @@ class LlmExecutionRecoveryWorker(
     private suspend fun appendStartupAudit() {
         commandEventLog.append(
             CommandEvent(
-                toolName = RECOVERY_TOOL_NAME,
+                toolName = EXECUTION_RECOVERY_TOOL_NAME,
                 toolCallId = null,
                 clientRequestId = null,
                 eventType = CommandEventType.LLM_EXECUTION_RECOVERY_STARTED,
@@ -151,6 +153,5 @@ private fun startupPhasePayload(policy: OneShotExecutionPolicy) = buildJsonArray
     }
 }
 
-private const val RECOVERY_TOOL_NAME = "llm_execution_recovery"
 private val RECOVERY_WORKER_TERMINATION_TIMEOUT: Duration = Duration.ofSeconds(6)
 private val RECOVERY_WORKER_LOGGER = Logger.getLogger(LlmExecutionRecoveryWorker::class.java.name)

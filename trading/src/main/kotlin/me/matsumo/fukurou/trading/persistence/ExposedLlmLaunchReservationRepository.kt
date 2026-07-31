@@ -154,7 +154,7 @@ private const val CLAIM_LLM_LAUNCH_RESERVATION_SQL = """
 /** claim rejection / reconciliation 用 snapshot SQL。 */
 private const val SELECT_LLM_EXECUTION_CLAIM_SQL = """
     SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
-        execution_claimed_at, execution_claim_heartbeat_at, reserved_at
+        execution_claimed_at, execution_claim_heartbeat_at, reserved_at, finished_at
     FROM llm_launch_reservations
     WHERE invocation_id = ?
 """
@@ -163,7 +163,7 @@ private const val SELECT_LLM_EXECUTION_CLAIM_SQL = """
 private const val SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL = """
     WITH candidates AS (
         SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
-            execution_claimed_at, execution_claim_heartbeat_at, reserved_at,
+            execution_claimed_at, execution_claim_heartbeat_at, reserved_at, finished_at,
             COALESCE(execution_claim_heartbeat_at, execution_claimed_at) AS sort_heartbeat_at,
             execution_claimed_at AS sort_claimed_at
         FROM llm_launch_reservations
@@ -173,7 +173,7 @@ private const val SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL = """
             AND COALESCE(execution_claim_heartbeat_at, execution_claimed_at) <= ?
         UNION ALL
         SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
-            execution_claimed_at, execution_claim_heartbeat_at, reserved_at,
+            execution_claimed_at, execution_claim_heartbeat_at, reserved_at, finished_at,
             reserved_at AS sort_heartbeat_at, reserved_at AS sort_claimed_at
         FROM llm_launch_reservations
         WHERE status = 'RUNNING'
@@ -181,7 +181,7 @@ private const val SELECT_STALE_LLM_EXECUTION_CLAIMS_SQL = """
             AND reserved_at <= ?
     )
     SELECT invocation_id, trigger_kind, status, execution_claim_state, execution_claim_token,
-        execution_claimed_at, execution_claim_heartbeat_at, reserved_at
+        execution_claimed_at, execution_claim_heartbeat_at, reserved_at, finished_at
     FROM candidates
     WHERE ? OR (sort_heartbeat_at, sort_claimed_at, invocation_id) > (?, ?, ?)
     ORDER BY sort_heartbeat_at ASC, sort_claimed_at ASC, invocation_id ASC
@@ -967,6 +967,7 @@ private fun java.sql.ResultSet.toExecutionClaimSnapshot(): LlmExecutionClaimSnap
         claimedAt = getLong("execution_claimed_at").takeUnless { wasNull() }?.let(Instant::ofEpochMilli),
         heartbeatAt = getLong("execution_claim_heartbeat_at").takeUnless { wasNull() }?.let(Instant::ofEpochMilli),
         reservedAt = Instant.ofEpochMilli(getLong("reserved_at")),
+        finishedAt = getLong("finished_at").takeUnless { wasNull() }?.let(Instant::ofEpochMilli),
     )
 }
 

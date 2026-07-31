@@ -67,6 +67,17 @@ object LlmExecutionAdmissionHealth {
         admissionLock.write { recoveryBlockers -= ClaimHealthKey(invocationId, claimantToken) }
     }
 
+    /**
+     * terminal 照合の対象になる unresolved blocker を snapshot として返す。
+     *
+     * 呼び出し側の iterate 中に registry が変化しないよう、lock 内でコピーを作る。
+     */
+    fun unresolvedBlockers(): Set<LlmExecutionAdmissionBlocker> = admissionLock.read {
+        (recoveryBlockers + heartbeatFailures).mapTo(mutableSetOf()) { key ->
+            LlmExecutionAdmissionBlocker(key.invocationId, key.claimantToken)
+        }
+    }
+
     /** terminal confirmation 後に同じ claim token の全 blocker を解除する。 */
     fun resolveClaim(invocationId: String, claimantToken: String) {
         val key = ClaimHealthKey(invocationId, claimantToken)
@@ -94,6 +105,17 @@ object LlmExecutionAdmissionHealth {
         recoveryBlockers.isEmpty() &&
         heartbeatFailures.isEmpty()
 }
+
+/**
+ * DB terminal 照合の対象になる admission blocker の識別子。
+ *
+ * @param invocationId blocker が指す LLM 起動 ID
+ * @param claimantToken blocker 登録時の claimant token
+ */
+data class LlmExecutionAdmissionBlocker(
+    val invocationId: String,
+    val claimantToken: String,
+)
 
 private data class ClaimHealthKey(val invocationId: String, val claimantToken: String)
 private const val UNKNOWN_TOKEN = "<unknown>"

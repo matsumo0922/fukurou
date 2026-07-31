@@ -14,6 +14,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
+import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionBlocker
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
@@ -164,6 +170,7 @@ class LlmExecutionRecoveryService(
     private val repository: LlmLaunchReservationRepository,
     private val policy: OneShotExecutionPolicy,
     private val clock: Clock,
+    private val commandEventLog: CommandEventLog,
     private val availableStaleAfter: Duration = Duration.ofMinutes(30),
     private val nanoTime: () -> Long = System::nanoTime,
 ) {
@@ -187,6 +194,8 @@ class LlmExecutionRecoveryService(
         requireRecoveryStartReserve(deadline)
 
         var recoveredCount = reconcilePendingRecoveries(deadline)
+
+        resolveTerminalConfirmedBlockers(deadline)
 
         val now = clock.instant()
         val hardDeadlineCutoff = now.minus(policy.hardTimeout).minus(policy.processTerminationGrace)
@@ -293,6 +302,73 @@ class LlmExecutionRecoveryService(
         deadline.requireStartReserve(nanoTime, EXECUTION_RECOVERY_START_RESERVE_MILLIS)
     }
 
+    /**
+     * DB 終端が確認できた blocker を解除する。
+     *
+     * stale scan は RUNNING 行しか候補にしないため、reservation が terminal になった後の blocker は
+     * この pass だけが解除できる。判断根拠は DB の終端事実に限り、推測では解除しない。
+     */
+    private suspend fun resolveTerminalConfirmedBlockers(deadline: LlmExecutionRecoveryDeadline) {
+        val blockers = LlmExecutionAdmissionHealth.unresolvedBlockers()
+        if (blockers.isEmpty()) return
+
+        val clearanceWindow = policy.hardTimeout.plus(policy.processTerminationGrace)
+
+        blockers.forEach { blocker ->
+            requireRecoveryStartReserve(deadline)
+
+            val snapshot = repository.findExecutionClaim(blocker.invocationId).getOrElse { throwable ->
+                LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+                throw throwable
+            } ?: return@forEach
+
+            val now = clock.instant()
+            if (!snapshot.isBlockerClearedBy(blocker.claimantToken, clearanceWindow, now)) return@forEach
+
+            val finishedAt = requireNotNull(snapshot.finishedAt)
+            appendBlockerResolvedAudit(
+                blocker = blocker,
+                status = snapshot.status,
+                finishedAt = finishedAt,
+                resolvedAt = now,
+                clearanceWindow = clearanceWindow,
+            )
+
+            // fence registry は触らない。admission health は fence を見ないため解除に不要で、fence を持つ claim は
+            // stale scan の正規経路が claim transition lock の内側で解除する。
+            LlmExecutionAdmissionHealth.resolveClaim(blocker.invocationId, blocker.claimantToken)
+        }
+    }
+
+    private suspend fun appendBlockerResolvedAudit(
+        blocker: LlmExecutionAdmissionBlocker,
+        status: LlmLaunchReservationStatus,
+        finishedAt: java.time.Instant,
+        resolvedAt: java.time.Instant,
+        clearanceWindow: Duration,
+    ) {
+        commandEventLog.append(
+            CommandEvent(
+                toolName = EXECUTION_RECOVERY_TOOL_NAME,
+                toolCallId = null,
+                clientRequestId = null,
+                eventType = CommandEventType.LLM_EXECUTION_ADMISSION_BLOCKER_RESOLVED,
+                payload = buildJsonObject {
+                    put("invocationId", blocker.invocationId)
+                    put("claimantToken", blocker.claimantToken)
+                    put("reservationStatus", status.name)
+                    put("finishedAt", finishedAt.toString())
+                    put("resolvedAt", resolvedAt.toString())
+                    put("clearanceWindowSeconds", clearanceWindow.seconds)
+                }.toString(),
+                occurredAt = resolvedAt,
+            ),
+        ).getOrElse { throwable ->
+            LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+            throw throwable
+        }
+    }
+
     private fun toRecoveryRequestOrNull(
         candidate: LlmExecutionClaimSnapshot,
         now: java.time.Instant,
@@ -373,6 +449,30 @@ class LlmExecutionRecoveryService(
             claimantToken = candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN,
         )
     }
+}
+
+/**
+ * blocker を解除できる DB 終端事実が揃っているか判定する。
+ *
+ * clearance window は UNCERTAIN 終端が残す遅延 fork の生存上限に対応する。fork した child がどの phase の
+ * ものかは blocker から判別できないため、invocation 全体の上限である hardTimeout で保守的に見る。
+ */
+private fun LlmExecutionClaimSnapshot.isBlockerClearedBy(
+    blockerToken: String,
+    clearanceWindow: Duration,
+    now: java.time.Instant,
+): Boolean {
+    val isTerminal = when (status) {
+        LlmLaunchReservationStatus.FINISHED,
+        LlmLaunchReservationStatus.FAILED,
+        -> true
+        LlmLaunchReservationStatus.RUNNING -> false
+    }
+    val terminalFinishedAt = finishedAt ?: return false
+    val tokenMatches = (claimantToken ?: MISSING_CLAIMANT_TOKEN) == blockerToken
+    val clearanceElapsed = !now.isBefore(terminalFinishedAt.plus(clearanceWindow))
+
+    return isTerminal && tokenMatches && clearanceElapsed
 }
 
 private data class PendingExecutionRecovery(
@@ -487,6 +587,9 @@ const val STALE_AVAILABLE_RESERVATION_RECOVERED = "launch_reservation_available_
 
 /** fenced stale CLAIMED reservation の recovery reason。 */
 const val STALE_CLAIMED_RESERVATION_RECOVERED = "launch_reservation_claimed_stale_recovered"
+
+/** execution recovery が command_event_log に残す tool 論理名。 */
+const val EXECUTION_RECOVERY_TOOL_NAME = "llm_execution_recovery"
 
 private const val EXECUTION_RECOVERY_SCAN_LIMIT = 100
 internal const val MISSING_CLAIMANT_TOKEN = "<missing-claimant-token>"
