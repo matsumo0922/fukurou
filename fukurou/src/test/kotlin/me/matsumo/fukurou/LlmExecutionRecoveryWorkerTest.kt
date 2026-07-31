@@ -27,6 +27,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertFailsWith
@@ -35,6 +37,16 @@ import kotlin.test.assertTrue
 
 /** startup recovery audit の secret-free policy snapshot を検証する。 */
 class LlmExecutionRecoveryWorkerTest {
+    @BeforeTest
+    fun setUp() {
+        resetAdmissionHealthForTest()
+    }
+
+    @AfterTest
+    fun tearDown() {
+        resetAdmissionHealthForTest()
+    }
+
     @Test
     fun close_waitsForInFlightAuditCancellation() = runBlocking {
         val appendEntered = CompletableDeferred<Unit>()
@@ -99,7 +111,6 @@ class LlmExecutionRecoveryWorkerTest {
 
     @Test
     fun start_clearsTerminalConfirmedBlockerThroughTheProductionWorkerPath() = runBlocking {
-        resetAdmissionHealthForTest()
         val policy = OneShotExecutionPolicy.from(LlmRunnerConfig())
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         val reservedAt = Instant.parse("2026-01-01T00:00:00Z")
@@ -154,7 +165,6 @@ class LlmExecutionRecoveryWorkerTest {
             }
         } finally {
             worker.close()
-            resetAdmissionHealthForTest()
         }
     }
 }
