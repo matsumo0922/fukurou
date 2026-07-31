@@ -6,7 +6,7 @@ fail-closed 自体は正しい。生死不明の CLI が注文を出しうる間
 
 ## What Changes
 
-- recovery scan の各 tick に、in-memory blocker を DB 終端事実に照合する pass を追加する。blocker が指す reservation が terminal（`FINISHED` / `FAILED`）かつ `finished_at + hardTimeout + processTerminationGrace` を超過している場合にだけ解除する
+- recovery scan の各 tick に、in-memory blocker を DB 終端事実に照合する pass を追加する。blocker が指す reservation が terminal（`FINISHED` / `FAILED`）かつ `finished_at + hardTimeout + processTerminationGrace`（既定値で 580 秒）を超過している場合にだけ解除する
 - 解除は blocker の claimant token が DB の `execution_claim_token` と厳密一致する場合に限る。`ReflectionTerminalPersistenceSupervisor` の合成 token（`reflection-terminal:<id>`）は DB token と一致しないため、この経路の対象外となり自前の retry loop に残る
 - 解除時に `command_event_log` へ監査イベント 1 件を残す（新 `CommandEventType`）
 - `LlmExecutionClaimSnapshot` に `finishedAt` を additive に追加する。既存の判定・比較ロジックの意味は変えない
@@ -49,3 +49,4 @@ human-authored diff は約 300 行の見積りで、1 PR で収まる。分割�
 | codex CLI timeout 自体の解消 | scope 外（issue 記載） |
 | fail-closed 機構の撤去・緩和 | scope 外（issue 記載） |
 | blocker の永続化・分散対応 | scope 外（issue 記載） |
+| MCP tool-call 経路への admission gate 追加 | scope 外（follow-up issue）。反証ゲートで既存の欠落として発見した。別 process への状態伝播という新機構を要し、受け入れ条件に紐付かない |

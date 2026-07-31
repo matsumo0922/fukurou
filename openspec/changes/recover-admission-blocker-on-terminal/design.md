@@ -54,9 +54,11 @@
 - **token 厳密一致**: blocker の `claimantToken` が `snapshot.claimantToken` と一致する。`MISSING_CLAIMANT_TOKEN` の blocker は `snapshot.claimantToken == null` の場合に対応させる
 - **窓超過**: `now >= snapshot.finishedAt + policy.hardTimeout + policy.processTerminationGrace`
 
-窓の根拠は UNCERTAIN の意味そのものである。`docs/mcp-runtime.md` が書くとおり、UNCERTAIN は「`/proc` 走査完了後に発生し得る遅延 fork を排除できない」状態を指す。そこで fork された child が生きうる上限は、その child が LLM CLI として持つ実行時間上限、すなわち `hardTimeout` である。加えて termination grace を足す。
+窓の根拠は UNCERTAIN の意味そのものである。`docs/mcp-runtime.md` が書くとおり、UNCERTAIN は「`/proc` 走査完了後に発生し得る遅延 fork を排除できない」状態を指す。そこで fork された child が生きうる上限として、その invocation 全体に許された実行時間の上限、すなわち `hardTimeout` を採る。加えて termination grace を足す。
 
-実障害の数値では 190 秒 + 10 秒 = 約 200 秒後に解除され、recovery tick 間隔（`heartbeatInterval`）を含めても停止は約 4 分に収まる。2 時間 15 分との差が修正の効果である。
+`hardTimeout` は `OneShotExecutionPolicy.from()` が `perRunTimeout × 3`（claimed one-shot の 3 phase 分）に `finalizationGrace`（`processTerminationGrace × 2 + persistenceTerminalTimeout`）を足した値である。既定値（`perRunTimeout` 180 秒 / `processTerminationGrace` 10 秒 / `persistenceTerminalTimeout` 10 秒）では 570 秒になる。したがって窓は 570 + 10 = 580 秒（約 9.7 分）で、recovery tick 間隔を含めた復旧は 10 分程度に収まる。実障害の 2 時間 15 分との差が修正の効果である。
+
+なお 1 phase の CLI 呼び出し上限は `phaseTimeout` = `perRunTimeout`（既定 180 秒）で、実障害の codex timeout 190 秒はこの値に対応する。窓に `phaseTimeout` ではなく `hardTimeout` を採るのは、遅延 fork が「どの phase の child か」を blocker から判別できず、invocation 全体の上限で保守的に見る必要があるためである。
 
 代替案として `grace` のみ（約 10 秒）を検討したが、遅延 fork child の生存窓と重なる時間帯に admission を開けることになり、5 不変条件の「生死不明の CLI が注文を出しうる間は止める」という設計意図を崩す。逆に窓を 2 倍で取る案は、数値の根拠が「念のため」になり説明がつかない。
 
@@ -123,7 +125,15 @@ read-only であり、`test-admission-health-isolation` spec が禁じる「runt
 
 ## Risks / Trade-offs
 
-**[遅延 fork child が hardTimeout を超えて生存する] → 未解決の残存リスクとして受け入れる。** `hardTimeout` は LLM CLI 呼び出しの実行時間上限であり、fork された child がこれを超えて生き続ける状況は、CLI 側が上限を無視した場合に限られる。この場合は blocker 解除後に child が注文を出しうる。ただし child が注文を出すには MCP gateway 経由の claim validation を通る必要があり、そこは reservation が terminal であることを理由に既に拒否する（`validateExecutionAdmission` が `status != RUNNING` で false を返す）。fail-closed の二重化がここで効く。
+**[遅延 fork child が hardTimeout を超えて生存する] → 未解決の残存リスクとして受け入れる。** `hardTimeout` は invocation 全体に許された実行時間の上限であり、fork された child がこれを超えて生き続ける状況は、CLI 側が上限を無視した場合に限られる。
+
+この残存リスクの評価にあたり、当初この設計は「child が注文を出すには MCP gateway 経由の claim validation を通るので二重に守られる」と記述していたが、これは**誤りであり撤回する**（反証ゲートで指摘された）。MCP module（`mcp/` / `mcp-core/` / `mcp-gmo-coin/`）には `validateExecutionAdmission` も `LlmExecutionAdmissionHealth` への参照も存在しない。`ToolCallGuard` が見るのは `RiskHaltState.HARD_HALT` だけである。さらに MCP server は `:mcp:buildFatJar` の独立 fat jar として stdio server で起動される別 process であり、process-local singleton である `LlmExecutionAdmissionHealth` は原理的に到達しない。
+
+重要なのは、この欠落が blocker の有無と無関係であることである。`LlmExecutionAdmissionHealth.isHealthy()` が gate するのは `withHealthyAdmission {}` の呼び出し元（`tryReserve` / `claimForExecution` / `validateExecutionAdmission` と runner 内の live claim 確認）だけで、いずれも「新規 LLM 起動」と「同一 runner process 内の確認」の経路である。既に走っている child の発注能力は blocker が立っていても止まらない。したがってこの change は既存の欠落を悪化させず、「新規 admission を止め続ける期間」を短縮するだけである。
+
+残存リスクの深刻度を下げる既存の構造として、単独の child は発注を完遂できない。`place_order` は `proposerTools` / `falsifierTools` / `riskReductionTools` のいずれの allowlist にも含まれず（`McpToolContractCatalog.kt:9-22`）、`McpToolCallLimiter` の allowlist フィルタが manifest 記載の tool だけを通す。加えて intent の発行（`submit_decision`、PROPOSER 専用）と承認（`submit_falsification`、FALSIFIER 専用）は別 phase に分離され、1 つの MCP server process は起動時に単一 phase へ bind される。
+
+MCP tool-call 経路への admission gate 追加は、別 process への状態伝播という新しい機構（DB 経由の共有か IPC）を要し、issue #350 の受け入れ条件にも紐付かないため follow-up issue とする。
 
 **[`finished_at` が NULL の terminal 行] → 解除しない。** `finish()` は必ず `finished_at` を set するが、`finishedAt == null` の場合は窓の起点が定まらないため解除条件を満たさないとする。`docker restart` は依然として最後の手段として残る。
 
