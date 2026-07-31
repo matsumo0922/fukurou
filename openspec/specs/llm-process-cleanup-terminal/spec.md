@@ -3,9 +3,7 @@
 ## Purpose
 
 LLM invocation の process cleanup、semantic commit、artifact retention の終端状態を独立して監査可能にする。
-
 ## Requirements
-
 ### Requirement: Started LLM processes receive bounded termination
 Issue #189 orphan-process DoD: The runtime MUST attempt bounded proxy termination and MUST make PID 1 terminate every active provider/MCP job process group before acknowledging launcher cancellation. It MUST NOT report proven provider-tree exit from proxy exit alone.
 
@@ -39,7 +37,7 @@ Issue #189 orphan-process DoD: The runtime MUST attempt bounded proxy terminatio
 
 #### Scenario: Supervisor acknowledgement is absent
 - **WHEN** the proxy is force-killed or exits without the fixed post-cleanup acknowledgement
-- **THEN** audit records process exit as unconfirmed and execution admission remains fail-closed until operator verification or container restart
+- **THEN** audit records process exit as unconfirmed and execution admission remains fail-closed until one of the following occurs: operator verification, container restart, or a recovery scan tick confirming that the invocation's reservation reached a database terminal with a recorded finish time and that the delayed-fork clearance window of hard timeout plus process termination grace has elapsed since that finish time
 
 #### Scenario: Timeout stress uses the candidate runtime image
 - **WHEN** 100 timeout-shaped proxy abandonments run through the candidate image supervisor job table
@@ -105,3 +103,4 @@ Issue #189 session-retention DoD: Provider auth copies, configuration, and sessi
 #### Scenario: Container restarts with quarantined artifacts
 - **WHEN** the application container restarts after operator inspection
 - **THEN** tmpfs destroys both quarantined per-run artifacts and the marker without touching persistent authentication source
+
