@@ -12,7 +12,7 @@ object McpToolContractCatalog {
         "knowledge_get_recent_lessons", "knowledge_search_similar_setups", "submit_decision",
     )
     val falsifierTools = setOf(
-        "get_trade_intent", "preview_order", "get_ticker", "get_candles", "get_orderbook", "get_trades",
+        "get_trade_intent", "get_ticker", "get_candles", "get_orderbook", "get_trades",
         "get_symbol_rules", "calc_indicator", "get_balance", "get_positions", "get_open_orders",
         "get_account_status", "knowledge_get_recent_lessons", "knowledge_search_similar_setups",
         "submit_falsification",
@@ -20,12 +20,13 @@ object McpToolContractCatalog {
     val riskReductionTools = setOf(
         "get_balance", "get_positions", "get_open_orders", "get_account_status", "submit_decision",
     )
+    private val standaloneTools = setOf("preview_order")
     private val requiredToolsByPhase = mapOf(
         LlmInvocationPhase.PROPOSER to setOf("submit_decision"),
         LlmInvocationPhase.FALSIFIER to setOf("submit_falsification"),
         LlmInvocationPhase.RISK_REDUCTION_ONLY to setOf("submit_decision"),
     )
-    val allTools = proposerTools + falsifierTools
+    val allTools = proposerTools + falsifierTools + standaloneTools
 
     fun toolsFor(phase: LlmInvocationPhase): Set<String> = when (phase) {
         LlmInvocationPhase.PROPOSER -> proposerTools

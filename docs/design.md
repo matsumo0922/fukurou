@@ -176,21 +176,25 @@ sequenceDiagram
 
     D->>DB: TriggerEvent保存
     D->>D: cooldown / call budget / halt確認
-    D->>CLI: one-shot起動(runId, prompt, MCP設定)
+    D->>CLI: Proposer one-shot起動(runId, prompt, MCP設定)
     CLI->>MCP: market/account/knowledge read tools
     MCP->>GMO: Public/Private REST取得
     MCP->>DB: ToolCall保存
-    CLI->>MCP: preview_order
-    MCP->>MCP: Safety Floor検証
     CLI->>MCP: submit_decision
     MCP->>APP: phase/invocation/hash付き判断提出(submission gateway socket)
-    APP->>DB: app roleでDecision保存
-    CLI->>MCP: place_order / update_protection / close_position
-    MCP->>MCP: Safety Floor再検証
-    MCP->>GMO: Paper or Live execution
-    MCP->>DB: Order/Fill/Position/Equity保存
-    MCP->>OBS: Trade note下書き/追記
-    CLI-->>D: exit
+    APP->>DB: app roleでDecisionとpending intent保存
+    CLI-->>D: Proposer exit
+    D->>CLI: Falsifier one-shot起動(intentId, read tools)
+    CLI->>MCP: market/account/knowledge read tools
+    CLI->>MCP: submit_falsification
+    MCP->>APP: verdict提出
+    APP->>DB: Falsifier verdict保存
+    CLI-->>D: Falsifier exit
+    D->>D: fresh APPROVED確認
+    D->>D: deterministic preview / Safety Floor検証
+    D->>D: authoritative place_order / Safety Floor再検証
+    D->>DB: Order/Fill/Position/Equity保存
+    D->>OBS: Trade note下書き/追記
     D->>DB: LlmRun終了状態保存
 ```
 
@@ -1836,7 +1840,7 @@ false-suppression proxy は distinct episode 単位で集計する。客観的 m
 
 | action                | 必須tool                                                                                                                                                                            |
 |-----------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ENTER`               | get_ticker, get_candles(5m/1h/1d), get_orderbook, get_trades, get_symbol_rules, get_balance, get_positions, preview_order, knowledge_get_recent_lessons, fresh_falsifier_approval |
+| `ENTER`               | get_ticker, get_candles(5m/1h/1d), get_orderbook, get_trades, get_symbol_rules, get_balance, get_positions, knowledge_get_recent_lessons |
 | `ADD_LONG`            | 上記 + current_position + pyramid_status                                                                                                                                            |
 | `ADJUST_PROTECTION`   | get_positions, calc_indicator(ATR), preview_protection_update                                                                                                                     |
 | `EXIT` / `REDUCE`     | get_ticker, get_orderbook, get_positions, preview_close                                                                                                                           |
@@ -1870,7 +1874,6 @@ LLMはEVゲートを通すために `p` を盛れるため、振り返りエー�
 | Knowledgeに類似失敗があり差分説明なし           |           0.55 |
 | 発火が急変直後で板が薄い                      |           0.60 |
 | 1時間足の方向不明で5分足だけの根拠                |           0.62 |
-| `preview_order` 未実施               |           0.00 |
 
 発注条件は次の通り。
 
@@ -1909,7 +1912,7 @@ canAct = expectedValueR > 0
 1. `submit_decision` が `ENTER` / `ADD_LONG` を受けた場合、entry intentを `PENDING_FALSIFICATION` としてDBへ保存する。
 2. Proposerセッションは `codex` skill起動を第一候補としてFalsifierを呼ぶ。ただし強制はプロンプトではなくDBとMCPに置く。
 3. Falsifierは `intentId` だけを受け取り、MCP read toolsで計画・相場・口座を読み直し、`submit_falsification(intentId, verdict)` を呼ぶ。
-4. `place_order` はfreshな `APPROVED` 判定がDBに存在する場合だけ発注へ進む。
+4. runner はfreshな `APPROVED` 判定がDBに存在する場合だけ deterministic preview を実行し、同じ intent content で authoritative `place_order` へ進む。Falsifier の tool surface には `preview_order` / `place_order` を公開しない。
 
 headless `claude` → `codex` skill → MCP の成立性は、実装前に小スパイクで検証する。
 

@@ -11,7 +11,7 @@ const commonTools = [
 const manifestId = process.argv[2] ?? "";
 const phase = manifestId.includes("-proposer-") ? "PROPOSER" : manifestId.includes("-falsifier-") ? "FALSIFIER" : "";
 const tools = phase === "PROPOSER" ? [...commonTools, "submit_decision"]
-  : phase === "FALSIFIER" ? [...commonTools, "preview_order", "submit_falsification"] : [];
+  : phase === "FALSIFIER" ? [...commonTools, "submit_falsification"] : [];
 const requiredTool = phase === "PROPOSER" ? "submit_decision" : "submit_falsification";
 const writeTools = new Set(["submit_decision", "submit_falsification"]);
 const openWorldTools = new Set([

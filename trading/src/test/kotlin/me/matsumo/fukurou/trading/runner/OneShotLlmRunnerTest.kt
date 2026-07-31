@@ -2138,6 +2138,9 @@ class OneShotLlmRunnerTest {
         val positions = fixture.runtime.broker.getPositions().getOrThrow()
         val violationRepository = fixture.runtime.safetyViolationRepository as InMemorySafetyViolationRepository
         val violations = violationRepository.violations()
+        val falsification = assertNotNull(
+            fixtureRepository.latestFalsification(assertNotNull(result.intent).intentId).getOrThrow(),
+        )
         val toolCompletionOrder = fixture.eventLog.events()
             .filter { event -> event.eventType == CommandEventType.TOOL_CALL_COMPLETED }
             .map { event -> event.toolName }
@@ -2152,6 +2155,7 @@ class OneShotLlmRunnerTest {
         assertEquals(0, positions.size)
         assertEquals(listOf("preview_order", "place_order"), toolCompletionOrder)
         assertEquals(listOf(SafetyFloorRule.NON_POSITIVE_EXPECTED_VALUE), violations.map { violation -> violation.rule })
+        assertEquals(FalsificationVerdict.APPROVED, falsification.verdict)
         assertEquals("false", latencyDetails.stringValue("previewAccepted"))
         assertEquals("NON_POSITIVE_EXPECTED_VALUE", latencyDetails.stringValue("previewSafetyViolationRule"))
         assertEquals("false", latencyDetails.stringValue("accepted"))
@@ -2174,7 +2178,7 @@ class OneShotLlmRunnerTest {
         assertTrue(manifestContent.contains("get_trade_intent"))
         assertTrue(manifestContent.contains("knowledge_get_recent_lessons"))
         assertTrue(manifestContent.contains("knowledge_search_similar_setups"))
-        assertTrue(manifestContent.contains("preview_order"))
+        assertFalse(manifestContent.contains("preview_order"))
         assertFalse(allowedToolsConfig.contains("place_order"))
         assertFalse(allowedToolsConfig.contains("submit_decision"))
     }

@@ -2198,7 +2198,7 @@ private class OneShotLlmRequestFactory(
             |$systemPrompt
             |
             |Run one Falsifier session for intent_id=$intentId.
-            |Use only the intent_id and fukurou MCP read/preview tools, then call submit_falsification.
+            |Use only the intent_id and fukurou MCP read tools, then call submit_falsification.
             |Do not call place_order and do not request proposer narrative from the caller.
         """.trimMargin()
     }

@@ -2125,40 +2125,47 @@ class FukurouMcpServerTest {
     }
 
     @Test
-    fun toolAllowlistDenied_returnsToolErrorAndNoTradeAudit() = runBlocking {
+    fun toolAllowlist_hidesDisallowedToolsFromRegistry() {
         val runtime = TradingRuntimeFactory.inMemory()
         val server = FukurouMcpServer(
             clientRole = GmoPublicClientRole.UNSPECIFIED,
             marketDataSource = FakeMarketDataSource,
             tradingRuntime = runtime,
+            allowedToolNames = setOf("get_balance"),
             toolCallLimiter = McpToolCallLimiter(
                 config = TradingBotConfig().runner,
                 toolCallGuard = runtime.toolCallGuard,
                 allowedToolNames = setOf("get_balance"),
             ),
         ).createServer()
-        val request = CallToolRequest(
-            params = CallToolRequestParams(
-                name = "get_positions",
-                arguments = buildJsonObject {},
-            ),
-        )
 
-        val deniedResult = server.tools.getValue("get_positions").handler.invoke(TestClientConnection, request)
-        val structuredContent = assertNotNull(deniedResult.structuredContent)
-        val eventLog = runtime.commandEventLog as InMemoryCommandEventLog
-        val noTradeEvent = eventLog.events().single { event ->
-            event.eventType == CommandEventType.NO_TRADE_EXIT
-        }
-
-        assertEquals(true, deniedResult.isError)
-        assertEquals("tool_call_not_allowed", structuredContent.getValue("type").jsonPrimitive.contentOrNull)
-        assertTrue(noTradeEvent.payload.contains("mcp_tool_not_allowed"))
+        assertEquals(setOf("get_balance"), server.tools.keys)
+        assertFalse(server.tools.containsKey("get_positions"))
     }
 }
 
 /** least-privilege PostgreSQL role と production bootstrap/server path の integration。 */
 class McpLaunchBootstrapPolicyTest {
+    @Test
+    fun falsifierBootstrap_exposesOnlyCanonicalToolsWithoutPreview() {
+        val clock = fixedClock()
+        val bootstrap = decodeBootstrap(bootstrapManifest(LlmInvocationPhase.FALSIFIER, clock), clock)
+        val server = FukurouMcpServer(
+            clientRole = bootstrap.phase.toGmoPublicClientRole(),
+            marketDataSource = FakeMarketDataSource,
+            clock = clock,
+            tradingRuntime = TradingRuntimeFactory.inMemory(clock = clock),
+            decisionRunContext = bootstrap.decisionRunContext,
+            allowedToolNames = bootstrap.allowedTools,
+            expiresAt = bootstrap.expiresAt,
+            invocationPhase = bootstrap.phase,
+        ).createServer()
+
+        assertEquals(CANONICAL_FALSIFIER_MCP_TOOL_NAMES, server.tools.keys)
+        assertFalse(server.tools.containsKey("preview_order"))
+        assertFalse(server.tools.containsKey("place_order"))
+    }
+
     @Test
     fun bootstrapAndDatabaseConfig_redactPasswordFromToString() {
         val bootstrap = decodeBootstrap(bootstrapManifest(LlmInvocationPhase.PROPOSER, fixedClock()), fixedClock())
@@ -2500,7 +2507,6 @@ private suspend fun assertRequiredMatrixThroughProductionPath(
             },
         )
         assertEquals(LlmSemanticSubmissionState.COMMITTED, falsifierGateway.semanticSubmissionState())
-        results["preview_order"] = callTool(server, "preview_order", placeOrderArguments(intentId))
 
         assertFalsificationPersistedThroughGateway(appRuntime.decisionRepository, intentId)
         assertEquals(MCP_REQUIRED_CALL_COUNT, results.size)
@@ -2919,7 +2925,7 @@ private fun HttpExchange.respondRequiredMatrixFixture() {
 private const val MCP_TEST_DATABASE_USER = "fukurou"
 private const val MCP_TEST_PASSWORD = "FUKUROU_CANARY_DB_ROLE_DUMMY_ONLY"
 private const val MCP_MATRIX_RUN_ID = "mcp-required-matrix-run"
-private const val MCP_REQUIRED_CALL_COUNT = 16
+private const val MCP_REQUIRED_CALL_COUNT = 15
 
 /**
  * #19 で観測した Proposer tool call 数。
