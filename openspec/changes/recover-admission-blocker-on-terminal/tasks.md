@@ -30,7 +30,7 @@
   - `now >= snapshot.finishedAt + policy.hardTimeout + policy.processTerminationGrace`
 - [x] 4.5 解除は「監査 append を先に成功させてから `resolveClaim`」の順で行う。append 失敗は throw して解除しない（design Decision 6 / spec「Audit append fails」Scenario）
 - [x] 4.6 監査 payload を組み立てる。`invocationId` / `claimantToken` / `reservationStatus` / `finishedAt` / `resolvedAt` / `clearanceWindowSeconds` を入れ、secret は入れない。tool name は既存の `llm_execution_recovery` を使う（`LlmExecutionRecoveryWorker.kt:154` の定数を共有できるか確認する。できなければ同値の定数を service 側に置く）
-- [x] 4.7 `LlmExecutionTerminationFenceRegistry` の fence entry も解除する invocation について片付けるか判断する。既存の `completeRecoveryHealth` は `resolve()` を呼んでいる。fence が残っても admission には影響しないが、registry の leak を避けるなら同様に呼ぶ。呼ぶ場合は blocker の token で `resolve(invocationId, claimantToken)` する
+- [x] 4.7 `LlmExecutionTerminationFenceRegistry` の fence entry も解除するか判断する。**判断: 触らない**。admission health は fence を見ないため解除に不要で、fence を持つ claim は stale scan の正規経路が claim transition lock の内側で解除する。この pass は lock を取らないため、lock 外から registry を触る理由をなくす方が安全（レビュー指摘対応）
 - [x] 4.8 blocker 照合 pass が stale scan の候補集合・cursor・`check(pendingRecoveries.isEmpty())` invariant に触れないことを確認する（spec「Stale claim recovery runs in the same tick」Scenario）
 
 ## 5. 回帰テスト

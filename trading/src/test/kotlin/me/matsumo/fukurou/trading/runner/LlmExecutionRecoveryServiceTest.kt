@@ -570,10 +570,14 @@ class LlmExecutionRecoveryServiceTest {
         claim(repository, "still-running", RECOVERY_INSTANT)
         LlmExecutionAdmissionHealth.registerRecoveryBlocker("still-running", CLAIM_TOKEN)
 
-        // stale scan の hard deadline 前を観測時刻にして、blocker 照合 pass だけが RUNNING を評価する状況にする。
-        val service = recoveryService(repository, RECOVERY_INSTANT.plusSeconds(1))
+        // clearance window を超えた時刻を観測させ、terminal 条件だけが解除を止めていることを分離して検証する。
+        val service = recoveryService(repository, afterClearanceWindow())
         assertEquals(0, service.tick().getOrThrow())
 
+        assertEquals(
+            LlmLaunchReservationStatus.RUNNING,
+            repository.findExecutionClaim("still-running").getOrThrow()?.status,
+        )
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
     }
 
@@ -587,6 +591,19 @@ class LlmExecutionRecoveryServiceTest {
 
         assertEquals(0, service.tick().getOrThrow())
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_missingClaimantTokenMatchesNullPersistedToken() = runBlocking {
+        val delegate = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(delegate, "null-token")
+        val repository = NullClaimantTokenRepository(delegate)
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("null-token", MISSING_CLAIMANT_TOKEN)
+
+        val service = recoveryService(repository, afterClearanceWindow())
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
     }
 
     @Test
@@ -606,6 +623,33 @@ class LlmExecutionRecoveryServiceTest {
     fun blockerRecovery_missingReservationKeepsBlocker() = runBlocking {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         LlmExecutionAdmissionHealth.registerRecoveryBlocker("never-reserved", CLAIM_TOKEN)
+
+        val service = recoveryService(repository, afterClearanceWindow())
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_clearanceWindowBoundaryIsInclusive() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(repository, "window-boundary")
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("window-boundary", CLAIM_TOKEN)
+        val policy = OneShotExecutionPolicy.from(LlmRunnerConfig())
+        val boundary = RECOVERY_INSTANT.plus(policy.hardTimeout).plus(policy.processTerminationGrace)
+
+        val service = recoveryService(repository, boundary)
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_terminalWithoutFinishedAtKeepsBlocker() = runBlocking {
+        val delegate = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(delegate, "no-finished-at")
+        val repository = FinishedAtStrippingRepository(delegate)
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("no-finished-at", CLAIM_TOKEN)
 
         val service = recoveryService(repository, afterClearanceWindow())
 
@@ -1152,6 +1196,24 @@ private fun afterClearanceWindow(): Instant {
 private class FailingAppendCommandEventLog : CommandEventLog by InMemoryCommandEventLog() {
     override suspend fun append(event: CommandEvent): Result<Unit> =
         Result.failure(IllegalStateException("audit append failed."))
+}
+
+/** claim token が NULL の legacy row を再現する。 */
+private class NullClaimantTokenRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    override suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> {
+        return delegate.findExecutionClaim(invocationId).map { snapshot -> snapshot?.copy(claimantToken = null) }
+    }
+}
+
+/** terminal だが finished_at を欠く legacy row を再現する。 */
+private class FinishedAtStrippingRepository(
+    private val delegate: LlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    override suspend fun findExecutionClaim(invocationId: String): Result<LlmExecutionClaimSnapshot?> {
+        return delegate.findExecutionClaim(invocationId).map { snapshot -> snapshot?.copy(finishedAt = null) }
+    }
 }
 
 private const val CLAIM_TOKEN = "claim-token"

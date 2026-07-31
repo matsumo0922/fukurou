@@ -334,8 +334,9 @@ class LlmExecutionRecoveryService(
                 clearanceWindow = clearanceWindow,
             )
 
+            // fence registry は触らない。admission health は fence を見ないため解除に不要で、fence を持つ claim は
+            // stale scan の正規経路が claim transition lock の内側で解除する。
             LlmExecutionAdmissionHealth.resolveClaim(blocker.invocationId, blocker.claimantToken)
-            LlmExecutionTerminationFenceRegistry.resolve(blocker.invocationId, blocker.claimantToken)
         }
     }
 
@@ -461,7 +462,12 @@ private fun LlmExecutionClaimSnapshot.isBlockerClearedBy(
     clearanceWindow: Duration,
     now: java.time.Instant,
 ): Boolean {
-    val isTerminal = status != LlmLaunchReservationStatus.RUNNING
+    val isTerminal = when (status) {
+        LlmLaunchReservationStatus.FINISHED,
+        LlmLaunchReservationStatus.FAILED,
+        -> true
+        LlmLaunchReservationStatus.RUNNING -> false
+    }
     val terminalFinishedAt = finishedAt ?: return false
     val tokenMatches = (claimantToken ?: MISSING_CLAIMANT_TOKEN) == blockerToken
     val clearanceElapsed = !now.isBefore(terminalFinishedAt.plus(clearanceWindow))

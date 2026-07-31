@@ -96,6 +96,8 @@ bound は既存の作法をそのまま使う。
 
 処理件数の上限は blocker registry の実サイズに委ねる。100 件の paging を持つ stale scan と違い、blocker は process-local で 1 invocation につき最大 1 件しか登録されないため、bound は deadline の 750ms reserve が実効的に効く。
 
+この pass は `LlmExecutionTerminationFenceRegistry` を触らない。admission health は fence を見ないため解除に不要であり、fence を持つ claim は stale scan の正規経路（`completeRecoveryHealth`）が claim transition lock の内側で解除する。pass 自体は lock を取らないので、lock 外から registry を変更する経路を作らない。
+
 `LlmExecutionRecoveryService` は現在 `CommandEventLog` を持たないので、constructor に追加する。`LlmExecutionRecoveryWorker` は既に `commandEventLog` を持っているのでそれを渡す。テストの既存 `LlmExecutionRecoveryService(...)` 呼び出しは、監査を検証しないものには `InMemoryCommandEventLog` を渡す。
 
 ### Decision 6: 監査イベントは新 `CommandEventType` を 1 つ追加する
