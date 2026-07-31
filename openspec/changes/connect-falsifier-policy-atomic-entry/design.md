@@ -42,22 +42,28 @@ production compositionとauthorized pathを明示的に検証するtestは`Tradi
 これにより型がInMemory / Exposedであるだけの任意repository mixをauthorized pathへ接続しない。
 
 publicだがproduction-safeなroot factoryは一つのowned `HikariDataSource`だけを入力に取り、database引数を受けず、early opaque `PostgresStorageRoot`を生成する。
-rootは同じDataSourceから作る`ExposedDatabase`、stable scope connection factory、physical connection eviction controllerだけを所有する。
+rootは同じDataSourceから作る`ExposedDatabase`、stable scope connection factory、physical connection eviction controller、stable identityそのものをkeyにするprocess-local cancellable mutex registryだけを所有する。
 active DB runtime configとclockの解決前にSafetyFloor、paper execution、max drawdown、ledger writer、decision / policy repository、backendを作ってはならない。
 
 active config / clock解決後、root overloadのruntime factoryがrootのdatabaseとscope infrastructureからledger writer / repository、decision repository、policy decision repository、A2a backendをconfig-bound bundleとして同時生成する。
-runtimeを同じrootと新しいresolved configでrebuildする場合はconfig-bound componentを新規作成し、root、DataSource、database、scope connection factory / evictorを再作成しない。
+runtimeを同じrootと新しいresolved configでrebuildする場合はconfig-bound componentを新規作成し、root、DataSource、database、scope connection factory / evictor、process-local mutex registryを再作成しない。
 opaque root / bundleのconstructorはfactory外から呼べず、個別componentの差し替えまたは別DataSource / databaseとの再結合を許さない。
 stable request scopeのdedicated connectionも必ずroot所有の同じDataSourceから取得し、eviction controllerもそのDataSourceだけを操作する。
 object identityの事後比較だけで任意pairを承認する案は、DataSource ownershipとscope connection / eviction先を証明できないため採用しない。
 
 actual productionは`Application.createApplicationDatabaseResources`でDataSourceと`ExposedDatabase` pairを別々に保持し、`LlmDaemonSchedulerWorker.createLlmLaunchRuntimeComponents`のdaemon / manual pathからpublic pair-based `connectedPostgres`を呼ぶ。
 A2bは`createApplicationDatabaseResources`でsingle-DataSource-only root factoryを呼び、`ApplicationDatabaseResources`がrootを保持する形へ移す。
-`ApplicationDatabaseResources.dataSource / database`はrootのread-only getterとして既存readiness、bootstrap、routes、monitoring、maintenance serviceへ渡し、scope infrastructureやauthorized componentを個別に外へ公開しない。
+`ApplicationDatabaseResources.dataSource / database`はrootのread-only getterとして既存readiness、bootstrap、routes、monitoring、maintenance serviceへ渡し、scope connection / eviction / mutex infrastructureやauthorized componentを個別に外へ公開しない。
 active DB runtime configとclock解決後、daemon schedulerと`ManualLlmLaunchRuntime` / `createManualLlmLaunchService`はpairではなく同じrootを`createLlmLaunchRuntimeComponents`へ渡し、root overloadの`TradingRuntimeFactory.connectedPostgres`でconfig-bound runtimeを作る。
 
 Applicationでrootを共有する各`TradingRuntime.close()`は自身のconfig-bound resourceだけを閉じ、rootを閉じない。
-Application shutdownはbackground workersとmanual launch resourceの終了後にrootを一度だけcloseし、DataSourceを閉じる。
+daemon schedulerは各loop generationが`TradingRuntime`を含むcloseable runtime bundleを一つ所有し、generation bodyを`try`、bundle closeを`finally`に置く。
+config refreshまたは通常loop継続でgenerationを作り直す場合も、旧generationのbound runtimeをcloseし終えてから次generationを構築する。
+worker shutdownはscheduler jobをcancelした後、`System.nanoTime()`を使うcode-owned 30秒monotonic termination deadlineまでjob終了をawaitする。
+job終了はin-flight runのfinallyがgeneration bundle / bound runtimeをcloseし終えたことまでを含み、Applicationはdaemon worker terminationとmanual launch resource closeの両方が成功した後だけshared rootを一度closeする。
+termination deadlineに到達した場合はtyped shutdown failureを返し、shared rootをcloseせず、in-flight runのcommit outcomeを未commit、`NO_TRADE`、または確定failureへ読み替えない。
+このfail-closed timeoutではroot ownershipをApplicationに残し、worker terminationを後で再確認できる状態を保つ。
+testはscheduler regenerationで旧bound close後に次generationが開始する順序、shutdown中のin-flight runがfinallyへ到達するまでroot closeが始まらないこと、termination timeout時にrootがopenでshutdown failureだけが返ることをbarrierで固定する。
 standalone production `TradingRuntimeFactory.postgres(config)`は自分でrootを作り、そのruntime closeがconfig-bound resourceの後にowned rootを一度だけcloseする。
 root closeはidempotentであり、shared runtime closeとApplication shutdownまたはstandalone failure cleanupが重なってもDataSourceを二重closeしない。
 
@@ -91,7 +97,13 @@ durable attribution / metric exclusion、新schema / durable fencing tokenはA2b
 scope取得failureはticker、SafetyFloor、audit、fresh IDより前にtyped unavailableとして返す。
 
 InMemoryはstable identity-keyed coroutine `Mutex`を使う。
-mutex registryはwaiter / holderを参照countし、release後に同じentryであることを確認して未使用entryを除去する。
+PostgreSQLもroot-owned registryのstable identity-keyed coroutine `Mutex`を、dedicated connection borrowより前のprocess-local admissionとして使う。
+PostgreSQLの同一rootからconfig-bound runtimeをrebuildしてもregistryを共有するため、同一processのsame-request waiterはgeneration / backend instanceを越えてconnectionをborrowしない。
+両registryはwaiter / holderを参照countし、cancellationまたはrelease後に同じentryであることを確認して未使用entryを除去する。
+PostgreSQLの取得順は`local identity mutex -> dedicated connection borrow -> two-int advisory lock`であり、local mutexはdedicated unlock / eviction完了後まで保持してouter `finally`で解放する。
+異なるstable identityは別mutex entryを使い、hash32 collisionがない限りdedicated connectionとadvisory lockを並行取得できる。
+PostgreSQL integration testは現行`maximumPoolSize=4`に対して4件以上のsame-request callをbarrierで交差させ、holder以外がconnectionをborrowせず、holderのstrict replay、preparation、A2a transaction用connectionが枯渇しないことを確認する。
+別processのsame-request callは各processのlocal admission後にtwo-int advisory lockで直列化し、異なるrequestの並行性も同じtest群で維持する。
 
 PostgreSQLはopaque root所有DataSourceから借りたdedicated physical connectionでstable client request IDから導出したsession advisory lockを取得する。
 repo内のadvisory SQLをgrepした現在状態ではglobal trading lock、market session lock、decision lockはsingle-bigint APIを使い、two-int APIの使用はない。
@@ -104,7 +116,8 @@ hash32 collisionはstable request同士を余分に直列化するだけで、au
 scope acquisitionはcode-owned `30秒` timeoutと`50ms` poll intervalを使う。
 30秒は既定`runner.perRunTimeout=180秒`の6分の1でOneShot hard deadline budget内に収まり、DB競合で1 run全体を使い切らない最小のbounded waitである。
 値はA2bのKDoc / code定数とし、新runtime configまたは運用調整面を追加しない。
-deadlineはHikari connection borrowを開始する前に`System.nanoTime()`から作り、monotonic elapsed timeだけで判定してwall clockを使わない。
+deadlineはprocess-local identity mutexを待ち始める前に`System.nanoTime()`から作り、monotonic elapsed timeだけで判定してwall clockを使わない。
+local mutex wait、Hikari connection borrow、advisory pollは同じremaining acquisition budgetに従い、local wait中にdeadlineへ到達したcallはconnectionを一度もborrowせずpreparation前typed unavailableを返す。
 connection borrow自体もremaining budgetを超えないdeadline-aware root connection factoryで行い、borrow timeout / cancellation後に遅れて返ったconnectionはpoolへ渡さずcleanupする。
 
 borrow後は既存`PersistenceTransactionTimeouts`と同じbudget patternで、各`pg_try_advisory_lock`直前にremaining budgetを再計算する。
@@ -116,7 +129,7 @@ restoreがthrowまたは結果不明ならphysical connectionをevictし、取�
 suspend callerのcancellation時は現在実行中の`Statement.cancel()`をscope専用cleanup executorで試みる。
 cancel resultにかかわらずtry responseはunknownとしてconnectionをevictし、network timeoutまたはconnection abortにより同期JDBC callもboundedに終了させる。
 serverでlock取得後にresponseを失った場合もsession close / evictionがlockを解放するため、connectionをpoolへ戻さない。
-InMemory identity mutex waitもcoroutine cancellationへ従い、`NonCancellable` waitまたはprocess-lifetime blockingを行わない。
+InMemory / PostgreSQL identity mutex waitもcoroutine cancellationへ従い、`NonCancellable` waitまたはprocess-lifetime blockingを行わない。
 
 dedicated connectionのacquisition outcomeを次に分類する。
 
@@ -147,6 +160,11 @@ resultを返しつつsessionをevictし、そのledger tradeを通常どおりst
 confirmed commit後にprocess crashしても成功を消さず、durable metric exclusion / infrastructure attributionはBまたは別changeへstage-outする。
 mid-preparation session lossにより別processがscopeを取得した場合、preparation、SafetyFloor evaluation、audit、HARD_HALT sweepの重複はinfrastructure residualとして許容する。
 A2a backendのtransaction内strict replay / flat predicate / intent consumptionによりentry mutationとconsumptionは最大1に保ち、scope lossを成功、`NO_TRADE`、未commitの根拠に使わない。
+
+heartbeatは観測であってfencingではないため、成功応答と別connection上のterminal readbackまたはA2a backend invocationの間にcheck-use gapが残る。
+このgapでdedicated sessionを失うと、別processがadvisory lockを取得し、先行callのnon-mutation terminal readback / return後にcommitすることがある。
+A2a transactionはmutation / consumption最大1を維持するが、A2bは先行のrejection / failureをdurable `NO_TRADE`または「commit不存在」の証明に変換しない。
+このresidualのdurable status / terminal mappingとcaller reconciliationは後続Bのactivation contractへstage-outする。
 
 testはproduction定数をruntime overrideせず、module-internalのnanoTime / delay / timeout seamで短いdeadlineを使う。
 dedicated connectionはscope中にlock保持だけを担当し、market / SafetyFloor external I/OとA2a transactionは別connectionを使う。
@@ -234,15 +252,18 @@ Bがruntime activation、active config snapshot、permit propagation、Falsifier
 - [active DB config解決前にenv/default configでbackendを固定する] → early rootはstorage infrastructureだけを持ち、resolved config / clockごとにbound componentを構築する
 - [任意DataSource / database pairや別poolのscope connectionを混ぜる] → public / pair-based factoryをunsupportedにし、single owned DataSourceのopaque rootからbound componentを生成する
 - [Application daemon / manualがpair pathを使いunsupportedになる] → `ApplicationDatabaseResources`がrootを保持しscheduler / manual inputsをroot overloadへ移す
-- [shared runtime closeがrootを早期closeする] → shared runtimeはbound resourceだけを閉じ、workers終了後のApplication shutdownがrootを一度だけcloseする
+- [shared runtime closeがrootを早期closeする] → scheduler generationはfinallyでbound runtimeをcloseし、worker termination確認後だけApplicationがrootを一度closeする
+- [shutdown timeout中にroot closeがin-flight commitを切断する] → worker cancel後を独立30秒monotonic deadlineでawaitし、timeoutはtyped shutdown failure + root非closeとしてcommit outcomeを読み替えない
 - [production composition移行でrunner behaviorが変わる] → runtime component identityだけを変え、runnerは引き続きFalsifier / public broker pathを使う回帰testを置く
-- [normal concurrencyで同じrequestがpreparationを並行する] → live stable session scopeをpreflightからterminal readbackまで保持する
+- [pool size以上のsame-request waiterがdedicated connectionを先取りする] → root-owned local identity mutexをborrow前に取得し、holder / waiter refcount cleanupでwaiterをpool外に置く
+- [normal concurrencyで同じrequestがpreparationを並行する] → local identity mutexとlive stable session scopeをpreflightからterminal readbackまで保持する
 - [mid-scope session loss後に別processがpreparation / auditを重複する] → 3点heartbeatで窓を狭め、重複をinfrastructure residualとして報告し、A2a atomic backendでmutation / consumptionを最大1にする
 - [scope lossをNO_TRADEまたは未commitと誤認する] → pre-mutationはtyped unavailable、confirmed backend result後はpaper truth resultと通常のstrategy evaluationを維持する
 - [blocking advisory lockがrunner deadlineを使い切る] → two-int try-lockをmonotonic 30秒deadline / 50ms cancellation-aware pollで取得する
 - [borrow / try-lock response lossで未把握lockをpoolへ返す] → remaining query / network budgetとStatement.cancelを使い、cancel / SQL failure / outcome不明はroot evictorでphysical connectionを非再利用にする
 - [unlockがmain deadline消費後にstallする] → 独立5秒cleanup deadlineとabort / evictでsession closeをboundedにする
 - [preparationがacquisition deadlineを超えた後にheartbeatを即timeoutする] → heartbeat開始ごとに独立5秒monotonic deadlineを作り、remaining query / network timeoutとcancel / evictを適用する
+- [heartbeat成功後のcheck-use gapでsessionを失う] → A2a atomicityでmutation最大1を維持し、non-mutation terminalをdurable `NO_TRADE`へ変換せずBのterminal mappingへstage-outする
 - [PostgreSQL advisory lockがconnection poolへ漏れる] → cancellationを含むfinallyでunlockし、unlock失敗 / 不明ならphysical connectionをclose / evictする
 - [advisory key hashがcollisionする] → fixed two-int namespace内のstable request同士を余分に直列化するだけで、各callのauthority / fingerprint / replay / mutation検証は共有しない
 - [global / market single-bigint keyと数値collisionして自己deadlockする] → stable scopeはreserved two-int key familyだけを使い、forced collision integration testで非干渉を固定する
@@ -259,8 +280,8 @@ Bがruntime activation、active config snapshot、permit propagation、Falsifier
 
 ## Migration Plan
 
-1. single owned DataSourceからopaque PostgreSQL storage root、config-bound runtime bundle、JDBC-bounded two-int try-lock scope、strict replay read、proposal validation順序を追加する。
-2. `ApplicationDatabaseResources`、daemon scheduler、manual launch、standalone `postgres(config)`をroot overloadへ移し、public pair-based factoryはunsupportedに保つ。
+1. single owned DataSourceからopaque PostgreSQL storage root、root-owned process-local admission、config-bound runtime bundle、JDBC-bounded two-int try-lock scope、strict replay read、proposal validation順序を追加する。
+2. `ApplicationDatabaseResources`、generation-owned daemon scheduler、manual launch、standalone `postgres(config)`をroot overloadへ移し、bounded worker termination後だけshared rootをcloseし、public pair-based factoryはunsupportedに保つ。
 3. authorized boundaryのscoped `Missing` continuation、non-mutation terminal readback、既存preparationからA2a proposalへの変換を追加する。
 4. InMemory / PostgreSQL focused testでaffinity mismatch、scope cleanup、exact-first、false rejection barrier、SafetyFloor、typed failureを確認する。
 5. internal pathが接続済みでもpublic/MCP/runnerから到達不能である状態をdeployする。

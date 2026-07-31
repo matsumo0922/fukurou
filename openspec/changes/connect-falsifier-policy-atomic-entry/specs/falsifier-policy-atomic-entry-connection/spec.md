@@ -4,9 +4,9 @@
 
 public `PaperBroker` constructorはauthorized capability unsupportedでなければならない（MUST）。
 任意のDataSource / `ExposedDatabase` pairを受け取るpublic `connectedPostgres` factoryもauthorized capability unsupportedでなければならない（MUST）。
-database引数を受けないproduction-safe factoryはPostgreSQLで単一のowned DataSourceからearly opaque `PostgresStorageRoot`として`ExposedDatabase`、stable scope connection factory、connection eviction controllerだけを生成しなければならない（MUST）。
+database引数を受けないproduction-safe factoryはPostgreSQLで単一のowned DataSourceからearly opaque `PostgresStorageRoot`として`ExposedDatabase`、stable scope connection factory、connection eviction controller、stable-identity keyed process-local cancellable mutex registryだけを生成しなければならない（MUST）。
 active DB runtime configとclockの解決後、root overloadはrootからledger / decision / policy decision repositoryとbackendをconfig-bound componentとして同時生成しなければならない（MUST）。
-early rootはconfig-bound repository / backendを生成してはならず（MUST NOT）、same rootからruntimeをrebuildするときは新しいresolved config / clockでbound componentを再生成しなければならない（MUST）。
+early rootはconfig-bound repository / backendを生成してはならず（MUST NOT）、same rootからruntimeをrebuildするときは新しいresolved config / clockでbound componentだけを再生成し、root-owned mutex registryを維持しなければならない（MUST）。
 PostgreSQL stable scopeのdedicated connectionとeviction controllerはroot所有の同じDataSourceだけを使わなければならない（MUST）。
 internal `TradingRuntime` compositionはこのroot-bound component setまたは同じruntime InMemory repository instancesを共有する場合だけcapabilityを注入しなければならない（MUST）。
 affinity mismatchはdurable authority readとstrict replayより前にtyped unsupportedとし、public lookupへfallbackしてはならない（MUST NOT）。
@@ -63,17 +63,7 @@ affinity mismatchはdurable authority readとstrict replayより前にtyped unsu
 #### Scenario: same root runtime rebuild
 
 - **WHEN** 同じApplication rootでactive configを更新してruntime componentをrebuildする
-- **THEN** 新config-bound repository / backendを作りroot、DataSource、database、scope connection factory / evictorを再生成またはcloseしない
-
-#### Scenario: Application shutdown ownership
-
-- **WHEN** shared daemon / manual `TradingRuntime`をcloseした後にApplication shutdownを実行する
-- **THEN** shared runtime closeはrootを閉じず、workers終了後のApplication shutdownがrootを一度だけcloseする
-
-#### Scenario: standalone shutdown ownership
-
-- **WHEN** standalone `postgres(config)` runtimeをcloseする
-- **THEN** runtimeはbound resourceの後にowned rootを一度だけcloseする
+- **THEN** 新config-bound repository / backendを作りroot、DataSource、database、scope connection factory / evictor、process-local mutex registryを再生成またはcloseしない
 
 #### Scenario: InMemory repository mismatch
 
@@ -84,6 +74,42 @@ affinity mismatchはdurable authority readとstrict replayより前にtyped unsu
 
 - **WHEN** internal factoryが全repositoryとbackendのsame storage identityを証明する
 - **THEN** authorized boundaryはそのcapabilityだけをauthority、scope、replay、commitに使用する
+
+### Requirement: Application scheduler generationはbound runtime終了後だけshared rootを解放する
+
+daemon schedulerの各loop generationは`TradingRuntime`を含むcloseable runtime bundleを所有し、normal completion、config regeneration、failure、cancellationの全経路でgeneration `finally`からbound runtimeを一度closeしなければならない（MUST）。
+worker shutdownはscheduler jobをcancelした後、`System.nanoTime`によるcode-owned 30秒monotonic deadlineまでjob terminationをawaitしなければならない（MUST）。
+job terminationはin-flight runのgeneration `finally`とbound runtime closeの完了を含まなければならない（MUST）。
+Applicationはdaemon worker terminationとmanual launch resource closeが成功した後だけshared rootをcloseしなければならない（MUST）。
+termination timeout時はtyped shutdown failureを返し、shared rootをcloseしてはならず（MUST NOT）、in-flight commit outcomeを未commit、`NO_TRADE`、または確定failureへ変換してはならない（MUST NOT）。
+shared `TradingRuntime.close()`はbound resourceだけをcloseし、Application rootをcloseしてはならない（MUST NOT）。
+
+#### Scenario: scheduler generation regeneration
+
+- **WHEN** daemon loopがresolved config更新または次iterationのためruntime generationを作り直す
+- **THEN** 旧generationのfinallyが所有するbound `TradingRuntime`を一度closeし終えてから次generationを構築する
+- **AND** shared rootはgeneration間で維持される
+
+#### Scenario: Application shutdown ownership
+
+- **WHEN** shutdownがdaemon workerをcancelしmanual launch resourceをcloseする
+- **THEN** worker job terminationと各bound runtime closeを確認した後だけApplicationがshared rootを一度closeする
+
+#### Scenario: shutdown during in-flight run
+
+- **WHEN** Application shutdownがA2a commitを含み得るin-flight daemon run中に開始する
+- **THEN** workerはcancel後もgeneration finally / bound runtime closeまでjob terminationをawaitし、その完了前にrootをcloseしない
+
+#### Scenario: worker termination timeout
+
+- **WHEN** scheduler jobがcancel後30秒のmonotonic deadline内にterminationしない
+- **THEN** Application shutdownはtyped failureを返しshared rootをopenのまま所有する
+- **AND** in-flight runを`NO_TRADE`、未commit、または確定failureとして報告しない
+
+#### Scenario: standalone shutdown ownership
+
+- **WHEN** standalone `postgres(config)` runtimeをcloseする
+- **THEN** runtimeはbound resourceの後にowned rootを一度だけcloseする
 
 ### Requirement: authorized replayはfresh preparationより先に判定する
 
@@ -116,9 +142,12 @@ backendはlive scope ownershipが存続するnormal concurrencyで、同じstabl
 scope取得failureはpreparation前のtyped unavailableでなければならない（MUST）。
 異なるstable request IDは同じscope keyであることだけを理由にauthorityまたはresultを共有してはならない（MUST NOT）。
 PostgreSQL scopeはfixed namespace `1179994962`とstable request hash32を使うtwo-int `pg_try_advisory_lock`だけを使用し、blocking `pg_advisory_lock`を使わず、既存global / market sessionのsingle-bigint key familyと分離しなければならない（MUST）。
-acquisitionはHikari connection borrow前に`System.nanoTime`でcode-owned 30秒deadlineを開始し、borrowと各try callをremaining budgetで拘束し、false応答後は最大50msのcancellation-aware pollを行い、timeoutをpreparation前typed unavailableにしなければならない（MUST）。
+PostgreSQL scopeはroot-owned stable-identity keyed cancellable mutexをdedicated connection borrow前に取得し、`local identity mutex -> dedicated borrow -> two-int advisory lock`の順を守らなければならない（MUST）。
+process-local mutexはsame rootのconfig generation / backend instance間で共有し、holder / waiter refcountをcancellationとreleaseの両方でcleanupし、同じentryに参照がなくなった場合だけregistryから除去しなければならない（MUST）。
+acquisitionはprocess-local mutex wait前に`System.nanoTime`でcode-owned 30秒deadlineを開始し、local wait、borrow、各try callをremaining budgetで拘束し、false応答後は最大50msのcancellation-aware pollを行い、timeoutをpreparation前typed unavailableにしなければならない（MUST）。
+same-request local waiterはmutex取得前にdedicated connectionをborrowしてはならず（MUST NOT）、異なるstable identityはhash32 collisionまたは別のDB lock競合がない限り並行できなければならない（MUST）。
 各try callはremaining budgetから`Statement.queryTimeout`と`Connection.networkTimeout`をarmし、original timeout restoreまで確認しなければならない（MUST）。
-InMemory mutex acquisitionもcoroutine cancellationへ従わなければならない（MUST）。
+InMemory / PostgreSQL mutex acquisitionはcoroutine cancellationへ従わなければならない（MUST）。
 PostgreSQL session loss / failoverを越えるcross-process preparation / audit完全直列化を保証してはならず（MUST NOT）、新schemaまたはdurable fencing tokenを追加してはならない（MUST NOT）。
 
 #### Scenario: InMemory same request
@@ -129,7 +158,18 @@ PostgreSQL session loss / failoverを越えるcross-process preparation / audit�
 #### Scenario: PostgreSQL cross-process same request
 
 - **WHEN** 同じstable requestの2 callが別processからPostgreSQLへ並行する
-- **THEN** dedicated sessionとadvisory lockが存続する間、後続callは先行callのterminalまでpreflightを開始しない
+- **THEN** 各processのlocal admission後にtwo-int advisory lockがcross-process barrierとなり、dedicated sessionとlockが存続する間、後続callは先行callのterminalまでpreflightを開始しない
+
+#### Scenario: PostgreSQL same-process pool admission
+
+- **WHEN** maximum pool sizeが現行値4で、4件以上のsame-request callを同一root内のbarrierで交差させる
+- **THEN** holderだけがdedicated connectionをborrowし、全local waiterはconnectionをborrowせずidentity mutexで待つ
+- **AND** holderのstrict replay、preparation、A2a transactionが使う別connectionをwaiterが枯渇させない
+
+#### Scenario: PostgreSQL different request concurrency
+
+- **WHEN** 異なるstable identityのcallを同一rootから並行開始する
+- **THEN** callは異なるlocal mutex entryを使い、same-request local admissionだけを理由に相互待機しない
 
 #### Scenario: PostgreSQL holder timeout
 
@@ -157,10 +197,10 @@ PostgreSQL session loss / failoverを越えるcross-process preparation / audit�
 - **WHEN** serverがtwo-int lockを取得した後にclientがtry responseを失う
 - **THEN** systemは取得結果をunknownとしてphysical connectionをevict / closeしsession終了でlockを解放する
 
-#### Scenario: InMemory cancellation while waiting
+#### Scenario: process-local cancellation while waiting
 
-- **WHEN** InMemory same-request mutexを待つcallがrunnerからcancelされる
-- **THEN** waiterはscopeを取得せずcancellationを伝播しprocess-lifetime blockを残さない
+- **WHEN** InMemoryまたはPostgreSQLのsame-request mutexを待つcallがrunnerからcancelされる
+- **THEN** waiterはscopeまたはdedicated connectionを取得せずcancellationを伝播し、holder / waiter refcountと未使用entryをcleanupしてprocess-lifetime blockを残さない
 
 #### Scenario: scope acquisition failure
 
@@ -185,9 +225,10 @@ PostgreSQL session loss / failoverを越えるcross-process preparation / audit�
 ### Requirement: PostgreSQL stable request lockはdedicated connectionで確実に解放する
 
 PostgreSQL stable request scopeはopaque storage root所有DataSourceのdedicated physical connectionで`pg_try_advisory_lock(namespaceInt, requestHashInt)`をbounded pollし、external market / SafetyFloor I/O中は取得済みstable lock以外のmarket session / ledger lockを保持してはならない（MUST NOT）。
-lock順はstable request lockをrealtime market session advisory、market session row、ledger locksより先にしなければならない（MUST）。
+取得順はprocess-local identity mutex、dedicated connection borrow、stable request advisory、realtime market session advisory、market session row、ledger locksでなければならない（MUST）。
 normal return、failure、cancellationの全経路でmain acquisition deadlineと独立したcode-owned 5秒monotonic cleanup deadlineを使い、remaining budget由来のquery / network timeoutをarmして同じtwo-int keyのunlockをfinallyから試みなければならない（MUST）。
 unlockがfalse、stall、throw、response loss、timeout restore failure、または結果不明の場合は`Connection.abort`を試み、root所有eviction controllerでphysical connectionをpoolへ再利用せずclose / evictしなければならない（MUST）。
+process-local identity mutexはdedicated unlockまたはeviction完了後にouter `finally`で解放しなければならない（MUST）。
 acquisition中のSQL failure、query timeout、cancellation、response lossで取得結果が不明の場合も同じevictionを行わなければならない（MUST）。
 
 #### Scenario: cancellation
@@ -223,7 +264,7 @@ acquisition中のSQL failure、query timeout、cancellation、response lossで�
 #### Scenario: lock order
 
 - **WHEN** eligibility付きresting entryをcommitする
-- **THEN** lock順はstable request advisory、market session advisory、market session row、risk state、account、positions、ordersとなる
+- **THEN** 取得順はlocal identity mutex、dedicated borrow、stable request advisory、market session advisory、market session row、risk state、account、positions、ordersとなる
 
 ### Requirement: PostgreSQL scope ownershipはmutationとterminalの境界で再確認する
 
@@ -235,6 +276,8 @@ loss、PID mismatch、SQL failure、timeout、stall、cancel、response loss、t
 scope lossを成功、`NO_TRADE`、未commitへ変換してはならない（MUST NOT）。
 A2bはscope lossだけを理由にconfirmed `Exact` / `Created` ledger tradeをstrategy evaluation対象から除外または変更してはならない（MUST NOT）。
 losing typed-unavailable attemptとduplicate preparation / auditはinfrastructure residualとして報告できるが、durable infrastructure attribution / metric exclusionはA2bで要求しない。
+heartbeat成功は別connection上のterminal readbackまたはbackend invocationまでsession ownershipをfenceせず、check-use gapにより後続processがcommitし得ることをA2bのresidualとして扱わなければならない（MUST）。
+A2bはこのgap後のnon-mutation terminalをdurable `NO_TRADE`またはcommit不存在の証明へ変換してはならず（MUST NOT）、durable status / terminal mappingとcaller reconciliationをBへstage-outしなければならない（MUST）。
 
 #### Scenario: heartbeat after slow preparation
 
@@ -278,6 +321,17 @@ losing typed-unavailable attemptとduplicate preparation / auditはinfrastructur
 - **THEN** duplicate preparation / auditはinfrastructure failure residualとして記録できる
 - **AND** A2a strict replay / transactionによりentry mutationとintent consumptionは各最大1件である
 - **AND** scope lossをstrategy success、`NO_TRADE`、未commitへ変換しない
+
+#### Scenario: heartbeat check-use gap before terminal readback
+
+- **WHEN** non-mutation terminal直前のheartbeatが成功した後、別connection上のfresh readbackまたはreturnまでにdedicated sessionを失い、別processが同じrequestをcommitする
+- **THEN** 先行callのterminalは後続commit不存在を証明せず、A2bはdurable `NO_TRADE`へ変換しない
+- **AND** A2a backendはentry mutation / intent consumptionを各最大1に保ち、durable terminal reconciliationはBが扱う
+
+#### Scenario: heartbeat check-use gap before backend invocation
+
+- **WHEN** backend invocation直前のheartbeat成功後かつ別connection上のA2a transaction開始前にdedicated sessionを失い、別processも同じrequestを開始する
+- **THEN** A2a strict replay / transactionが`Exact`または単一`Created`へ収束し、A2bはsession heartbeatだけからcommit outcomeを推定しない
 
 ### Requirement: Missing continuationは既存broker preparationとSafetyFloorを維持する
 

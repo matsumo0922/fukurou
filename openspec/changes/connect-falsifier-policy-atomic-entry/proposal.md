@@ -7,12 +7,13 @@ A2a までは backend が inactive で A1 `Missing` が常に fail closed にな
 
 - A1 authorized place boundary は authority と fingerprint を検証し、stable identity だけの strict replay を fresh preparation より先に実行する
 - public `PaperBroker` constructor と任意の`connectedPostgres(dataSource, database)` pairを受けるfactoryは authorized capability unsupported のままとし、database引数を受けないproduction-safe factoryだけがearly opaque `PostgresStorageRoot`を生成する
-- rootは同じDataSource由来の`ExposedDatabase`、scope connection factory / eviction controllerだけを所有し、active DB runtime configとclock解決後にroot overloadがledger / decision / policy repository、backendをconfig-bound bundleとして構成する。InMemoryは同じruntime repository instancesを要求し、mismatchは`Exact` / `Missing`にかかわらずtyped unsupportedにする
-- `ApplicationDatabaseResources`はrootを保持してread-only DataSource / database getterを他serviceへ渡し、daemon schedulerとmanual launchはresolved configごとにroot overloadから`TradingRuntime`を構築する。shared runtimeはrootをcloseせずApplication shutdownがworkers終了後に一度だけcloseし、standalone runtimeは所有rootを一度だけcloseする
-- backendはstable request execution scopeを提供し、PostgreSQLはdedicated sessionが存続するnormal concurrency、InMemoryはprocess内mutexの存続中に同じrequestを直列化する。PostgreSQL session loss / failoverを完全直列化とは扱わない
+- rootは同じDataSource由来の`ExposedDatabase`、scope connection factory / eviction controller、stable-identity keyed process-local cancellable mutex registryだけを所有し、active DB runtime configとclock解決後にroot overloadがledger / decision / policy repository、backendをconfig-bound bundleとして構成する。InMemoryは同じruntime repository instancesを要求し、mismatchは`Exact` / `Missing`にかかわらずtyped unsupportedにする
+- `ApplicationDatabaseResources`はrootを保持してread-only DataSource / database getterを他serviceへ渡し、daemon schedulerとmanual launchはresolved configごとにroot overloadから`TradingRuntime`を構築する。schedulerの各loop generationは`TradingRuntime`を含むcloseable bundleを所有してfinallyでbound runtimeをcloseし、worker shutdownはcancel後のjob terminationを独立30秒deadlineでawaitする。termination成功後だけApplicationがshared rootをcloseし、timeout時はrootをcloseせずtyped shutdown failureを返す。standalone runtimeは所有rootを一度だけcloseする
+- backendはstable request execution scopeを提供し、PostgreSQLはroot-owned process-local identity mutexをdedicated connection borrow前に取得してからcross-process advisory lockを取得し、InMemoryはprocess内mutexで同じrequestを直列化する。mutex registryはholder / waiter refcountでcleanupし、異なるrequestの並行性を維持する。PostgreSQL session loss / failoverを完全直列化とは扱わない
 - PostgreSQL stable request lockはblocking APIを使わず、既存global / market-sessionのsingle-bigint advisory key familyと分離したtwo-int `pg_try_advisory_lock`を固定namespace `1179994962`とstable request hash32で30秒のmonotonic deadlineまで50ms間隔pollする
-- 30秒deadlineはHikari connection borrow前に開始し、borrowと各try callをremaining budgetのquery / network timeoutで拘束する。cancel / SQL failure / response loss / timeout restore failureはconnectionをevictし、unlockは独立5秒cleanup deadlineで失敗時にabort / evictする
+- 30秒deadlineはprocess-local mutex wait前に開始し、local wait、borrow、各try callをremaining budgetで拘束する。same-request local waiterはconnectionをborrowせず、cancel / SQL failure / response loss / timeout restore failureはconnectionをevictし、unlockは独立5秒cleanup deadlineで失敗時にabort / evictする
 - PostgreSQLはSafetyFloor / DB-visible preparation side effect前、A2a backend invocation前、non-mutation terminal return前にacquisitionと無関係な独立5秒monotonic deadlineで同じdedicated sessionのheartbeat / ownershipを確認する。remaining query / network timeout、running statement cancel、timeout restore failure時のevictをacquisition / unlockと同様に適用し、loss / unknownはtyped unavailableで成功・NO_TRADE・未commitへ変換せず、backend confirmed result後のscope lossはpaper truthとstrategy evaluationを覆わない
+- heartbeat成功と別connection上のterminal readback / backend invocationの間にはsession lossのcheck-use gapが残る。別processの後続commitをA2bのnon-mutation terminalからdurable `NO_TRADE`へ畳まず、terminal mappingはBへstage-outする
 - `Exact` は保存済み result をそのまま返し、`Ambiguous` / read failure は mutation へ進めず typed failure を維持する
 - `Missing` の場合だけ、既存 public place path と同じ command validation、market preparation、SafetyFloor、symbol / price / cash contract、MARKET / resting proposal preparation を実行する
 - preparation 後は InMemory / PostgreSQL の A2a `AuthorizedAtomicPaperEntryBackend` を呼び、backend の `Exact` / `Created` を `PaperTradeResult` へ変換する
@@ -36,7 +37,7 @@ A2a までは backend が inactive で A1 `Missing` が常に fail closed にな
 ## Impact
 
 - `AuthorizedFalsifierPolicyBoundary` の storage affinity / stable request scope / strict replay / `Missing` continuation
-- `TradingRuntimeFactory` のopaque `PostgresStorageRoot`、config-bound runtime bundle、`PaperBroker` capability injection、shutdown ownership
+- `TradingRuntimeFactory` のopaque `PostgresStorageRoot`、process-local scope admission、config-bound runtime bundle、`PaperBroker` capability injection、scheduler generation / shutdown ownership
 - `PaperBroker` の authorized place preparation とnon-mutation terminal readback
 - InMemory / PostgreSQL の stable request scope、two-int advisory namespace、connection eviction、strict replay reader adapter、`AuthorizedAtomicPaperEntryBackend`
 - authorized boundary / broker / backend integration test
