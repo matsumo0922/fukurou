@@ -19,6 +19,7 @@ import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRetryPermit
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryScan
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
@@ -526,6 +527,103 @@ class LlmExecutionRecoveryServiceTest {
         )
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
     }
+
+    @Test
+    fun blockerRecovery_terminalConfirmationClearsBlockerAndAudits() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val commandEventLog = InMemoryCommandEventLog()
+        finishClaimedReservation(repository, "uncertain-terminal")
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("uncertain-terminal", CLAIM_TOKEN)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+
+        val service = recoveryService(repository, afterClearanceWindow(), commandEventLog)
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+
+        val audits = commandEventLog.findEvents(
+            limit = 10,
+            eventType = CommandEventType.LLM_EXECUTION_ADMISSION_BLOCKER_RESOLVED,
+        ).getOrThrow()
+        assertEquals(1, audits.size)
+        assertTrue(audits.single().payload.contains("uncertain-terminal"))
+        assertTrue(audits.single().payload.contains(LlmLaunchReservationStatus.FAILED.name))
+    }
+
+    @Test
+    fun blockerRecovery_heartbeatFailureUnderTheSameKeyAlsoClears() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(repository, "heartbeat-terminal")
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("heartbeat-terminal", CLAIM_TOKEN)
+        LlmExecutionAdmissionHealth.recordHeartbeatResult("heartbeat-terminal", CLAIM_TOKEN, healthy = false)
+
+        val service = recoveryService(repository, afterClearanceWindow())
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_runningReservationKeepsBlocker() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        reserve(repository, "still-running", RECOVERY_INSTANT)
+        claim(repository, "still-running", RECOVERY_INSTANT)
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("still-running", CLAIM_TOKEN)
+
+        // stale scan の hard deadline 前を観測時刻にして、blocker 照合 pass だけが RUNNING を評価する状況にする。
+        val service = recoveryService(repository, RECOVERY_INSTANT.plusSeconds(1))
+        assertEquals(0, service.tick().getOrThrow())
+
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_clearanceWindowNotElapsedKeepsBlocker() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(repository, "window-open")
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("window-open", CLAIM_TOKEN)
+
+        val service = recoveryService(repository, RECOVERY_INSTANT.plusSeconds(1))
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_mismatchedTokenKeepsBlocker() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(repository, "token-mismatch")
+        val reflectionStyleToken = "reflection-terminal:token-mismatch"
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("token-mismatch", reflectionStyleToken)
+
+        val service = recoveryService(repository, afterClearanceWindow())
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_missingReservationKeepsBlocker() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("never-reserved", CLAIM_TOKEN)
+
+        val service = recoveryService(repository, afterClearanceWindow())
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerRecovery_auditFailureKeepsBlockerAndFailsTick() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        finishClaimedReservation(repository, "audit-failure")
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("audit-failure", CLAIM_TOKEN)
+
+        val service = recoveryService(repository, afterClearanceWindow(), FailingAppendCommandEventLog())
+
+        assertTrue(service.tick().isFailure)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
 }
 
 private class MutableClock(var current: Instant) : Clock() {
@@ -1020,6 +1118,35 @@ private suspend fun claim(
             claimedAt = now,
         ),
     )
+}
+
+/** claim 済み reservation を FAILED で終端し、blocker 照合の前提を作る。 */
+private suspend fun finishClaimedReservation(
+    repository: LlmLaunchReservationRepository,
+    invocationId: String,
+) {
+    reserve(repository, invocationId, RECOVERY_INSTANT)
+    claim(repository, invocationId, RECOVERY_INSTANT)
+    repository.finish(
+        LlmLaunchReservationFinish(
+            invocationId = invocationId,
+            status = LlmLaunchReservationStatus.FAILED,
+            reason = "test_uncertain_terminal",
+            finishedAt = RECOVERY_INSTANT,
+            claimantToken = CLAIM_TOKEN,
+        ),
+    ).getOrThrow()
+}
+
+/** clearance window（hardTimeout + processTerminationGrace）を確実に超えた観測時刻を返す。 */
+private fun afterClearanceWindow(): Instant {
+    val policy = OneShotExecutionPolicy.from(LlmRunnerConfig())
+    return RECOVERY_INSTANT.plus(policy.hardTimeout).plus(policy.processTerminationGrace).plusSeconds(1)
+}
+
+private class FailingAppendCommandEventLog : CommandEventLog by InMemoryCommandEventLog() {
+    override suspend fun append(event: CommandEvent): Result<Unit> =
+        Result.failure(IllegalStateException("audit append failed."))
 }
 
 private const val CLAIM_TOKEN = "claim-token"
