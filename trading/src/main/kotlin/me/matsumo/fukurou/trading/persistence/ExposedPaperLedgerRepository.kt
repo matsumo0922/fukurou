@@ -1,7 +1,5 @@
 package me.matsumo.fukurou.trading.persistence
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.AccountSnapshotWithUpdatedAt
 import me.matsumo.fukurou.trading.broker.ExecutionActivityDecisionContext
 import me.matsumo.fukurou.trading.broker.ExecutionActivityOrderContext
@@ -54,7 +52,6 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.util.UUID
 import org.jetbrains.exposed.v1.jdbc.Database as ExposedDatabase
-import org.jetbrains.exposed.v1.jdbc.transactions.transaction as exposedTransaction
 
 /**
  * paper account single row を読む SQL。
@@ -846,53 +843,6 @@ private class ExposedPaperLedgerExecutionReader(
 }
 
 /**
- * Exposed/JDBC で paper ledger の order 履歴を読む repository。
- *
- * @param database Exposed database
- */
-private class ExposedPaperLedgerOrderReader(
-    private val database: ExposedDatabase,
-) : PaperLedgerOrderRepository {
-    override suspend fun findOrdersByTradeGroupId(tradeGroupId: UUID): Result<List<Order>> {
-        return readLedgerResult(database) { selectOrdersByTradeGroupId(tradeGroupId.toString()) }
-    }
-}
-
-/**
- * Exposed/JDBC で paper ledger の履歴系読み取りを行う repository。
- *
- * @param database Exposed database
- */
-private class ExposedPaperLedgerHistoryReader(
-    private val database: ExposedDatabase,
-) : PaperLedgerHistoryRepository {
-    override suspend fun findClosedPositionsClosedBetween(
-        from: Instant,
-        toExclusive: Instant,
-        limit: Int,
-    ): Result<List<ClosedPaperPosition>> {
-        return readLedgerResult(
-            database = database,
-            beforeRead = {
-                require(limit > 0) {
-                    "limit must be greater than 0."
-                }
-            },
-        ) {
-            selectClosedPositionsClosedBetween(
-                from = from,
-                toExclusive = toExclusive,
-                limit = limit,
-            )
-        }
-    }
-
-    override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
-        return readLedgerResult(database) { findPlaceOrderResultByClientRequestId(clientRequestId) }
-    }
-}
-
-/**
  * Exposed/JDBC で paper ledger を読む repository。
  *
  * @param database Exposed database
@@ -901,7 +851,7 @@ private class ExposedPaperLedgerHistoryReader(
  * @param gateShadowObservationSink TTL 失効 capture の post-commit 保存経路
  */
 class ExposedPaperLedgerRepository private constructor(
-    private val writer: ExposedPaperLedgerWriter,
+    internal val writer: ExposedPaperLedgerWriter,
     accountRepository: PaperLedgerAccountRepository,
     executionRepository: PaperLedgerExecutionRepository,
     orderRepository: PaperLedgerOrderRepository,
@@ -960,22 +910,6 @@ class ExposedPaperLedgerRepository private constructor(
     }
 }
 
-private suspend fun <T> readLedgerResult(
-    database: ExposedDatabase,
-    beforeRead: () -> Unit = {},
-    read: JdbcTransaction.() -> T,
-): Result<T> {
-    return withContext(Dispatchers.IO) {
-        runCatching {
-            beforeRead()
-
-            exposedTransaction(database) {
-                read()
-            }
-        }
-    }
-}
-
 /**
  * paper_account single row を SELECT する。
  */
@@ -993,7 +927,7 @@ internal fun JdbcTransaction.selectPaperAccount(): AccountSnapshot {
 /**
  * paper_account single row と updated_at を同一 SELECT で取得する。
  */
-internal fun JdbcTransaction.selectPaperAccountWithUpdatedAt(): AccountSnapshotWithUpdatedAt {
+private fun JdbcTransaction.selectPaperAccountWithUpdatedAt(): AccountSnapshotWithUpdatedAt {
     return jdbcConnection().prepareStatement(SELECT_PAPER_ACCOUNT_SQL).use { statement ->
         statement.setInt(1, PAPER_ACCOUNT_SINGLE_ROW_ID)
         statement.executeQuery().use { resultSet ->
@@ -1137,7 +1071,7 @@ private fun JdbcTransaction.findPlaceOrderResultByClientRequestId(clientRequestI
     )
 }
 
-private fun JdbcTransaction.selectOrdersByClientRequestId(clientRequestId: String): List<Order> {
+internal fun JdbcTransaction.selectOrdersByClientRequestId(clientRequestId: String): List<Order> {
     return jdbcConnection().prepareStatement(SELECT_ORDERS_BY_CLIENT_REQUEST_ID_SQL).use { statement ->
         statement.setString(1, clientRequestId)
         statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -1153,7 +1087,7 @@ internal fun JdbcTransaction.selectOrdersByTradeGroupId(tradeGroupId: String): L
     }
 }
 
-private fun JdbcTransaction.selectPositionsByTradeGroupId(tradeGroupId: String): List<Position> {
+internal fun JdbcTransaction.selectPositionsByTradeGroupId(tradeGroupId: String): List<Position> {
     return jdbcConnection().prepareStatement(SELECT_POSITIONS_BY_TRADE_GROUP_ID_SQL).use { statement ->
         statement.setObject(1, UUID.fromString(tradeGroupId))
         statement.setInt(2, PAPER_ACCOUNT_SINGLE_ROW_ID)
@@ -1175,7 +1109,7 @@ internal fun JdbcTransaction.selectExecutionsByOrderIds(orderIds: List<String>):
     }
 }
 
-private fun JdbcTransaction.selectExecutionsByPositionIds(positionIds: List<String>): List<Execution> {
+internal fun JdbcTransaction.selectExecutionsByPositionIds(positionIds: List<String>): List<Execution> {
     if (positionIds.isEmpty()) {
         return emptyList()
     }
@@ -1540,4 +1474,34 @@ private fun ResultSet.getNullableString(columnName: String): String? {
     val value = getString(columnName)
 
     return if (wasNull()) null else value
+}
+
+/**
+ * Exposed/JDBC で paper ledger の履歴系読み取りを行う repository。
+ *
+ * @param database Exposed database
+ */
+private class ExposedPaperLedgerHistoryReader(
+    private val database: ExposedDatabase,
+) : PaperLedgerHistoryRepository {
+    override suspend fun findClosedPositionsClosedBetween(
+        from: Instant,
+        toExclusive: Instant,
+        limit: Int,
+    ): Result<List<ClosedPaperPosition>> {
+        return readLedgerResult(
+            database = database,
+            beforeRead = {
+                require(limit > 0) {
+                    "limit must be greater than 0."
+                }
+            },
+        ) {
+            selectClosedPositionsClosedBetween(from, toExclusive, limit)
+        }
+    }
+
+    override suspend fun findPlaceOrderResultByClientRequestId(clientRequestId: String): Result<PaperTradeResult?> {
+        return readLedgerResult(database) { findPlaceOrderResultByClientRequestId(clientRequestId) }
+    }
 }

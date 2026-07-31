@@ -22,13 +22,13 @@
 
 ## 3. PostgreSQL atomic backend
 
-- [ ] 3.1 Exposed backendにinternal capabilityを実装し、MARKET / eligibilityなしrestingを`risk_state -> paper_account -> positions -> orders`でlockする
+- [x] 3.1 Exposed backendにinternal capabilityを実装し、MARKET / eligibilityなしrestingを`risk_state -> paper_account -> positions -> orders`でlockする
 - [ ] 3.2 eligibility付きrestingを`session advisory -> market_data_sessions FOR UPDATE / verify -> risk_state -> paper_account -> positions -> orders`でlockし、ledger後のsession取得を禁止する
 - [ ] 3.3 同じtransaction内にstable identityだけを読むstrict exact replay readerを追加し、entryをv2 IDでanchorし、persisted statusからlifecycleを判定し、NULL client request IDのprotective STOPをpersisted position ID・trade group・SELL / STOP roleで一意に特定する
 - [ ] 3.4 `Missing`後にintent存在 / consumptionとflat predicateを読み、既存write policyを通してMARKET / resting mutationとconsumptionを一括commitする
 - [ ] 3.5 mutation transactionを`maxAttempts=1`とbody-completed markerで囲み、rollback確認済みpre-body / pre-commit failureをUnavailable、body完了後またはrollback不明をOutcomeIndeterminateに分類する
 - [ ] 3.6 OutcomeIndeterminate直後に`maxAttempts=1`のfresh strict readbackを一度だけ実行し、`Exact`なら回復、unavailable / `Missing` / `Ambiguous`ならindeterminateを維持する
-- [ ] 3.7 schema migration、index、data backfillを追加せず既存table / unique constraintで実装する
+- [x] 3.7 schema migration、index、data backfillを追加せず既存table / unique constraintで実装する
 
 ## 4. Replay, failure, and concurrency tests
 

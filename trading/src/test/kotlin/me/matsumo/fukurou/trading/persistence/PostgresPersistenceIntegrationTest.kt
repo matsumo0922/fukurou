@@ -44,6 +44,12 @@ import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
 import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
 import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryCreationProposal
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIdentity
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryNotFlatException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryReplayIndeterminateException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryResult
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicPaperEntryRequest
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.FillSimulator
@@ -11346,6 +11352,349 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2, classifications["NEW_EPISODE"])
         assertEquals(1, classifications["MAINTAIN_PENDING"])
         runtime.close()
+    }
+
+    @Test
+    fun authorizedAtomicEntryCreatesThenReplaysPostgresMarketEntry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val groupId = UUID.randomUUID()
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-market",
+            ).copy(tradeGroupId = groupId),
+        )
+        val entry = directPostgresMarketEntryRequest(command, groupId)
+        val request = AuthorizedAtomicPaperEntryRequest(
+            identity = AuthorizedAtomicEntryIdentity.from(command, TradingMode.PAPER),
+            proposal = AuthorizedAtomicEntryCreationProposal.Market(
+                IntentConsumingMarketEntryFillRequest(
+                    entry = entry,
+                    consumption = TradeIntentConsumptionRequest(
+                        intentId = requireNotNull(command.intentId),
+                        consumedAt = fixedInstant(),
+                    ),
+                ),
+            ),
+        )
+        val backend = ledger.authorizedAtomicEntryBackend()
+
+        val created = backend.commit(request).getOrThrow()
+        val replayed = backend.commit(request).getOrThrow()
+
+        assertIs<AuthorizedAtomicEntryResult.Created>(created)
+        assertIs<AuthorizedAtomicEntryResult.Exact>(replayed)
+        assertEquals(created.result.orderIds, replayed.result.orderIds)
+        assertEquals(1, ledger.getOpenPositions().getOrThrow().size)
+        assertEquals(1, ledger.getOpenOrders().getOrThrow().size)
+    }
+
+    @Test
+    fun authorizedAtomicEntryReplaysMarketEntryWhenStableGroupIsNull() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val stableCommand = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-null-group",
+            ),
+        )
+        val resolvedCommand = stableCommand.copy(tradeGroupId = UUID.randomUUID())
+        val entry = directPostgresMarketEntryRequest(resolvedCommand, requireNotNull(resolvedCommand.tradeGroupId))
+        val request = AuthorizedAtomicPaperEntryRequest(
+            identity = AuthorizedAtomicEntryIdentity.from(stableCommand, TradingMode.PAPER),
+            proposal = AuthorizedAtomicEntryCreationProposal.Market(
+                IntentConsumingMarketEntryFillRequest(
+                    entry = entry,
+                    consumption = TradeIntentConsumptionRequest(
+                        intentId = requireNotNull(stableCommand.intentId),
+                        consumedAt = fixedInstant(),
+                    ),
+                ),
+            ),
+        )
+
+        val created = ledger.authorizedAtomicEntryBackend().commit(request).getOrThrow()
+        val replayed = ledger.authorizedAtomicEntryBackend().commit(request).getOrThrow()
+
+        assertIs<AuthorizedAtomicEntryResult.Created>(created)
+        assertIs<AuthorizedAtomicEntryResult.Exact>(replayed)
+        assertEquals(created.result.orderIds, replayed.result.orderIds)
+    }
+
+    @Test
+    fun authorizedAtomicEntryRejectsNonFlatStateWithoutConsumingSecondIntent() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val first = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-first",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val firstEntry = directPostgresMarketEntryRequest(first, requireNotNull(first.tradeGroupId))
+        ledger.authorizedAtomicEntryBackend().commit(
+            authorizedPostgresMarketRequest(first, firstEntry),
+        ).getOrThrow()
+        val second = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-second",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val secondEntry = directPostgresMarketEntryRequest(second, requireNotNull(second.tradeGroupId))
+
+        val failure = ledger.authorizedAtomicEntryBackend().commit(
+            authorizedPostgresMarketRequest(second, secondEntry),
+        ).exceptionOrNull()
+
+        assertIs<AuthorizedAtomicEntryNotFlatException>(failure)
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions WHERE intent_id='${second.intentId}'"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryCreatesThenReplaysPostgresRestingEntry() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-resting",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresRestingRequest(
+            command = command,
+            order = directPostgresRestingEntryRequest(command, requireNotNull(command.tradeGroupId)).copy(
+                orderId = UUID.randomUUID(),
+            ),
+        )
+        val backend = ledger.authorizedAtomicEntryBackend()
+
+        val created = backend.commit(request).getOrThrow()
+        val replayed = backend.commit(request).getOrThrow()
+
+        assertIs<AuthorizedAtomicEntryResult.Created>(created)
+        assertIs<AuthorizedAtomicEntryResult.Exact>(replayed)
+        assertEquals(created.result.orderIds, replayed.result.orderIds)
+        assertEquals(1, ledger.getOpenOrders().getOrThrow().size)
+        assertTrue(ledger.getOpenPositions().getOrThrow().isEmpty())
+    }
+
+    @Test
+    fun authorizedAtomicEntrySerializesSameRequestAtPaperAccountLock() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-concurrent",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresMarketRequest(
+            command = command,
+            entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+        )
+        val backend = ledger.authorizedAtomicEntryBackend()
+        val lockConnection = dataSource.connection
+        lockConnection.autoCommit = false
+        lockConnection.prepareStatement("SELECT id FROM paper_account WHERE id = 1 FOR UPDATE").use { statement ->
+            statement.executeQuery().use { rows -> assertTrue(rows.next()) }
+        }
+
+        try {
+            coroutineScope {
+                val first = async(Dispatchers.IO) { backend.commit(request) }
+                val second = async(Dispatchers.IO) { backend.commit(request) }
+
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+                lockConnection.commit()
+
+                val outcomes = awaitAll(first, second).map { result -> result.getOrThrow() }
+                assertEquals(1, outcomes.count { outcome -> outcome is AuthorizedAtomicEntryResult.Created })
+                assertEquals(1, outcomes.count { outcome -> outcome is AuthorizedAtomicEntryResult.Exact })
+            }
+        } finally {
+            if (!lockConnection.isClosed) lockConnection.close()
+        }
+
+        assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM executions"))
+        assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryRejectsFreshIdCollisionWithCanceledOrder() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val historicalCommand = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-historical",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val historicalOrder = directPostgresRestingEntryRequest(
+            historicalCommand,
+            requireNotNull(historicalCommand.tradeGroupId),
+        ).copy(orderId = UUID.randomUUID())
+        ledger.authorizedAtomicEntryBackend().commit(
+            authorizedPostgresRestingRequest(historicalCommand, historicalOrder),
+        ).getOrThrow()
+        ledger.cancelOrder(
+            CancelOrderCommand(
+                commandId = UUID.randomUUID(),
+                orderId = historicalOrder.orderId,
+                reasonJa = "fresh ID collision fixture",
+                auditContext = PaperTradeAuditContext.EMPTY,
+            ),
+        ).getOrThrow()
+        val candidate = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-candidate",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val collidingEntry = directPostgresMarketEntryRequest(
+            candidate,
+            requireNotNull(candidate.tradeGroupId),
+        ).copy(positionId = historicalOrder.orderId)
+
+        val failure = ledger.authorizedAtomicEntryBackend().commit(
+            authorizedPostgresMarketRequest(candidate, collidingEntry),
+        ).exceptionOrNull()
+
+        assertIs<IllegalStateException>(failure)
+        assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryRejectsOrphanExecutionWithSameStableRequestId() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-orphan-execution",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        insertOrphanExecution(database, requireNotNull(command.auditContext.clientRequestId))
+        val entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId))
+
+        val failure = ledger.authorizedAtomicEntryBackend().commit(
+            authorizedPostgresMarketRequest(command, entry),
+        ).exceptionOrNull()
+
+        assertIs<AuthorizedAtomicEntryReplayIndeterminateException>(failure)
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM orders"))
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryRejectsExtraOrphanExecutionBesideCompleteReplay() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-extra-orphan",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId))
+        val request = authorizedPostgresMarketRequest(command, entry)
+        ledger.authorizedAtomicEntryBackend().commit(request).getOrThrow()
+        insertOrphanExecution(
+            database = database,
+            clientRequestId = requireNotNull(command.auditContext.clientRequestId),
+            positionId = entry.positionId,
+        )
+
+        val failure = ledger.authorizedAtomicEntryBackend().commit(request).exceptionOrNull()
+
+        assertIs<AuthorizedAtomicEntryReplayIndeterminateException>(failure)
+        assertEquals(2L, selectLongForTest(database, "SELECT COUNT(*) FROM orders"))
+        assertEquals(2L, selectLongForTest(database, "SELECT COUNT(*) FROM executions"))
+        assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+}
+
+private fun authorizedPostgresMarketRequest(
+    command: PlaceOrderCommand,
+    entry: MarketEntryFillRequest,
+): AuthorizedAtomicPaperEntryRequest {
+    return AuthorizedAtomicPaperEntryRequest(
+        identity = AuthorizedAtomicEntryIdentity.from(command, TradingMode.PAPER),
+        proposal = AuthorizedAtomicEntryCreationProposal.Market(
+            IntentConsumingMarketEntryFillRequest(
+                entry = entry,
+                consumption = TradeIntentConsumptionRequest(
+                    intentId = requireNotNull(command.intentId),
+                    consumedAt = fixedInstant(),
+                ),
+            ),
+        ),
+    )
+}
+
+private fun authorizedPostgresRestingRequest(
+    command: PlaceOrderCommand,
+    order: RestingEntryOrderRequest,
+): AuthorizedAtomicPaperEntryRequest {
+    return AuthorizedAtomicPaperEntryRequest(
+        identity = AuthorizedAtomicEntryIdentity.from(command, TradingMode.PAPER),
+        proposal = AuthorizedAtomicEntryCreationProposal.Resting(
+            IntentConsumingRestingEntryOrderRequest(
+                order = order,
+                consumption = TradeIntentConsumptionRequest(
+                    intentId = requireNotNull(command.intentId),
+                    consumedAt = fixedInstant(),
+                ),
+            ),
+        ),
+    )
+}
+
+private fun insertOrphanExecution(
+    database: ExposedDatabase,
+    clientRequestId: String,
+    positionId: UUID? = null,
+) {
+    exposedTransaction(database) {
+        prepare(
+            """
+                INSERT INTO executions (
+                    id, order_id, position_id, mode, symbol, side, price_jpy, size_btc,
+                    fee_jpy, realized_pnl_jpy, liquidity, executed_at, client_request_id
+                )
+                VALUES (?, NULL, ?, 'PAPER', 'BTC', 'BUY', 10000000, 0.01, 0, 0, 'TAKER', ?, ?)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(2, positionId)
+            statement.setLong(3, fixedInstant().toEpochMilli())
+            statement.setString(4, clientRequestId)
+            assertEquals(1, statement.executeUpdate())
+        }
     }
 }
 

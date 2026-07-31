@@ -6,6 +6,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryNotFlatException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryReplayIndeterminateException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryResult
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicPaperEntryRequest
+import me.matsumo.fukurou.trading.broker.AuthorizedPlaceOrderReplay
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentConsumedException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentMissingException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryCreationProposal
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
@@ -37,6 +45,7 @@ import me.matsumo.fukurou.trading.broker.UpdateProtectionCommand
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.broker.btcScale
 import me.matsumo.fukurou.trading.broker.emptyReconcileProgress
+import me.matsumo.fukurou.trading.broker.freshEntityIds
 import me.matsumo.fukurou.trading.broker.hasTightenedStop
 import me.matsumo.fukurou.trading.broker.limitOrderReached
 import me.matsumo.fukurou.trading.broker.marketFill
@@ -52,6 +61,8 @@ import me.matsumo.fukurou.trading.broker.unrealizedPnlAt
 import me.matsumo.fukurou.trading.broker.unrealizedRAt
 import me.matsumo.fukurou.trading.broker.withEntryCommandContext
 import me.matsumo.fukurou.trading.broker.withOrderContext
+import me.matsumo.fukurou.trading.broker.ProtectiveStopClientRequestIdPolicy
+import me.matsumo.fukurou.trading.broker.classifyAuthorizedAtomicEntryReplay
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.domain.AccountSnapshot
@@ -114,6 +125,7 @@ private val gateShadowLogger = Logger.getLogger(ExposedPaperLedgerWriter::class.
  * @param maxDrawdownPolicy active runtime config に束縛された最大 drawdown policy
  * @param gateShadowObservationSink TTL 失効 capture の post-commit 保存経路
  */
+@Suppress("TooManyFunctions")
 internal class ExposedPaperLedgerWriter(
     private val database: ExposedDatabase,
     private val fallbackSymbolRules: SymbolRules,
@@ -270,6 +282,58 @@ internal class ExposedPaperLedgerWriter(
                         messageJa = "resting entry intent を保存しました。",
                     )
                 }
+            }
+        }
+    }
+
+    /**
+     * eligibility を持たない authorized entry を一つの JDBC transaction で確定する。
+     *
+     * realtime eligibility と commit outcome 不明時の readback は後続 slice で追加する。
+     */
+    suspend fun commitAuthorizedAtomicEntry(
+        request: AuthorizedAtomicPaperEntryRequest,
+    ): Result<AuthorizedAtomicEntryResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                Result.success(
+                    exposedTransaction(database) {
+                        request.requireStableIdentityValid()
+                        val riskState = lockPaperLedgerMutationRows()
+                        when (val replay = readAuthorizedAtomicEntryReplay(request)) {
+                            is AuthorizedPlaceOrderReplay.Exact -> return@exposedTransaction AuthorizedAtomicEntryResult.Exact(
+                                replay.result,
+                            )
+                            AuthorizedPlaceOrderReplay.Ambiguous -> {
+                                throw AuthorizedAtomicEntryReplayIndeterminateException()
+                            }
+                            AuthorizedPlaceOrderReplay.Missing -> Unit
+                        }
+
+                        request.requireCreationProposalValid()
+                        val hasRealtimeEligibility = request.proposal is AuthorizedAtomicEntryCreationProposal.Resting &&
+                            request.proposal.request.order.marketEligibility != null
+                        require(!hasRealtimeEligibility)
+                        requireAuthorizedEntryProposalFresh(request.proposal)
+                        requireAuthorizedEntryIntentAvailable(request)
+                        requireAuthorizedEntryFlat()
+                        val writeIntent = resolvePaperWriteContext(request.proposal.command.auditContext, riskState)
+                            .intent(PaperWritePolicy.RISK_INCREASING)
+                        val result = writeAuthorizedAtomicEntry(request.proposal, writeIntent, clock)
+
+                        insertTradeIntentConsumption(
+                            intentId = request.identity.intentId,
+                            orderId = UUID.fromString(result.orderIds.first()),
+                            consumedAt = request.proposal.consumption.consumedAt,
+                        )
+
+                        AuthorizedAtomicEntryResult.Created(result)
+                    },
+                )
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (failure: Throwable) {
+                Result.failure(failure)
             }
         }
     }
@@ -778,6 +842,165 @@ private fun JdbcTransaction.closePositionInTransaction(
 }
 
 /** ledger mutation が共有する row lock を authority 順に取得する。 */
+private fun JdbcTransaction.readAuthorizedAtomicEntryReplay(
+    request: AuthorizedAtomicPaperEntryRequest,
+): AuthorizedPlaceOrderReplay {
+    val identity = request.identity
+    val sameRequestOrders = selectOrdersByClientRequestId(identity.clientRequestId)
+    val groupIds = (
+        sameRequestOrders.mapNotNull { order -> order.tradeGroupId } +
+            listOfNotNull(identity.tradeGroupId?.toString())
+        ).distinct()
+    val stableGroupOrders = groupIds.flatMap { groupId -> selectOrdersByTradeGroupId(groupId) }
+    val orders = (sameRequestOrders + stableGroupOrders).distinctBy { order -> order.orderId }
+    val persistedGroupIds = (groupIds + orders.mapNotNull { order -> order.tradeGroupId }).distinct()
+    val positions = persistedGroupIds.flatMap { groupId -> selectPositionsByTradeGroupId(groupId) }
+        .distinctBy { position -> position.positionId }
+    val executions = selectExecutionsByOrderIds(orders.map { order -> order.orderId }) +
+        selectExecutionsByPositionIds(positions.map { position -> position.positionId })
+    val replay = classifyAuthorizedAtomicEntryReplay(
+        identity = identity,
+        orders = orders,
+        positions = positions,
+        executions = executions.distinctBy { execution -> execution.executionId },
+        stopClientRequestIdPolicy = ProtectiveStopClientRequestIdPolicy.NULL,
+    )
+    val auditArtifactIds = selectAuthorizedAtomicAuditArtifactIds(identity.clientRequestId)
+    val auditArtifactsMatchReplay = replay is AuthorizedPlaceOrderReplay.Exact &&
+        auditArtifactIds.positionIds == replay.result.positionIds.toSet() &&
+        auditArtifactIds.executionIds == replay.result.executionIds.toSet()
+
+    return when {
+        replay == AuthorizedPlaceOrderReplay.Ambiguous -> replay
+        auditArtifactIds.isEmpty() -> replay
+        auditArtifactsMatchReplay -> replay
+        else -> AuthorizedPlaceOrderReplay.Ambiguous
+    }
+}
+
+private fun JdbcTransaction.selectAuthorizedAtomicAuditArtifactIds(
+    clientRequestId: String,
+): AuthorizedAtomicAuditArtifactIds {
+    val positionIds = prepare("SELECT id FROM positions WHERE client_request_id=? AND mode='PAPER'").use { statement ->
+        statement.setString(1, clientRequestId)
+        statement.executeQuery().use { resultSet ->
+            buildSet {
+                while (resultSet.next()) add(resultSet.getObject(1, UUID::class.java).toString())
+            }
+        }
+    }
+    val executionIds = prepare("SELECT id FROM executions WHERE client_request_id=? AND mode='PAPER'").use { statement ->
+        statement.setString(1, clientRequestId)
+        statement.executeQuery().use { resultSet ->
+            buildSet {
+                while (resultSet.next()) add(resultSet.getObject(1, UUID::class.java).toString())
+            }
+        }
+    }
+
+    return AuthorizedAtomicAuditArtifactIds(positionIds, executionIds)
+}
+
+/** stable audit ID に紐づく position / execution artifact IDs。 */
+private data class AuthorizedAtomicAuditArtifactIds(
+    val positionIds: Set<String>,
+    val executionIds: Set<String>,
+) {
+    fun isEmpty(): Boolean = positionIds.isEmpty() && executionIds.isEmpty()
+}
+
+private fun JdbcTransaction.requireAuthorizedEntryIntentAvailable(request: AuthorizedAtomicPaperEntryRequest) {
+    val intentId = request.identity.intentId
+    if (!tradeIntentExists(intentId)) throw AuthorizedAtomicEntryIntentMissingException()
+    if (tradeIntentConsumed(intentId)) throw AuthorizedAtomicEntryIntentConsumedException()
+}
+
+private fun JdbcTransaction.requireAuthorizedEntryProposalFresh(proposal: AuthorizedAtomicEntryCreationProposal) {
+    val entityIds = proposal.freshEntityIds() + proposal.resolvedTradeGroupId()
+    entityIds.forEach { entityId ->
+        if (hasAuthorizedAtomicEntityReference(entityId)) {
+            error("authorized atomic entry proposal ID is already persisted.")
+        }
+    }
+}
+
+private fun AuthorizedAtomicEntryCreationProposal.resolvedTradeGroupId(): UUID {
+    return when (this) {
+        is AuthorizedAtomicEntryCreationProposal.Market -> request.entry.tradeGroupId
+        is AuthorizedAtomicEntryCreationProposal.Resting -> request.order.tradeGroupId
+    }
+}
+
+private fun JdbcTransaction.hasAuthorizedAtomicEntityReference(entityId: UUID): Boolean {
+    return prepare(
+        """
+            SELECT EXISTS(SELECT 1 FROM orders WHERE id=? OR position_id=? OR trade_group_id=?)
+                OR EXISTS(SELECT 1 FROM positions WHERE id=? OR trade_group_id=?)
+                OR EXISTS(SELECT 1 FROM executions WHERE id=? OR order_id=? OR position_id=?)
+                OR EXISTS(SELECT 1 FROM trade_intent_consumptions WHERE order_id=?)
+        """.trimIndent(),
+    ).use { statement ->
+        repeat(9) { index -> statement.setObject(index + 1, entityId) }
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getBoolean(1)
+        }
+    }
+}
+
+private fun JdbcTransaction.requireAuthorizedEntryFlat() {
+    val hasOpenPosition = selectOpenPositions().isNotEmpty()
+    val hasRiskIncreasingOrder = selectOpenOrders().any { order -> order.side == OrderSide.BUY }
+
+    if (hasOpenPosition || hasRiskIncreasingOrder) throw AuthorizedAtomicEntryNotFlatException()
+}
+
+private fun JdbcTransaction.writeAuthorizedAtomicEntry(
+    proposal: AuthorizedAtomicEntryCreationProposal,
+    writeIntent: PaperWriteIntent,
+    clock: Clock,
+): PaperTradeResult {
+    return when (proposal) {
+        is AuthorizedAtomicEntryCreationProposal.Market -> insertEntryFill(
+            EntryFillWriteRequest(
+                entry = proposal.request.entry,
+                entryOrderId = proposal.request.entry.command.commandId,
+                insertEntryOrder = true,
+            ),
+            writeIntent,
+            clock,
+        )
+        is AuthorizedAtomicEntryCreationProposal.Resting -> {
+            insertEntryOrder(
+                EntryOrderInsertRequest(
+                    command = proposal.request.order.command,
+                    orderId = proposal.request.order.orderId,
+                    positionId = null,
+                    tradeGroupId = proposal.request.order.tradeGroupId,
+                    status = OrderStatus.OPEN,
+                    writeIntent = writeIntent,
+                    createdAt = proposal.request.order.createdAt,
+                    expiresAt = proposal.request.order.expiresAt,
+                    expirySource = proposal.request.order.expirySource,
+                    effectiveTtlSeconds = proposal.request.order.effectiveTtlSeconds,
+                    marketEligibility = null,
+                    marketEligibleAfterAdmissionOrdinal = null,
+                ),
+                clock,
+            )
+
+            PaperTradeResult(
+                accepted = true,
+                status = OrderStatus.OPEN,
+                orderIds = listOf(proposal.request.order.orderId.toString()),
+                positionIds = emptyList(),
+                executionIds = emptyList(),
+                messageJa = "resting entry intent を保存しました。",
+            )
+        }
+    }
+}
+
 private fun JdbcTransaction.lockPaperLedgerMutationRows(): RiskState {
     val riskState = selectRiskState(forUpdate = true)
     prepare("SELECT id FROM paper_account WHERE id = ? FOR UPDATE").use { statement ->

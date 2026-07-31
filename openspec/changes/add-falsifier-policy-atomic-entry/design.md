@@ -365,6 +365,15 @@ transaction wrapper testはattempt counterでmutation bodyとreadbackが各最�
 
 ## Migration Plan
 
+### PostgreSQL A2a implementation split
+
+PostgreSQL A2a は、normal ledger transaction と realtime session / commit-outcome handling を別 stack PR に分ける。
+
+1. normal transaction foundation は eligibility のない MARKET / resting request だけを扱う。`risk_state -> paper_account -> positions -> orders` の既存 lock 順で、transaction-local strict replay、`Missing` 後の intent / flat / write-policy 検証、mutation、consumption を一つの transaction で確定する。paper account row を先に lock して zero-row flat predicate を直列化する。A2a capability は internal adapter のままで、public / A1 / runner へ接続しない。
+2. realtime / outcome slice は eligibility 付き resting の advisory / session row lock、`maxAttempts=1`、body-completed marker、OutcomeIndeterminate readback、session と `applyMarketEvent` の deterministic cross-test を追加する。
+
+第一 slice は second slice の outcome semantics を部分実装しない。eligibility を含む proposal は reject し、commit acknowledgement failure を OutcomeIndeterminate と主張しない。
+
 1. schema migration / backfillなしでInMemory / Exposed internal capabilityとdirect testを追加する。
 2. A1 boundaryが`Missing`でfail closedのまま、public/MCP schema、runner Falsifier behavior、status / outcome mappingが不変であることを確認する。
 3. A2aをinactive deployし、production call graphからcapabilityへ到達しないことを確認する。
