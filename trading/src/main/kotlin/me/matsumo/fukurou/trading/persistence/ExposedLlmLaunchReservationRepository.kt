@@ -4,12 +4,19 @@ package me.matsumo.fukurou.trading.persistence
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.daemon.ADMISSION_BLOCKER_RESOLUTION_TOOL_NAME
 import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolution
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolutionRequest
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerRetentionReason
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
@@ -28,7 +35,9 @@ import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import me.matsumo.fukurou.trading.daemon.admissionBlockerResolutionEvent
 import me.matsumo.fukurou.trading.daemon.executionClaimState
+import me.matsumo.fukurou.trading.daemon.isTerminal
 import me.matsumo.fukurou.trading.daemon.launchBudgetRejection
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_FAILED
 import me.matsumo.fukurou.trading.evaluation.LLM_RUN_STATUS_RUNNING
@@ -455,6 +464,54 @@ class ExposedLlmLaunchReservationRepository(
         }.getOrDefault(RecoveryReadbackOutcome.Unknown)
     }
 
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> = withContext(Dispatchers.IO) {
+        runCatching {
+            exposedTransaction(database) {
+                maxAttempts = 1
+                val existingAudit = selectRecoveryAudit(request.resolutionAttemptId, deadline, nanoTime)
+                if (existingAudit != null) {
+                    val observedStatus = existingAudit.admissionBlockerResolutionStatus(request)
+                    check(observedStatus != null) { "Admission blocker resolution audit identity mismatch." }
+                    armRecoveryCommitDeadline(deadline, nanoTime)
+
+                    return@exposedTransaction LlmAdmissionBlockerResolution.Resolved(observedStatus)
+                }
+
+                val reservation = selectRecoveryReservation(request.invocationId, deadline, nanoTime)
+                if (reservation == null) {
+                    armRecoveryCommitDeadline(deadline, nanoTime)
+                    return@exposedTransaction LlmAdmissionBlockerResolution.Retained(
+                        LlmAdmissionBlockerRetentionReason.RESERVATION_MISSING,
+                    )
+                }
+                if (!reservation.status.isTerminal()) {
+                    armRecoveryCommitDeadline(deadline, nanoTime)
+                    return@exposedTransaction LlmAdmissionBlockerResolution.Retained(
+                        LlmAdmissionBlockerRetentionReason.RESERVATION_RUNNING,
+                    )
+                }
+                if (!request.quietPeriodElapsed) {
+                    armRecoveryCommitDeadline(deadline, nanoTime)
+                    return@exposedTransaction LlmAdmissionBlockerResolution.Retained(
+                        LlmAdmissionBlockerRetentionReason.QUIET_PERIOD_NOT_ELAPSED,
+                    )
+                }
+
+                insertRecoveryEvent(
+                    admissionBlockerResolutionEvent(request, reservation.status),
+                    deadline,
+                    nanoTime,
+                )
+                armRecoveryCommitDeadline(deadline, nanoTime)
+
+                LlmAdmissionBlockerResolution.Resolved(reservation.status)
+            }
+        }
+    }
+
     override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -690,6 +747,26 @@ private fun RecoveryReservationSnapshot.matchesIdentity(request: LlmExecutionRec
         claimantToken == request.claimantToken &&
         reservedAt == request.observedReservedAt &&
         heartbeatAt == request.observedHeartbeatAt
+}
+
+private fun RecoveryAuditSnapshot.admissionBlockerResolutionStatus(
+    request: LlmAdmissionBlockerResolutionRequest,
+): LlmLaunchReservationStatus? {
+    val payloadObject = runCatching { Json.parseToJsonElement(payload).jsonObject }.getOrNull() ?: return null
+    val observedStatus = payloadObject["observedStatus"]?.jsonPrimitive?.content
+        ?.let { status -> runCatching { LlmLaunchReservationStatus.valueOf(status) }.getOrNull() }
+    val exactIdentity = id == request.resolutionAttemptId &&
+        decisionRunId == request.invocationId &&
+        toolCallId == null &&
+        clientRequestId == request.invocationId &&
+        toolName == ADMISSION_BLOCKER_RESOLUTION_TOOL_NAME &&
+        eventType == CommandEventType.LLM_ADMISSION_BLOCKER_AUTO_RESOLVED.name &&
+        payloadObject["invocationId"]?.jsonPrimitive?.content == request.invocationId &&
+        payloadObject["claimantToken"]?.jsonPrimitive?.content == request.claimantToken &&
+        payloadObject["resolutionAttemptId"]?.jsonPrimitive?.content == request.resolutionAttemptId.toString() &&
+        payloadObject["registeredAt"]?.jsonPrimitive?.content == request.registeredAt.toString()
+
+    return observedStatus?.takeIf { status -> exactIdentity && status.isTerminal() }
 }
 
 private fun RecoveryAuditSnapshot.matches(request: LlmExecutionRecoveryRequest): Boolean {

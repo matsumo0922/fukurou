@@ -78,6 +78,7 @@ data class ReflectionPromptCandidatePersistence(
  * @param llm LLM 実行境界
  * @param persistence 永続化境界
  * @param clock retry / audit timestamp 用 clock
+ * @param nanoTime monotonic elapsed time 用 clock
  * @param idGenerator invocation ID generator
  * @param logger 運用ログ出力
  */
@@ -85,6 +86,7 @@ data class ReflectionPromptCandidateGeneratorRuntime(
     val llm: ReflectionPromptCandidateLlmRuntime,
     val persistence: ReflectionPromptCandidatePersistence,
     val clock: Clock = Clock.systemUTC(),
+    val nanoTime: () -> Long = System::nanoTime,
     val idGenerator: () -> UUID = { UUID.randomUUID() },
     val logger: (String) -> Unit = {},
 )
@@ -390,7 +392,11 @@ class ReflectionPromptCandidateGenerator(
             terminalFailure = result.exceptionOrNull()
         }
 
-        ReflectionTerminalPersistenceSupervisor.register(start.invocationId) {
+        ReflectionTerminalPersistenceSupervisor.register(
+            invocationId = start.invocationId,
+            registeredAt = clock.instant(),
+            registeredAtNanos = runtime.nanoTime(),
+        ) {
             finishFailedRun(start, cause)
         }
         throw requireNotNull(terminalFailure)

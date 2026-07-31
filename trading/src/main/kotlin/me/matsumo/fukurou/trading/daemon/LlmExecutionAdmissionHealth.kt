@@ -1,5 +1,7 @@
 package me.matsumo.fukurou.trading.daemon
 
+import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -11,7 +13,7 @@ import kotlin.concurrent.write
 object LlmExecutionAdmissionHealth {
     private val admissionLock = ReentrantReadWriteLock(true)
     private val ambiguousClaims = ConcurrentHashMap.newKeySet<ClaimHealthKey>()
-    private val recoveryBlockers = ConcurrentHashMap.newKeySet<ClaimHealthKey>()
+    private val recoveryBlockers = ConcurrentHashMap<ClaimHealthKey, RecoveryBlockerRecord>()
     private val heartbeatFailures = ConcurrentHashMap.newKeySet<ClaimHealthKey>()
     private val heartbeatHealthy = AtomicBoolean(true)
     private val recoveryScanHealthy = AtomicBoolean(true)
@@ -58,13 +60,38 @@ object LlmExecutionAdmissionHealth {
     }
 
     /** termination fence 不明または recovery race 中の claim を fail-closed blocker にする。 */
-    fun registerRecoveryBlocker(invocationId: String, claimantToken: String = UNKNOWN_TOKEN) {
-        admissionLock.write { recoveryBlockers += ClaimHealthKey(invocationId, claimantToken) }
+    fun registerRecoveryBlocker(
+        invocationId: String,
+        claimantToken: String = UNKNOWN_TOKEN,
+        registeredAt: Instant,
+        registeredAtNanos: Long,
+    ) {
+        val key = ClaimHealthKey(invocationId, claimantToken)
+        val record = RecoveryBlockerRecord(
+            registeredAt = registeredAt,
+            registeredAtNanos = registeredAtNanos,
+            resolutionAttemptId = UUID.randomUUID(),
+        )
+        admissionLock.write { recoveryBlockers.putIfAbsent(key, record) }
+    }
+
+    /** recovery blocker を安定順の bounded snapshot として返す。 */
+    fun snapshotRecoveryBlockers(after: ClaimHealthKey?, limit: Int): List<RecoveryBlockerSnapshot> {
+        require(limit > 0) { "recovery blocker snapshot limit must be positive." }
+
+        return admissionLock.read {
+            recoveryBlockers.entries.asSequence()
+                .filter { (key) -> after == null || key > after }
+                .sortedBy { (key) -> key }
+                .take(limit)
+                .map { (key, record) -> RecoveryBlockerSnapshot(key, record) }
+                .toList()
+        }
     }
 
     /** live heartbeat または terminal 確認後だけ recovery blocker を解除する。 */
     fun resolveRecoveryBlocker(invocationId: String, claimantToken: String = UNKNOWN_TOKEN) {
-        admissionLock.write { recoveryBlockers -= ClaimHealthKey(invocationId, claimantToken) }
+        admissionLock.write { recoveryBlockers.remove(ClaimHealthKey(invocationId, claimantToken)) }
     }
 
     /** terminal confirmation 後に同じ claim token の全 blocker を解除する。 */
@@ -95,5 +122,25 @@ object LlmExecutionAdmissionHealth {
         heartbeatFailures.isEmpty()
 }
 
-private data class ClaimHealthKey(val invocationId: String, val claimantToken: String)
+/** recovery blocker の安定 cursor key。 */
+data class ClaimHealthKey(val invocationId: String, val claimantToken: String) : Comparable<ClaimHealthKey> {
+    override fun compareTo(other: ClaimHealthKey): Int {
+        val invocationComparison = invocationId.compareTo(other.invocationId)
+        return if (invocationComparison != 0) invocationComparison else claimantToken.compareTo(other.claimantToken)
+    }
+}
+
+/** recovery blocker の初回観測情報。 */
+data class RecoveryBlockerRecord(
+    val registeredAt: Instant,
+    val registeredAtNanos: Long,
+    val resolutionAttemptId: UUID,
+)
+
+/** recovery scan が読む blocker snapshot。 */
+data class RecoveryBlockerSnapshot(
+    val key: ClaimHealthKey,
+    val record: RecoveryBlockerRecord,
+)
+
 private const val UNKNOWN_TOKEN = "<unknown>"

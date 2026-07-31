@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 
 /** Reflection の run/reservation terminal persistence を restart なしで再試行する。 */
@@ -18,7 +19,12 @@ internal object ReflectionTerminalPersistenceSupervisor {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** unresolved lifecycle を admission blocker として登録して retry loop を開始する。 */
-    fun register(invocationId: String, terminalize: suspend () -> Unit) {
+    fun register(
+        invocationId: String,
+        registeredAt: Instant,
+        registeredAtNanos: Long,
+        terminalize: suspend () -> Unit,
+    ) {
         val blockerToken = blockerToken(invocationId)
         val job = scope.launch(start = CoroutineStart.LAZY) {
             while (currentCoroutineContext().isActive) {
@@ -37,7 +43,12 @@ internal object ReflectionTerminalPersistenceSupervisor {
             return
         }
 
-        LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, blockerToken)
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+            invocationId = invocationId,
+            claimantToken = blockerToken,
+            registeredAt = registeredAt,
+            registeredAtNanos = registeredAtNanos,
+        )
         job.start()
     }
 }

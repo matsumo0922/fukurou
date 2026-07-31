@@ -329,6 +329,7 @@ data class OneShotRunnerResult(
  * @param runtimeConfigSnapshot 起動開始時に固定する runtime config snapshot
  * @param parentEnvironment 親 process environment
  * @param clock audit timestamp 用 clock
+ * @param nanoTime monotonic elapsed time 用 clock
  * @param idGenerator invocation / tool call ID generator
  * @param logger 人間向け runner log 出力
  */
@@ -341,6 +342,7 @@ class OneShotLlmRunner(
     private val runtimeConfigSnapshot: RuntimeConfigAuditSnapshot? = null,
     private val parentEnvironment: Map<String, String> = System.getenv(),
     private val clock: Clock = Clock.systemUTC(),
+    private val nanoTime: () -> Long = System::nanoTime,
     private val idGenerator: () -> UUID = { UUID.randomUUID() },
     private val logger: (String) -> Unit = { message -> println(message) },
     private val cliVersionProbe: LlmCliVersionProbe = ProcessScopedLlmCliVersionProbe,
@@ -617,7 +619,12 @@ class OneShotLlmRunner(
                         observedAt = clock.instant(),
                     )
                 ProcessTreeTerminationProof.UNCERTAIN ->
-                    LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
+                    LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+                        invocationId = invocationId,
+                        claimantToken = claimantToken,
+                        registeredAt = clock.instant(),
+                        registeredAtNanos = nanoTime(),
+                    )
                 null -> Unit
             }
             withContext(NonCancellable) {

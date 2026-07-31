@@ -39,12 +39,14 @@ class LlmExecutionRecoveryWorker(
     private val interval: Duration = policy.heartbeatInterval,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val terminationTimeout: Duration = RECOVERY_WORKER_TERMINATION_TIMEOUT,
+    nanoTime: () -> Long = System::nanoTime,
 ) : AutoCloseable {
     private val recoveryService = LlmExecutionRecoveryService(
         repository = repository,
         policy = policy,
         clock = clock,
         availableStaleAfter = availableStaleAfter,
+        nanoTime = nanoTime,
     )
     private var job: Job? = null
 

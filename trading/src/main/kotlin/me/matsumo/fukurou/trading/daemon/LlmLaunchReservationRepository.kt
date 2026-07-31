@@ -2,6 +2,14 @@ package me.matsumo.fukurou.trading.daemon
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.DecisionRunContext
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.risk.RiskHaltState
 import me.matsumo.fukurou.trading.risk.RiskStateRepository
@@ -11,6 +19,9 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val RECOVERY_REPOSITORY_START_RESERVE_MILLIS = 750L
+
+/** admission blocker 自動解除 audit の論理 tool 名。 */
+internal const val ADMISSION_BLOCKER_RESOLUTION_TOOL_NAME = "llm_admission_blocker_resolution"
 
 /**
  * LLM daemon scheduler が起動する trigger 種別。
@@ -189,6 +200,40 @@ class LlmExecutionRecoveryRetryPermit {
 
     /** 明示 mutation retry の開始権を不可逆に1回だけ取得する。 */
     fun tryConsume(): Boolean = available.compareAndSet(true, false)
+}
+
+/** admission blocker 自動解除の判定要求。 */
+data class LlmAdmissionBlockerResolutionRequest(
+    val invocationId: String,
+    val claimantToken: String,
+    val resolutionAttemptId: UUID,
+    val quietPeriodElapsed: Boolean,
+    val elapsedQuietMillis: Long,
+    val registeredAt: Instant,
+    val observedAt: Instant,
+)
+
+/** admission blocker を維持する理由。 */
+enum class LlmAdmissionBlockerRetentionReason {
+    /** reservation がまだ RUNNING である。 */
+    RESERVATION_RUNNING,
+
+    /** reservation record が存在しない。 */
+    RESERVATION_MISSING,
+
+    /** 静穏期間が経過していない。 */
+    QUIET_PERIOD_NOT_ELAPSED,
+}
+
+/** admission blocker 自動解除の確定結果。 */
+sealed interface LlmAdmissionBlockerResolution {
+    /** terminal observation と audit commit が確定した。 */
+    data class Resolved(val status: LlmLaunchReservationStatus) : LlmAdmissionBlockerResolution
+
+    /** 安全な解除条件が不足している。 */
+    data class Retained(
+        val reason: LlmAdmissionBlockerRetentionReason,
+    ) : LlmAdmissionBlockerResolution
 }
 
 /** stale execution recovery mutation または exact readback の確定結果。 */
@@ -425,6 +470,14 @@ interface LlmLaunchReservationRepository {
         return Result.failure(UnsupportedOperationException("Execution recovery reconciliation is not implemented."))
     }
 
+    /** DB 終端事実と監査 commit を同じ deadline-aware 境界で確定する。 */
+    suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> {
+        return Result.failure(UnsupportedOperationException("Admission blocker resolution is not implemented."))
+    }
+
     /** runner preflight 用に予約の trigger identity を返す。 */
     suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> {
         return Result.failure(UnsupportedOperationException("Reservation identity lookup is not implemented."))
@@ -468,6 +521,7 @@ class InMemoryLlmLaunchReservationRepository(
 
     private val mutex = Mutex()
     private val reservations = mutableListOf<LlmLaunchReservationRecord>()
+    private val admissionResolutionAudits = mutableMapOf<UUID, CommandEvent>()
 
     override suspend fun tryReserve(request: LlmLaunchReservationRequest): Result<LlmLaunchReservationOutcome> {
         return runCatching {
@@ -671,6 +725,46 @@ class InMemoryLlmLaunchReservationRepository(
         }
     }
 
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> = runCatching {
+        deadline.requireStartReserve(nanoTime, RECOVERY_REPOSITORY_START_RESERVE_MILLIS)
+        mutex.withLock {
+            admissionResolutionAudits[request.resolutionAttemptId]?.let { audit ->
+                val observedStatus = audit.admissionBlockerResolutionStatus(request)
+                check(observedStatus != null) { "Admission blocker resolution audit identity mismatch." }
+
+                return@withLock LlmAdmissionBlockerResolution.Resolved(observedStatus)
+            }
+
+            val reservation = reservations.firstOrNull { it.invocationId == request.invocationId }
+                ?: return@withLock LlmAdmissionBlockerResolution.Retained(
+                    LlmAdmissionBlockerRetentionReason.RESERVATION_MISSING,
+                )
+            if (!reservation.status.isTerminal()) {
+                return@withLock LlmAdmissionBlockerResolution.Retained(
+                    LlmAdmissionBlockerRetentionReason.RESERVATION_RUNNING,
+                )
+            }
+            if (!request.quietPeriodElapsed) {
+                return@withLock LlmAdmissionBlockerResolution.Retained(
+                    LlmAdmissionBlockerRetentionReason.QUIET_PERIOD_NOT_ELAPSED,
+                )
+            }
+
+            admissionResolutionAudits[request.resolutionAttemptId] = admissionBlockerResolutionEvent(
+                request,
+                reservation.status,
+            )
+            LlmAdmissionBlockerResolution.Resolved(reservation.status)
+        }
+    }
+
+    internal suspend fun admissionResolutionAuditsForTest(): List<CommandEvent> = mutex.withLock {
+        admissionResolutionAudits.values.toList()
+    }
+
     override suspend fun findTriggerKind(invocationId: String): Result<LlmDaemonTriggerKind?> = runCatching {
         mutex.withLock { reservations.firstOrNull { it.invocationId == invocationId }?.triggerKind }
     }
@@ -787,6 +881,59 @@ class InMemoryLlmLaunchReservationRepository(
             }.distinctBy { it.invocationId }.size,
         )
     }
+}
+
+internal fun admissionBlockerResolutionEvent(
+    request: LlmAdmissionBlockerResolutionRequest,
+    status: LlmLaunchReservationStatus,
+): CommandEvent {
+    return CommandEvent(
+        id = request.resolutionAttemptId,
+        decisionRunContext = DecisionRunContext(
+            decisionRunId = request.invocationId,
+            llmProvider = null,
+            promptHash = null,
+            systemPromptVersion = null,
+            marketSnapshotId = null,
+        ),
+        toolName = ADMISSION_BLOCKER_RESOLUTION_TOOL_NAME,
+        toolCallId = null,
+        clientRequestId = request.invocationId,
+        eventType = CommandEventType.LLM_ADMISSION_BLOCKER_AUTO_RESOLVED,
+        payload = buildJsonObject {
+            put("invocationId", request.invocationId)
+            put("claimantToken", request.claimantToken)
+            put("resolutionAttemptId", request.resolutionAttemptId.toString())
+            put("registeredAt", request.registeredAt.toString())
+            put("observedStatus", status.name)
+            put("elapsedQuietMillis", request.elapsedQuietMillis)
+        }.toString(),
+        occurredAt = request.observedAt,
+    )
+}
+
+internal fun CommandEvent.admissionBlockerResolutionStatus(
+    request: LlmAdmissionBlockerResolutionRequest,
+): LlmLaunchReservationStatus? {
+    val payloadObject = runCatching { Json.parseToJsonElement(payload).jsonObject }.getOrNull() ?: return null
+    val observedStatus = payloadObject["observedStatus"]?.jsonPrimitive?.content
+        ?.let { status -> runCatching { LlmLaunchReservationStatus.valueOf(status) }.getOrNull() }
+    val eventIdentityMatches = id == request.resolutionAttemptId &&
+        decisionRunContext.decisionRunId == request.invocationId &&
+        toolCallId == null &&
+        clientRequestId == request.invocationId &&
+        toolName == ADMISSION_BLOCKER_RESOLUTION_TOOL_NAME &&
+        eventType == CommandEventType.LLM_ADMISSION_BLOCKER_AUTO_RESOLVED
+    val payloadIdentityMatches = payloadObject["invocationId"]?.jsonPrimitive?.content == request.invocationId &&
+        payloadObject["claimantToken"]?.jsonPrimitive?.content == request.claimantToken &&
+        payloadObject["resolutionAttemptId"]?.jsonPrimitive?.content == request.resolutionAttemptId.toString() &&
+        payloadObject["registeredAt"]?.jsonPrimitive?.content == request.registeredAt.toString()
+
+    return observedStatus?.takeIf { status -> eventIdentityMatches && payloadIdentityMatches && status.isTerminal() }
+}
+
+internal fun LlmLaunchReservationStatus.isTerminal(): Boolean {
+    return this == LlmLaunchReservationStatus.FINISHED || this == LlmLaunchReservationStatus.FAILED
 }
 
 private fun LlmExecutionClaimSnapshot?.isLiveAdmissionFor(claimantToken: String?): Boolean {

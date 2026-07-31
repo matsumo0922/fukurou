@@ -109,6 +109,9 @@ enum class CommandEventType {
     /** one-shot execution recovery policy と worker 起動を記録した。 */
     LLM_EXECUTION_RECOVERY_STARTED,
 
+    /** DB 終端確認後に execution admission blocker を自動解除した。 */
+    LLM_ADMISSION_BLOCKER_AUTO_RESOLVED,
+
     /**
      * CLI auth login process を開始した。
      */

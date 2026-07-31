@@ -14,20 +14,28 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.matsumo.fukurou.trading.daemon.ClaimHealthKey
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolution
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolutionRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimState
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadlineExceededException
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRetryPermit
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryScan
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationStatus
+import java.net.SocketTimeoutException
+import java.sql.SQLException
+import java.sql.SQLTimeoutException
 import java.time.Clock
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /** recovery が認める child process tree の終了証跡。 */
 enum class LlmExecutionTerminationFenceKind {
@@ -168,6 +176,7 @@ class LlmExecutionRecoveryService(
     private val nanoTime: () -> Long = System::nanoTime,
 ) {
     private var cursor: LlmExecutionRecoveryCursor? = null
+    private var admissionBlockerCursor: ClaimHealthKey? = null
     private val pendingRecoveries = LinkedHashMap<String, PendingExecutionRecovery>()
 
     /** 1 bounded scan を実行し、競合安全に stale claim を回収する。 */
@@ -184,6 +193,7 @@ class LlmExecutionRecoveryService(
     }
 
     private suspend fun tickWithinBudget(deadline: LlmExecutionRecoveryDeadline): Int {
+        resolveAdmissionBlockers(deadline)
         requireRecoveryStartReserve(deadline)
 
         var recoveredCount = reconcilePendingRecoveries(deadline)
@@ -240,6 +250,92 @@ class LlmExecutionRecoveryService(
         }
 
         return recoveredCount
+    }
+
+    private suspend fun resolveAdmissionBlockers(tickDeadline: LlmExecutionRecoveryDeadline) {
+        val blockerDeadline = LlmExecutionRecoveryDeadline(
+            expiresAtNanos = tickDeadline.expiresAtNanos - ADMISSION_BLOCKER_SCAN_HANDOFF_RESERVE.toNanos(),
+        )
+        var candidates = LlmExecutionAdmissionHealth.snapshotRecoveryBlockers(
+            after = admissionBlockerCursor,
+            limit = ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT,
+        )
+        if (candidates.isEmpty() && admissionBlockerCursor != null) {
+            admissionBlockerCursor = null
+            candidates = LlmExecutionAdmissionHealth.snapshotRecoveryBlockers(
+                after = null,
+                limit = ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT,
+            )
+        }
+        var completedCandidates = 0
+
+        for (candidate in candidates) {
+            if (!canStartAdmissionBlockerCandidate(blockerDeadline)) break
+
+            val elapsedNanos = (nanoTime() - candidate.record.registeredAtNanos).coerceAtLeast(0L)
+            val quietPeriod = policy.hardTimeout.plus(policy.processTerminationGrace)
+            val quietPeriodElapsed = elapsedNanos >= quietPeriod.toNanos()
+            if (!quietPeriodElapsed) {
+                admissionBlockerCursor = candidate.key
+                completedCandidates += 1
+                continue
+            }
+
+            val request = LlmAdmissionBlockerResolutionRequest(
+                invocationId = candidate.key.invocationId,
+                claimantToken = candidate.key.claimantToken,
+                resolutionAttemptId = candidate.record.resolutionAttemptId,
+                quietPeriodElapsed = true,
+                elapsedQuietMillis = TimeUnit.NANOSECONDS.toMillis(elapsedNanos),
+                registeredAt = candidate.record.registeredAt,
+                observedAt = clock.instant(),
+            )
+            val result = repository.resolveAdmissionBlockerIfTerminal(request, blockerDeadline)
+            admissionBlockerCursor = candidate.key
+            completedCandidates += 1
+
+            val failure = result.exceptionOrNull()
+            if (failure != null) {
+                if (isBlockerHandoff(failure, blockerDeadline)) break
+                throw failure
+            }
+            val resolution = result.getOrThrow()
+            if (resolution is LlmAdmissionBlockerResolution.Resolved) {
+                LlmExecutionAdmissionHealth.resolveRecoveryBlocker(
+                    candidate.key.invocationId,
+                    candidate.key.claimantToken,
+                )
+            }
+        }
+
+        val completedPage = completedCandidates == candidates.size
+        if (completedPage && candidates.size < ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT) {
+            admissionBlockerCursor = null
+        }
+    }
+
+    private suspend fun canStartAdmissionBlockerCandidate(deadline: LlmExecutionRecoveryDeadline): Boolean {
+        currentCoroutineContext().ensureActive()
+
+        return runCatching {
+            deadline.requireStartReserve(nanoTime, ADMISSION_BLOCKER_CANDIDATE_START_RESERVE_MILLIS)
+        }.isSuccess
+    }
+
+    private fun isBlockerHandoff(failure: Throwable, deadline: LlmExecutionRecoveryDeadline): Boolean {
+        if (failure is LlmExecutionRecoveryDeadlineExceededException) return true
+        if (deadline.remainingMillis(nanoTime) >= ADMISSION_BLOCKER_CANDIDATE_START_RESERVE_MILLIS) return false
+
+        return generateSequence(failure) { cause -> cause.cause }
+            .any(::isDeadlineTimeout)
+    }
+
+    private fun isDeadlineTimeout(failure: Throwable): Boolean {
+        if (failure is SQLTimeoutException || failure is SocketTimeoutException) return true
+        if (failure !is SQLException) return false
+
+        return failure.sqlState == STATEMENT_TIMEOUT_SQL_STATE ||
+            failure.sqlState?.startsWith(CONNECTION_EXCEPTION_SQL_STATE_PREFIX) == true
     }
 
     private fun stagePendingRecovery(candidate: LlmExecutionClaimSnapshot, request: LlmExecutionRecoveryRequest) {
@@ -306,8 +402,10 @@ class LlmExecutionRecoveryService(
                 }
                 if (fence == null) {
                     LlmExecutionAdmissionHealth.registerRecoveryBlocker(
-                        candidate.invocationId,
-                        claimantToken ?: MISSING_CLAIMANT_TOKEN,
+                        invocationId = candidate.invocationId,
+                        claimantToken = claimantToken ?: MISSING_CLAIMANT_TOKEN,
+                        registeredAt = clock.instant(),
+                        registeredAtNanos = nanoTime(),
                     )
                     return null
                 }
@@ -349,8 +447,10 @@ class LlmExecutionRecoveryService(
             LlmExecutionRecoveryOutcome.PreconditionChanged -> {
                 pendingRecoveries.remove(candidate.invocationId)
                 LlmExecutionAdmissionHealth.registerRecoveryBlocker(
-                    candidate.invocationId,
-                    candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN,
+                    invocationId = candidate.invocationId,
+                    claimantToken = candidate.claimantToken ?: MISSING_CLAIMANT_TOKEN,
+                    registeredAt = clock.instant(),
+                    registeredAtNanos = nanoTime(),
                 )
                 return 0
             }
@@ -489,6 +589,11 @@ const val STALE_AVAILABLE_RESERVATION_RECOVERED = "launch_reservation_available_
 const val STALE_CLAIMED_RESERVATION_RECOVERED = "launch_reservation_claimed_stale_recovered"
 
 private const val EXECUTION_RECOVERY_SCAN_LIMIT = 100
+private const val ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT = 20
 internal const val MISSING_CLAIMANT_TOKEN = "<missing-claimant-token>"
 private const val EXECUTION_RECOVERY_START_RESERVE_MILLIS = 750L
+private const val ADMISSION_BLOCKER_CANDIDATE_START_RESERVE_MILLIS = 750L
+private const val STATEMENT_TIMEOUT_SQL_STATE = "57014"
+private const val CONNECTION_EXCEPTION_SQL_STATE_PREFIX = "08"
+private val ADMISSION_BLOCKER_SCAN_HANDOFF_RESERVE: Duration = Duration.ofMillis(2_500)
 private val EXECUTION_RECOVERY_TICK_TIMEOUT: Duration = Duration.ofSeconds(5)
