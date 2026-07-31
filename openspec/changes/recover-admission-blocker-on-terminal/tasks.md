@@ -51,8 +51,8 @@
 
 ## 7. 検証
 
-- [ ] 7.1 編集した Kotlin ファイルに対し IntelliJ MCP の `get_file_problems` で warning を確認する。使えない場合は `make detekt` で代替する
-- [ ] 7.2 `make test` を実行して通す
-- [ ] 7.3 `make detekt` を実行して通す
-- [ ] 7.4 `openspec validate recover-admission-blocker-on-terminal --strict` を実行して通す
-- [ ] 7.5 検証記録（コマンド、結果、HEAD SHA、scope）を PR description に転記する。ドキュメント影響を 1 行明記する
+- [x] 7.1 編集した Kotlin ファイルに対し IntelliJ MCP の `get_file_problems` で warning を確認する。使えない場合は `make detekt` で代替する
+- [x] 7.2 `make test` を実行して通す
+- [x] 7.3 `make detekt` を実行して通す
+- [x] 7.4 `openspec validate recover-admission-blocker-on-terminal --strict` を実行して通す
+- [x] 7.5 検証記録（コマンド、結果、HEAD SHA、scope）を PR description に転記する。ドキュメント影響を 1 行明記する

@@ -1121,12 +1121,17 @@ private suspend fun claim(
 }
 
 /** claim 済み reservation を FAILED で終端し、blocker 照合の前提を作る。 */
-private suspend fun finishClaimedReservation(
-    repository: LlmLaunchReservationRepository,
-    invocationId: String,
-) {
-    reserve(repository, invocationId, RECOVERY_INSTANT)
-    claim(repository, invocationId, RECOVERY_INSTANT)
+private suspend fun finishClaimedReservation(repository: LlmLaunchReservationRepository, invocationId: String) {
+    reserve(
+        repository = repository,
+        invocationId = invocationId,
+        now = RECOVERY_INSTANT,
+    )
+    claim(
+        repository = repository,
+        invocationId = invocationId,
+        now = RECOVERY_INSTANT,
+    )
     repository.finish(
         LlmLaunchReservationFinish(
             invocationId = invocationId,
