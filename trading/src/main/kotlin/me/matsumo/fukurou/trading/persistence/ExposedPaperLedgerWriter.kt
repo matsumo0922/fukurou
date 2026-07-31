@@ -16,6 +16,7 @@ import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentMissingExcep
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryOutcomeIndeterminateException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryUnavailableException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryCreationProposal
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIdentity
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
 import me.matsumo.fukurou.trading.broker.IntentConsumingMarketEntryFillRequest
@@ -306,6 +307,22 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
+    /** stable identity だけを使う fresh strict replay transaction。 */
+    suspend fun readAuthorizedAtomicEntryReplay(
+        identity: AuthorizedAtomicEntryIdentity,
+    ): Result<AuthorizedPlaceOrderReplay> {
+        identity.requireValid()
+
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                exposedTransaction(database) {
+                    maxAttempts = 1
+                    readAuthorizedAtomicEntryReplay(identity)
+                }
+            }
+        }
+    }
+
     @Suppress("CyclomaticComplexMethod", "LongMethod", "SwallowedException")
     private fun commitAuthorizedAtomicEntryOnce(
         request: AuthorizedAtomicPaperEntryRequest,
@@ -319,7 +336,17 @@ internal class ExposedPaperLedgerWriter(
                     maxAttempts = 1
                     try {
                         request.requireStableIdentityValid()
-                        when (val replay = readAuthorizedAtomicEntryReplay(request)) {
+                        when (val replay = readAuthorizedAtomicEntryReplay(request.identity)) {
+                            is AuthorizedPlaceOrderReplay.Exact -> return@exposedTransaction AuthorizedAtomicEntryResult.Exact(
+                                replay.result,
+                            )
+                            AuthorizedPlaceOrderReplay.Ambiguous -> throw AuthorizedAtomicEntryReplayIndeterminateException()
+                            AuthorizedPlaceOrderReplay.Missing -> Unit
+                        }
+
+                        val creationAuthority =
+                            lockAuthorizedAtomicEntryRows(request.proposal.realtimeSessionLockHint())
+                        when (val replay = readAuthorizedAtomicEntryReplay(request.identity)) {
                             is AuthorizedPlaceOrderReplay.Exact -> return@exposedTransaction AuthorizedAtomicEntryResult.Exact(
                                 replay.result,
                             )
@@ -328,16 +355,8 @@ internal class ExposedPaperLedgerWriter(
                         }
 
                         request.requireCreationProposalValid()
+                        creationAuthority.requireEligibility(request.proposal.restingEligibility())
                         requestValidated = true
-                        val creationAuthority = lockRestingOrderCreationRows(request.proposal.restingEligibility())
-                        when (val replay = readAuthorizedAtomicEntryReplay(request)) {
-                            is AuthorizedPlaceOrderReplay.Exact -> return@exposedTransaction AuthorizedAtomicEntryResult.Exact(
-                                replay.result,
-                            )
-                            AuthorizedPlaceOrderReplay.Ambiguous -> throw AuthorizedAtomicEntryReplayIndeterminateException()
-                            AuthorizedPlaceOrderReplay.Missing -> Unit
-                        }
-
                         requireAuthorizedEntryProposalFresh(request.proposal)
                         requireAuthorizedEntryIntentAvailable(request)
                         requireAuthorizedEntryFlat()
@@ -394,7 +413,7 @@ internal class ExposedPaperLedgerWriter(
         return runCatching {
             exposedTransaction(database) {
                 maxAttempts = 1
-                when (val replay = readAuthorizedAtomicEntryReplay(request)) {
+                when (val replay = readAuthorizedAtomicEntryReplay(request.identity)) {
                     is AuthorizedPlaceOrderReplay.Exact -> replay.result
                     AuthorizedPlaceOrderReplay.Missing,
                     AuthorizedPlaceOrderReplay.Ambiguous,
@@ -911,9 +930,8 @@ private fun JdbcTransaction.closePositionInTransaction(
 
 /** ledger mutation が共有する row lock を authority 順に取得する。 */
 private fun JdbcTransaction.readAuthorizedAtomicEntryReplay(
-    request: AuthorizedAtomicPaperEntryRequest,
+    identity: AuthorizedAtomicEntryIdentity,
 ): AuthorizedPlaceOrderReplay {
-    val identity = request.identity
     val sameRequestOrders = selectOrdersByClientRequestId(identity.clientRequestId)
     val groupIds = (
         sameRequestOrders.mapNotNull { order -> order.tradeGroupId } +
@@ -1074,6 +1092,14 @@ private fun AuthorizedAtomicEntryCreationProposal.restingEligibility(): RestingO
     return (this as? AuthorizedAtomicEntryCreationProposal.Resting)?.request?.order?.marketEligibility
 }
 
+private fun AuthorizedAtomicEntryCreationProposal.realtimeSessionLockHint(): UUID? {
+    return (this as? AuthorizedAtomicEntryCreationProposal.Resting)
+        ?.request
+        ?.order
+        ?.marketEligibility
+        ?.sessionId
+}
+
 private fun Throwable.isAuthorizedAtomicEntryRejection(): Boolean {
     return this is AuthorizedAtomicEntryReplayIndeterminateException ||
         this is AuthorizedAtomicEntryIntentMissingException ||
@@ -1117,24 +1143,50 @@ private fun JdbcTransaction.lockPaperLedgerMutationRows(): RiskState {
 private data class RestingOrderCreationAuthority(
     val riskState: RiskState,
     val admissionBoundary: Long?,
-)
+    val lockedSessionSequence: Long? = null,
+) {
+    fun requireEligibility(eligibility: RestingOrderMarketEligibility?) {
+        if (eligibility == null) {
+            require(lockedSessionSequence == null)
+            return
+        }
+
+        require(lockedSessionSequence != null) {
+            QueueSnapshotDiagnostics.LEDGER_SESSION_NOT_CONNECTED
+        }
+        require(lockedSessionSequence == eligibility.eligibleAfterSequence) {
+            QueueSnapshotDiagnostics.LEDGER_SESSION_ADVANCED
+        }
+    }
+}
 
 private fun JdbcTransaction.lockRestingOrderCreationRows(
     eligibility: RestingOrderMarketEligibility?,
 ): RestingOrderCreationAuthority {
-    if (eligibility == null) {
+    val authority = lockAuthorizedAtomicEntryRows(eligibility?.sessionId)
+    authority.requireEligibility(eligibility)
+
+    return authority
+}
+
+private fun JdbcTransaction.lockAuthorizedAtomicEntryRows(realtimeSessionId: UUID?): RestingOrderCreationAuthority {
+    if (realtimeSessionId == null) {
         return RestingOrderCreationAuthority(
             riskState = lockPaperLedgerMutationRows(),
             admissionBoundary = null,
         )
     }
 
-    acquireExclusivePaperMarketSessionLock(eligibility.sessionId)
-    verifyMarketEligibilitySession(eligibility)
+    acquireExclusivePaperMarketSessionLock(realtimeSessionId)
+    val lockedSessionSequence = lockConnectedMarketSession(realtimeSessionId)
     val riskState = lockPaperLedgerMutationRows()
     val admissionBoundary = selectGlobalPaperMarketAdmissionBoundary()
 
-    return RestingOrderCreationAuthority(riskState, admissionBoundary)
+    return RestingOrderCreationAuthority(
+        riskState = riskState,
+        admissionBoundary = admissionBoundary,
+        lockedSessionSequence = lockedSessionSequence,
+    )
 }
 
 private fun JdbcTransaction.acquireExclusivePaperMarketSessionLock(sessionId: UUID) {
@@ -1149,6 +1201,22 @@ private fun JdbcTransaction.selectGlobalPaperMarketAdmissionBoundary(): Long {
         statement.executeQuery().use { resultSet ->
             check(resultSet.next()) { "paper market-event receipt boundary was not returned." }
             resultSet.getLong(1)
+        }
+    }
+}
+
+private fun JdbcTransaction.lockConnectedMarketSession(sessionId: UUID): Long? {
+    return prepare(
+        """
+            SELECT last_processed_sequence
+            FROM market_data_sessions
+            WHERE id = ? AND state = 'CONNECTED'
+            FOR UPDATE
+        """,
+    ).use { statement ->
+        statement.setObject(1, sessionId)
+        statement.executeQuery().use { resultSet ->
+            if (resultSet.next()) resultSet.getLong("last_processed_sequence") else null
         }
     }
 }
@@ -2439,27 +2507,6 @@ private fun JdbcTransaction.insertEntryOrder(request: EntryOrderInsertRequest, c
         statement.setLong(39, createdAt)
         statement.bindLineage(40, lineage)
         statement.executeUpdate()
-    }
-}
-
-private fun JdbcTransaction.verifyMarketEligibilitySession(eligibility: RestingOrderMarketEligibility) {
-    prepare(
-        """
-            SELECT last_processed_sequence
-            FROM market_data_sessions
-            WHERE id = ? AND state = 'CONNECTED'
-            FOR UPDATE
-        """,
-    ).use { statement ->
-        statement.setObject(1, eligibility.sessionId)
-        statement.executeQuery().use { resultSet ->
-            require(resultSet.next()) {
-                QueueSnapshotDiagnostics.LEDGER_SESSION_NOT_CONNECTED
-            }
-            require(resultSet.getLong("last_processed_sequence") == eligibility.eligibleAfterSequence) {
-                QueueSnapshotDiagnostics.LEDGER_SESSION_ADVANCED
-            }
-        }
     }
 }
 

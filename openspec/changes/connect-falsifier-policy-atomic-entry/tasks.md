@@ -10,9 +10,9 @@
 - [ ] 1.8 standalone `postgres(config)`はowned rootを生成し、runtime closeがbound resource後にrootを一度だけcloseする
 - [ ] 1.9 InMemory runtime factoryはledger / decision / policy repository / backendが同じruntime repository instancesを共有することを検証する
 - [ ] 1.10 public / pair-based constructor、custom backend、PostgreSQL root / scope DataSource、InMemory identity mismatchをauthority / replay前のtyped unsupportedにしpublic lookupへfallbackしない
-- [ ] 1.11 `AuthorizedAtomicPaperEntryBackend`へstable identity strict replayとstable request execution scopeを追加し、scope acquisition failureをpreparation前typed unavailableにする
+- [x] 1.11 `AuthorizedAtomicPaperEntryBackend`へstable identity strict replayとstable request execution scopeを追加し、scope acquisition failureをpreparation前typed unavailableにする
 - [ ] 1.12 InMemory scopeとPostgreSQL rootにcancellable stable-identity keyed coroutine mutex registryを実装し、holder / waiter参照がなくなった同一entryだけをcancellation / release後に安全に除去する
-- [ ] 1.13 repo内two-int advisory usageを再grepしてnamespace `1179994962`が未使用であることを確認し、stable request ID SHA-256先頭4 byteのsigned hash32とtwo-int try-lock / unlock SQLを実装する
+- [x] 1.13 repo内two-int advisory usageを再grepしてnamespace `1179994962`が未使用であることを確認し、stable request ID SHA-256先頭4 byteのsigned hash32とtwo-int try-lock / unlock SQLを実装する
 - [ ] 1.14 PostgreSQLは30秒deadlineをlocal mutex wait前に開始し、`local identity mutex -> dedicated borrow -> two-int advisory`の順でremaining budgetを使い、same-request local waiterがconnectionをborrowしないdeadline-aware acquisitionを実装する
 - [ ] 1.15 各try callへremaining budget由来の`Statement.queryTimeout` / `Connection.networkTimeout`をarmし、original timeout restore failureをroot evictorへ送る
 - [ ] 1.16 cancellation時はcleanup executorでrunning `Statement.cancel`を試み、borrow / SQL failure / query timeout / response loss / outcome不明をroot evictorで非再利用にする
@@ -27,10 +27,10 @@
 
 - [ ] 2.1 authorized boundaryをaffinity -> authority -> fingerprint -> stable identity -> stable request scope -> strict replayの順にし、unsupportedをauthority read前、`Exact`をfresh preparation前に返す
 - [ ] 2.2 initial replay `Ambiguous` / read failureはpreparationとmutationへ進めず、`Missing`だけscopeを保持してauthorized creation continuationへ渡す
-- [ ] 2.3 A2a backend initial replayをstable identity-onlyにし、`Exact` pathがproposalのsubtype、session、command、fresh ID、fill、TTL、eligibilityへ一切依存しないようにする
-- [ ] 2.4 initial `Missing`後はsubtype / realtime session lock hintだけを読み、必要なsession / ledger lockを取得してsecond strict replayを実行する
-- [ ] 2.5 full `requireCreationProposalValid`、fresh entity ID / resolved group検査、business identity、fill / TTL / eligibility validationをsecond replay `Missing`後へ移す
-- [ ] 2.6 initial / second `Exact`はfresh proposalとpersisted ID / lifecycle / subtypeを比較せず、`Created`だけがvalidated proposalをmutationへ使う
+- [x] 2.3 A2a backend initial replayをstable identity-onlyにし、`Exact` pathがproposalのsubtype、session、command、fresh ID、fill、TTL、eligibilityへ一切依存しないようにする
+- [x] 2.4 initial `Missing`後はsubtype / realtime session lock hintだけを読み、必要なsession / ledger lockを取得してsecond strict replayを実行する
+- [x] 2.5 full `requireCreationProposalValid`、fresh entity ID / resolved group検査、business identity、fill / TTL / eligibility validationをsecond replay `Missing`後へ移す
+- [x] 2.6 initial / second `Exact`はfresh proposalとpersisted ID / lifecycle / subtypeを比較せず、`Created`だけがvalidated proposalをmutationへ使う
 
 ## 3. Broker preparation and terminal finalization
 

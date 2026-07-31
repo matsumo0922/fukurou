@@ -6,6 +6,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -14,6 +15,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import me.matsumo.fukurou.trading.activity.DecisionRunCursor
 import me.matsumo.fukurou.trading.activity.DecisionRunFilter
@@ -66,6 +68,7 @@ import me.matsumo.fukurou.trading.broker.PlaceOrderCommand
 import me.matsumo.fukurou.trading.broker.RestingEntryOrderRequest
 import me.matsumo.fukurou.trading.broker.RestingOrderMarketEligibility
 import me.matsumo.fukurou.trading.broker.SimulatedFill
+import me.matsumo.fukurou.trading.broker.StableRequestMutexRegistry
 import me.matsumo.fukurou.trading.broker.TradeIntentConsumptionRequest
 import me.matsumo.fukurou.trading.broker.VIRTUAL_TAKE_PROFIT_TRIGGER_REASON
 import me.matsumo.fukurou.trading.config.DEFAULT_RUNTIME_CONFIG_VERSION_LIMIT
@@ -11940,6 +11943,138 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(2L, selectLongForTest(database, "SELECT COUNT(*) FROM orders"))
         assertEquals(2L, selectLongForTest(database, "SELECT COUNT(*) FROM executions"))
         assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun stableRequestScopeUsesTwoIntLockAndReleasesAfterHeartbeat() = runPostgresTest {
+        val identity = AuthorizedAtomicEntryIdentity.from(
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-stable-scope",
+            ).copy(intentId = UUID.randomUUID()),
+            mode = TradingMode.PAPER,
+        )
+        val scope = PostgresStableRequestExecutionScope(
+            dataSource = dataSource,
+            mutexRegistry = StableRequestMutexRegistry(),
+        )
+
+        scope.withScope(identity) {
+            verifyOwnership().getOrThrow()
+            assertEquals(1L, selectLongForTest(database, COUNT_CURRENT_DATABASE_ADVISORY_LOCKS_SQL))
+        }
+
+        assertEquals(0L, selectLongForTest(database, COUNT_CURRENT_DATABASE_ADVISORY_LOCKS_SQL))
+    }
+
+    @Test
+    fun stableRequestScopeEvictsConnectionWhenTimeoutWinsBorrowHandoff() = runPostgresTest {
+        val identity = AuthorizedAtomicEntryIdentity.from(
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-borrow-handoff",
+            ).copy(intentId = UUID.randomUUID()),
+            mode = TradingMode.PAPER,
+        )
+        val connectionPublished = CompletableDeferred<Unit>()
+        val releaseHandoff = CompletableDeferred<Unit>()
+        val borrowedConnection = AtomicReference<Connection>()
+        val borrowedBackendPid = AtomicInteger()
+        val scope = PostgresStableRequestExecutionScope(
+            dataSource = dataSource,
+            mutexRegistry = StableRequestMutexRegistry(),
+            acquisitionTimeout = Duration.ofMillis(100),
+            connectionBorrower = { publish ->
+                dataSource.connection.also { connection ->
+                    borrowedConnection.set(connection)
+                    borrowedBackendPid.set(connection.backendPid())
+                    publish(connection)
+                }
+            },
+            afterConnectionPublished = {
+                connectionPublished.complete(Unit)
+                withContext(NonCancellable) { releaseHandoff.await() }
+            },
+        )
+        coroutineScope {
+            val result = async {
+                runCatching {
+                    scope.withScope(identity) { Unit }
+                }
+            }
+            connectionPublished.await()
+            delay(150)
+            releaseHandoff.complete(Unit)
+
+            assertIs<AuthorizedAtomicEntryUnavailableException>(result.await().exceptionOrNull())
+            assertTrue(borrowedConnection.get().isClosed)
+            withTimeout(1_000) {
+                while (dataSource.hikariPoolMXBean.activeConnections != 0) delay(1)
+            }
+            dataSource.connection.use { replacement ->
+                assertNotEquals(borrowedBackendPid.get(), replacement.backendPid())
+            }
+        }
+    }
+
+    @Test
+    fun stableRequestScopeMapsFalseResponseDeadlineRaceToTypedUnavailable() = runPostgresTest {
+        val clientRequestId = "runner-place-v2-postgres-false-deadline"
+        val identity = AuthorizedAtomicEntryIdentity.from(
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = clientRequestId,
+            ).copy(intentId = UUID.randomUUID()),
+            mode = TradingMode.PAPER,
+        )
+        val nanoTime = AtomicReference(0L)
+        val requestHash = clientRequestId.stableRequestHash()
+
+        dataSource.connection.use { holder ->
+            holder.executeAdvisory("SELECT pg_advisory_lock(?, ?)", requestHash)
+            try {
+                val scope = PostgresStableRequestExecutionScope(
+                    dataSource = dataSource,
+                    mutexRegistry = StableRequestMutexRegistry(),
+                    acquisitionTimeout = Duration.ofSeconds(1),
+                    nanoTime = nanoTime::get,
+                    afterAdvisoryNotAcquired = { nanoTime.set(Duration.ofSeconds(1).toNanos()) },
+                )
+
+                val failure = runCatching {
+                    scope.withScope(identity) { Unit }
+                }.exceptionOrNull()
+
+                val unavailable = assertIs<AuthorizedAtomicEntryUnavailableException>(failure)
+                assertIs<StableRequestLockTimeoutException>(unavailable.cause)
+            } finally {
+                holder.executeAdvisory("SELECT pg_advisory_unlock(?, ?)", requestHash)
+            }
+        }
+    }
+}
+
+private const val COUNT_CURRENT_DATABASE_ADVISORY_LOCKS_SQL = """
+    SELECT COUNT(*)
+    FROM pg_locks
+    WHERE locktype = 'advisory'
+      AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+"""
+
+private fun Connection.backendPid(): Int {
+    return prepareStatement("SELECT pg_backend_pid()").use { statement ->
+        statement.executeQuery().use { resultSet ->
+            check(resultSet.next())
+            resultSet.getInt(1)
+        }
+    }
+}
+
+private fun Connection.executeAdvisory(sql: String, requestHash: Int) {
+    prepareStatement(sql).use { statement ->
+        statement.setInt(1, STABLE_REQUEST_ADVISORY_NAMESPACE)
+        statement.setInt(2, requestHash)
+        statement.executeQuery().use { resultSet -> check(resultSet.next()) }
     }
 }
 

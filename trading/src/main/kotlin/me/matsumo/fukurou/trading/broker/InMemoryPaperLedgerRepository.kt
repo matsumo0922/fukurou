@@ -635,6 +635,7 @@ private class InMemoryPaperLedgerHistoryReader(
 private class InMemoryPaperLedgerMutationWriter(
     private val state: InMemoryPaperLedgerState,
 ) : PaperLedgerMutationRepository {
+    @Suppress("LongMethod")
     fun commitAuthorizedAtomicEntryLocked(
         decision: InMemoryAuthorizedAtomicEntryDecisionTransaction,
         request: AuthorizedAtomicPaperEntryRequest,

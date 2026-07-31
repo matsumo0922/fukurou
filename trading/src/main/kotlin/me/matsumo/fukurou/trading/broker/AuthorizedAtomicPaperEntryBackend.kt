@@ -12,7 +12,36 @@ import java.util.UUID
  * A2a では production path へ接続しない。
  */
 internal interface AuthorizedAtomicPaperEntryBackend {
+    /**
+     * 同じ stable request の preflight から terminal までを直列化する。
+     *
+     * scope 取得に失敗した場合は [AuthorizedAtomicEntryUnavailableException] を送出する。
+     */
+    suspend fun <T> withStableRequestScope(
+        identity: AuthorizedAtomicEntryIdentity,
+        block: suspend AuthorizedStableRequestScope.() -> T,
+    ): T
+
+    /** attempt-local proposal を参照せず stable identity だけで replay を分類する。 */
+    suspend fun strictReplay(identity: AuthorizedAtomicEntryIdentity): Result<AuthorizedPlaceOrderReplay>
+
     suspend fun commit(request: AuthorizedAtomicPaperEntryRequest): Result<AuthorizedAtomicEntryResult>
+}
+
+/** PostgreSQL root などが backend へ注入する stable request scope。 */
+internal interface AuthorizedStableRequestExecutionScope {
+    suspend fun <T> withScope(
+        identity: AuthorizedAtomicEntryIdentity,
+        block: suspend AuthorizedStableRequestScope.() -> T,
+    ): T
+}
+
+/** live stable request scope のownership確認面。 */
+internal interface AuthorizedStableRequestScope {
+    suspend fun verifyOwnership(): Result<Unit>
+
+    /** A2a が durable `Exact` / `Created` を確定した後に呼ぶ。 */
+    fun markBackendResultConfirmed()
 }
 
 /** internal capability に渡す stable replay identity と attempt-local proposal。 */
