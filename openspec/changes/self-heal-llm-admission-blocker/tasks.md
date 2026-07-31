@@ -8,13 +8,13 @@
 
 - [ ] 2.1 `CommandEventType.LLM_ADMISSION_BLOCKER_AUTO_RESOLVED` と `OpsRoutes` の projection 名を追加する
 - [ ] 2.2 `LlmLaunchReservationRepository.resolveAdmissionBlockerIfTerminal(request, deadline)` を追加し、`Resolved` / `Retained(reason)` を返す
-- [ ] 2.3 Exposed 実装で 1 transaction 内に「既存 audit の readback → reservation 読み取り → audit insert」を順に置き、すべて `prepareRecoveryStatement` を通す（既存 audit 一致で再 insert せず `Resolved`、不一致は failure）
+- [ ] 2.3 Exposed 実装で 1 transaction 内に「既存 audit の readback → reservation 読み取り → audit insert」を順に置き、すべて `prepareRecoveryStatement` を通す（readback は id / decision_run_id / tool_call_id / client_request_id / tool_name / event_type と payload の blocker identity まで exact match し、一致で再 insert せず `Resolved`、不一致は failure）
 - [ ] 2.4 in-memory 実装（`InMemoryLlmLaunchReservationRepository`）へ同じ意味論を実装する
 
 ## 3. Recovery scan への組み込み
 
 - [ ] 3.1 `LlmExecutionRecoveryService.tick()` 冒頭に bounded batch + cursor の自動解除 step を実装する（monotonic quiet period 判定、`Resolved` のときだけ in-memory 解除）
-- [ ] 3.2 件数上限と scan handoff reserve の両方で正常打ち切りする（打ち切りは failure にしない）
+- [ ] 3.2 tick deadline から handoff reserve を引いた sub-deadline を作り、候補の repository call へはそれを渡す。件数上限と sub-deadline 枯渇の両方で正常打ち切りする（打ち切りは failure にしない）
 - [ ] 3.3 cursor を候補ごとに前進させる（失敗した候補も含む）
 - [ ] 3.4 解除 step の候補失敗と deadline 超過を tick の failure として伝播させる
 
@@ -27,8 +27,9 @@
 - [ ] 4.5 unit テスト: batch limit を超える retained blocker があっても後続の解除可能 blocker が有限 tick 数で解除される
 - [ ] 4.6 unit テスト: audit commit 済みで caller が failure を観測した後、次 tick が readback で `Resolved` に到達し audit が重複しない
 - [ ] 4.7 unit テスト: 先頭候補が毎回失敗しても cursor が前進し、後続の解除可能 blocker が有限 tick 数で解除される
-- [ ] 4.8 unit テスト: 候補評価が遅い場合、handoff reserve で正常打ち切りして stale-claim scan が start reserve 内で開始できる
-- [ ] 4.9 production call path テスト: `LlmExecutionRecoveryWorker` を application と同じ配線で起動し、blocker 登録 → 終端 → 自動解除 → readiness 復帰を確認する
+- [ ] 4.8 unit テスト: 候補評価が遅い場合、sub-deadline で正常打ち切りして stale-claim scan が start reserve 内で開始できる（候補の DB call が sub-deadline で bound される）
+- [ ] 4.9 unit テスト: 同一 invocationId で claimant token 違いの blocker が 2 つあるとき、片方の audit を他方が自分のものと誤認せず failure になる
+- [ ] 4.10 production call path テスト: `LlmExecutionRecoveryWorker` を application と同じ配線で起動し、blocker 登録 → 終端 → 自動解除 → readiness 復帰を確認する
 
 ## 5. ドキュメントと検証
 

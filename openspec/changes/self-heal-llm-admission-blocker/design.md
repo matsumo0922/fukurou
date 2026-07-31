@@ -75,12 +75,16 @@ tick 先頭に置く理由は、既存の scan 本体が例外を投げた場合
 
 解除 step の DB access は、既存 scan と同じ `LlmExecutionRecoveryDeadline` に参加させる。tick 冒頭で `setRecoveryScanHealthy(false)` を立てる以上、解除 step が deadline なしで JDBC を待つと「tick が返らない → `recoveryScanHealthy=false` が永久に残る」という同型の障害を新設してしまう。したがって既存の `findExecutionClaim()`（untimed な `exposedTransaction`）を再利用せず、`prepareRecoveryStatement` / `insertRecoveryEvent` と同じ deadline-aware 経路を使う専用 repository API を足す（D8）。
 
-解除 step は tick 全体の deadline を使い切らない。step 専用の sub-budget を設け、次の 2 条件のどちらかで正常に打ち切って stale-claim scan へ移る。
+解除 step は tick 全体の deadline を使い切らない。tick deadline から `ADMISSION_BLOCKER_SCAN_HANDOFF_RESERVE`（既定 2,500 ms）を差し引いた専用の sub-deadline を作り、候補の repository call には tick deadline ではなくこの sub-deadline を渡す。次の 2 条件のどちらかで正常に打ち切って stale-claim scan へ移る。
 
 - 評価済みの候補数が `ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT`（既定 20）に達した
-- tick deadline の残りが `ADMISSION_BLOCKER_SCAN_HANDOFF_RESERVE`（既定 2,500 ms）を下回った
+- sub-deadline の残りが候補 1 件を開始するための reserve を下回った
 
-打ち切りは failure ではない。件数だけを上限にすると、1 候補あたりの DB 応答が遅い環境（20 件 × 225 ms ≒ 4.5 秒）で scan 本体の start reserve を食い潰し、stale-claim scan が永久に成功しなくなる。これは #350 と同型の恒久 fail-closed であり、時間側の上限が必須である。
+打ち切りは failure ではない。sub-deadline 到達による打ち切りは正常 handoff として扱い、lookup / audit の failure とは区別する。
+
+件数だけを上限にすると、1 候補あたりの DB 応答が遅い環境（20 件 × 225 ms ≒ 4.5 秒）で scan 本体の start reserve を食い潰し、stale-claim scan が永久に成功しなくなる。これは #350 と同型の恒久 fail-closed である。
+
+さらに、開始前の残時間チェックだけでも足りない。`prepareRecoveryStatement` は渡された deadline の残りいっぱいまで statement / network timeout を張るので、tick deadline をそのまま渡すと「残り 2,501 ms で候補を開始 → その候補が 2,000 ms 消費 → 残り 501 ms で handoff → scan の 750 ms start reserve を満たせず失敗」という系列が成立してしまう。sub-deadline を渡して statement 側の上限そのものを handoff 境界で切ることで、進行中の候補が reserve を侵食できないようにする。
 
 個々の候補の failure（deadline 超過、audit 失敗、lookup 失敗）は tick 全体の failure として伝播させる。部分成功を隠さない。次 tick が新しい budget で再試行する。
 
@@ -138,8 +142,8 @@ request は invocationId、claimantToken、blocker record が持つ安定な `re
 実装は 1 つの deadline-aware transaction 内で次の順に照合する。すべての statement は `prepareRecoveryStatement` を通す。
 
 1. `command_event_log` に `id = resolutionAttemptId` の row が既に存在するか読む
-   - 存在し、`event_type` が `LLM_ADMISSION_BLOCKER_AUTO_RESOLVED` かつ `client_request_id` が同じ invocationId なら、前回 tick が commit 済みと確定して `Resolved` を返す（新たな INSERT はしない）
-   - 存在するが event_type / invocationId が食い違うなら `Result.failure`（ID 衝突は握り潰さない）
+   - 存在する場合、その row がこの blocker のために書かれたものであることを exact match で確認する。照合対象は `id`、`decision_run_id`、`tool_call_id`、`client_request_id`、`tool_name`、`event_type`、および payload に含まれる blocker identity（`invocationId`、`claimantToken`、`resolutionAttemptId`、`registeredAt`）である。すべて一致すれば前回 tick が commit 済みと確定して `Resolved` を返す（新たな INSERT はしない）
+   - 1 つでも食い違うなら `Result.failure`（ID 衝突は握り潰さない）。`event_type` と invocationId だけの照合では、同一 invocationId に対して claimant token 違いの blocker が 2 つある状況で他方の audit を自分のものと誤認しうるため、identity 全体を照合する
 2. reservation status を読む。terminal でなければ `Retained(reason)` を返して audit を書かない
 3. terminal かつ service が quiet period 成立を宣言しているなら、`insertRecoveryEvent` で `id = resolutionAttemptId` の audit を書いて `Resolved(status)` を返す
 
@@ -153,7 +157,7 @@ quiet period 判定を service 側（monotonic）に置き、DB 側に置かな�
 
 - **偽解除**: 静穏期間経過後も子孫 process が生きていれば、admission を開けた後に旧 process が動きうる。ただし D1 に列挙した 4 層（phase allowlist、manifest expiry、gateway binding、runner の注文直前 claim validation）により risk-increasing な注文へは到達しない。静穏期間はその外側の層。
 - **静穏期間の設定変更**: `perRunTimeout` を 600 秒へ上げた運用では静穏期間も 610 秒になる。復旧が遅くなるが、危険側には振れない。
-- **batch limit と復旧遅延**: blocker が 100 件溜まっている場合、全件評価に 5 tick かかる。heartbeat interval 単位なので実時間では数十秒程度で、障害時の 2 時間 15 分に比べれば無視できる。
+- **batch limit と復旧遅延**: blocker が 100 件溜まっている場合、全件評価に少なくとも 5 tick かかる。DB latency が高ければ sub-deadline による handoff で 1 tick あたり 20 件未満しか処理できず、さらに増える。それでも heartbeat interval 単位なので実時間では数十秒から数分で、障害時の 2 時間 15 分に比べれば十分短い。
 - **reservation record が存在しない blocker**: 仕様上いつまでも残る。absence から終端を推論しない fail-closed invariant を優先した結果で、既知の残存 risk として受容する。production の登録元はいずれも reservation 作成後の invocationId なので、実際には発生しない想定。
 - **snapshot と DB 問い合わせの間の race**: snapshot 取得後に新しい blocker が登録されても、その tick では扱わない。次 tick が拾う。逆に snapshot 後に別経路で解除された blocker を再度 remove しても冪等。
 
@@ -163,4 +167,11 @@ DB schema 変更なし。設定変更なし。deploy は通常の container 差�
 
 ## Open Questions
 
-なし。独立反証で挙がった blocking 3 件（deadline 非参加の DB read、unbounded snapshot による starvation、wall clock 後退）は D2 / D4 / D5 / D7 / D8 で処置済み。
+なし。独立反証 3 ラウンドで挙がった blocking はすべて処置済み。
+
+- deadline 非参加の DB read → D4 / D7 / D8
+- unbounded snapshot による starvation → D5
+- wall clock 後退 → D2
+- commit ack 消失による重複 audit / 恒久 failure → D2 / D3 / D8（stable attempt ID + readback）
+- 固定件数のみでは scan budget を保証できない、失敗候補による後続 starvation → D4（sub-deadline）/ D4b（候補ごとの cursor 前進）
+- readback の一致条件が緩く他 blocker の audit を誤認しうる → D8（identity 全体の exact match）
