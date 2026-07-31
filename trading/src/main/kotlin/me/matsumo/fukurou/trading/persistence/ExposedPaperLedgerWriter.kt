@@ -13,6 +13,8 @@ import me.matsumo.fukurou.trading.broker.AuthorizedAtomicPaperEntryRequest
 import me.matsumo.fukurou.trading.broker.AuthorizedPlaceOrderReplay
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentConsumedException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIntentMissingException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryOutcomeIndeterminateException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryUnavailableException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryCreationProposal
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
 import me.matsumo.fukurou.trading.broker.EntryFillWriteRequest
@@ -286,54 +288,120 @@ internal class ExposedPaperLedgerWriter(
         }
     }
 
-    /**
-     * eligibility を持たない authorized entry を一つの JDBC transaction で確定する。
-     *
-     * realtime eligibility と commit outcome 不明時の readback は後続 slice で追加する。
-     */
+    /** authorized entry を一つの JDBC transaction で確定する。 */
     suspend fun commitAuthorizedAtomicEntry(
         request: AuthorizedAtomicPaperEntryRequest,
     ): Result<AuthorizedAtomicEntryResult> {
         return withContext(Dispatchers.IO) {
-            try {
-                Result.success(
-                    exposedTransaction(database) {
+            val mutation = commitAuthorizedAtomicEntryOnce(request)
+            if (mutation.isSuccess) return@withContext mutation
+
+            val failure = requireNotNull(mutation.exceptionOrNull())
+            if (failure !is AuthorizedAtomicEntryOutcomeIndeterminateException) return@withContext Result.failure(failure)
+
+            readAuthorizedAtomicEntryAfterIndeterminateOutcome(request).fold(
+                onSuccess = { replay -> Result.success(AuthorizedAtomicEntryResult.Exact(replay)) },
+                onFailure = { Result.failure(failure) },
+            )
+        }
+    }
+
+    @Suppress("CyclomaticComplexMethod", "LongMethod", "SwallowedException")
+    private fun commitAuthorizedAtomicEntryOnce(
+        request: AuthorizedAtomicPaperEntryRequest,
+    ): Result<AuthorizedAtomicEntryResult> {
+        var bodyCompleted = false
+        var requestValidated = false
+
+        return try {
+            Result.success(
+                exposedTransaction(database) {
+                    maxAttempts = 1
+                    try {
                         request.requireStableIdentityValid()
-                        val riskState = lockPaperLedgerMutationRows()
                         when (val replay = readAuthorizedAtomicEntryReplay(request)) {
                             is AuthorizedPlaceOrderReplay.Exact -> return@exposedTransaction AuthorizedAtomicEntryResult.Exact(
                                 replay.result,
                             )
-                            AuthorizedPlaceOrderReplay.Ambiguous -> {
-                                throw AuthorizedAtomicEntryReplayIndeterminateException()
-                            }
+                            AuthorizedPlaceOrderReplay.Ambiguous -> throw AuthorizedAtomicEntryReplayIndeterminateException()
                             AuthorizedPlaceOrderReplay.Missing -> Unit
                         }
 
                         request.requireCreationProposalValid()
-                        val hasRealtimeEligibility = request.proposal is AuthorizedAtomicEntryCreationProposal.Resting &&
-                            request.proposal.request.order.marketEligibility != null
-                        require(!hasRealtimeEligibility)
+                        requestValidated = true
+                        val creationAuthority = lockRestingOrderCreationRows(request.proposal.restingEligibility())
+                        when (val replay = readAuthorizedAtomicEntryReplay(request)) {
+                            is AuthorizedPlaceOrderReplay.Exact -> return@exposedTransaction AuthorizedAtomicEntryResult.Exact(
+                                replay.result,
+                            )
+                            AuthorizedPlaceOrderReplay.Ambiguous -> throw AuthorizedAtomicEntryReplayIndeterminateException()
+                            AuthorizedPlaceOrderReplay.Missing -> Unit
+                        }
+
                         requireAuthorizedEntryProposalFresh(request.proposal)
                         requireAuthorizedEntryIntentAvailable(request)
                         requireAuthorizedEntryFlat()
-                        val writeIntent = resolvePaperWriteContext(request.proposal.command.auditContext, riskState)
+                        val writeIntent = resolvePaperWriteContext(request.proposal.command.auditContext, creationAuthority.riskState)
                             .intent(PaperWritePolicy.RISK_INCREASING)
-                        val result = writeAuthorizedAtomicEntry(request.proposal, writeIntent, clock)
+                        val result = writeAuthorizedAtomicEntry(
+                            proposal = request.proposal,
+                            writeIntent = writeIntent,
+                            admissionBoundary = creationAuthority.admissionBoundary,
+                            clock = clock,
+                        )
 
                         insertTradeIntentConsumption(
                             intentId = request.identity.intentId,
                             orderId = UUID.fromString(result.orderIds.first()),
                             consumedAt = request.proposal.consumption.consumedAt,
                         )
+                        bodyCompleted = true
 
                         AuthorizedAtomicEntryResult.Created(result)
-                    },
-                )
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (failure: Throwable) {
-                Result.failure(failure)
+                    } catch (cancellation: CancellationException) {
+                        val rollbackOutcome = cancellation.withAuthorizedAtomicEntryRollbackOutcome(this)
+                        if (rollbackOutcome is AuthorizedAtomicEntryOutcomeIndeterminateException) {
+                            throw rollbackOutcome
+                        }
+                        throw cancellation
+                    } catch (failure: Throwable) {
+                        if (failure.shouldPreserveAuthorizedAtomicEntryFailure(requestValidated)) {
+                            throw failure
+                        }
+                        throw failure.withAuthorizedAtomicEntryRollbackOutcome(this)
+                    }
+                },
+            )
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: Throwable) {
+            if (failure.shouldPreserveAuthorizedAtomicEntryFailure(requestValidated)) {
+                return Result.failure(failure)
+            }
+
+            val typedFailure = if (bodyCompleted) {
+                AuthorizedAtomicEntryOutcomeIndeterminateException(failure)
+            } else {
+                AuthorizedAtomicEntryUnavailableException(failure)
+            }
+            Result.failure(typedFailure)
+        }
+    }
+
+    private fun readAuthorizedAtomicEntryAfterIndeterminateOutcome(
+        request: AuthorizedAtomicPaperEntryRequest,
+    ): Result<PaperTradeResult> {
+        return runCatching {
+            exposedTransaction(database) {
+                maxAttempts = 1
+                when (val replay = readAuthorizedAtomicEntryReplay(request)) {
+                    is AuthorizedPlaceOrderReplay.Exact -> replay.result
+                    AuthorizedPlaceOrderReplay.Missing,
+                    AuthorizedPlaceOrderReplay.Ambiguous,
+                    -> throw AuthorizedAtomicEntryOutcomeIndeterminateException(
+                        IllegalStateException("authorized atomic entry readback was not exact."),
+                    )
+                }
             }
         }
     }
@@ -958,6 +1026,7 @@ private fun JdbcTransaction.requireAuthorizedEntryFlat() {
 private fun JdbcTransaction.writeAuthorizedAtomicEntry(
     proposal: AuthorizedAtomicEntryCreationProposal,
     writeIntent: PaperWriteIntent,
+    admissionBoundary: Long?,
     clock: Clock,
 ): PaperTradeResult {
     return when (proposal) {
@@ -983,8 +1052,8 @@ private fun JdbcTransaction.writeAuthorizedAtomicEntry(
                     expiresAt = proposal.request.order.expiresAt,
                     expirySource = proposal.request.order.expirySource,
                     effectiveTtlSeconds = proposal.request.order.effectiveTtlSeconds,
-                    marketEligibility = null,
-                    marketEligibleAfterAdmissionOrdinal = null,
+                    marketEligibility = proposal.request.order.marketEligibility,
+                    marketEligibleAfterAdmissionOrdinal = admissionBoundary,
                 ),
                 clock,
             )
@@ -999,6 +1068,35 @@ private fun JdbcTransaction.writeAuthorizedAtomicEntry(
             )
         }
     }
+}
+
+private fun AuthorizedAtomicEntryCreationProposal.restingEligibility(): RestingOrderMarketEligibility? {
+    return (this as? AuthorizedAtomicEntryCreationProposal.Resting)?.request?.order?.marketEligibility
+}
+
+private fun Throwable.isAuthorizedAtomicEntryRejection(): Boolean {
+    return this is AuthorizedAtomicEntryReplayIndeterminateException ||
+        this is AuthorizedAtomicEntryIntentMissingException ||
+        this is AuthorizedAtomicEntryIntentConsumedException ||
+        this is AuthorizedAtomicEntryNotFlatException ||
+        this is AuthorizedAtomicEntryUnavailableException ||
+        this is AuthorizedAtomicEntryOutcomeIndeterminateException ||
+        this is HardHaltTradingRejectedException
+}
+
+private fun Throwable.shouldPreserveAuthorizedAtomicEntryFailure(requestValidated: Boolean): Boolean {
+    return when (this) {
+        is IllegalArgumentException -> !requestValidated
+        else -> isAuthorizedAtomicEntryRejection()
+    }
+}
+
+private fun Throwable.withAuthorizedAtomicEntryRollbackOutcome(transaction: JdbcTransaction): Throwable {
+    val rollbackFailure = runCatching { transaction.rollback() }.exceptionOrNull()
+    if (rollbackFailure == null) return AuthorizedAtomicEntryUnavailableException(this)
+
+    addSuppressed(rollbackFailure)
+    return AuthorizedAtomicEntryOutcomeIndeterminateException(this)
 }
 
 private fun JdbcTransaction.lockPaperLedgerMutationRows(): RiskState {

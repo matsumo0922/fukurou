@@ -47,8 +47,10 @@ import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryCreationProposal
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryIdentity
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryNotFlatException
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryOutcomeIndeterminateException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryReplayIndeterminateException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryResult
+import me.matsumo.fukurou.trading.broker.AuthorizedAtomicEntryUnavailableException
 import me.matsumo.fukurou.trading.broker.AuthorizedAtomicPaperEntryRequest
 import me.matsumo.fukurou.trading.broker.CancelOrderCommand
 import me.matsumo.fukurou.trading.broker.ClosePositionCommand
@@ -230,6 +232,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.PreparedStatement
+import java.sql.ResultSet
 import java.sql.SQLException
 import java.sql.SQLTimeoutException
 import java.sql.Types
@@ -243,6 +246,7 @@ import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.sql.DataSource
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -11393,6 +11397,180 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun authorizedAtomicEntryRecoversExactReplayAfterCommitAcknowledgementLoss() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val faultController = RiskExitCommitFaultController()
+        val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+        val decisions = ExposedDecisionRepository(faultDatabase, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-ack-loss",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresMarketRequest(
+            command = command,
+            entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+        )
+
+        faultController.armAtomicEntryCommitResponseLoss()
+        val result = ledger.authorizedAtomicEntryBackend().commit(request).getOrThrow()
+
+        assertIs<AuthorizedAtomicEntryResult.Exact>(result)
+        assertEquals(1L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM executions"))
+        assertEquals(1L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+        assertEquals(1, faultController.atomicEntryMutationBodies)
+        assertEquals(1, faultController.atomicEntryReadbacks)
+    }
+
+    @Test
+    fun authorizedAtomicEntryClassifiesRolledBackMutationFailureAsUnavailable() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val faultController = RiskExitCommitFaultController()
+        val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+        val decisions = ExposedDecisionRepository(faultDatabase, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-rollback",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresMarketRequest(
+            command = command,
+            entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+        )
+
+        faultController.armAtomicEntryMutationFailure()
+        val failure = ledger.authorizedAtomicEntryBackend().commit(request).exceptionOrNull()
+
+        assertIs<AuthorizedAtomicEntryUnavailableException>(failure)
+        assertEquals(0, faultController.atomicEntryMutationBodies)
+        assertEquals(0L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM orders"))
+        assertEquals(0L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryPreservesInvalidStableIdentityExceptionBeforeMutation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-invalid-stable",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresMarketRequest(
+            command = command,
+            entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+        ).copy(
+            identity = AuthorizedAtomicEntryIdentity.from(command, TradingMode.PAPER)
+                .copy(clientRequestId = "invalid-reserved-prefix"),
+        )
+
+        val failure = ledger.authorizedAtomicEntryBackend().commit(request).exceptionOrNull()
+
+        assertIs<IllegalArgumentException>(failure)
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM orders"))
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryClassifiesRollbackFailureAsOutcomeIndeterminate() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val faultController = RiskExitCommitFaultController()
+        val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+        val decisions = ExposedDecisionRepository(faultDatabase, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-rollback-loss",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresMarketRequest(
+            command = command,
+            entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+        )
+
+        faultController.armAtomicEntryMutationFailure()
+        faultController.armAtomicEntryRollbackFailure()
+        val failure = ledger.authorizedAtomicEntryBackend().commit(request).exceptionOrNull()
+
+        assertIs<AuthorizedAtomicEntryOutcomeIndeterminateException>(failure)
+        assertEquals(0, faultController.atomicEntryMutationBodies)
+        assertEquals(0L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM orders"))
+        assertEquals(0L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryRollsBackLedgerWhenConcurrentConsumptionWins() = runPostgresTest {
+        val result = runAuthorizedAtomicEntryConcurrentConsumption(rollbackFails = false)
+
+        assertIs<AuthorizedAtomicEntryUnavailableException>(result.failure)
+        assertEquals(0L, result.orderCount)
+        assertEquals(1L, result.consumptionCount)
+    }
+
+    @Test
+    fun authorizedAtomicEntryKeepsOutcomeIndeterminateWhenConcurrentConsumptionRollbackFails() = runPostgresTest {
+        val result = runAuthorizedAtomicEntryConcurrentConsumption(rollbackFails = true)
+
+        assertIs<AuthorizedAtomicEntryOutcomeIndeterminateException>(result.failure)
+        assertEquals(0L, result.orderCount)
+        assertEquals(1L, result.consumptionCount)
+    }
+
+    @Test
+    fun authorizedAtomicEntryKeepsIndeterminateWhenReadbackIsUnavailable() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val faultController = RiskExitCommitFaultController()
+        val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+        val decisions = ExposedDecisionRepository(faultDatabase, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-readback-unavailable",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val request = authorizedPostgresMarketRequest(
+            command = command,
+            entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+        )
+
+        faultController.armAtomicEntryCommitResponseLoss()
+        faultController.armAtomicEntryReadbackFailure()
+        val failure = ledger.authorizedAtomicEntryBackend().commit(request).exceptionOrNull()
+
+        assertIs<AuthorizedAtomicEntryOutcomeIndeterminateException>(failure)
+        assertEquals(1, faultController.atomicEntryMutationBodies)
+        assertEquals(1, faultController.atomicEntryReadbacks)
+        assertEquals(1L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedAtomicEntryKeepsIndeterminateWhenReadbackProjectsMissing() = runPostgresTest {
+        val failure = runAuthorizedAtomicEntryReadbackProjection(ReadbackProjection.MISSING)
+
+        assertIs<AuthorizedAtomicEntryOutcomeIndeterminateException>(failure)
+    }
+
+    @Test
+    fun authorizedAtomicEntryKeepsIndeterminateWhenReadbackProjectsAmbiguous() = runPostgresTest {
+        val failure = runAuthorizedAtomicEntryReadbackProjection(ReadbackProjection.AMBIGUOUS)
+
+        assertIs<AuthorizedAtomicEntryOutcomeIndeterminateException>(failure)
+    }
+
+    @Test
     fun authorizedAtomicEntryReplaysMarketEntryWhenStableGroupIsNull() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val decisions = ExposedDecisionRepository(database, fixedClock())
@@ -11461,6 +11639,32 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun authorizedAtomicEntryKeepsHardHaltRejectionTypeWithoutMutation() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-hard-halt",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        ExposedRiskStateRepository(database).setHardHalt("authorized atomic hard halt", fixedInstant()).getOrThrow()
+
+        val failure = ledger.authorizedAtomicEntryBackend().commit(
+            authorizedPostgresMarketRequest(
+                command = command,
+                entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+            ),
+        ).exceptionOrNull()
+
+        assertIs<HardHaltTradingRejectedException>(failure)
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM orders"))
+        assertEquals(0L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
     fun authorizedAtomicEntryCreatesThenReplaysPostgresRestingEntry() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val decisions = ExposedDecisionRepository(database, fixedClock())
@@ -11490,6 +11694,107 @@ class PostgresPersistenceIntegrationTest {
         assertEquals(created.result.orderIds, replayed.result.orderIds)
         assertEquals(1, ledger.getOpenOrders().getOrThrow().size)
         assertTrue(ledger.getOpenPositions().getOrThrow().isEmpty())
+    }
+
+    @Test
+    fun authorizedAtomicEntryCreatesRealtimeEligibleRestingEntryAfterSessionLock() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.randomUUID()
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-realtime-resting",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val order = realtimeRestingEntryRequest(command, sessionId, processedSequence = 0)
+            .copy(
+                orderId = UUID.randomUUID(),
+                tradeGroupId = requireNotNull(command.tradeGroupId),
+            )
+
+        val result = ledger.authorizedAtomicEntryBackend()
+            .commit(authorizedPostgresRestingRequest(command, order))
+            .getOrThrow()
+        val replayWithUnavailableFreshSession = ledger.authorizedAtomicEntryBackend()
+            .commit(
+                authorizedPostgresRestingRequest(
+                    command = command,
+                    order = order.copy(
+                        orderId = UUID.randomUUID(),
+                        marketEligibility = requireNotNull(order.marketEligibility).copy(sessionId = UUID.randomUUID()),
+                    ),
+                ),
+            )
+            .getOrThrow()
+
+        assertIs<AuthorizedAtomicEntryResult.Created>(result)
+        assertIs<AuthorizedAtomicEntryResult.Exact>(replayWithUnavailableFreshSession)
+        assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+    }
+
+    @Test
+    fun authorizedRealtimeRestingEntryAndMarketEventCompleteInSessionToLedgerOrder() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        val sessionId = UUID.randomUUID()
+        ExposedMarketDataIntegrityRepository(database).beginSession(sessionId, fixedInstant()).getOrThrow()
+        val decisions = ExposedDecisionRepository(database, fixedClock())
+        val ledger = ExposedPaperLedgerRepository(database, clock = fixedClock())
+        val command = approvedPostgresEntryCommand(
+            repository = decisions,
+            command = postgresEntryCommand(
+                orderType = OrderType.LIMIT,
+                priceJpy = BigDecimal("9990000"),
+                takeProfitPriceJpy = BigDecimal("11000000"),
+                clientRequestId = "runner-place-v2-postgres-atomic-session-ledger-barrier",
+            ).copy(tradeGroupId = UUID.randomUUID()),
+        )
+        val order = realtimeRestingEntryRequest(command, sessionId, processedSequence = 0).copy(
+            orderId = UUID.randomUUID(),
+            tradeGroupId = requireNotNull(command.tradeGroupId),
+        )
+        val riskLockConnection = dataSource.connection
+        riskLockConnection.autoCommit = false
+        riskLockConnection.prepareStatement("SELECT id FROM risk_state WHERE id = 1 FOR UPDATE").use { statement ->
+            statement.executeQuery().use { rows -> assertTrue(rows.next()) }
+        }
+
+        try {
+            coroutineScope {
+                val entry = async(Dispatchers.IO) {
+                    ledger.authorizedAtomicEntryBackend().commit(authorizedPostgresRestingRequest(command, order))
+                }
+                awaitPaperMarketSessionAdvisoryLock(
+                    dataSource = dataSource,
+                    sessionId = sessionId,
+                    mode = PaperMarketSessionAdvisoryLockMode.EXCLUSIVE,
+                    granted = true,
+                )
+                val marketEvent = async(Dispatchers.IO) {
+                    ledger.applyMarketEvent(
+                        event = paperTradeEvent(sessionId, 1, sizeBtc = "0.0100"),
+                        simulator = FillSimulator(clock = fixedClock()),
+                    )
+                }
+
+                awaitDatabaseLockWaiters(dataSource, expectedCount = 2)
+                riskLockConnection.commit()
+                riskLockConnection.close()
+
+                val entryResult = withTimeout(10_000) { entry.await().getOrThrow() }
+                withTimeout(10_000) { marketEvent.await().getOrThrow() }
+                assertIs<AuthorizedAtomicEntryResult.Created>(entryResult)
+            }
+        } finally {
+            closeTransactionBlocker(riskLockConnection)
+        }
+
+        assertEquals(1L, selectLongForTest(database, "SELECT COUNT(*) FROM trade_intent_consumptions"))
     }
 
     @Test
@@ -12569,6 +12874,79 @@ private suspend fun PostgresTestContext.runDirectEntryHardHaltBarrierRace(
     }
 }
 
+private suspend fun PostgresTestContext.runAuthorizedAtomicEntryReadbackProjection(
+    projection: ReadbackProjection,
+): Throwable? {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    val faultController = RiskExitCommitFaultController()
+    val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+    val decisions = ExposedDecisionRepository(faultDatabase, fixedClock())
+    val ledger = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+    val command = approvedPostgresEntryCommand(
+        repository = decisions,
+        command = postgresEntryCommand(
+            takeProfitPriceJpy = BigDecimal("11000000"),
+            clientRequestId = "runner-place-v2-postgres-atomic-readback-${projection.name.lowercase()}",
+        ).copy(tradeGroupId = UUID.randomUUID()),
+    )
+    val request = authorizedPostgresMarketRequest(
+        command = command,
+        entry = directPostgresMarketEntryRequest(command, requireNotNull(command.tradeGroupId)),
+    )
+
+    faultController.armAtomicEntryCommitResponseLoss()
+    faultController.armAtomicEntryReadbackProjection(projection)
+    val failure = ledger.authorizedAtomicEntryBackend().commit(request).exceptionOrNull()
+
+    assertEquals(1, faultController.atomicEntryMutationBodies)
+    assertEquals(1, faultController.atomicEntryReadbacks)
+    assertEquals(1L, selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM trade_intent_consumptions"))
+
+    return failure
+}
+
+private suspend fun PostgresTestContext.runAuthorizedAtomicEntryConcurrentConsumption(
+    rollbackFails: Boolean,
+): ConcurrentConsumptionRaceResult {
+    TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+    val faultController = RiskExitCommitFaultController()
+    val faultDatabase = ExposedDatabase.connect(RiskExitCommitFaultDataSource(dataSource, faultController))
+    val decisions = ExposedDecisionRepository(faultDatabase, fixedClock())
+    val ledger = ExposedPaperLedgerRepository(faultDatabase, clock = fixedClock())
+    val command = approvedPostgresEntryCommand(
+        repository = decisions,
+        command = postgresEntryCommand(
+            orderType = OrderType.LIMIT,
+            priceJpy = BigDecimal("9990000"),
+            takeProfitPriceJpy = BigDecimal("11000000"),
+            clientRequestId = "runner-place-v2-postgres-atomic-consumption-race-$rollbackFails",
+        ).copy(tradeGroupId = UUID.randomUUID()),
+    )
+    val intentId = requireNotNull(command.intentId)
+    val order = directPostgresRestingEntryRequest(command, requireNotNull(command.tradeGroupId)).copy(orderId = UUID.randomUUID())
+
+    faultController.armCompetingConsumption(dataSource, intentId)
+    if (rollbackFails) faultController.armAtomicEntryRollbackFailure()
+    val failure = ledger.authorizedAtomicEntryBackend().commit(
+        authorizedPostgresRestingRequest(command, order),
+    ).exceptionOrNull()
+
+    return ConcurrentConsumptionRaceResult(
+        failure = failure,
+        orderCount = selectLongForTest(faultDatabase, "SELECT COUNT(*) FROM orders"),
+        consumptionCount = selectLongForTest(
+            faultDatabase,
+            "SELECT COUNT(*) FROM trade_intent_consumptions WHERE intent_id='$intentId'",
+        ),
+    )
+}
+
+private data class ConcurrentConsumptionRaceResult(
+    val failure: Throwable?,
+    val orderCount: Long,
+    val consumptionCount: Long,
+)
+
 private fun entryDecisionSubmission(command: PlaceOrderCommand): DecisionSubmission {
     return DecisionSubmission(
         invocationId = "run-entry-${command.commandId}",
@@ -13261,6 +13639,18 @@ private class RiskExitCommitFaultDataSource(
 private class RiskExitCommitFaultController {
     private val preCommitFailureArmed = AtomicBoolean(false)
     private val commitResponseLossArmed = AtomicBoolean(false)
+    private val atomicEntryCommitResponseLossArmed = AtomicBoolean(false)
+    private val atomicEntryMutationFailureArmed = AtomicBoolean(false)
+    private val atomicEntryRollbackFailureArmed = AtomicBoolean(false)
+    private val atomicEntryReadbackFailureArmed = AtomicBoolean(false)
+    private val readbackProjection = AtomicReference<ReadbackProjection?>(null)
+    private val competingConsumption = AtomicReference<CompetingConsumption?>(null)
+    private val commitResponseLost = AtomicBoolean(false)
+    private val mutationBodies = AtomicInteger(0)
+    private val readbacks = AtomicInteger(0)
+
+    val atomicEntryMutationBodies: Int get() = mutationBodies.get()
+    val atomicEntryReadbacks: Int get() = readbacks.get()
 
     fun armPreCommitFailure() {
         preCommitFailureArmed.set(true)
@@ -13270,9 +13660,77 @@ private class RiskExitCommitFaultController {
         commitResponseLossArmed.set(true)
     }
 
+    fun armAtomicEntryCommitResponseLoss() {
+        atomicEntryCommitResponseLossArmed.set(true)
+    }
+
+    fun armAtomicEntryMutationFailure() {
+        atomicEntryMutationFailureArmed.set(true)
+    }
+
+    fun armAtomicEntryReadbackFailure() {
+        atomicEntryReadbackFailureArmed.set(true)
+    }
+
+    fun armAtomicEntryRollbackFailure() {
+        atomicEntryRollbackFailureArmed.set(true)
+    }
+
+    fun armAtomicEntryReadbackProjection(projection: ReadbackProjection) {
+        readbackProjection.set(projection)
+    }
+
+    fun armCompetingConsumption(dataSource: DataSource, intentId: UUID) {
+        competingConsumption.set(CompetingConsumption(dataSource, intentId))
+    }
+
     fun shouldFailBeforeCommit(): Boolean = preCommitFailureArmed.compareAndSet(true, false)
 
     fun shouldLoseCommitResponse(): Boolean = commitResponseLossArmed.compareAndSet(true, false)
+
+    fun shouldLoseAtomicEntryCommitResponse(): Boolean {
+        return atomicEntryCommitResponseLossArmed.compareAndSet(true, false)
+    }
+
+    fun shouldFailAtomicEntryRollback(): Boolean = atomicEntryRollbackFailureArmed.compareAndSet(true, false)
+
+    fun recordCommitResponseLoss() {
+        commitResponseLost.set(true)
+    }
+
+    fun shouldFailAtomicEntryMutation(): Boolean {
+        return atomicEntryMutationFailureArmed.compareAndSet(true, false)
+    }
+
+    fun shouldFailAtomicEntryReadback(): Boolean {
+        return commitResponseLost.get() && atomicEntryReadbackFailureArmed.compareAndSet(true, false)
+    }
+
+    fun recordAtomicEntryMutationBody() {
+        mutationBodies.incrementAndGet()
+    }
+
+    fun recordAtomicEntryReadback() {
+        if (commitResponseLost.get()) readbacks.incrementAndGet()
+    }
+
+    fun insertCompetingConsumptionAfterMutation() {
+        val competing = competingConsumption.getAndSet(null) ?: return
+        competing.dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                "INSERT INTO trade_intent_consumptions (id, intent_id, order_id, consumed_at) VALUES (?, ?, NULL, ?)",
+            ).use { statement ->
+                statement.setObject(1, UUID.randomUUID())
+                statement.setObject(2, competing.intentId)
+                statement.setLong(3, fixedInstant().toEpochMilli())
+                statement.executeUpdate()
+            }
+        }
+    }
+
+    fun readbackProjection(): ReadbackProjection? {
+        return readbackProjection.get().takeIf { commitResponseLost.get() }
+    }
 }
 
 private fun Connection.withRiskExitCommitFault(controller: RiskExitCommitFaultController): Connection {
@@ -13282,11 +13740,23 @@ private fun Connection.withRiskExitCommitFault(controller: RiskExitCommitFaultCo
         arrayOf(Connection::class.java),
     ) { _, method, arguments ->
         try {
+            if (method.name == "prepareStatement" && arguments?.firstOrNull() is String) {
+                val statement = method.invoke(delegate, *arguments) as PreparedStatement
+                return@newProxyInstance statement.withRiskExitCommitFault(arguments.first() as String, controller)
+            }
+            if (method.name == "rollback" && controller.shouldFailAtomicEntryRollback()) {
+                throw SQLException("authorized atomic entry rollback failed")
+            }
             if (method.name != "commit") return@newProxyInstance method.invoke(delegate, *(arguments ?: emptyArray()))
             if (controller.shouldFailBeforeCommit()) error("risk-exit failed before commit")
 
             val result = method.invoke(delegate, *(arguments ?: emptyArray()))
+            if (controller.shouldLoseAtomicEntryCommitResponse()) {
+                controller.recordCommitResponseLoss()
+                throw SQLException("risk-exit commit response was lost")
+            }
             if (controller.shouldLoseCommitResponse()) {
+                controller.recordCommitResponseLoss()
                 error("risk-exit commit response was lost")
             }
 
@@ -13295,6 +13765,95 @@ private fun Connection.withRiskExitCommitFault(controller: RiskExitCommitFaultCo
             throw failure.targetException
         }
     } as Connection
+}
+
+@Suppress("CyclomaticComplexMethod")
+private fun PreparedStatement.withRiskExitCommitFault(
+    sql: String,
+    controller: RiskExitCommitFaultController,
+): PreparedStatement {
+    val normalizedSql = sql.replace(Regex("\\s+"), " ").trim()
+    val isAtomicEntryOrderMutation = normalizedSql.startsWith("INSERT INTO orders", ignoreCase = true)
+    val isAtomicEntryConsumptionMutation = normalizedSql.startsWith(
+        "INSERT INTO trade_intent_consumptions",
+        ignoreCase = true,
+    )
+    val isAtomicEntryOrderRead = normalizedSql.contains("FROM orders", ignoreCase = true)
+    val isAtomicEntryReplayRead = normalizedSql.contains("FROM orders WHERE client_request_id", ignoreCase = true)
+    val isAtomicEntryAuditRead = normalizedSql.contains("FROM positions", ignoreCase = true) ||
+        normalizedSql.contains("FROM executions", ignoreCase = true)
+    val needsFaultProxy = listOf(
+        isAtomicEntryOrderMutation,
+        isAtomicEntryConsumptionMutation,
+        isAtomicEntryOrderRead,
+        isAtomicEntryAuditRead,
+    ).any { value -> value }
+    if (!needsFaultProxy) return this
+
+    val delegate = this
+    return Proxy.newProxyInstance(
+        PreparedStatement::class.java.classLoader,
+        arrayOf(PreparedStatement::class.java),
+    ) { _, method, arguments ->
+        when (method.name) {
+            "executeUpdate" -> if (isAtomicEntryOrderMutation && controller.shouldFailAtomicEntryMutation()) {
+                throw SQLException("authorized atomic entry mutation body failed")
+            } else if (isAtomicEntryConsumptionMutation) {
+                controller.recordAtomicEntryMutationBody()
+            }
+
+            "executeQuery" -> {
+                if (isAtomicEntryReplayRead) controller.recordAtomicEntryReadback()
+                if (isAtomicEntryReplayRead && controller.shouldFailAtomicEntryReadback()) {
+                    throw SQLException("authorized atomic entry readback failed")
+                }
+                val projection = controller.readbackProjection()
+                if (projection != null && projection.hides(isAtomicEntryOrderRead, isAtomicEntryAuditRead)) {
+                    return@newProxyInstance emptyResultSet()
+                }
+            }
+        }
+
+        val result = try {
+            method.invoke(delegate, *(arguments ?: emptyArray()))
+        } catch (failure: InvocationTargetException) {
+            throw failure.targetException
+        }
+        if (method.name == "executeUpdate" && isAtomicEntryOrderMutation) {
+            controller.insertCompetingConsumptionAfterMutation()
+        }
+
+        result
+    } as PreparedStatement
+}
+
+private data class CompetingConsumption(
+    val dataSource: DataSource,
+    val intentId: UUID,
+)
+
+private enum class ReadbackProjection {
+    MISSING,
+    AMBIGUOUS,
+    ;
+
+    fun hides(isReplayRead: Boolean, isAuditRead: Boolean): Boolean {
+        return isReplayRead || (this == MISSING && isAuditRead)
+    }
+}
+
+private fun emptyResultSet(): ResultSet {
+    return Proxy.newProxyInstance(
+        ResultSet::class.java.classLoader,
+        arrayOf(ResultSet::class.java),
+    ) { _, method, _ ->
+        when (method.name) {
+            "next" -> false
+            "close" -> null
+            "isClosed" -> false
+            else -> error("empty result set does not support ${method.name}")
+        }
+    } as ResultSet
 }
 
 private class RecoveryCommitFaultController {
