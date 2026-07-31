@@ -3,9 +3,11 @@
 ### Requirement: Recovery scan resolves admission blockers from database terminal facts
 **Trace:** Issue #350 受け入れ条件「UNKNOWN 終端で登録された blocker が、DB 終端確認後の recovery scan で自動解除される」
 
-Each periodic recovery scan tick SHALL evaluate every registered execution admission recovery blocker against the durable reservation record identified by the blocker's invocation ID. The scan SHALL resolve a blocker only when both of the following hold: the reservation for that invocation ID is in a terminal status (`FINISHED` or `FAILED`), and the elapsed time since the blocker was registered is at least `hardTimeout + processTerminationGrace`. A blocker whose reservation is still `RUNNING`, whose reservation cannot be read, or whose quiet period has not elapsed SHALL remain registered and SHALL keep admission fail-closed.
+Each periodic recovery scan tick SHALL evaluate a bounded batch of registered execution admission recovery blockers against the durable reservation record identified by each blocker's invocation ID. The scan SHALL resolve a blocker only when both of the following hold: the reservation for that invocation ID is in a terminal status (`FINISHED` or `FAILED`), and the elapsed time since the blocker was registered is at least `hardTimeout + processTerminationGrace`. A blocker whose reservation is still `RUNNING`, whose reservation cannot be read, or whose quiet period has not elapsed SHALL remain registered and SHALL keep admission fail-closed.
 
 Blocker resolution SHALL be derived only from the durable reservation record. The scan SHALL NOT infer termination from the absence of a record, from process-local heuristics, or from the passage of time alone.
+
+The quiet period SHALL be measured from a monotonic clock reading captured when the blocker was registered. Wall-clock timestamps recorded for audit purposes SHALL NOT determine eligibility, so that a backward or forward system clock adjustment neither delays nor accelerates resolution.
 
 #### Scenario: Blocker whose reservation reached a terminal status clears after the quiet period
 
@@ -40,10 +42,34 @@ Blocker resolution SHALL be derived only from the durable reservation record. Th
 - **WHEN** no reservation record exists for that invocation ID
 - **THEN** the recovery scan tick keeps the blocker registered
 
+#### Scenario: System clock moves backward after registration
+
+- **GIVEN** a recovery blocker registered for an invocation whose reservation is terminal
+- **WHEN** the system wall clock is adjusted backward and at least `hardTimeout + processTerminationGrace` of real elapsed time has since passed
+- **THEN** the recovery scan tick resolves the blocker
+
+### Requirement: Blocker evaluation is bounded and starvation-free
+**Trace:** Issue #350 受け入れ条件「回帰テスト 1 本」（自己回復が実際に完了すること）
+
+Each tick SHALL evaluate at most a fixed batch of registered blockers so that the evaluation cannot exhaust the recovery tick budget before the stale-claim scan runs. Evaluation SHALL advance through the registry in a stable order using a cursor that resumes from the previous tick's position, so that blockers which are repeatedly retained do not prevent later blockers from being evaluated.
+
+#### Scenario: Registry holds more blockers than one batch
+
+- **GIVEN** more registered blockers than a single tick's batch limit, where the earlier ones are all retained and a later one is resolvable
+- **WHEN** successive recovery ticks run
+- **THEN** the resolvable blocker is evaluated and resolved within a bounded number of ticks
+
+#### Scenario: Blocker evaluation shares the tick deadline
+
+- **GIVEN** registered blockers to evaluate
+- **WHEN** the database does not respond within the tick's remaining budget
+- **THEN** the tick fails within its bounded deadline rather than blocking indefinitely
+- **AND** a later tick retries with a fresh budget
+
 ### Requirement: Automatic blocker resolution is audited before it takes effect
 **Trace:** Issue #350 受け入れ条件「解除の監査イベントが command_event_log に残る」
 
-Every automatic blocker resolution SHALL append exactly one audit event to `command_event_log` recording the invocation ID, the claimant token, the observed terminal reservation status, and the elapsed quiet duration. The audit append SHALL precede the in-memory resolution, and a failed append SHALL leave the blocker registered so that the next tick retries. Audit payloads SHALL NOT contain secrets.
+Every automatic blocker resolution SHALL append exactly one audit event to `command_event_log` recording the invocation ID, the claimant token, the observed terminal reservation status, and the elapsed quiet duration. The audit append SHALL be committed in the same durable transaction that observes the terminal reservation, and the in-memory blocker SHALL be removed only after that transaction commits. A failed or uncommitted append SHALL leave the blocker registered so that the next tick retries. Audit payloads SHALL NOT contain secrets.
 
 #### Scenario: Resolution appends an audit event
 
