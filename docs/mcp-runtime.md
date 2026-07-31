@@ -149,6 +149,10 @@ MCP subprocess は manifest の `submissionSocketPath` へ `SocketChannel` で�
 
 `ShellProcessRunner` は自身が `setsid` で作った Linux process group に対して `kill -TERM/-KILL -<pgid>` と `/proc` 走査で終了を確認する。process が自然に終了した場合はこの確認だけで `PROVEN_EXITED` とする。timeout/cancellation による forced kill の場合は、`/proc` 走査完了後に発生し得る遅延 fork を排除できないため `UNCERTAIN` のまま残し、`OneShotLlmRunner` が recovery blocker を登録して次 tick の recovery scan に委ねる。
 
+recovery blocker が立っている間、`LlmExecutionAdmissionHealth` は fail-closed になり、新規 LLM 起動と `/health/ready` の両方を止める。blocker は recovery scan の各 tick が DB の終端事実で解除する。解除条件は、reservation が terminal（`FINISHED` / `FAILED`）であり、`finished_at` が記録済みであり、blocker の claimant token が `execution_claim_token` と厳密一致し、かつ `finished_at` から `hardTimeout + processTerminationGrace`（既定 580 秒）が経過していることである。この待機は遅延 fork した child が生きうる上限に対応する。4 条件のいずれかを欠く場合は解除せず、`docker restart` と運用者の確認が引き続き最終手段として残る。解除時は `LLM_EXECUTION_ADMISSION_BLOCKER_RESOLVED` を `command_event_log` に残す。
+
+`ReflectionTerminalPersistenceSupervisor` が登録する blocker は `reflection-terminal:<invocationId>` という claim 由来でない token を使うため、この解除経路の対象外であり、自身の retry loop が解除する。
+
 manifest IDはexpiryまでMCPを再実行できるbearer capabilityである。tool call limiterは`command_event_log`のinitial countを復元してrun budgetを共有するが、複数MCP processが同時にloadしてinsertする間の競合では上限を少数call超える可能性がある。各act toolは同じSafetyFloorとcaller guardを通り、phaseのcanonical allowlist（`McpToolContractCatalog`から導出）外のtoolはcall時に拒否する。
 
 Claude/Codex config と session は `/run/fukurou/llm-homes` tmpfs の per-run home に `appuser` owner・0700 で生成する。cleanup は current-user 権限のファイル削除だけで行い、cross-UID の別プロセスを必要としない。永続`llm-auth`はauth sourceだけに使い、必要なauth fileだけをper-run homeへcopyする。normal、非0終了、timeout、cancel、parse/start/request/render failureの全経路でconfig/home/manifestを削除する。cleanup failureはinfrastructure failureとしてcurrent processをquarantineし、markerと残存artifactを同じtmpfsに保持する。operatorが監査・解消するかcontainer restartでtmpfs全体を破棄するまでmanual/daemonの次runを拒否する。CLI に見える設定は次の形になる。
