@@ -1407,11 +1407,16 @@ class OpsRouteTest {
         val recoveryStartedEvent = auditEventTypes.single { element ->
             element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_EXECUTION_RECOVERY_STARTED"
         }
+        val blockerResolvedEvent = auditEventTypes.single { element ->
+            element.jsonObject.getValue("value").jsonPrimitive.content == "LLM_ADMISSION_BLOCKER_AUTO_RESOLVED"
+        }
         val normalizedActual = JsonObject(
             actualJson + mapOf(
                 "auditEventTypes" to JsonArray(
                     auditEventTypes.filter { element ->
-                        element != recoveryEvent && element != recoveryStartedEvent
+                        element != recoveryEvent &&
+                            element != recoveryStartedEvent &&
+                            element != blockerResolvedEvent
                     },
                 ),
             ),
@@ -1423,6 +1428,10 @@ class OpsRouteTest {
         assertEquals(
             "activity.catalog.audit.llmExecutionRecoveryStarted.label",
             recoveryStartedEvent.jsonObject.getValue("labelKey").jsonPrimitive.content,
+        )
+        assertEquals(
+            "activity.catalog.audit.llmAdmissionBlockerAutoResolved.label",
+            blockerResolvedEvent.jsonObject.getValue("labelKey").jsonPrimitive.content,
         )
         assertEquals(expectedJson, normalizedActual)
     }

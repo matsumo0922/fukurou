@@ -7,6 +7,7 @@ import me.matsumo.fukurou.trading.runner.OneShotRunnerMainTest
 import org.junit.Assume.assumeTrue
 import org.junit.runner.RunWith
 import org.junit.runners.Suite
+import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertFalse
 
@@ -55,7 +56,12 @@ private fun leaveAdmissionUnhealthy() {
     LlmExecutionAdmissionHealth.setHeartbeatHealthy(false)
     LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
     LlmExecutionAdmissionHealth.registerAmbiguous("ordered-regression-ambiguous", "ambiguous-token")
-    LlmExecutionAdmissionHealth.registerRecoveryBlocker("ordered-regression-blocker", "blocker-token")
+    LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+        invocationId = "ordered-regression-blocker",
+        claimantToken = "blocker-token",
+        registeredAt = Instant.now(),
+        registeredAtNanos = System.nanoTime(),
+    )
     LlmExecutionAdmissionHealth.recordHeartbeatResult(
         invocationId = "ordered-regression-heartbeat-failure",
         claimantToken = "heartbeat-failure-token",

@@ -71,6 +71,8 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigResolver
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.config.calculateRuntimeConfigHash
 import me.matsumo.fukurou.trading.daemon.LlmActiveLaunchReservation
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolution
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolutionRequest
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonOpenRiskSnapshot
@@ -5961,6 +5963,68 @@ class PostgresPersistenceIntegrationTest {
     }
 
     @Test
+    fun admissionBlockerResolution_exactReadbackPreventsDuplicateAndRejectsIdentityMismatch() = runPostgresTest {
+        TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
+        LlmExecutionAdmissionHealth.resetForTest()
+        val now = fixedInstant()
+        val repository = ExposedLlmLaunchReservationRepository(database)
+        val invocationId = "admission-blocker-readback"
+        repository.tryReserve(
+            LlmLaunchReservationRequest(
+                invocationId = invocationId,
+                triggerKind = LlmDaemonTriggerKind.FLAT_HEARTBEAT,
+                triggerKey = invocationId,
+                reservedAt = now,
+                runnerConfig = LlmRunnerConfig(),
+                hourlyWindow = Duration.ofHours(1),
+                dailyWindow = Duration.ofDays(1),
+                activeReservationStaleAfter = Duration.ofMinutes(30),
+            ),
+        ).getOrThrow()
+        repository.finish(
+            LlmLaunchReservationFinish(
+                invocationId = invocationId,
+                status = LlmLaunchReservationStatus.FINISHED,
+                reason = null,
+                finishedAt = now.plusSeconds(1),
+            ),
+        ).getOrThrow()
+        val attemptId = UUID.randomUUID()
+        val request = LlmAdmissionBlockerResolutionRequest(
+            invocationId = invocationId,
+            claimantToken = "claimant-a",
+            resolutionAttemptId = attemptId,
+            quietPeriodElapsed = true,
+            elapsedQuietMillis = 600_000L,
+            registeredAt = now,
+            observedAt = now.plusSeconds(600),
+        )
+
+        assertIs<LlmAdmissionBlockerResolution.Resolved>(
+            repository.resolveAdmissionBlockerIfTerminal(
+                request,
+                LlmExecutionRecoveryDeadline.start(Duration.ofSeconds(5), System::nanoTime),
+            ).getOrThrow(),
+        )
+        assertIs<LlmAdmissionBlockerResolution.Resolved>(
+            repository.resolveAdmissionBlockerIfTerminal(
+                request,
+                LlmExecutionRecoveryDeadline.start(Duration.ofSeconds(5), System::nanoTime),
+            ).getOrThrow(),
+        )
+        assertEquals(1, countCommandEventsById(database, attemptId))
+
+        val mismatchedRequest = request.copy(claimantToken = "claimant-b")
+        assertTrue(
+            repository.resolveAdmissionBlockerIfTerminal(
+                mismatchedRequest,
+                LlmExecutionRecoveryDeadline.start(Duration.ofSeconds(5), System::nanoTime),
+            ).isFailure,
+        )
+        assertEquals(1, countCommandEventsById(database, attemptId))
+    }
+
+    @Test
     fun recoveryScanTableLockTimesOutClosedWithoutMutationAndRetryConverges() = runPostgresTest {
         TradingPersistenceBootstrap(database, fixedClock()).ensureSchema().getOrThrow()
         val now = fixedInstant()
@@ -6014,7 +6078,12 @@ class PostgresPersistenceIntegrationTest {
                 claimantToken = claimantToken,
             )
             runRepository.insertRunning(llmRunStart(invocationId, claimedAt)).getOrThrow()
-            LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
+            LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+                invocationId = invocationId,
+                claimantToken = claimantToken,
+                registeredAt = claimedAt,
+                registeredAtNanos = System.nanoTime(),
+            )
             LlmExecutionTerminationFenceRegistry.registerNoChildStarted(invocationId, claimantToken, claimedAt)
         }
         installLatePageRecoveryDelay(database, "late-page-3")
@@ -15642,6 +15711,18 @@ private fun recoveryAuditFixture(request: LlmExecutionRecoveryRequest): CommandE
         payload = """{"recoveryAttemptId":"${request.recoveryAttemptId}"}""",
         occurredAt = request.finishedAt,
     )
+}
+
+private fun countCommandEventsById(database: ExposedDatabase, eventId: UUID): Int {
+    return exposedTransaction(database) {
+        jdbcConnection().prepareStatement("SELECT COUNT(*) FROM command_event_log WHERE id = ?").use { statement ->
+            statement.setObject(1, eventId)
+            statement.executeQuery().use { resultSet ->
+                check(resultSet.next())
+                resultSet.getInt(1)
+            }
+        }
+    }
 }
 
 private fun countRecoveryAuditEvents(database: ExposedDatabase, invocationId: String): Int {

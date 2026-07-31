@@ -5,16 +5,22 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
+import me.matsumo.fukurou.trading.daemon.ClaimHealthKey
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolution
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerResolutionRequest
+import me.matsumo.fukurou.trading.daemon.LlmAdmissionBlockerRetentionReason
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
+import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadlineExceededException
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryRetryPermit
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryScan
+import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationFinish
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationOutcome
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmLaunchReservationRequest
@@ -31,6 +37,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -381,7 +388,12 @@ class LlmExecutionRecoveryServiceTest {
         val snapshots = (1..3).map { index -> claimedRecoverySnapshot("late-$index") }
         snapshots.forEach { snapshot ->
             val claimantToken = requireNotNull(snapshot.claimantToken)
-            LlmExecutionAdmissionHealth.registerRecoveryBlocker(snapshot.invocationId, claimantToken)
+            LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+                invocationId = snapshot.invocationId,
+                claimantToken = claimantToken,
+                registeredAt = RECOVERY_INSTANT,
+                registeredAtNanos = System.nanoTime(),
+            )
             LlmExecutionTerminationFenceRegistry.registerNoChildStarted(
                 invocationId = snapshot.invocationId,
                 claimantToken = claimantToken,
@@ -414,7 +426,7 @@ class LlmExecutionRecoveryServiceTest {
         assertEquals(751L, deadline.requireStartReserve({ nowNanos }, 750L))
 
         nowNanos += Duration.ofMillis(2).toNanos()
-        assertFailsWith<me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadlineExceededException> {
+        assertFailsWith<LlmExecutionRecoveryDeadlineExceededException> {
             deadline.requireStartReserve({ nowNanos }, 750L)
         }
     }
@@ -517,12 +529,317 @@ class LlmExecutionRecoveryServiceTest {
         )
         assertFalse(LlmExecutionAdmissionHealth.isHealthy())
     }
+
+    @Test
+    fun terminalReservationAfterQuietPeriod_resolvesBlockerAndAuditsOnce() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) { QUIET_PERIOD_NANOS }
+        reserve(repository, "auto-resolved", RECOVERY_INSTANT)
+        finish(repository, "auto-resolved", RECOVERY_INSTANT.plusSeconds(1))
+        registerBlocker("auto-resolved", CLAIM_TOKEN, registeredAtNanos = 0L)
+        val service = recoveryService(
+            repository = repository,
+            now = RECOVERY_INSTANT.plusSeconds(1),
+            nanoTime = { QUIET_PERIOD_NANOS },
+        )
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(1, repository.admissionResolutionAuditsForTest().size)
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertEquals(1, repository.admissionResolutionAuditsForTest().size)
+    }
+
+    @Test
+    fun nonTerminalMissingAndPrematureReservations_keepBlockersRegistered() = runBlocking {
+        val runningRepository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+            QUIET_PERIOD_NANOS
+        }
+        reserve(runningRepository, "running-blocker", RECOVERY_INSTANT)
+        registerBlocker("running-blocker", CLAIM_TOKEN, registeredAtNanos = 0L)
+
+        assertEquals(
+            0,
+            recoveryService(runningRepository, RECOVERY_INSTANT, nanoTime = { QUIET_PERIOD_NANOS })
+                .tick()
+                .getOrThrow(),
+        )
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+
+        LlmExecutionAdmissionHealth.resetForTest()
+        val terminalRepository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) { 1L }
+        reserve(terminalRepository, "premature-blocker", RECOVERY_INSTANT)
+        finish(terminalRepository, "premature-blocker", RECOVERY_INSTANT.plusSeconds(1))
+        registerBlocker("premature-blocker", CLAIM_TOKEN, registeredAtNanos = 0L)
+
+        assertEquals(
+            0,
+            recoveryService(terminalRepository, RECOVERY_INSTANT, nanoTime = { 1L }).tick().getOrThrow(),
+        )
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+        assertTrue(terminalRepository.admissionResolutionAuditsForTest().isEmpty())
+
+        LlmExecutionAdmissionHealth.resetForTest()
+        val missingRepository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+            QUIET_PERIOD_NANOS
+        }
+        registerBlocker("missing-blocker", CLAIM_TOKEN, registeredAtNanos = 0L)
+
+        assertEquals(
+            0,
+            recoveryService(missingRepository, RECOVERY_INSTANT, nanoTime = { QUIET_PERIOD_NANOS })
+                .tick()
+                .getOrThrow(),
+        )
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun resolutionFailure_keepsBlockerAndFailsTick() = runBlocking {
+        val repository = AdmissionResolutionFailureRepository()
+        registerBlocker("resolution-failure", CLAIM_TOKEN, registeredAtNanos = 0L)
+        val service = recoveryService(repository, RECOVERY_INSTANT, nanoTime = { QUIET_PERIOD_NANOS })
+
+        assertTrue(service.tick().isFailure)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(
+            listOf(ClaimHealthKey("resolution-failure", CLAIM_TOKEN)),
+            LlmExecutionAdmissionHealth.snapshotRecoveryBlockers(null, 20).map { it.key },
+        )
+    }
+
+    @Test
+    fun wallClockRollback_doesNotDelayMonotonicResolution() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+            QUIET_PERIOD_NANOS
+        }
+        reserve(repository, "clock-rollback", RECOVERY_INSTANT)
+        finish(repository, "clock-rollback", RECOVERY_INSTANT.plusSeconds(1))
+        registerBlocker("clock-rollback", CLAIM_TOKEN, registeredAtNanos = 0L)
+        val clock = MutableClock(RECOVERY_INSTANT.minus(Duration.ofDays(1)))
+        val service = LlmExecutionRecoveryService(
+            repository = repository,
+            policy = DEFAULT_RECOVERY_POLICY,
+            clock = clock,
+            nanoTime = { QUIET_PERIOD_NANOS },
+        )
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun blockerCursor_reachesResolvableCandidateBeyondBatchLimit() = runBlocking {
+        val repository = BatchAdmissionResolutionRepository(resolvableInvocationId = "blocker-020")
+        (0..20).forEach { index ->
+            registerBlocker(
+                invocationId = "blocker-${index.toString().padStart(3, '0')}",
+                claimantToken = CLAIM_TOKEN,
+                registeredAtNanos = 0L,
+            )
+        }
+        val service = recoveryService(repository, RECOVERY_INSTANT, nanoTime = { QUIET_PERIOD_NANOS })
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertEquals(20, repository.requests.size)
+        assertEquals(0, service.tick().getOrThrow())
+        assertEquals("blocker-020", repository.requests.last().invocationId)
+        assertFalse(
+            LlmExecutionAdmissionHealth.snapshotRecoveryBlockers(null, 30)
+                .any { snapshot -> snapshot.key.invocationId == "blocker-020" },
+        )
+    }
+
+    @Test
+    fun committedAuditWithLostAcknowledgement_isReadBackWithoutDuplicate() = runBlocking {
+        val delegate = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+            QUIET_PERIOD_NANOS
+        }
+        reserve(delegate, "lost-ack", RECOVERY_INSTANT)
+        finish(delegate, "lost-ack", RECOVERY_INSTANT.plusSeconds(1))
+        registerBlocker("lost-ack", CLAIM_TOKEN, registeredAtNanos = 0L)
+        val repository = LostAcknowledgementAdmissionRepository(delegate)
+        val service = recoveryService(repository, RECOVERY_INSTANT, nanoTime = { QUIET_PERIOD_NANOS })
+
+        assertTrue(service.tick().isFailure)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(1, delegate.admissionResolutionAuditsForTest().size)
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertEquals(1, delegate.admissionResolutionAuditsForTest().size)
+    }
+
+    @Test
+    fun failingCandidateAdvancesCursorAndDoesNotStarveLaterBlocker() = runBlocking {
+        val repository = FailingFirstAdmissionRepository()
+        registerBlocker("a-failing", CLAIM_TOKEN, registeredAtNanos = 0L)
+        registerBlocker("b-resolvable", CLAIM_TOKEN, registeredAtNanos = 0L)
+        val service = recoveryService(repository, RECOVERY_INSTANT, nanoTime = { QUIET_PERIOD_NANOS })
+
+        assertTrue(service.tick().isFailure)
+        assertEquals(listOf("a-failing"), repository.requests)
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertEquals(listOf("a-failing", "b-resolvable"), repository.requests)
+        assertEquals(
+            listOf("a-failing"),
+            LlmExecutionAdmissionHealth.snapshotRecoveryBlockers(null, 20).map { it.key.invocationId },
+        )
+    }
+
+    @Test
+    fun exhaustedBlockerSubDeadline_handsOffToStaleScanWithoutTickFailure() = runBlocking {
+        val nanoClock = MutableNanoClock()
+        val repository = SubDeadlineAdmissionRepository(nanoClock)
+        registerBlocker("slow-blocker", CLAIM_TOKEN, registeredAtNanos = -QUIET_PERIOD_NANOS)
+        val service = recoveryService(repository, RECOVERY_INSTANT, nanoTime = nanoClock::read)
+
+        assertEquals(0, service.tick().getOrThrow())
+        assertEquals(1, repository.resolutionCalls)
+        assertEquals(1, repository.scanCalls)
+        assertTrue(repository.scanRemainingMillis >= 750L)
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun auditAttemptCollisionWithDifferentClaimantToken_failsExactReadback() = runBlocking {
+        val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        reserve(repository, "shared-invocation", RECOVERY_INSTANT)
+        finish(repository, "shared-invocation", RECOVERY_INSTANT.plusSeconds(1))
+        val attemptId = UUID.randomUUID()
+        val deadline = LlmExecutionRecoveryDeadline.start(Duration.ofSeconds(5), System::nanoTime)
+        val firstRequest = admissionRequest("shared-invocation", "token-a", attemptId)
+        val secondRequest = admissionRequest("shared-invocation", "token-b", attemptId)
+
+        assertIs<LlmAdmissionBlockerResolution.Resolved>(
+            repository.resolveAdmissionBlockerIfTerminal(firstRequest, deadline).getOrThrow(),
+        )
+        assertTrue(repository.resolveAdmissionBlockerIfTerminal(secondRequest, deadline).isFailure)
+        assertEquals(1, repository.admissionResolutionAuditsForTest().size)
+    }
 }
 
 private class MutableClock(var current: Instant) : Clock() {
     override fun instant(): Instant = current
     override fun getZone(): ZoneId = ZoneId.of("UTC")
     override fun withZone(zone: ZoneId): Clock = this
+}
+
+private class MutableNanoClock(var nowNanos: Long = 0L) {
+    fun read(): Long = nowNanos
+
+    fun advance(duration: Duration) {
+        nowNanos += duration.toNanos()
+    }
+}
+
+private class AdmissionResolutionFailureRepository :
+    LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> = Result.failure(IllegalStateException("resolution unavailable"))
+
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<RecoverySnapshots> = Result.success(emptyList())
+}
+
+private class BatchAdmissionResolutionRepository(
+    private val resolvableInvocationId: String,
+) : LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+    val requests = mutableListOf<LlmAdmissionBlockerResolutionRequest>()
+
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> {
+        requests += request
+        val outcome = if (request.invocationId == resolvableInvocationId) {
+            LlmAdmissionBlockerResolution.Resolved(LlmLaunchReservationStatus.FINISHED)
+        } else {
+            LlmAdmissionBlockerResolution.Retained(LlmAdmissionBlockerRetentionReason.RESERVATION_RUNNING)
+        }
+
+        return Result.success(outcome)
+    }
+
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<RecoverySnapshots> = Result.success(emptyList())
+}
+
+private class LostAcknowledgementAdmissionRepository(
+    private val delegate: InMemoryLlmLaunchReservationRepository,
+) : LlmLaunchReservationRepository by delegate {
+    private var loseAcknowledgement = true
+
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> {
+        val result = delegate.resolveAdmissionBlockerIfTerminal(request, deadline)
+        if (loseAcknowledgement) {
+            loseAcknowledgement = false
+            result.getOrThrow()
+            return Result.failure(IllegalStateException("commit acknowledgement lost"))
+        }
+
+        return result
+    }
+}
+
+private class FailingFirstAdmissionRepository :
+    LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+    val requests = mutableListOf<String>()
+
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> {
+        requests += request.invocationId
+        return if (request.invocationId == "a-failing") {
+            Result.failure(IllegalStateException("lookup failed"))
+        } else {
+            Result.success(LlmAdmissionBlockerResolution.Resolved(LlmLaunchReservationStatus.FAILED))
+        }
+    }
+
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<RecoverySnapshots> = Result.success(emptyList())
+}
+
+private class SubDeadlineAdmissionRepository(
+    private val nanoClock: MutableNanoClock,
+) : LlmLaunchReservationRepository by InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository()) {
+    var resolutionCalls = 0
+    var scanCalls = 0
+    var scanRemainingMillis = 0L
+
+    override suspend fun resolveAdmissionBlockerIfTerminal(
+        request: LlmAdmissionBlockerResolutionRequest,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<LlmAdmissionBlockerResolution> {
+        resolutionCalls += 1
+        nanoClock.advance(Duration.ofMillis(2_500))
+        return Result.failure(
+            LlmExecutionRecoveryDeadlineExceededException(0L, 750L),
+        )
+    }
+
+    override suspend fun scanStaleExecutionClaims(
+        scan: LlmExecutionRecoveryScan,
+        deadline: LlmExecutionRecoveryDeadline,
+    ): Result<RecoverySnapshots> {
+        scanCalls += 1
+        scanRemainingMillis = deadline.remainingMillis(nanoClock::read)
+        return Result.success(emptyList())
+    }
 }
 
 private class FaultingRecoveryRepository(
@@ -851,11 +1168,60 @@ private fun availableRecoverySnapshot(invocationId: String): LlmExecutionClaimSn
     )
 }
 
-private fun recoveryService(repository: LlmLaunchReservationRepository, now: Instant): LlmExecutionRecoveryService {
+private fun recoveryService(
+    repository: LlmLaunchReservationRepository,
+    now: Instant,
+    nanoTime: () -> Long = System::nanoTime,
+): LlmExecutionRecoveryService {
     return LlmExecutionRecoveryService(
         repository = repository,
-        policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+        policy = DEFAULT_RECOVERY_POLICY,
         clock = Clock.fixed(now, ZoneId.of("UTC")),
+        nanoTime = nanoTime,
+    )
+}
+
+private fun registerBlocker(
+    invocationId: String,
+    claimantToken: String,
+    registeredAtNanos: Long,
+) {
+    LlmExecutionAdmissionHealth.registerRecoveryBlocker(
+        invocationId = invocationId,
+        claimantToken = claimantToken,
+        registeredAt = RECOVERY_INSTANT,
+        registeredAtNanos = registeredAtNanos,
+    )
+}
+
+private suspend fun finish(
+    repository: LlmLaunchReservationRepository,
+    invocationId: String,
+    finishedAt: Instant,
+) {
+    repository.finish(
+        LlmLaunchReservationFinish(
+            invocationId = invocationId,
+            status = LlmLaunchReservationStatus.FINISHED,
+            reason = null,
+            finishedAt = finishedAt,
+        ),
+    ).getOrThrow()
+}
+
+private fun admissionRequest(
+    invocationId: String,
+    claimantToken: String,
+    attemptId: UUID,
+): LlmAdmissionBlockerResolutionRequest {
+    return LlmAdmissionBlockerResolutionRequest(
+        invocationId = invocationId,
+        claimantToken = claimantToken,
+        resolutionAttemptId = attemptId,
+        quietPeriodElapsed = true,
+        elapsedQuietMillis = Duration.ofNanos(QUIET_PERIOD_NANOS).toMillis(),
+        registeredAt = RECOVERY_INSTANT,
+        observedAt = RECOVERY_INSTANT.plusSeconds(1),
     )
 }
 
@@ -1010,4 +1376,8 @@ private suspend fun claim(
 
 private const val CLAIM_TOKEN = "claim-token"
 private val RECOVERY_INSTANT: Instant = Instant.parse("2026-01-01T00:00:00Z")
+private val DEFAULT_RECOVERY_POLICY = OneShotExecutionPolicy.from(LlmRunnerConfig())
+private val QUIET_PERIOD_NANOS = DEFAULT_RECOVERY_POLICY.hardTimeout
+    .plus(DEFAULT_RECOVERY_POLICY.processTerminationGrace)
+    .toNanos()
 private typealias RecoverySnapshots = List<LlmExecutionClaimSnapshot>
