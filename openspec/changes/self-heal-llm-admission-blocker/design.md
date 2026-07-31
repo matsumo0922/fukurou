@@ -53,13 +53,17 @@ DB の終端だけで即解除しない。reservation の終端 row は「JVM �
 
 登録 API は `registerRecoveryBlocker(invocationId, claimantToken, registeredAt, registeredAtNanos)` を取り、既存の登録は上書きしない（`putIfAbsent`）。同一 blocker が再登録されても最初の観測時刻を保ち、静穏期間が延び続けることを防ぐ。
 
+record はさらに、登録時に生成する安定な `resolutionAttemptId: UUID` を持つ。これは自動解除 audit の `CommandEvent.id` として使い、tick を跨いでも同じ値を保つ（D8 の exactly-once 照合に使う）。
+
 時刻源は呼び出し側の `Clock` と `nanoTime` を使い、singleton 内部で `Instant.now()` / `System.nanoTime()` を直接呼ばない（テスト可能性のため）。
 
 ### D3: 解除は audit 成功後に行う
 
 **帰属: agent 仮決め**
 
-「解除したが audit が残っていない」状態を作らない。audit → 解除の順にする。逆順（解除 → audit）だと audit 失敗時に無記録の解除が残る。audit が失敗した場合は blocker を残し、次 tick が再試行する（audit は同じ blocker に対して複数回試行されうるが、成功するのは解除に至った 1 回だけなので `command_event_log` に重複は残らない）。
+「解除したが audit が残っていない」状態を作らない。audit → 解除の順にする。逆順（解除 → audit）だと audit 失敗時に無記録の解除が残る。audit が失敗した場合は blocker を残し、次 tick が再試行する。
+
+再試行が重複 audit を生まないよう、event ID は blocker record が持つ安定な `resolutionAttemptId` を使い、tick ごとに新規生成しない（D2）。commit 応答が失われて caller が失敗として観測した場合、次 tick は同じ ID の audit row が既に存在することを readback で確認し、そこから `Resolved` を確定させる（D8）。単なる deterministic ID + INSERT 再試行だけでは主キー衝突で恒久的に失敗し続けるので、readback を伴わせることが必須である。
 
 ### D4: 解除 step は recovery scan tick の内部に置き、同じ monotonic deadline を共有する
 
@@ -71,7 +75,22 @@ tick 先頭に置く理由は、既存の scan 本体が例外を投げた場合
 
 解除 step の DB access は、既存 scan と同じ `LlmExecutionRecoveryDeadline` に参加させる。tick 冒頭で `setRecoveryScanHealthy(false)` を立てる以上、解除 step が deadline なしで JDBC を待つと「tick が返らない → `recoveryScanHealthy=false` が永久に残る」という同型の障害を新設してしまう。したがって既存の `findExecutionClaim()`（untimed な `exposedTransaction`）を再利用せず、`prepareRecoveryStatement` / `insertRecoveryEvent` と同じ deadline-aware 経路を使う専用 repository API を足す（D8）。
 
-解除 step 自体は失敗を伝播させ、tick 全体を failure にする。部分成功を隠さない。deadline 超過も failure であり、次 tick が新しい budget で再試行する。
+解除 step は tick 全体の deadline を使い切らない。step 専用の sub-budget を設け、次の 2 条件のどちらかで正常に打ち切って stale-claim scan へ移る。
+
+- 評価済みの候補数が `ADMISSION_BLOCKER_RESOLUTION_BATCH_LIMIT`（既定 20）に達した
+- tick deadline の残りが `ADMISSION_BLOCKER_SCAN_HANDOFF_RESERVE`（既定 2,500 ms）を下回った
+
+打ち切りは failure ではない。件数だけを上限にすると、1 候補あたりの DB 応答が遅い環境（20 件 × 225 ms ≒ 4.5 秒）で scan 本体の start reserve を食い潰し、stale-claim scan が永久に成功しなくなる。これは #350 と同型の恒久 fail-closed であり、時間側の上限が必須である。
+
+個々の候補の failure（deadline 超過、audit 失敗、lookup 失敗）は tick 全体の failure として伝播させる。部分成功を隠さない。次 tick が新しい budget で再試行する。
+
+### D4b: cursor は候補ごとに前進させる
+
+**帰属: agent 仮決め**
+
+cursor は「batch 全体を成功で返しきったとき」ではなく、各候補の評価が終わるたびに、その候補のキーまで前進させる。失敗した候補についても、失敗を伝播させる前に cursor を進める。
+
+そうしないと、batch 先頭に毎回失敗する候補があった場合、次 tick も同じ候補から始まり、後方の解除可能な blocker が永久に skip される。cursor を進めておけば、失敗した候補は wrap 後の次周で再試行され、その間に後方の候補も評価される。失敗の記録は tick の failure として残るので、再試行が握り潰されることはない。
 
 ### D5: 解除候補の走査は bounded batch + stable cursor にする
 
@@ -114,7 +133,17 @@ suspend fun resolveAdmissionBlockerIfTerminal(
 ): Result<LlmAdmissionBlockerResolution>
 ```
 
-request は invocationId、claimantToken、quiet period を満たしているか（service が monotonic 値で判定済み）、audit payload に必要な観測値を持つ。実装は 1 transaction 内で `prepareRecoveryStatement` により reservation status を読み、terminal かつ service が quiet period 成立を宣言している場合だけ `insertRecoveryEvent` で audit を書いて `Resolved(status)` を返す。それ以外は `Retained(reason)` を返し、audit を書かない。
+request は invocationId、claimantToken、blocker record が持つ安定な `resolutionAttemptId`、quiet period が成立しているか（service が monotonic 値で判定済み）、audit payload に必要な観測値を持つ。
+
+実装は 1 つの deadline-aware transaction 内で次の順に照合する。すべての statement は `prepareRecoveryStatement` を通す。
+
+1. `command_event_log` に `id = resolutionAttemptId` の row が既に存在するか読む
+   - 存在し、`event_type` が `LLM_ADMISSION_BLOCKER_AUTO_RESOLVED` かつ `client_request_id` が同じ invocationId なら、前回 tick が commit 済みと確定して `Resolved` を返す（新たな INSERT はしない）
+   - 存在するが event_type / invocationId が食い違うなら `Result.failure`（ID 衝突は握り潰さない）
+2. reservation status を読む。terminal でなければ `Retained(reason)` を返して audit を書かない
+3. terminal かつ service が quiet period 成立を宣言しているなら、`insertRecoveryEvent` で `id = resolutionAttemptId` の audit を書いて `Resolved(status)` を返す
+
+この照合順により、commit 応答が失われて caller が failure を観測した場合でも、次 tick は主キー衝突ではなく readback で `Resolved` に到達する。既存の stale-claim recovery が `recoveryAttemptId` + exact readback + retry permit で解いている問題と同型で、同じ形に揃える。
 
 戻り値が `Resolved` の場合だけ、service が in-memory の `resolveRecoveryBlocker` を呼ぶ。audit が commit されない限り in-memory 解除も起きない（D3 の順序をトランザクション境界で保証する）。lookup 失敗や deadline 超過は `Result.failure` として service へ伝わり、blocker は残る。
 

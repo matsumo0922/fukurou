@@ -51,13 +51,29 @@ The quiet period SHALL be measured from a monotonic clock reading captured when 
 ### Requirement: Blocker evaluation is bounded and starvation-free
 **Trace:** Issue #350 受け入れ条件「回帰テスト 1 本」（自己回復が実際に完了すること）
 
-Each tick SHALL evaluate at most a fixed batch of registered blockers so that the evaluation cannot exhaust the recovery tick budget before the stale-claim scan runs. Evaluation SHALL advance through the registry in a stable order using a cursor that resumes from the previous tick's position, so that blockers which are repeatedly retained do not prevent later blockers from being evaluated.
+Each tick SHALL stop evaluating blockers when either a fixed candidate count is reached or the remaining tick deadline falls below a reserve sufficient for the stale-claim scan to start, whichever comes first. Reaching either limit SHALL be a normal handoff to the stale-claim scan, not a tick failure. A count limit alone SHALL NOT be treated as sufficient, because slow per-candidate database responses would otherwise consume the scan's budget.
+
+Evaluation SHALL advance through the registry in a stable order using a cursor that resumes from the previous tick's position. The cursor SHALL advance past each evaluated candidate, including candidates whose evaluation failed, so that a repeatedly failing candidate cannot prevent later candidates from ever being evaluated.
 
 #### Scenario: Registry holds more blockers than one batch
 
 - **GIVEN** more registered blockers than a single tick's batch limit, where the earlier ones are all retained and a later one is resolvable
 - **WHEN** successive recovery ticks run
 - **THEN** the resolvable blocker is evaluated and resolved within a bounded number of ticks
+
+#### Scenario: Per-candidate lookups are slow
+
+- **GIVEN** registered blockers whose individual database lookups each consume a large fraction of the tick budget
+- **WHEN** the remaining deadline falls below the stale-claim scan reserve
+- **THEN** the tick stops evaluating further blockers and proceeds to the stale-claim scan
+- **AND** the stale-claim scan is able to start within its required reserve
+
+#### Scenario: A candidate fails on every evaluation
+
+- **GIVEN** a blocker at the front of the stable order whose evaluation fails on every attempt, and a resolvable blocker later in the order
+- **WHEN** successive recovery ticks run
+- **THEN** the cursor advances past the failing candidate
+- **AND** the resolvable blocker is evaluated and resolved within a bounded number of ticks
 
 #### Scenario: Blocker evaluation shares the tick deadline
 
@@ -70,6 +86,8 @@ Each tick SHALL evaluate at most a fixed batch of registered blockers so that th
 **Trace:** Issue #350 受け入れ条件「解除の監査イベントが command_event_log に残る」
 
 Every automatic blocker resolution SHALL append exactly one audit event to `command_event_log` recording the invocation ID, the claimant token, the observed terminal reservation status, and the elapsed quiet duration. The audit append SHALL be committed in the same durable transaction that observes the terminal reservation, and the in-memory blocker SHALL be removed only after that transaction commits. A failed or uncommitted append SHALL leave the blocker registered so that the next tick retries. Audit payloads SHALL NOT contain secrets.
+
+Each blocker SHALL carry a stable resolution attempt identifier assigned at registration and reused across retries as the audit event identifier. Before appending, the resolving transaction SHALL read back whether an audit event with that identifier already exists. A matching existing event SHALL confirm resolution without appending again. A conflicting existing event SHALL fail rather than resolve. This guarantees that a lost commit acknowledgement neither duplicates the audit event nor leaves the blocker permanently unresolvable.
 
 #### Scenario: Resolution appends an audit event
 
@@ -87,6 +105,19 @@ Every automatic blocker resolution SHALL append exactly one audit event to `comm
 
 - **WHEN** a blocker is resolved on one tick and subsequent ticks run
 - **THEN** no further `LLM_ADMISSION_BLOCKER_AUTO_RESOLVED` event is appended for that blocker
+
+#### Scenario: Commit acknowledgement is lost after the audit event commits
+
+- **GIVEN** a resolvable blocker whose resolving transaction committed its audit event
+- **WHEN** the caller observes a failure instead of the committed result and a later tick re-evaluates the same blocker
+- **THEN** the later tick observes the already-committed audit event and resolves the blocker
+- **AND** no second audit event is appended
+
+#### Scenario: An event with the attempt identifier exists but does not match
+
+- **GIVEN** a blocker whose resolution attempt identifier collides with an unrelated audit event
+- **WHEN** the resolving transaction reads it back
+- **THEN** the tick fails and the blocker remains registered
 
 ### Requirement: Self-healing applies to production admission wiring
 **Trace:** Issue #350 受け入れ条件「回帰テスト 1 本」（production call path での発動確認）

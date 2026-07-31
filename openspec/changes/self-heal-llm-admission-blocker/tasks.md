@@ -1,6 +1,6 @@
 ## 1. Blocker registry が観測時刻を持つ
 
-- [ ] 1.1 `LlmExecutionAdmissionHealth` の `recoveryBlockers` を `RecoveryBlockerRecord`（`registeredAt: Instant` と `registeredAtNanos: Long`）付き map にし、`registerRecoveryBlocker` へ両方を受け取らせる（再登録は最初の観測を保つ）
+- [ ] 1.1 `LlmExecutionAdmissionHealth` の `recoveryBlockers` を `RecoveryBlockerRecord`（`registeredAt: Instant`、`registeredAtNanos: Long`、安定な `resolutionAttemptId: UUID`）付き map にし、`registerRecoveryBlocker` へ観測時刻を受け取らせる（再登録は最初の record を保つ）
 - [ ] 1.2 副作用のない bounded `snapshotRecoveryBlockers(after, limit)` を安定順で追加する
 - [ ] 1.3 既存の登録元（`OneShotLlmRunner`、`LlmExecutionClaimSupervisor` の 2 箇所、`ReflectionTerminalPersistenceSupervisor`）へ観測時刻を配線する
 
@@ -8,13 +8,15 @@
 
 - [ ] 2.1 `CommandEventType.LLM_ADMISSION_BLOCKER_AUTO_RESOLVED` と `OpsRoutes` の projection 名を追加する
 - [ ] 2.2 `LlmLaunchReservationRepository.resolveAdmissionBlockerIfTerminal(request, deadline)` を追加し、`Resolved` / `Retained(reason)` を返す
-- [ ] 2.3 Exposed 実装で `prepareRecoveryStatement` による reservation 読み取りと `insertRecoveryEvent` による audit を 1 transaction にまとめる
+- [ ] 2.3 Exposed 実装で 1 transaction 内に「既存 audit の readback → reservation 読み取り → audit insert」を順に置き、すべて `prepareRecoveryStatement` を通す（既存 audit 一致で再 insert せず `Resolved`、不一致は failure）
 - [ ] 2.4 in-memory 実装（`InMemoryLlmLaunchReservationRepository`）へ同じ意味論を実装する
 
 ## 3. Recovery scan への組み込み
 
 - [ ] 3.1 `LlmExecutionRecoveryService.tick()` 冒頭に bounded batch + cursor の自動解除 step を実装する（monotonic quiet period 判定、`Resolved` のときだけ in-memory 解除）
-- [ ] 3.2 解除 step の失敗と deadline 超過を tick の failure として伝播させる
+- [ ] 3.2 件数上限と scan handoff reserve の両方で正常打ち切りする（打ち切りは failure にしない）
+- [ ] 3.3 cursor を候補ごとに前進させる（失敗した候補も含む）
+- [ ] 3.4 解除 step の候補失敗と deadline 超過を tick の failure として伝播させる
 
 ## 4. 回帰テスト
 
@@ -23,7 +25,10 @@
 - [ ] 4.3 unit テスト: audit 失敗時に blocker が残り tick が failure を返す。解除済み blocker が再 audit されない
 - [ ] 4.4 unit テスト: wall clock を後退させても monotonic 経過で解除される
 - [ ] 4.5 unit テスト: batch limit を超える retained blocker があっても後続の解除可能 blocker が有限 tick 数で解除される
-- [ ] 4.6 production call path テスト: `LlmExecutionRecoveryWorker` を application と同じ配線で起動し、blocker 登録 → 終端 → 自動解除 → readiness 復帰を確認する
+- [ ] 4.6 unit テスト: audit commit 済みで caller が failure を観測した後、次 tick が readback で `Resolved` に到達し audit が重複しない
+- [ ] 4.7 unit テスト: 先頭候補が毎回失敗しても cursor が前進し、後続の解除可能 blocker が有限 tick 数で解除される
+- [ ] 4.8 unit テスト: 候補評価が遅い場合、handoff reserve で正常打ち切りして stale-claim scan が start reserve 内で開始できる
+- [ ] 4.9 production call path テスト: `LlmExecutionRecoveryWorker` を application と同じ配線で起動し、blocker 登録 → 終端 → 自動解除 → readiness 復帰を確認する
 
 ## 5. ドキュメントと検証
 
