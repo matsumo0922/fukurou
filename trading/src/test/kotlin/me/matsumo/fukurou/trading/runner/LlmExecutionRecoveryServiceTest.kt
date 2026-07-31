@@ -4,6 +4,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.CommandEvent
+import me.matsumo.fukurou.trading.audit.CommandEventLog
+import me.matsumo.fukurou.trading.audit.CommandEventType
+import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
@@ -124,7 +128,12 @@ class LlmExecutionRecoveryServiceTest {
         val repository = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
         reserve(repository, "claimed", now)
         claim(repository, "claimed", now)
-        val service = LlmExecutionRecoveryService(repository, OneShotExecutionPolicy.from(LlmRunnerConfig()), clock)
+        val service = LlmExecutionRecoveryService(
+            repository = repository,
+            policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
+            clock = clock,
+            commandEventLog = InMemoryCommandEventLog(),
+        )
 
         assertEquals(0, service.tick().getOrThrow())
         assertTrue(LlmExecutionAdmissionHealth.isHealthy())
@@ -851,11 +860,16 @@ private fun availableRecoverySnapshot(invocationId: String): LlmExecutionClaimSn
     )
 }
 
-private fun recoveryService(repository: LlmLaunchReservationRepository, now: Instant): LlmExecutionRecoveryService {
+private fun recoveryService(
+    repository: LlmLaunchReservationRepository,
+    now: Instant,
+    commandEventLog: CommandEventLog = InMemoryCommandEventLog(),
+): LlmExecutionRecoveryService {
     return LlmExecutionRecoveryService(
         repository = repository,
         policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
         clock = Clock.fixed(now, ZoneId.of("UTC")),
+        commandEventLog = commandEventLog,
     )
 }
 

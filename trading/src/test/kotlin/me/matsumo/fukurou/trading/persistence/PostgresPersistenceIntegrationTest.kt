@@ -23,6 +23,7 @@ import me.matsumo.fukurou.trading.activity.DecisionRunSafetyDenialQuery
 import me.matsumo.fukurou.trading.audit.CommandEvent
 import me.matsumo.fukurou.trading.audit.CommandEventType
 import me.matsumo.fukurou.trading.audit.DecisionRunContext
+import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.audit.LlmAuditRootKind
 import me.matsumo.fukurou.trading.audit.LlmDecisionReconstructionClassification
 import me.matsumo.fukurou.trading.audit.LlmDecisionReconstructionReason
@@ -4979,6 +4980,7 @@ class PostgresPersistenceIntegrationTest {
                     repository = repository,
                     policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
                     clock = Clock.fixed(now, ZoneOffset.UTC),
+                    commandEventLog = InMemoryCommandEventLog(),
                 )
                 faultController.armCommitResponseLoss()
                 faultController.armFirstReadbackFailure()
@@ -5028,6 +5030,7 @@ class PostgresPersistenceIntegrationTest {
                     repository = repository,
                     policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
                     clock = Clock.fixed(now, ZoneOffset.UTC),
+                    commandEventLog = InMemoryCommandEventLog(),
                 )
                 faultController.armPreCommitMutationFailure(count = 2)
 
@@ -5086,6 +5089,7 @@ class PostgresPersistenceIntegrationTest {
                     repository = repository,
                     policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
                     clock = Clock.fixed(now, ZoneOffset.UTC),
+                    commandEventLog = InMemoryCommandEventLog(),
                 )
                 faultController.armPreCommitMutationFailure()
                 faultController.armFirstReadbackFailure()
@@ -5900,6 +5904,7 @@ class PostgresPersistenceIntegrationTest {
             repository = repository,
             policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
             clock = Clock.fixed(now, ZoneOffset.UTC),
+            commandEventLog = InMemoryCommandEventLog(),
         )
 
         assertEquals(1, recoveryService.tick().getOrThrow())
@@ -5938,6 +5943,7 @@ class PostgresPersistenceIntegrationTest {
             repository = ExposedLlmLaunchReservationRepository(instrumentedDatabase),
             policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
             clock = Clock.fixed(now, ZoneOffset.UTC),
+            commandEventLog = InMemoryCommandEventLog(),
         )
 
         assertEquals(candidateCount, service.tick().getOrThrow())
@@ -5970,6 +5976,7 @@ class PostgresPersistenceIntegrationTest {
             repository = ExposedLlmLaunchReservationRepository(database),
             policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
             clock = Clock.fixed(now, ZoneOffset.UTC),
+            commandEventLog = InMemoryCommandEventLog(),
         )
         val lockConnection = dataSource.connection
         lockConnection.autoCommit = false
@@ -6023,6 +6030,7 @@ class PostgresPersistenceIntegrationTest {
             repository = reservationRepository,
             policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
             clock = Clock.fixed(now, ZoneOffset.UTC),
+            commandEventLog = InMemoryCommandEventLog(),
         )
         val startedAt = System.nanoTime()
 

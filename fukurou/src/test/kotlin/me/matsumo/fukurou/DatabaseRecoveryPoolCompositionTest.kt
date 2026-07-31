@@ -1,6 +1,7 @@
 package me.matsumo.fukurou
 
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.audit.InMemoryCommandEventLog
 import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
@@ -59,6 +60,7 @@ class DatabaseRecoveryPoolCompositionTest {
                     repository = repository,
                     policy = OneShotExecutionPolicy.from(LlmRunnerConfig()),
                     clock = clock,
+                    commandEventLog = InMemoryCommandEventLog(),
                 )
                 val heldConnections = holdEveryPoolConnection(dataSource.maximumPoolSize) { dataSource.connection }
                 val startedAt = System.nanoTime()

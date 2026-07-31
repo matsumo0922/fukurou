@@ -136,7 +136,11 @@ sealed interface LlmExecutionClaimOutcome {
     data class OutcomeUnknown(val cause: Throwable) : LlmExecutionClaimOutcome
 }
 
-/** outcome-unknown reconciliation に使う予約 snapshot。 */
+/**
+ * outcome-unknown reconciliation に使う予約 snapshot。
+ *
+ * @param finishedAt reservation が terminal になった時刻。RUNNING の間は null
+ */
 data class LlmExecutionClaimSnapshot(
     val invocationId: String,
     val triggerKind: LlmDaemonTriggerKind,
@@ -146,6 +150,7 @@ data class LlmExecutionClaimSnapshot(
     val claimedAt: Instant?,
     val heartbeatAt: Instant?,
     val reservedAt: Instant,
+    val finishedAt: Instant? = null,
 )
 
 /** stale execution claim の bounded scan 条件。 */
@@ -912,6 +917,7 @@ private data class LlmLaunchReservationRecord(
         claimedAt = claimedAt,
         heartbeatAt = heartbeatAt,
         reservedAt = reservedAt,
+        finishedAt = finishedAt,
     )
 }
 
