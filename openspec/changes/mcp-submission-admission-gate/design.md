@@ -111,14 +111,17 @@ monotonic tightening（新 TP が既存 TP 以下）を条件に例外化する�
 
 **帰属: ユーザー確認済み**（R4 の反証結果を提示のうえ「直近 tick 失敗を区別して gate」を選択）
 
-`recoveryScanHealthy` は 2 つの異なる意味に使われている。呼び出し 11 箇所のうち、**tick 冒頭の 1 箇所だけが「正常な scan の実行中」を表し、残り 10 箇所はすべて実障害を表す**。
+`recoveryScanHealthy` は異なる意味に使われている。production の呼び出し 10 箇所のうち、**tick 冒頭の 1 箇所だけが「正常な scan の実行中」を表す**。
 
 | 呼び出し元 | 意味 |
 |---|---|
 | `LlmExecutionClaimSupervisor.kt:182`（tick 冒頭の無条件 false） | **正常な実行中** |
-| `:216` scan 失敗 / `:268` `:291` recovery mutation 失敗 / `:321` blocker read 失敗 / `:367` audit append 失敗 / `:434` outcome unknown | 実障害 |
-| `LlmExecutionRecoveryWorker.kt:71` tick 例外 | 実障害 |
-| `Application.kt:925,992` startup recovery 失敗 | 実障害 |
+| `:216` scan 失敗 / `:268` `:291` recovery mutation 失敗 / `:321` blocker read 失敗 / `:367` audit append 失敗 / `:434` outcome unknown | 実障害（6） |
+| `LlmExecutionRecoveryWorker.kt:71` tick 例外 | 実障害（1） |
+| `Application.kt:992` previous-generation recovery 失敗 | 実障害（1） |
+| `Application.kt:925` worker start 前の初期化 | 初回 scan 未完了（1） |
+
+初期化の 1 箇所は失敗ではないが、「まだ成功した scan が無い」ことを表すため false が正しい。`recoveryScanHealthy` を「最後に完了した scan の成功状態」と定義し直したとき、この初期値の意味とも整合する。
 
 初版の D4（3 集合のみを見る）は、この 2 つをまとめて無視していた。誤拒否は消えるが、**recovery が stale claim を発見できない状態でも risk-increasing submission を通す**。これは fail-closed の目的に反する。
 

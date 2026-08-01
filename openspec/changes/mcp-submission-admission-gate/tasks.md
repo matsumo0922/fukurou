@@ -3,7 +3,7 @@
 - [ ] 1.1 `trading/.../daemon/LlmExecutionAdmissionHealth.kt` に `recoveryScanInProgress` flag と、tick の開始／完了を伝える API を追加する。完了 API は成否を受け取り、`recoveryScanHealthy` と `recoveryScanInProgress` を `admissionLock.write` の内側で同時に更新する
 - [ ] 1.2 `trading/.../runner/LlmExecutionClaimSupervisor.kt:182`（tick 冒頭の無条件 `setRecoveryScanHealthy(false)`）を開始 API の呼び出しへ置き換える。`recoveryScanHealthy` は前回の値を維持する
 - [ ] 1.3 tick の終了時に**成否によらず**完了 API を呼ぶ。`try`/`finally` で `recoveryScanInProgress` を確実に下ろし、成功時のみ `recoveryScanHealthy=true`、失敗・timeout・cancellation では false を確定させる（`:186-190` の置き換え）
-- [ ] 1.4 実障害を表す残り 10 箇所（`LlmExecutionClaimSupervisor.kt:216,268,291,321,367,434`、`LlmExecutionRecoveryWorker.kt:71`、`Application.kt:925,992`）は `setRecoveryScanHealthy(false)` のまま変更しない
+- [ ] 1.4 残り 9 箇所は `setRecoveryScanHealthy(false)` のまま変更しない。内訳は実障害 8 箇所（`LlmExecutionClaimSupervisor.kt:216,268,291,321,367,434`、`LlmExecutionRecoveryWorker.kt:71`、`Application.kt:992`）と初期化 1 箇所（`Application.kt:925`。worker start 前に初回 scan 未完了を fail-closed にする）。初期化も「まだ成功した scan が無い」を表すため false のままでよい
 - [ ] 1.5 submission gate 用の read API を追加する。条件は「3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空、かつ `recoveryScanHealthy` が true」とし、`recoveryScanInProgress` は無視する。`admissionLock.read` の内側で判定する
 - [ ] 1.6 `isHealthy()` の内部式に `!recoveryScanInProgress` を加え、**外部から観測できる判定結果**を変更しない。tick 実行中に false を返す従来の挙動が保たれることを確認する
 - [ ] 1.7 新 API の KDoc に「submission gate 用であり、正常な scan 実行中は通すが scan の実障害は fail-closed にする」ことを現在形で書く

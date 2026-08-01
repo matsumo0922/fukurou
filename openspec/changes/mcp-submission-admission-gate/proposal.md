@@ -12,7 +12,7 @@
 
 - **完了済み child の UNCERTAIN 履歴を照会する API**: `LlmProcessTreeTerminationRegistry` に、`anyUncertain`（完了した child の少なくとも 1 つが `UNCERTAIN` だった）だけを返す read API を追加する。実行中で未終了の child を `UNCERTAIN` 扱いしないため、正常な phase 自身の submission は妨げない。あわせて registry entry の解放条件を修正し、`UNCERTAIN` で終端した run でも one-shot 終了時に entry を解放する（従来は解放されず JVM 終了まで蓄積していた）。
 - **gateway への precondition**: `LlmDecisionSubmissionGateway` が `SUBMIT_FALSIFICATION` と risk を増やす `SUBMIT_DECISION` を、gate 条件が該当するとき、または当該 invocation に `UNCERTAIN` 履歴があるときに拒否する。`EXIT` / `REDUCE` / `NO_TRADE` は通す。既存の `ToolCallGuard` が HARD_HALT 中でも decision を通す安全方向と揃える。`ADJUST_PROTECTION` は take-profit のみを変更して単調性の保証が無いため例外に含めない。
-- **正常な scan 実行中と scan の実障害を分離する**: `recoveryScanHealthy` は tick 冒頭の無条件 false（正常な実行中）と、DB 障害・timeout・blocker 照会失敗など 10 箇所の実障害を同じ flag で表している。前者を別 flag へ分離し、submission gate は「3 集合が空、かつ実障害が無い」を条件とする。これにより正常 tick 窓での誤拒否を避けつつ、recovery が stale claim を発見できない状態は fail-closed に保つ。`isHealthy()` の判定結果は変更しない。
+- **正常な scan 実行中と scan の実障害を分離する**: `recoveryScanHealthy` は tick 冒頭の無条件 false（正常な実行中）と、DB 障害・timeout・blocker 照会失敗といった実障害を同じ flag で表している。前者を別 flag へ分離し、submission gate は「3 集合が空、かつ実障害が無い」を条件とする。これにより正常 tick 窓での誤拒否を避けつつ、recovery が stale claim を発見できない状態は fail-closed に保つ。`isHealthy()` の外部から観測できる判定結果は変更しない。
 - **rejection code の追加**: `SubmissionRejectionCode` に admission 由来の値を 1 つ追加し、既存の `error=SUBMISSION_REJECTED` と併せて wire 応答へ載せる。client の typed exception、MCP tool error、`NO_TRADE_EXIT` の `rejectionCode` 監査はいずれも既存経路のまま新しい拒否点を運ぶ。
 - **gate 範囲の明文化**: 新規起動・runner 発注・gateway submission が対象で、MCP server process の read-only tool call は対象外であることを requirement として書き下す。
 
