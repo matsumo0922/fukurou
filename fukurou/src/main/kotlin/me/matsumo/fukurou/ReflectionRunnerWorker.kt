@@ -250,6 +250,8 @@ private fun createReflectionRunner(
                             ),
                         ),
                         authEvidenceState = authEvidenceState,
+                        // 単一 phase で完結し、同じ invocation の後続 phase へ制御を渡さない。
+                        retainsProcessTreeProof = false,
                     ),
                     workingDirectory = workingDirectory,
                     parentEnvironment = environment,

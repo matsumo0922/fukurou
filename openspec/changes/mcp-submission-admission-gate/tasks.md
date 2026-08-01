@@ -17,8 +17,8 @@
 - [x] 2.5 この変更が admission health を読み書きしないことを確認する（`LlmExecutionAdmissionHealth` への参照を追加しない）
 - [x] 2.6 **one-shot の entry lifecycle を閉じる（H1 の処置 / design D1a）**: `OneShotLlmRunner` の `finally` で、proof 読み取りと blocker 登録の直後・**terminal persistence より前**に `LlmProcessTreeTerminationRegistry.resolve(invocationId)` を呼ぶ。`requireTerminalLlmRun` と `finish().getOrThrow()` は throw しうるため後ろに置かない
 - [x] 2.7 `LlmExecutionAdmissionHealth.resolveClaim` と `LlmExecutionTerminationFenceRegistry.resolve` は従来どおり UNCERTAIN では呼ばない。これらは blocker 解除に相当し DB 確認を要するため、registry の resolve だけを条件から外す
-- [x] 2.8 **単一 phase の呼び出し元の entry lifecycle を閉じる**: `LlmInvocationAuditor` に `retainsProcessTreeProof`（既定 false）を追加し、false のとき phase 終了時に registry を解放する。解放は gateway close と `terminalProjection` 生成の**後**に置く（`processExitTerminal` が `processResult` 不在時に `find()` へフォールバックするため）
-- [x] 2.9 `OneShotLlmRunner` と daemon pre-filter が生成する auditor へ `retainsProcessTreeProof = true` を渡す。pre-filter は one-shot と同じ invocation ID で動き失敗時に同じ run へ fail-open するため、run 終了まで履歴を保持する。Reflection / EVALUATION_REPORT は既定の false のままとし、phase 終了で解放されることを確認する
+- [x] 2.8 **単一 phase の呼び出し元の entry lifecycle を閉じる**: `LlmInvocationAuditor` に `retainsProcessTreeProof`（**既定 true = 保持**。解放しすぎは gate の穴、保持しすぎはリークで、後者の方が軽いため安全側を既定にする）を追加し、false のとき phase 終了時に registry を解放する。解放は gateway close と `terminalProjection` 生成の**後**に置く（`processExitTerminal` が `processResult` 不在時に `find()` へフォールバックするため）
+- [x] 2.9 `OneShotLlmRunner` と daemon pre-filter は既定のまま保持する。Reflection / EVALUATION_REPORT だけが明示的に `false` を渡す。pre-filter は one-shot と同じ invocation ID で動き失敗時に同じ run へ fail-open するため、run 終了まで履歴を保持する
 
 ## 3. Rejection code の追加
 

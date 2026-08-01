@@ -939,13 +939,14 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
-    fun invokeAndAudit_releasesProcessTreeProofByDefault() = runBlocking {
+    fun invokeAndAudit_releasesProcessTreeProofForSinglePhaseCaller() = runBlocking {
         LlmProcessTreeTerminationRegistry.markChildStarted("audit-run")
         LlmProcessTreeTerminationRegistry.record("audit-run", ProcessTreeTerminationProof.UNCERTAIN)
         val auditor = LlmInvocationAuditor(
             commandEventLog = InMemoryCommandEventLog(),
             redactor = SecretRedactor(emptySet()),
             clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            retainsProcessTreeProof = false,
         )
         val request = auditRequest(LlmProvider.CLAUDE)
 
@@ -955,14 +956,14 @@ class LlmInvocationAuditorTest {
     }
 
     @Test
-    fun invokeAndAudit_retainsProcessTreeProofForMultiPhaseCaller() = runBlocking {
+    fun invokeAndAudit_retainsProcessTreeProofByDefault() = runBlocking {
+        // 既定は保持側。解放しすぎると後続 phase の gate が素通りするため、安全側を既定にする。
         LlmProcessTreeTerminationRegistry.markChildStarted("audit-run")
         LlmProcessTreeTerminationRegistry.record("audit-run", ProcessTreeTerminationProof.UNCERTAIN)
         val auditor = LlmInvocationAuditor(
             commandEventLog = InMemoryCommandEventLog(),
             redactor = SecretRedactor(emptySet()),
             clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
-            retainsProcessTreeProof = true,
         )
         val request = auditRequest(LlmProvider.CLAUDE)
 

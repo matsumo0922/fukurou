@@ -80,8 +80,10 @@ registry entry は UNCERTAIN でない場合のみ `resolve()` される（`OneS
 
 **処置**: entry の解放責務を「履歴を必要とする範囲」で定義する。
 
-- **単一 phase の呼び出し元**（Reflection / EVALUATION_REPORT）: `LlmInvocationAuditor` が phase 終了時に解放する。auditor に `retainsProcessTreeProof` を設け、既定を false とする。解放は gateway close と terminal projection の後に置く（`processExitTerminal` が `processResult` 不在時に registry へフォールバックするため、その読み取りより後でなければならない）
-- **one-shot runner と daemon pre-filter**: `retainsProcessTreeProof = true` を渡して phase 終了では解放せず、run 全体の `finally` で解放する。PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ渡す必要があるため
+auditor に `retainsProcessTreeProof` を設け、**既定を true（保持）** とする。既定を保持側に置くのは、2 種類の誤りの重さが非対称なためである。保持しすぎた場合の誤りは registry のリークで、観測でき安全側に倒れる。解放しすぎた場合の誤りは後続 phase の gate が素通りすることで、安全機構の穴になる。既定を安全側に置けば、新しい呼び出し元が追加されたとき何も書かなくても穴は開かない。
+
+- **単一 phase の呼び出し元**（Reflection / EVALUATION_REPORT）: 明示的に `retainsProcessTreeProof = false` を渡し、`LlmInvocationAuditor` が phase 終了時に解放する。解放は gateway close と terminal projection の後に置く（`processExitTerminal` が `processResult` 不在時に registry へフォールバックするため、その読み取りより後でなければならない）
+- **one-shot runner と daemon pre-filter**: 既定のまま保持し、run 全体の `finally` で解放する。PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ渡す必要があるため
 
 daemon pre-filter が後者に入るのは、pre-filter が one-shot と**同じ invocation ID** で動き（`LlmDaemonScheduler.kt:563-570`）、失敗時に `RUN_FULL` へ fail-open して同じ run の PROPOSER / FALSIFIER へ進むためである（`LlmDaemonPreFilter.kt:286-299`）。phase 終了で解放すると、pre-filter child が `UNCERTAIN` で終端しても後続 phase の gate へ伝わらない。
 

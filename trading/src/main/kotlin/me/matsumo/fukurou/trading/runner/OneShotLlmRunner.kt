@@ -367,9 +367,8 @@ class OneShotLlmRunner(
         ),
         decisionRepository = tradingRuntime.decisionRepository,
         authEvidenceState = authEvidenceState,
-        // PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ渡すため、phase 終了では
-        // 解放しない。解放は run 全体の finally が行う。
-        retainsProcessTreeProof = true,
+        // 既定どおり履歴を保持する。PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ
+        // 渡す必要があり、解放は run 全体の finally が行う。
     )
     private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
         tradingRuntime = tradingRuntime,

@@ -56,9 +56,10 @@ import java.time.Instant
  * @param authFailureMessage 認証失敗疑いを検出したときに出す運用ログ。null なら出さない
  * @param unstartedManifestCleanup child process 起動前に残った MCP manifest の cleanup 境界
  * @param authEvidenceState CLI auth 失敗 evidence の in-process state。null なら記録しない
- * @param retainsProcessTreeProof phase 終了後も process tree proof を保持するか。同一 invocation の
- *   後続 phase が UNCERTAIN 履歴を参照する呼び出し元（one-shot runner）だけ true にする。単一 phase の
- *   呼び出し元は false にして、phase 終了時に registry entry を解放する
+ * @param retainsProcessTreeProof phase 終了後も process tree proof を保持するか。既定は保持する。
+ *   同一 invocation の後続 phase が UNCERTAIN 履歴を gate 判定に使うため、解放しすぎると
+ *   その phase が素通りする。単一 phase で完結し後続へ制御を渡さない呼び出し元だけ false にして、
+ *   phase 終了時に registry entry を解放する
  */
 class LlmInvocationAuditor(
     private val commandEventLog: CommandEventLog,
@@ -71,7 +72,7 @@ class LlmInvocationAuditor(
     private val decisionRepository: DecisionRepository? = null,
     private val unstartedManifestCleanup: (Path) -> Unit = { path -> Files.deleteIfExists(path) },
     private val authEvidenceState: LlmAuthEvidenceState? = null,
-    private val retainsProcessTreeProof: Boolean = false,
+    private val retainsProcessTreeProof: Boolean = true,
 ) {
 
     /**
