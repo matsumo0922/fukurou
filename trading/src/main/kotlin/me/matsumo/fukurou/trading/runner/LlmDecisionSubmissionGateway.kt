@@ -37,7 +37,9 @@ import me.matsumo.fukurou.trading.decision.submitTerminalFalsification
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
@@ -343,6 +345,12 @@ class LlmDecisionSubmissionGateway private constructor(
                             SubmissionRejectionCode.RISK_INCREASING_ACTION_REJECTED,
                         )
                     }
+                    if (submission.action !in ADMISSION_EXEMPT_ACTIONS) {
+                        rejectUnless(
+                            terminalSubmissionAdmitted(invocationId),
+                            SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE,
+                        )
+                    }
                     LlmSubmissionGatewayCodec.decisionResult(
                         submitRepositoryRequest(submissionState) {
                             repository.submitTerminalDecision(
@@ -358,6 +366,10 @@ class LlmDecisionSubmissionGateway private constructor(
                         phase == LlmInvocationPhase.FALSIFIER,
                         SubmissionRejectionCode.FALSIFICATION_PHASE_NOT_AUTHORIZED,
                     )
+                    rejectUnless(
+                        terminalSubmissionAdmitted(invocationId),
+                        SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE,
+                    )
                     val submission = request.decodeFalsificationPayload()
                     LlmSubmissionGatewayCodec.falsificationResult(
                         submitRepositoryRequest(submissionState) {
@@ -370,6 +382,19 @@ class LlmDecisionSubmissionGateway private constructor(
                 }
                 else -> throw SubmissionRejectedException(SubmissionRejectionCode.UNKNOWN_OPERATION)
             }
+        }
+
+        /**
+         * terminal submission を確定させてよいかを、admission と process tree proof の両面から判定する。
+         *
+         * admission blocker は process 全体の健全性を、UNCERTAIN 履歴は同一 run の過去 phase が
+         * 終了を証明できなかったことを表す。後者は admission へ伝播するのが one-shot 全体の終了時
+         * なので、run の途中では registry を直接見ないと後続 phase を止められない。
+         */
+        private fun terminalSubmissionAdmitted(invocationId: String): Boolean {
+            if (LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild(invocationId)) return false
+
+            return LlmExecutionAdmissionHealth.allowsTerminalSubmission()
         }
 
         private suspend fun <T> submitRepositoryRequest(
@@ -801,5 +826,19 @@ private val RISK_REDUCTION_ONLY_ACTIONS = setOf(
     DecisionAction.EXIT,
     DecisionAction.REDUCE,
     DecisionAction.ADJUST_PROTECTION,
+    DecisionAction.NO_TRADE,
+)
+
+/**
+ * admission gate を免除する decision action。
+ *
+ * exposure を増やさないことが実装で保証できるものだけを入れる。EXIT は position の全 close
+ * または resting entry の cancel、REDUCE は close ratio 上限つきの部分 close、NO_TRADE は
+ * lifecycle を実行しない。ADJUST_PROTECTION は take-profit だけを動かし、既存 TP との単調性も
+ * 上限も課されないため、exposure を延ばせる。よってここには含めない。
+ */
+private val ADMISSION_EXEMPT_ACTIONS = setOf(
+    DecisionAction.EXIT,
+    DecisionAction.REDUCE,
     DecisionAction.NO_TRADE,
 )

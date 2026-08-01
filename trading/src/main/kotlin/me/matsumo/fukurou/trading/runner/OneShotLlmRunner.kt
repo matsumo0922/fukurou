@@ -637,8 +637,11 @@ class OneShotLlmRunner(
             if (processTreeTerminationProof != ProcessTreeTerminationProof.UNCERTAIN) {
                 LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
                 LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
-                LlmProcessTreeTerminationRegistry.resolve(invocationId)
             }
+            // proof が UNCERTAIN でも解放する。この run の全 phase gateway は既に閉じており、
+            // 履歴を残す先がない。終了を証明できない child が残りうることは、上で登録した
+            // recovery blocker が引き継ぐ（解除は DB terminal 確認と token 一致を要する）。
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
             activeClaimantTokens.remove(invocationId, claimantToken)
         }
     }

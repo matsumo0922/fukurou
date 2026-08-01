@@ -225,6 +225,15 @@ object LlmProcessTreeTerminationRegistry {
         }
     }
 
+    /**
+     * 完了した child のうち少なくとも 1 つが UNCERTAIN で終端したかを返す。
+     *
+     * submission gateway の gate 条件として使う。実行中で未終了の child は UNCERTAIN
+     * 扱いしないため、現在の phase 自身の submission は妨げない。同一 invocation の
+     * 過去 phase が終了を証明できなかった場合だけ true になる。
+     */
+    fun hasCompletedUncertainChild(invocationId: String): Boolean = proofs[invocationId]?.anyUncertain == true
+
     /** terminal persistence確認後にentryを削除する。 */
     fun resolve(invocationId: String) {
         proofs.remove(invocationId)
