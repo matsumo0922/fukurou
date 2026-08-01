@@ -15,6 +15,7 @@ import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundleStatus
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceIncompleteReason
 import me.matsumo.fukurou.trading.audit.ToolEvidenceSourceTimestampStatus
 import me.matsumo.fukurou.trading.audit.TrustedTerminalToolEvidenceBundle
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -37,7 +38,6 @@ import me.matsumo.fukurou.trading.decision.submitTerminalFalsification
 import me.matsumo.fukurou.trading.domain.OrderSide
 import me.matsumo.fukurou.trading.domain.OrderType
 import me.matsumo.fukurou.trading.domain.TradingSymbol
-import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
 import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
@@ -330,37 +330,14 @@ class LlmDecisionSubmissionGateway private constructor(
             )
 
             return when (request.gatewayString("operation")) {
-                OPERATION_SUBMIT_DECISION -> {
-                    val phaseAuthorized = phase == LlmInvocationPhase.PROPOSER ||
-                        phase == LlmInvocationPhase.RISK_REDUCTION_ONLY
-                    rejectUnless(phaseAuthorized, SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED)
-                    val submission = request.decodeDecisionPayload()
-                    rejectUnless(
-                        submission.invocationId == invocationId,
-                        SubmissionRejectionCode.DECISION_INVOCATION_MISMATCH,
-                    )
-                    if (phase == LlmInvocationPhase.RISK_REDUCTION_ONLY) {
-                        rejectUnless(
-                            submission.action in RISK_REDUCTION_ONLY_ACTIONS,
-                            SubmissionRejectionCode.RISK_INCREASING_ACTION_REJECTED,
-                        )
-                    }
-                    if (submission.action !in ADMISSION_EXEMPT_ACTIONS) {
-                        rejectUnless(
-                            terminalSubmissionAdmitted(invocationId),
-                            SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE,
-                        )
-                    }
-                    LlmSubmissionGatewayCodec.decisionResult(
-                        submitRepositoryRequest(submissionState) {
-                            repository.submitTerminalDecision(
-                                authority = DecisionSubmissionAuthority(invocationId, phase),
-                                submission = submission,
-                                evidence = trustedTerminalEvidence,
-                            )
-                        },
-                    )
-                }
+                OPERATION_SUBMIT_DECISION -> handleDecisionRequest(
+                    request = request,
+                    repository = repository,
+                    invocationId = invocationId,
+                    phase = phase,
+                    trustedTerminalEvidence = trustedTerminalEvidence,
+                    submissionState = submissionState,
+                )
                 OPERATION_SUBMIT_FALSIFICATION -> {
                     rejectUnless(
                         phase == LlmInvocationPhase.FALSIFIER,
@@ -382,6 +359,47 @@ class LlmDecisionSubmissionGateway private constructor(
                 }
                 else -> throw SubmissionRejectedException(SubmissionRejectionCode.UNKNOWN_OPERATION)
             }
+        }
+
+        @Suppress("LongParameterList")
+        private suspend fun handleDecisionRequest(
+            request: JsonObject,
+            repository: DecisionRepository,
+            invocationId: String,
+            phase: LlmInvocationPhase,
+            trustedTerminalEvidence: TrustedTerminalToolEvidenceBundle,
+            submissionState: AtomicReference<LlmSemanticSubmissionState>,
+        ): JsonObject {
+            val phaseAuthorized = phase == LlmInvocationPhase.PROPOSER ||
+                phase == LlmInvocationPhase.RISK_REDUCTION_ONLY
+            rejectUnless(phaseAuthorized, SubmissionRejectionCode.DECISION_PHASE_NOT_AUTHORIZED)
+            val submission = request.decodeDecisionPayload()
+            rejectUnless(
+                submission.invocationId == invocationId,
+                SubmissionRejectionCode.DECISION_INVOCATION_MISMATCH,
+            )
+            if (phase == LlmInvocationPhase.RISK_REDUCTION_ONLY) {
+                rejectUnless(
+                    submission.action in RISK_REDUCTION_ONLY_ACTIONS,
+                    SubmissionRejectionCode.RISK_INCREASING_ACTION_REJECTED,
+                )
+            }
+            if (submission.action !in ADMISSION_EXEMPT_ACTIONS) {
+                rejectUnless(
+                    terminalSubmissionAdmitted(invocationId),
+                    SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE,
+                )
+            }
+
+            return LlmSubmissionGatewayCodec.decisionResult(
+                submitRepositoryRequest(submissionState) {
+                    repository.submitTerminalDecision(
+                        authority = DecisionSubmissionAuthority(invocationId, phase),
+                        submission = submission,
+                        evidence = trustedTerminalEvidence,
+                    )
+                },
+            )
         }
 
         /**

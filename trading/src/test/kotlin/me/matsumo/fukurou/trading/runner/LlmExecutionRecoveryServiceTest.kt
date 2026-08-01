@@ -12,6 +12,7 @@ import me.matsumo.fukurou.trading.config.LlmRunnerConfig
 import me.matsumo.fukurou.trading.daemon.InMemoryLlmLaunchReservationRepository
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealthTestFixture
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmExecutionRecoveryDeadline
@@ -50,14 +51,55 @@ import kotlin.test.assertTrue
 class LlmExecutionRecoveryServiceTest {
     @BeforeTest
     fun setUp() {
-        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionAdmissionHealthTestFixture.reset()
         LlmExecutionTerminationFenceRegistry.resetForTest()
     }
 
     @AfterTest
     fun tearDown() {
-        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionAdmissionHealthTestFixture.reset()
         LlmExecutionTerminationFenceRegistry.resetForTest()
+    }
+
+    @Test
+    fun recoveryScanStatePreservesExternalHealthContractWhileSubmissionIgnoresInProgress() {
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertTrue(LlmExecutionAdmissionHealth.allowsTerminalSubmission())
+
+        LlmExecutionAdmissionHealth.beginRecoveryScan()
+
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+        assertTrue(LlmExecutionAdmissionHealth.allowsTerminalSubmission())
+
+        LlmExecutionAdmissionHealth.completeRecoveryScan(successful = true)
+
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        assertTrue(LlmExecutionAdmissionHealth.allowsTerminalSubmission())
+    }
+
+    @Test
+    fun failedTimedOutAndCancelledTicksClearRecoveryScanInProgress() = runBlocking {
+        val delegate = InMemoryLlmLaunchReservationRepository(InMemoryRiskStateRepository())
+        val services = listOf(
+            recoveryService(FaultingRecoveryRepository(delegate, failedScans = 1), RECOVERY_INSTANT),
+            recoveryService(SlowRecoveryRepository(delegate), RECOVERY_INSTANT),
+            recoveryService(
+                PendingBeforeCallFailureRepository(
+                    snapshot = availableRecoverySnapshot("cancelled-scan"),
+                    failure = CancellationException("cancel recovery scan"),
+                ),
+                RECOVERY_INSTANT.plus(Duration.ofHours(1)),
+            ),
+        )
+
+        services.forEach { service ->
+            LlmExecutionAdmissionHealthTestFixture.reset()
+
+            assertTrue(service.tick().isFailure)
+            assertFalse(LlmExecutionAdmissionHealth.allowsTerminalSubmission())
+            LlmExecutionAdmissionHealth.setRecoveryScanHealthy(true)
+            assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+        }
     }
 
     @Test
