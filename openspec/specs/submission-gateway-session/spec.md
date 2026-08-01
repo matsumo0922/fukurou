@@ -89,3 +89,114 @@ app-owned submission gateway は、1 度の要求処理で接続と受付を終�
 - **WHEN** gateway を close したあとに socket へ接続を試みる
 - **THEN** 接続は成立せず、gateway の worker thread は終了している
 
+### Requirement: Gateway は risk を増やす submission を gate 条件が満たされるときだけ処理する
+
+app-owned submission gateway は、terminal submission を repository へ渡す前に次の 2 つを検査しなければならない (SHALL)。(1) LLM execution admission blocker の有無 (2) 当該 invocation における完了済み child の `UNCERTAIN` 履歴の有無。いずれかが該当するとき、`SUBMIT_FALSIFICATION` と、risk を増やす action の `SUBMIT_DECISION` を拒否しなければならず (SHALL)、対応する repository へ到達させてはならない (MUST NOT)。
+
+2 つの条件は役割が異なる。admission blocker は process-global で、別 invocation の異常も含めて admission 全体の健全性を表す。`UNCERTAIN` 履歴は invocation-local で、同一 run 内の過去 phase が終了を証明できなかったことを表す。
+
+risk を減らす action（`EXIT` / `REDUCE`）と `NO_TRADE` の decision submission は、gate 条件が該当しても処理しなければならない (SHALL)。これらを止めることは、既にあるリスクを減らせなくする点で fail-closed の目的に反する。
+
+`ADJUST_PROTECTION` はこの例外に含めてはならない (MUST NOT)。当該 action は take-profit のみを変更して stop を変更せず、既存 take-profit との単調性も上限も課されないため、risk を減らすことが保証されない。
+
+gateway は admission health の状態を変更してはならない (MUST NOT)。
+
+#### Scenario: blocker 有りで falsification submission が拒否される
+
+- **WHEN** admission blocker が存在する状態で、binding が正しい `SUBMIT_FALSIFICATION` 要求を FALSIFIER phase の gateway へ送る
+- **THEN** 応答は `accepted=false` となり、falsification repository は呼ばれず、falsification 行は増えない
+
+#### Scenario: blocker 有りで risk を増やす decision submission が拒否される
+
+- **WHEN** admission blocker が存在する状態で、`ENTER` を含む risk を増やす action の `SUBMIT_DECISION` 要求を gateway へ送る
+- **THEN** 応答は `accepted=false` となり、decision repository は呼ばれず、decision 行は増えない
+
+#### Scenario: blocker 有りでも risk を減らす decision submission は通る
+
+- **WHEN** admission blocker が存在する状態で、`EXIT` または `REDUCE` の `SUBMIT_DECISION` 要求を gateway へ送る
+- **THEN** 応答は `accepted=true` となり、decision が repository へ永続化される
+
+#### Scenario: blocker 有りで ADJUST_PROTECTION は拒否される
+
+- **WHEN** admission blocker が存在する状態で、`ADJUST_PROTECTION` の `SUBMIT_DECISION` 要求を gateway へ送る
+- **THEN** 応答は `accepted=false` となり、decision repository は呼ばれない
+
+#### Scenario: blocker 有りでも NO_TRADE は通る
+
+- **WHEN** admission blocker が存在する状態で、`NO_TRADE` の `SUBMIT_DECISION` 要求を gateway へ送る
+- **THEN** 応答は `accepted=true` となり、decision が repository へ永続化される
+
+#### Scenario: blocker 無しなら従来どおり処理される
+
+- **WHEN** admission blocker が存在しない状態で、受理可能な submission を送る
+- **THEN** 応答は `accepted=true` となり、wire 応答と永続化の挙動はこの要件の導入前と同一である
+
+#### Scenario: gateway は admission health を書き換えない
+
+- **WHEN** admission 由来の拒否が発生する
+- **THEN** admission health の blocker 集合と flag はその拒否によって変化しない
+
+#### Scenario: binding 不一致は admission より先に判定される
+
+- **WHEN** admission blocker が存在する状態で、binding が一致しない要求を gateway へ送る
+- **THEN** 応答の拒否理由は binding mismatch であり、admission 由来の識別子ではない
+
+### Requirement: admission 由来の拒否は確定した submission 状態を劣化させない
+
+admission 由来の拒否が発生しても、一度 `COMMITTED` になった semantic submission 状態を `IN_FLIGHT` / `REJECTED` / `NOT_ATTEMPTED` へ戻してはならない (MUST NOT)。admission 由来の拒否は gateway を終了させてはならず (MUST NOT)、後続要求を処理できる状態を保たなければならない (SHALL)。
+
+gateway は admission 由来の拒否によって reservation を終端させてはならない (MUST NOT)。停滞した invocation の回収は既存の execution claim recovery の責務のままとする。
+
+#### Scenario: commit 後の admission 拒否で COMMITTED が維持される
+
+- **WHEN** submission が受理されたあと、admission blocker が登録された状態で同じ gateway へ risk を増やす要求を送る
+- **THEN** その要求は拒否されるが、`semanticSubmissionState()` は `COMMITTED` のままである
+
+#### Scenario: admission 拒否で reservation は終端しない
+
+- **WHEN** admission blocker により submission が拒否される
+- **THEN** 当該 invocation の launch reservation の status と execution claim state は、その拒否によって変化しない
+
+### Requirement: gate は best-effort であり残余 race を持つ
+
+2 つの gate 条件の検査は repository 呼び出しの直前に行わなければならない (SHALL)。検査と repository commit の間に、admission blocker が登録された場合、または `UNCERTAIN` 履歴が真へ遷移した場合、その commit は許容される (MAY)。gateway はこの区間を atomic にすることを保証しない (SHALL NOT)。
+
+この残余 race を閉じることは、submission 経路へ claim fence を通す別の設計を要する。本要件は gate が「検査時点で判明している状態」に対して働くことだけを保証する。
+
+#### Scenario: 検査通過後の状態遷移は commit を止めない
+
+- **WHEN** gate 検査を通過した submission が repository へ渡る直前に、admission blocker が登録されるか `UNCERTAIN` 履歴が真になる
+- **THEN** その submission は commit され、拒否されない
+
+### Requirement: admission gate の適用範囲
+
+admission blocker による submission gate の対象は、app-owned submission gateway 経由の falsification と、risk を増やす decision とする (SHALL)。MCP server process が実行する read-only tool call は対象としない (SHALL NOT)。
+
+新規 LLM 起動と `/health/ready` の判定は従来どおり `isHealthy()` を用いる (SHALL)。
+
+submission gate は次を条件とする (SHALL)。3 集合が空であること、および recovery scan が実障害を報告していないこと。periodic recovery scan が正常に実行中であることを理由に submission を拒否してはならない (MUST NOT)。一方、recovery scan が失敗した状態（DB 障害、timeout、blocker 照会の失敗、recovery 結果の不明を含む）では、risk を増やす submission を拒否しなければならない (SHALL)。
+
+recovery scan が stale claim を発見できない状態は、未知の停滞 invocation が存在しうることを意味するため、fail-closed の対象とする。
+
+MCP server は独立 process として起動されるため process-local な admission health へ到達できない。read-only tool call の抑止は、tool allowlist、tool call budget、manifest 有効期限、`HARD_HALT`、global trading lock によって行う。
+
+#### Scenario: read-only tool call は admission に依存しない
+
+- **WHEN** admission blocker が存在する状態で、MCP server が read-only tool を実行する
+- **THEN** その tool call は admission health を理由に拒否されない
+
+#### Scenario: 正常な recovery scan 実行中の submission は拒否されない
+
+- **WHEN** blocker が存在せず recovery scan が実障害を報告していない状態で、periodic recovery scan の実行中に submission を送る
+- **THEN** 応答は `accepted=true` となり、gate を理由に拒否されない
+
+#### Scenario: recovery scan の実障害中は risk を増やす submission が拒否される
+
+- **WHEN** blocker が存在しないが recovery scan が DB 障害または timeout で失敗した状態で、risk を増やす `SUBMIT_DECISION` を送る
+- **THEN** 応答は `accepted=false` となり、decision repository は呼ばれない
+
+#### Scenario: 資金を動かす操作は admission gate を通る
+
+- **WHEN** admission blocker が存在する状態で、runner が承認済み entry の発注を試みる
+- **THEN** 発注は既存の admission 検証で失敗し、broker は呼ばれない
+
