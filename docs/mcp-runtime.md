@@ -153,6 +153,14 @@ recovery blocker が立っている間、`LlmExecutionAdmissionHealth` は fail-
 
 `ReflectionTerminalPersistenceSupervisor` が登録する blocker は `reflection-terminal:<invocationId>` という claim 由来でない token を使うため、この解除経路の対象外であり、自身の retry loop が解除する。
 
+submission gateway は terminal submission を repository へ渡す直前に、admission blocker の有無と、同一 invocation で完了した child の `UNCERTAIN` 履歴の有無を検査する。どちらかが該当すると `SUBMIT_FALSIFICATION` と、`EXIT` / `REDUCE` / `NO_TRADE` 以外の action の `SUBMIT_DECISION` を `execution_admission_unavailable` で拒否する。exposure を増やさない action だけを免除するため、`ADJUST_PROTECTION` は免除しない。take-profit のみを動かし、既存 take-profit との単調性も上限も課されないためである。
+
+`UNCERTAIN` 履歴を直接見るのは、recovery blocker の登録が one-shot 全体の終了時に行われるためである。PROPOSER と FALSIFIER は同一 one-shot 内で順に走るので、blocker だけでは PROPOSER の `UNCERTAIN` 終端後に FALSIFIER の承認を止められない。履歴は process tree termination registry が保持し、単一 phase の呼び出し元では phase 監査完了時に、one-shot runner では run 終了時に解放する。
+
+submission gate は 3 集合の blocker に加えて、直近に完了した recovery scan の成否を見る。scan の正常な実行中は submission を拒否せず、scan が失敗した場合だけ拒否する。scan は既定 28.5 秒間隔で走るため、実行中まで止めると run ごとに 1 回だけ起きる submission がその窓に当たって失われる。新規起動と `/health/ready` は従来どおり scan 実行中も fail-closed のままである。
+
+MCP server process が実行する read-only tool call は admission の gate 対象ではない。MCP server は独立 process のため process-local な admission health へ到達できず、抑止は tool allowlist、tool call budget、manifest 有効期限、`HARD_HALT`、global trading lock が担う。
+
 manifest IDはexpiryまでMCPを再実行できるbearer capabilityである。tool call limiterは`command_event_log`のinitial countを復元してrun budgetを共有するが、複数MCP processが同時にloadしてinsertする間の競合では上限を少数call超える可能性がある。各act toolは同じSafetyFloorとcaller guardを通り、phaseのcanonical allowlist（`McpToolContractCatalog`から導出）外のtoolはcall時に拒否する。
 
 Claude/Codex config と session は `/run/fukurou/llm-homes` tmpfs の per-run home に `appuser` owner・0700 で生成する。cleanup は current-user 権限のファイル削除だけで行い、cross-UID の別プロセスを必要としない。永続`llm-auth`はauth sourceだけに使い、必要なauth fileだけをper-run homeへcopyする。normal、非0終了、timeout、cancel、parse/start/request/render failureの全経路でconfig/home/manifestを削除する。cleanup failureはinfrastructure failureとしてcurrent processをquarantineし、markerと残存artifactを同じtmpfsに保持する。operatorが監査・解消するかcontainer restartでtmpfs全体を破棄するまでmanual/daemonの次runを拒否する。CLI に見える設定は次の形になる。
