@@ -15,8 +15,10 @@
 - [ ] 2.3 既存の `find()` / `record()` / `markChildStarted()` / `resolve()` の実装を変更しない
 - [ ] 2.4 新 API の KDoc に「gateway の submission gate 用であり、実行中 child を UNCERTAIN 扱いしない」ことを現在形で書く
 - [ ] 2.5 この変更が admission health を読み書きしないことを確認する（`LlmExecutionAdmissionHealth` への参照を追加しない）
-- [ ] 2.6 **entry lifecycle を閉じる（H1 の処置 / design D1a）**: `OneShotLlmRunner.kt:637-641` の条件分岐から `LlmProcessTreeTerminationRegistry.resolve(invocationId)` を外に出し、UNCERTAIN の場合も `finally` の末尾で呼ぶ。全 phase の gateway は既に close 済みのため履歴は不要
+- [ ] 2.6 **one-shot の entry lifecycle を閉じる（H1 の処置 / design D1a）**: `OneShotLlmRunner` の `finally` で、proof 読み取りと blocker 登録の直後・**terminal persistence より前**に `LlmProcessTreeTerminationRegistry.resolve(invocationId)` を呼ぶ。`requireTerminalLlmRun` と `finish().getOrThrow()` は throw しうるため後ろに置かない
 - [ ] 2.7 `LlmExecutionAdmissionHealth.resolveClaim` と `LlmExecutionTerminationFenceRegistry.resolve` は従来どおり UNCERTAIN では呼ばない。これらは blocker 解除に相当し DB 確認を要するため、registry の resolve だけを条件から外す
+- [ ] 2.8 **単一 phase の呼び出し元の entry lifecycle を閉じる**: `LlmInvocationAuditor` に `retainsProcessTreeProof`（既定 false）を追加し、false のとき phase 終了時に registry を解放する。解放は gateway close と `terminalProjection` 生成の**後**に置く（`processExitTerminal` が `processResult` 不在時に `find()` へフォールバックするため）
+- [ ] 2.9 `OneShotLlmRunner` が生成する auditor だけ `retainsProcessTreeProof = true` を渡す。Reflection / EVALUATION_REPORT / daemon pre-filter は既定の false のままとし、phase 終了で解放されることを確認する
 
 ## 3. Rejection code の追加
 
@@ -50,6 +52,9 @@
 - [ ] 5.9d 初回 tick 成功前は risk を増やす submission が拒否され、成功後に通ることを検証する
 - [ ] 5.9e UNCERTAIN で終端した run の `finally` 完了後、registry entry が resolve されていることを検証する（H1 の処置）
 - [ ] 5.9f 同一 invocationId で新しい gateway を作ったとき、前の run の UNCERTAIN 履歴によって拒否されないことを検証する（H1 の処置）
+- [ ] 5.9g **failure injection**: terminal persistence（`requireTerminalLlmRun` または `finish()`）が throw しても registry entry が解放されていることを検証する（B1 の処置）
+- [ ] 5.9h `retainsProcessTreeProof = false` の auditor が phase 終了時に registry を解放することを検証する（B2 の処置）
+- [ ] 5.9i `retainsProcessTreeProof = true` の auditor が phase 終了時に解放せず、後続 phase が UNCERTAIN 履歴を参照できることを検証する
 - [ ] 5.10 blocker 無し時の wire 応答と永続化がこの変更の前後で同一であることを、既存 test が変更なしで通ることをもって確認する
 - [ ] 5.11 rejection code 語彙の閉性 test に新しい値が含まれ、`[a-z][a-z0-9_]*` に一致することを検証する
 - [ ] 5.12 `NO_TRADE_EXIT` の監査 payload の `rejectionCode` が admission 由来の識別子になり、`reason` が `tool_call_failed` のままであることを検証する

@@ -78,7 +78,12 @@ registry entry は UNCERTAIN でない場合のみ `resolve()` される（`OneS
 
 これは既存のリークだが、この change が registry を gate の判定材料にすることで correctness 問題へ格上げされる。同じ invocationId で後続の gateway が作られた場合、恒久的に拒否される。
 
-**処置**: `finally` の末尾で、UNCERTAIN の場合も `LlmProcessTreeTerminationRegistry.resolve(invocationId)` を呼ぶ。
+**処置**: entry の解放責務を「履歴を必要とする範囲」で定義する。
+
+- **単一 phase の呼び出し元**（Reflection / EVALUATION_REPORT / daemon pre-filter）: `LlmInvocationAuditor` が phase 終了時に解放する。auditor に `retainsProcessTreeProof` を設け、既定を false とする。解放は gateway close と terminal projection の後に置く（`processExitTerminal` が `processResult` 不在時に registry へフォールバックするため、その読み取りより後でなければならない）
+- **one-shot runner**: `retainsProcessTreeProof = true` を渡して phase 終了では解放せず、run 全体の `finally` で解放する。PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ渡す必要があるため
+
+one-shot の `finally` では、proof を読んで blocker 登録した直後、**terminal persistence より前**に解放する。`requireTerminalLlmRun` と `repository.finish().getOrThrow()` は DB 障害で throw しうるため、後ろに置くと entry が残る。この時点で全 phase の gateway は auditor が閉じ終えており、参照する側はいない。
 
 **安全性の根拠**: この時点で当該 run の全 phase の gateway は既に close されている（`LlmInvocationAuditor.kt:110` が phase ごとに close する）。したがって履歴を残す必要がない。UNCERTAIN が意味する「終了を証明できない child が残りうる」ことは、同じ `finally` の `registerRecoveryBlocker`（`:620`）によって admission blocker へ移されており、そちらは DB terminal 確認と exact token 一致による既存の解除契約（PR #350 / #351）で管理される。registry の役割は「同一 run 内の後続 phase へ履歴を伝える」ことに限定され、run が終わればその役割は尽きる。
 

@@ -367,6 +367,9 @@ class OneShotLlmRunner(
         ),
         decisionRepository = tradingRuntime.decisionRepository,
         authEvidenceState = authEvidenceState,
+        // PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ渡すため、phase 終了では
+        // 解放しない。解放は run 全体の finally が行う。
+        retainsProcessTreeProof = true,
     )
     private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
         tradingRuntime = tradingRuntime,
@@ -620,6 +623,11 @@ class OneShotLlmRunner(
                     LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
                 null -> Unit
             }
+            // proof を上で読み終え、UNCERTAIN なら recovery blocker へ引き継いだので、履歴の
+            // 役割はここで尽きる。この run の全 phase gateway は auditor が既に閉じており、
+            // 参照する側もいない。terminal persistence は throw しうるため、その前に解放して
+            // DB 障害時の entry 残留を防ぐ。
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
             withContext(NonCancellable) {
                 withTimeout(executionPolicy.persistenceTerminalTimeout.toMillis()) {
                     if (llmRunStarted) requireTerminalLlmRun(invocationId)
@@ -638,10 +646,6 @@ class OneShotLlmRunner(
                 LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
                 LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
             }
-            // proof が UNCERTAIN でも解放する。この run の全 phase gateway は既に閉じており、
-            // 履歴を残す先がない。終了を証明できない child が残りうることは、上で登録した
-            // recovery blocker が引き継ぐ（解除は DB terminal 確認と token 一致を要する）。
-            LlmProcessTreeTerminationRegistry.resolve(invocationId)
             activeClaimantTokens.remove(invocationId, claimantToken)
         }
     }

@@ -35,11 +35,18 @@ app-owned submission gateway は、terminal submission の可否判定にこの�
 - **WHEN** UNCERTAIN 履歴により submission が拒否される
 - **THEN** admission health の blocker 集合と flag はその拒否によって変化せず、新規起動 gate と `/health/ready` の判定も変化しない
 
-### Requirement: UNCERTAIN 履歴は run の終了時に解放される
+### Requirement: UNCERTAIN 履歴は履歴を必要とする範囲の終了時に解放される
 
-process tree termination registry の entry は、当該 invocation の one-shot 実行が終了した時点で解放されなければならない (SHALL)。終端の proof が `UNCERTAIN` であることを理由に entry を保持し続けてはならない (MUST NOT)。
+process tree termination registry の entry は、その履歴を参照する範囲が終了した時点で解放されなければならない (SHALL)。終端の proof が `UNCERTAIN` であることを理由に entry を保持し続けてはならない (MUST NOT)。
 
-解放の時点で当該 run の全 phase の submission gateway は既に閉じられているため、履歴を保持する必要がない。`UNCERTAIN` が意味する「終了を証明できない child が残りうる」ことは、同じ終了処理で登録される admission recovery blocker が表す (SHALL)。
+解放の責務は履歴の参照範囲に応じて定める (SHALL)。
+
+- 単一 phase のみを実行する呼び出し元では、phase の監査完了時に解放する。解放は submission gateway の close と、proof を読む監査処理の後でなければならない (SHALL)
+- 同一 invocation の複数 phase をまたいで履歴を参照する呼び出し元では、phase 終了では解放せず、当該 invocation の実行全体の終了時に解放する (SHALL)
+
+複数 phase をまたぐ呼び出し元における解放は、終端状態の永続化が失敗した場合にも行われなければならない (SHALL)。永続化の後に解放を置いてはならない (MUST NOT)。
+
+解放の時点で当該範囲の submission gateway は既に閉じられているため、履歴を保持する必要がない。`UNCERTAIN` が意味する「終了を証明できない child が残りうる」ことは、同じ終了処理で登録される admission recovery blocker が表す (SHALL)。
 
 registry の解放は admission recovery blocker と execution termination fence の解放を伴ってはならない (MUST NOT)。後者 2 つは DB terminal 確認と claimant token の一致を経てのみ解放される既存契約を維持する。
 
@@ -57,3 +64,18 @@ registry の解放は admission recovery blocker と execution termination fence
 
 - **WHEN** ある invocation が `UNCERTAIN` で終端したあと、同じ process 内で新しい submission gateway が作られる
 - **THEN** その gateway の submission は過去の run の UNCERTAIN 履歴を理由に拒否されない
+
+#### Scenario: 終端の永続化が失敗しても解放される
+
+- **WHEN** `UNCERTAIN` で終端した実行の終了処理で、終端状態の永続化が例外で失敗する
+- **THEN** registry の entry は解放されており、admission recovery blocker は登録されたまま残る
+
+#### Scenario: 単一 phase の実行が phase 終了で解放する
+
+- **WHEN** 単一 phase のみを実行する呼び出し元の phase が `UNCERTAIN` で終端し、その監査が完了する
+- **THEN** registry には当該 invocation の entry が残らない
+
+#### Scenario: 複数 phase の実行は phase 終了で解放しない
+
+- **WHEN** 複数 phase をまたぐ呼び出し元の最初の phase が `UNCERTAIN` で終端し、その監査が完了する
+- **THEN** registry の entry は残り、後続 phase の gate 判定が UNCERTAIN 履歴を参照できる
