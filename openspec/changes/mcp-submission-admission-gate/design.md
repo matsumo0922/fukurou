@@ -70,6 +70,20 @@ registry entry は UNCERTAIN でない場合のみ `resolve()` される（`OneS
 
 **この判定は admission health を変更しない**ため、`isHealthy()` の意味論、新規起動 gate、`/health/ready`、runner の `validateExecutionAdmission` はいずれも不変である。gate は gateway の中だけで閉じる。
 
+### D1a: UNCERTAIN entry の lifecycle を閉じる（H1 の処置）
+
+**帰属: agent 仮決め**
+
+`LlmProcessTreeTerminationRegistry` の production な `resolve()` 呼び出しは `OneShotLlmRunner.kt:640` の 1 箇所だけで、しかも `processTreeTerminationProof != UNCERTAIN` の条件下にある（`:637`）。したがって **UNCERTAIN の entry は JVM 終了まで残る**。registry は process-global な `ConcurrentHashMap` で、Reflection / EVALUATION_REPORT / daemon scheduler など他 lifecycle も同じ `ShellLlmInvoker` を共有するため、entry は invocation ごとに蓄積する。
+
+これは既存のリークだが、この change が registry を gate の判定材料にすることで correctness 問題へ格上げされる。同じ invocationId で後続の gateway が作られた場合、恒久的に拒否される。
+
+**処置**: `finally` の末尾で、UNCERTAIN の場合も `LlmProcessTreeTerminationRegistry.resolve(invocationId)` を呼ぶ。
+
+**安全性の根拠**: この時点で当該 run の全 phase の gateway は既に close されている（`LlmInvocationAuditor.kt:110` が phase ごとに close する）。したがって履歴を残す必要がない。UNCERTAIN が意味する「終了を証明できない child が残りうる」ことは、同じ `finally` の `registerRecoveryBlocker`（`:620`）によって admission blocker へ移されており、そちらは DB terminal 確認と exact token 一致による既存の解除契約（PR #350 / #351）で管理される。registry の役割は「同一 run 内の後続 phase へ履歴を伝える」ことに限定され、run が終わればその役割は尽きる。
+
+`LlmExecutionAdmissionHealth.resolveClaim` と `LlmExecutionTerminationFenceRegistry.resolve` は従来どおり UNCERTAIN では呼ばない。これらは blocker の解除に相当し、DB 確認を経ずに解除してはならないためである。**registry の resolve だけを条件から外す。**
+
 ### D2: gate は risk を増やす submission に限定する（F5 の処置）
 
 **帰属: agent 仮決め**
@@ -108,17 +122,25 @@ monotonic tightening（新 TP が既存 TP 以下）を条件に例外化する�
 
 初版の D4（3 集合のみを見る）は、この 2 つをまとめて無視していた。誤拒否は消えるが、**recovery が stale claim を発見できない状態でも risk-increasing submission を通す**。これは fail-closed の目的に反する。
 
-そこで「scan が現在実行中である」ことを表す状態を分離する。`LlmExecutionAdmissionHealth` に scan の実行中フラグを追加し、tick 冒頭ではそれを立てる。tick 成功時に下ろす。実障害の 10 箇所は従来どおり `recoveryScanHealthy` を false にする。
+そこで「scan が現在実行中である」ことを表す状態 `recoveryScanInProgress` を分離し、`recoveryScanHealthy` を「最後に完了した scan の成功状態」として定義し直す。状態機械は次のとおり。
 
-submission gate の条件は次のとおり。
+| 遷移 | `recoveryScanHealthy` | `recoveryScanInProgress` |
+|---|---|---|
+| production 初期状態 | false（`Application.kt:925` が初回 tick 前に false にする） | false |
+| tick 開始 | 前回の値を維持 | true |
+| tick 成功 | true | false |
+| tick 失敗 / timeout / cancellation | false | false |
 
-- 3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空
-- かつ `recoveryScanHealthy` が true（実障害が無い）
-- 「scan 実行中」フラグは無視する
+**tick の終了時は成否によらず必ず `recoveryScanInProgress` を false にする**。個別の failure site に依存すると漏れるため、tick の完了 API で集約し、`try`/`finally` で確実に下ろす。両フラグの更新は `admissionLock.write` の内側で行い、submission 側の read に中間状態を見せない。
 
-これにより F3 の誤拒否（正常 tick 窓）を避けつつ、R4 の実障害を取りこぼさない。`heartbeatHealthy` は production の setter が存在せず（定義は `LlmExecutionAdmissionHealth.kt:39` のみ）、実働の heartbeat failure は `heartbeatFailures` 集合に入るため、条件に含めない。
+判定条件は経路ごとに次のとおり。
 
-既存の `isHealthy()` は変更しない。新規起動と `/health/ready` は従来どおり scan 実行中も fail-closed になる。新規起動は頻度が低く、数百ミリ秒の待ちが実害にならないためである。
+- **submission gate**: 3 集合が空、かつ `recoveryScanHealthy` が true。`recoveryScanInProgress` は無視する
+- **新規起動 / `/health/ready`**（`isHealthy()`）: 従来の条件に `!recoveryScanInProgress` を加える
+
+これにより F3 の誤拒否（正常 tick 窓）を避けつつ、R4 の実障害を取りこぼさない。初回 tick 成功前と直近 tick 失敗後は risk を増やす submission が拒否され、次の成功 tick で自動回復する。`heartbeatHealthy` は production の setter が存在せず（定義は `LlmExecutionAdmissionHealth.kt:39` のみ）、実働の heartbeat failure は `heartbeatFailures` 集合に入るため、submission の条件に含めない。
+
+`isHealthy()` は**外部から観測できる判定結果を変更しない**。内部式には `!recoveryScanInProgress` を加える必要があるため実装は変わるが、tick 実行中に false を返す従来の挙動は保たれる。新規起動と readiness が scan 実行中も fail-closed になるのは従来どおりで、新規起動は頻度が低く数百ミリ秒の待ちが実害にならない。
 
 **受容するコスト**: submission gate と新規起動 gate で条件が 1 つ異なる（scan 実行中の扱い）。両者は目的が違う（前者は「この結論を確定してよいか」、後者は「新しい起動を許してよいか」）ので、差は spec に明記して意味を確定させる。
 

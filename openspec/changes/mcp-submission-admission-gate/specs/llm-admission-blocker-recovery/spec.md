@@ -34,3 +34,26 @@ app-owned submission gateway は、terminal submission の可否判定にこの�
 
 - **WHEN** UNCERTAIN 履歴により submission が拒否される
 - **THEN** admission health の blocker 集合と flag はその拒否によって変化せず、新規起動 gate と `/health/ready` の判定も変化しない
+
+### Requirement: UNCERTAIN 履歴は run の終了時に解放される
+
+process tree termination registry の entry は、当該 invocation の one-shot 実行が終了した時点で解放されなければならない (SHALL)。終端の proof が `UNCERTAIN` であることを理由に entry を保持し続けてはならない (MUST NOT)。
+
+解放の時点で当該 run の全 phase の submission gateway は既に閉じられているため、履歴を保持する必要がない。`UNCERTAIN` が意味する「終了を証明できない child が残りうる」ことは、同じ終了処理で登録される admission recovery blocker が表す (SHALL)。
+
+registry の解放は admission recovery blocker と execution termination fence の解放を伴ってはならない (MUST NOT)。後者 2 つは DB terminal 確認と claimant token の一致を経てのみ解放される既存契約を維持する。
+
+#### Scenario: UNCERTAIN で終端した run の entry が解放される
+
+- **WHEN** one-shot 実行が `UNCERTAIN` proof で終了し、終了処理が完了する
+- **THEN** registry には当該 invocation の entry が残らず、同一 invocation を照会しても UNCERTAIN 履歴は報告されない
+
+#### Scenario: entry 解放は admission blocker を解除しない
+
+- **WHEN** `UNCERTAIN` で終端した run の registry entry が解放される
+- **THEN** 同じ終了処理で登録された admission recovery blocker は登録されたまま残り、execution termination fence も解放されない
+
+#### Scenario: 後続 run が過去の履歴に影響されない
+
+- **WHEN** ある invocation が `UNCERTAIN` で終端したあと、同じ process 内で新しい submission gateway が作られる
+- **THEN** その gateway の submission は過去の run の UNCERTAIN 履歴を理由に拒否されない

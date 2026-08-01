@@ -1,19 +1,22 @@
 ## 1. admission health への submission 判定 API 追加（design D4 / R4 の処置）
 
-- [ ] 1.1 `trading/.../daemon/LlmExecutionAdmissionHealth.kt` に「recovery scan が実行中である」ことを表す状態を追加する。`recoveryScanHealthy` とは別の flag とする
-- [ ] 1.2 `trading/.../runner/LlmExecutionClaimSupervisor.kt:182`（tick 冒頭の無条件 `setRecoveryScanHealthy(false)`）を、1.1 の「実行中」flag を立てる呼び出しへ置き換える。tick 成功時（`:188`）に flag を下ろす
-- [ ] 1.3 実障害を表す残り 10 箇所（`LlmExecutionClaimSupervisor.kt:216,268,291,321,367,434`、`LlmExecutionRecoveryWorker.kt:71`、`Application.kt:925,992`）は `setRecoveryScanHealthy(false)` のまま変更しない
-- [ ] 1.4 submission gate 用の read API を追加する。条件は「3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空、かつ `recoveryScanHealthy` が true」とし、1.1 の実行中 flag は無視する。`admissionLock.read` の内側で判定する
-- [ ] 1.5 既存の `isHealthy()` と `withHealthyAdmission()` の判定結果を変更しない。tick 実行中に `isHealthy()` が false になる従来の挙動を保つため、`isHealthy()` は 1.1 の実行中 flag も条件に含める
-- [ ] 1.6 新 API の KDoc に「submission gate 用であり、正常な scan 実行中は通すが scan の実障害は fail-closed にする」ことを現在形で書く
+- [ ] 1.1 `trading/.../daemon/LlmExecutionAdmissionHealth.kt` に `recoveryScanInProgress` flag と、tick の開始／完了を伝える API を追加する。完了 API は成否を受け取り、`recoveryScanHealthy` と `recoveryScanInProgress` を `admissionLock.write` の内側で同時に更新する
+- [ ] 1.2 `trading/.../runner/LlmExecutionClaimSupervisor.kt:182`（tick 冒頭の無条件 `setRecoveryScanHealthy(false)`）を開始 API の呼び出しへ置き換える。`recoveryScanHealthy` は前回の値を維持する
+- [ ] 1.3 tick の終了時に**成否によらず**完了 API を呼ぶ。`try`/`finally` で `recoveryScanInProgress` を確実に下ろし、成功時のみ `recoveryScanHealthy=true`、失敗・timeout・cancellation では false を確定させる（`:186-190` の置き換え）
+- [ ] 1.4 実障害を表す残り 10 箇所（`LlmExecutionClaimSupervisor.kt:216,268,291,321,367,434`、`LlmExecutionRecoveryWorker.kt:71`、`Application.kt:925,992`）は `setRecoveryScanHealthy(false)` のまま変更しない
+- [ ] 1.5 submission gate 用の read API を追加する。条件は「3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空、かつ `recoveryScanHealthy` が true」とし、`recoveryScanInProgress` は無視する。`admissionLock.read` の内側で判定する
+- [ ] 1.6 `isHealthy()` の内部式に `!recoveryScanInProgress` を加え、**外部から観測できる判定結果**を変更しない。tick 実行中に false を返す従来の挙動が保たれることを確認する
+- [ ] 1.7 新 API の KDoc に「submission gate 用であり、正常な scan 実行中は通すが scan の実障害は fail-closed にする」ことを現在形で書く
 
 ## 2. UNCERTAIN 履歴の照会 API（F1 の処置 / design D1）
 
 - [ ] 2.1 `trading/.../invoker/LlmInvoker.kt` の `LlmProcessTreeTerminationRegistry` に、`anyUncertain` のみを返す read API を追加する（完了済み child の UNCERTAIN 履歴。entry 不在は false）
 - [ ] 2.2 新 API が `childUnresolved` を判定に使わないことを確認する。実行中で未終了の child を UNCERTAIN 扱いしてはならない
-- [ ] 2.3 既存の `find()` / `record()` / `markChildStarted()` / `resolve()` を変更しない。`OneShotLlmRunner.kt:619-620,637-640` の既存挙動は不変
+- [ ] 2.3 既存の `find()` / `record()` / `markChildStarted()` / `resolve()` の実装を変更しない
 - [ ] 2.4 新 API の KDoc に「gateway の submission gate 用であり、実行中 child を UNCERTAIN 扱いしない」ことを現在形で書く
 - [ ] 2.5 この変更が admission health を読み書きしないことを確認する（`LlmExecutionAdmissionHealth` への参照を追加しない）
+- [ ] 2.6 **entry lifecycle を閉じる（H1 の処置 / design D1a）**: `OneShotLlmRunner.kt:637-641` の条件分岐から `LlmProcessTreeTerminationRegistry.resolve(invocationId)` を外に出し、UNCERTAIN の場合も `finally` の末尾で呼ぶ。全 phase の gateway は既に close 済みのため履歴は不要
+- [ ] 2.7 `LlmExecutionAdmissionHealth.resolveClaim` と `LlmExecutionTerminationFenceRegistry.resolve` は従来どおり UNCERTAIN では呼ばない。これらは blocker 解除に相当し DB 確認を要するため、registry の resolve だけを条件から外す
 
 ## 3. Rejection code の追加
 
@@ -43,6 +46,10 @@
 - [ ] 5.9 recovery scan が正常に実行中（1.1 の実行中 flag が立っている）でも、blocker が無く実障害も無ければ submission が通ることを検証する（F3 の誤拒否回避）
 - [ ] 5.9a `recoveryScanHealthy` が false（実障害）のとき、blocker が無くても risk を増やす submission が拒否されることを検証する（R4 の処置）
 - [ ] 5.9b `isHealthy()` の判定結果がこの変更の前後で同一であることを検証する。特に tick 実行中に false になる従来の挙動が保たれること
+- [ ] 5.9c tick が失敗・timeout・cancellation で終わったとき `recoveryScanInProgress` が false へ戻り、`recoveryScanHealthy` が false で確定することを検証する（1.3 の `finally` 保証）
+- [ ] 5.9d 初回 tick 成功前は risk を増やす submission が拒否され、成功後に通ることを検証する
+- [ ] 5.9e UNCERTAIN で終端した run の `finally` 完了後、registry entry が resolve されていることを検証する（H1 の処置）
+- [ ] 5.9f 同一 invocationId で新しい gateway を作ったとき、前の run の UNCERTAIN 履歴によって拒否されないことを検証する（H1 の処置）
 - [ ] 5.10 blocker 無し時の wire 応答と永続化がこの変更の前後で同一であることを、既存 test が変更なしで通ることをもって確認する
 - [ ] 5.11 rejection code 語彙の閉性 test に新しい値が含まれ、`[a-z][a-z0-9_]*` に一致することを検証する
 - [ ] 5.12 `NO_TRADE_EXIT` の監査 payload の `rejectionCode` が admission 由来の識別子になり、`reason` が `tool_call_failed` のままであることを検証する

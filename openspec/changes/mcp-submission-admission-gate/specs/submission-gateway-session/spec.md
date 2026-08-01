@@ -70,13 +70,13 @@ gateway は admission 由来の拒否によって reservation を終端させて
 
 ### Requirement: gate は best-effort であり残余 race を持つ
 
-admission blocker の検査は repository 呼び出しの直前に行わなければならない (SHALL)。検査と repository commit の間に blocker が登録された場合、その commit は許容される (MAY)。gateway はこの区間を atomic にすることを保証しない (SHALL NOT)。
+2 つの gate 条件の検査は repository 呼び出しの直前に行わなければならない (SHALL)。検査と repository commit の間に、admission blocker が登録された場合、または `UNCERTAIN` 履歴が真へ遷移した場合、その commit は許容される (MAY)。gateway はこの区間を atomic にすることを保証しない (SHALL NOT)。
 
-この残余 race を閉じることは、submission 経路へ claim fence を通す別の設計を要する。本要件は gate が「検査時点で判明している blocker」に対して働くことだけを保証する。
+この残余 race を閉じることは、submission 経路へ claim fence を通す別の設計を要する。本要件は gate が「検査時点で判明している状態」に対して働くことだけを保証する。
 
-#### Scenario: 検査通過後の blocker 登録は commit を止めない
+#### Scenario: 検査通過後の状態遷移は commit を止めない
 
-- **WHEN** admission 検査を通過した submission が repository へ渡る直前に blocker が登録される
+- **WHEN** gate 検査を通過した submission が repository へ渡る直前に、admission blocker が登録されるか `UNCERTAIN` 履歴が真になる
 - **THEN** その submission は commit され、拒否されない
 
 ### Requirement: admission gate の適用範囲
