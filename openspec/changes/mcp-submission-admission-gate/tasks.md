@@ -1,8 +1,11 @@
-## 1. admission health への submission 判定 API 追加
+## 1. admission health への submission 判定 API 追加（design D4 / R4 の処置）
 
-- [ ] 1.1 `trading/.../daemon/LlmExecutionAdmissionHealth.kt` に、3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空であることだけを見る read API を追加する。`admissionLock.read` の内側で判定する
-- [ ] 1.2 既存の `isHealthy()` と `withHealthyAdmission()` を変更しない。新規起動と `/health/ready` の意味論は不変であることを確認する
-- [ ] 1.3 新 API の KDoc に「submission gate 用であり、periodic recovery scan の一時的な flag 低下を無視する」ことを現在形で書く
+- [ ] 1.1 `trading/.../daemon/LlmExecutionAdmissionHealth.kt` に「recovery scan が実行中である」ことを表す状態を追加する。`recoveryScanHealthy` とは別の flag とする
+- [ ] 1.2 `trading/.../runner/LlmExecutionClaimSupervisor.kt:182`（tick 冒頭の無条件 `setRecoveryScanHealthy(false)`）を、1.1 の「実行中」flag を立てる呼び出しへ置き換える。tick 成功時（`:188`）に flag を下ろす
+- [ ] 1.3 実障害を表す残り 10 箇所（`LlmExecutionClaimSupervisor.kt:216,268,291,321,367,434`、`LlmExecutionRecoveryWorker.kt:71`、`Application.kt:925,992`）は `setRecoveryScanHealthy(false)` のまま変更しない
+- [ ] 1.4 submission gate 用の read API を追加する。条件は「3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空、かつ `recoveryScanHealthy` が true」とし、1.1 の実行中 flag は無視する。`admissionLock.read` の内側で判定する
+- [ ] 1.5 既存の `isHealthy()` と `withHealthyAdmission()` の判定結果を変更しない。tick 実行中に `isHealthy()` が false になる従来の挙動を保つため、`isHealthy()` は 1.1 の実行中 flag も条件に含める
+- [ ] 1.6 新 API の KDoc に「submission gate 用であり、正常な scan 実行中は通すが scan の実障害は fail-closed にする」ことを現在形で書く
 
 ## 2. UNCERTAIN 履歴の照会 API（F1 の処置 / design D1）
 
@@ -21,8 +24,8 @@
 ## 4. Gateway への action-aware precondition（design D2 / D3 / D4 / D5）
 
 - [ ] 4.1 `trading/.../runner/LlmDecisionSubmissionGateway.kt` の `SUBMIT_FALSIFICATION` 経路に、phase 認可の直後・payload decode の前で precondition を追加する
-- [ ] 4.2 `SUBMIT_DECISION` 経路に、payload decode の後・repository 呼び出しの直前で precondition を追加する。action が `RISK_REDUCTION_ONLY_ACTIONS`（`EXIT` / `REDUCE` / `ADJUST_PROTECTION` / `NO_TRADE`）に含まれる場合は通す
-- [ ] 4.3 gate 条件は「1.1 の 3 集合 API が blocker を報告する」または「2.1 の UNCERTAIN 履歴 API が true を返す」の OR とする。`isHealthy()` を使わない
+- [ ] 4.2 `SUBMIT_DECISION` 経路に、payload decode の後・repository 呼び出しの直前で precondition を追加する。action が `EXIT` / `REDUCE` / `NO_TRADE` の場合は通す。**`ADJUST_PROTECTION` は通さない**（design D2: take-profit のみ変更し単調性の保証が無いため risk-reducing と言えない）
+- [ ] 4.3 gate 条件は「1.4 の submission 判定 API が false を返す」または「2.1 の UNCERTAIN 履歴 API が true を返す」の OR とする。`isHealthy()` を使わない
 - [ ] 4.4 gateway が admission health の状態を変更しないこと、reservation を終端させないことを実装で担保する（読み取りのみ、副作用なし）
 - [ ] 4.5 `make detekt` を通す
 
@@ -31,12 +34,15 @@
 - [ ] 5.1 全ケースで `LlmExecutionAdmissionHealthTestFixture.reset()` により test 間隔離を担保する
 - [ ] 5.2 blocker 有りで `SUBMIT_FALSIFICATION` が `accepted=false` で拒否され、falsification repository が呼ばれないことを検証する
 - [ ] 5.3 blocker 有りで risk を増やす `SUBMIT_DECISION`（`ENTER`）が拒否され、decision repository が呼ばれないことを検証する
-- [ ] 5.4 blocker 有りでも `EXIT` / `REDUCE` / `ADJUST_PROTECTION` の decision submission が `accepted=true` で通ることを検証する
+- [ ] 5.4 blocker 有りでも `EXIT` / `REDUCE` の decision submission が `accepted=true` で通ることを検証する
 - [ ] 5.5 blocker 有りでも `NO_TRADE` の decision submission が通ることを検証する
+- [ ] 5.5a blocker 有りで `ADJUST_PROTECTION` の decision submission が拒否されることを検証する（R3 の処置）
 - [ ] 5.6 binding 不一致の要求では、blocker があっても拒否理由が binding mismatch になることを検証する（precondition の順序を固定する）
 - [ ] 5.7 `COMMITTED` 到達後に blocker で拒否されても `semanticSubmissionState()` が `COMMITTED` のままであることを検証する
 - [ ] 5.8 admission 由来の拒否によって launch reservation の status と execution claim state が変化しないことを検証する
-- [ ] 5.9 `recoveryScanHealthy` が false でも blocker が無ければ submission が通ることを検証する（D4 の誤拒否回避）
+- [ ] 5.9 recovery scan が正常に実行中（1.1 の実行中 flag が立っている）でも、blocker が無く実障害も無ければ submission が通ることを検証する（F3 の誤拒否回避）
+- [ ] 5.9a `recoveryScanHealthy` が false（実障害）のとき、blocker が無くても risk を増やす submission が拒否されることを検証する（R4 の処置）
+- [ ] 5.9b `isHealthy()` の判定結果がこの変更の前後で同一であることを検証する。特に tick 実行中に false になる従来の挙動が保たれること
 - [ ] 5.10 blocker 無し時の wire 応答と永続化がこの変更の前後で同一であることを、既存 test が変更なしで通ることをもって確認する
 - [ ] 5.11 rejection code 語彙の閉性 test に新しい値が含まれ、`[a-z][a-z0-9_]*` に一致することを検証する
 - [ ] 5.12 `NO_TRADE_EXIT` の監査 payload の `rejectionCode` が admission 由来の識別子になり、`reason` が `tool_call_failed` のままであることを検証する

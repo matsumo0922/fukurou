@@ -11,8 +11,8 @@
 ## What Changes
 
 - **完了済み child の UNCERTAIN 履歴を照会する API**: `LlmProcessTreeTerminationRegistry` に、`anyUncertain`（完了した child の少なくとも 1 つが `UNCERTAIN` だった）だけを返す read API を追加する。実行中で未終了の child を `UNCERTAIN` 扱いしないため、正常な phase 自身の submission は妨げない。
-- **gateway への precondition**: `LlmDecisionSubmissionGateway` が `SUBMIT_FALSIFICATION` と risk を増やす `SUBMIT_DECISION` を、admission blocker があるとき、または当該 invocation に `UNCERTAIN` 履歴があるときに拒否する。risk を減らす action（`EXIT` / `REDUCE` / `ADJUST_PROTECTION`）と `NO_TRADE` は通す。既存の `ToolCallGuard` が HARD_HALT 中でも decision を通す安全方向と揃える。
-- **submission gate 専用の判定条件**: 3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）のみを条件とする read API を `LlmExecutionAdmissionHealth` へ追加する。periodic recovery scan 中に周期的に false になる `recoveryScanHealthy` を条件から外し、正常な run の誤拒否を避ける。`isHealthy()` は新規起動と `/health/ready` の意味論を保つため変更しない。
+- **gateway への precondition**: `LlmDecisionSubmissionGateway` が `SUBMIT_FALSIFICATION` と risk を増やす `SUBMIT_DECISION` を、gate 条件が該当するとき、または当該 invocation に `UNCERTAIN` 履歴があるときに拒否する。`EXIT` / `REDUCE` / `NO_TRADE` は通す。既存の `ToolCallGuard` が HARD_HALT 中でも decision を通す安全方向と揃える。`ADJUST_PROTECTION` は take-profit のみを変更して単調性の保証が無いため例外に含めない。
+- **正常な scan 実行中と scan の実障害を分離する**: `recoveryScanHealthy` は tick 冒頭の無条件 false（正常な実行中）と、DB 障害・timeout・blocker 照会失敗など 10 箇所の実障害を同じ flag で表している。前者を別 flag へ分離し、submission gate は「3 集合が空、かつ実障害が無い」を条件とする。これにより正常 tick 窓での誤拒否を避けつつ、recovery が stale claim を発見できない状態は fail-closed に保つ。`isHealthy()` の判定結果は変更しない。
 - **rejection code の追加**: `SubmissionRejectionCode` に admission 由来の値を 1 つ追加し、既存の `error=SUBMISSION_REJECTED` と併せて wire 応答へ載せる。client の typed exception、MCP tool error、`NO_TRADE_EXIT` の `rejectionCode` 監査はいずれも既存経路のまま新しい拒否点を運ぶ。
 - **gate 範囲の明文化**: 新規起動・runner 発注・gateway submission が対象で、MCP server process の read-only tool call は対象外であることを requirement として書き下す。
 
@@ -34,7 +34,8 @@
 
 - `trading/src/main/kotlin/me/matsumo/fukurou/trading/invoker/LlmInvoker.kt` — `LlmProcessTreeTerminationRegistry` に `anyUncertain` のみを返す read API を 1 つ追加。既存 API は不変。
 - `trading/src/main/kotlin/me/matsumo/fukurou/trading/runner/LlmDecisionSubmissionGateway.kt` — `handleRequest` に action-aware な precondition。gate 条件は admission blocker と UNCERTAIN 履歴の OR。
-- `trading/src/main/kotlin/me/matsumo/fukurou/trading/daemon/LlmExecutionAdmissionHealth.kt` — 3 集合のみを見る read API を 1 つ追加。既存 API は不変。
+- `trading/src/main/kotlin/me/matsumo/fukurou/trading/daemon/LlmExecutionAdmissionHealth.kt` — scan 実行中を表す flag と submission gate 用 read API を追加。`isHealthy()` の判定結果は不変。
+- `trading/src/main/kotlin/me/matsumo/fukurou/trading/runner/LlmExecutionClaimSupervisor.kt` — tick 冒頭の 1 箇所を実行中 flag へ置き換え。実障害の 6 箇所は不変。
 - `trading/src/main/kotlin/me/matsumo/fukurou/trading/decision/SubmissionRejection.kt` — enum 値 1 つ追加。
 - `mcp/` 配下は無変更。MCP server は既存の rejection code 伝播経路をそのまま使う。
 - 監査: `command_event_log` の `NO_TRADE_EXIT` payload に新しい `rejectionCode` 値が出現しうる。schema 変更なし。

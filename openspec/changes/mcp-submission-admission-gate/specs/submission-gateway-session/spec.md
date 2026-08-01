@@ -6,7 +6,9 @@ app-owned submission gateway は、terminal submission を repository へ渡す�
 
 2 つの条件は役割が異なる。admission blocker は process-global で、別 invocation の異常も含めて admission 全体の健全性を表す。`UNCERTAIN` 履歴は invocation-local で、同一 run 内の過去 phase が終了を証明できなかったことを表す。
 
-risk を減らす action（`EXIT` / `REDUCE` / `ADJUST_PROTECTION`）と `NO_TRADE` の decision submission は、blocker が存在しても処理しなければならない (SHALL)。admission が不健全な状態でこれらを止めることは、既にあるリスクを減らせなくする点で fail-closed の目的に反する。
+risk を減らす action（`EXIT` / `REDUCE`）と `NO_TRADE` の decision submission は、gate 条件が該当しても処理しなければならない (SHALL)。これらを止めることは、既にあるリスクを減らせなくする点で fail-closed の目的に反する。
+
+`ADJUST_PROTECTION` はこの例外に含めてはならない (MUST NOT)。当該 action は take-profit のみを変更して stop を変更せず、既存 take-profit との単調性も上限も課されないため、risk を減らすことが保証されない。
 
 gateway は admission health の状態を変更してはならない (MUST NOT)。
 
@@ -22,8 +24,13 @@ gateway は admission health の状態を変更してはならない (MUST NOT)�
 
 #### Scenario: blocker 有りでも risk を減らす decision submission は通る
 
-- **WHEN** admission blocker が存在する状態で、`EXIT` / `REDUCE` / `ADJUST_PROTECTION` のいずれかの `SUBMIT_DECISION` 要求を gateway へ送る
+- **WHEN** admission blocker が存在する状態で、`EXIT` または `REDUCE` の `SUBMIT_DECISION` 要求を gateway へ送る
 - **THEN** 応答は `accepted=true` となり、decision が repository へ永続化される
+
+#### Scenario: blocker 有りで ADJUST_PROTECTION は拒否される
+
+- **WHEN** admission blocker が存在する状態で、`ADJUST_PROTECTION` の `SUBMIT_DECISION` 要求を gateway へ送る
+- **THEN** 応答は `accepted=false` となり、decision repository は呼ばれない
 
 #### Scenario: blocker 有りでも NO_TRADE は通る
 
@@ -76,7 +83,11 @@ admission blocker の検査は repository 呼び出しの直前に行わなけ�
 
 admission blocker による submission gate の対象は、app-owned submission gateway 経由の falsification と、risk を増やす decision とする (SHALL)。MCP server process が実行する read-only tool call は対象としない (SHALL NOT)。
 
-新規 LLM 起動と `/health/ready` の判定は従来どおり `isHealthy()`（3 集合に加えて `recoveryScanHealthy` / `heartbeatHealthy` の 2 flag を含む）を用いる (SHALL)。submission gate は 3 集合のみを条件とし (SHALL)、periodic recovery scan の実行中に生じる一時的な flag 低下によって submission を拒否してはならない (MUST NOT)。
+新規 LLM 起動と `/health/ready` の判定は従来どおり `isHealthy()` を用いる (SHALL)。
+
+submission gate は次を条件とする (SHALL)。3 集合が空であること、および recovery scan が実障害を報告していないこと。periodic recovery scan が正常に実行中であることを理由に submission を拒否してはならない (MUST NOT)。一方、recovery scan が失敗した状態（DB 障害、timeout、blocker 照会の失敗、recovery 結果の不明を含む）では、risk を増やす submission を拒否しなければならない (SHALL)。
+
+recovery scan が stale claim を発見できない状態は、未知の停滞 invocation が存在しうることを意味するため、fail-closed の対象とする。
 
 MCP server は独立 process として起動されるため process-local な admission health へ到達できない。read-only tool call の抑止は、tool allowlist、tool call budget、manifest 有効期限、`HARD_HALT`、global trading lock によって行う。
 
@@ -85,10 +96,15 @@ MCP server は独立 process として起動されるため process-local な ad
 - **WHEN** admission blocker が存在する状態で、MCP server が read-only tool を実行する
 - **THEN** その tool call は admission health を理由に拒否されない
 
-#### Scenario: recovery scan 中の submission は拒否されない
+#### Scenario: 正常な recovery scan 実行中の submission は拒否されない
 
-- **WHEN** blocker が存在しない状態で periodic recovery scan が実行中（`recoveryScanHealthy` が一時的に false）に submission を送る
-- **THEN** 応答は `accepted=true` となり、admission を理由に拒否されない
+- **WHEN** blocker が存在せず recovery scan が実障害を報告していない状態で、periodic recovery scan の実行中に submission を送る
+- **THEN** 応答は `accepted=true` となり、gate を理由に拒否されない
+
+#### Scenario: recovery scan の実障害中は risk を増やす submission が拒否される
+
+- **WHEN** blocker が存在しないが recovery scan が DB 障害または timeout で失敗した状態で、risk を増やす `SUBMIT_DECISION` を送る
+- **THEN** 応答は `accepted=false` となり、decision repository は呼ばれない
 
 #### Scenario: 資金を動かす操作は admission gate を通る
 

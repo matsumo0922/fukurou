@@ -74,9 +74,13 @@ registry entry は UNCERTAIN でない場合のみ `resolve()` される（`OneS
 
 **帰属: agent 仮決め**
 
-gateway の admission precondition は、`SUBMIT_FALSIFICATION` と、risk を増やす action の `SUBMIT_DECISION` にのみ適用する。`RISK_REDUCTION_ONLY_ACTIONS`（`EXIT` / `REDUCE` / `ADJUST_PROTECTION` / `NO_TRADE`）の decision submission は admission が unhealthy でも通す。
+gateway の precondition は、`SUBMIT_FALSIFICATION` と、`EXIT` / `REDUCE` / `NO_TRADE` **以外**の action の `SUBMIT_DECISION` に適用する。`EXIT` / `REDUCE` / `NO_TRADE` の decision submission は gate 条件が該当しても通す。
 
-**理由**: 既存の `ToolCallGuard` が HARD_HALT 中でも decision を通す設計と方向を揃える。admission fail-closed の目的は「信頼できない状態で新しいリスクを取らせない」ことであり、既にあるリスクを減らす操作を止めるのは目的に反する。`NO_TRADE` は何も起こさないので止める理由がない。
+**理由**: 既存の `ToolCallGuard` が HARD_HALT 中でも decision を通す設計と方向を揃える。gate の目的は「信頼できない状態で新しいリスクを取らせない」ことであり、既にあるリスクを減らす操作を止めるのは目的に反する。`NO_TRADE` は何も起こさないので止める理由がない。
+
+**`ADJUST_PROTECTION` は例外に含めない**。runner の実装は take-profit のみを変更し、stop は変更しない（`DecisionExecutionLifecycle.kt:299-305` が `newTakeProfitPriceJpy` だけを渡す）。検証も `targetPrice <= currentPrice` と `targetPrice <= stopPrice` を弾くだけで、既存 TP との単調性も上限も課さない（`:421-427`）。したがって take-profit を無制限に遠ざけて exposure を延ばすことができ、risk を減らす保証がない。`RISK_REDUCTION_ONLY_ACTIONS` に含まれることは runner の phase 制約であって、untrusted な submitter に対する安全性の証明ではない。
+
+monotonic tightening（新 TP が既存 TP 以下）を条件に例外化する案もあるが、既存 TP の取得と比較を gateway へ持ち込むことになり、gate 1 つの change には重い。`ADJUST_PROTECTION` を gate 対象に含めても、正当な run は gate 条件が該当しないので通る。
 
 この判断は action を見るため、precondition は payload decode の後に置く必要がある。D3 はこれに合わせて改める。
 
@@ -89,19 +93,34 @@ gateway の admission precondition は、`SUBMIT_FALSIFICATION` と、risk を�
 
 初版は「binding 検証より前」としていたが、D2 が action を要求するので撤回する。F6（binding 不一致 client への health 1bit 漏洩）もこの変更で解消する。binding 検証が先に走るため、binding が一致しない client は admission の状態を観測できない。
 
-### D4: gate 条件は 3 集合のみを使う（F3 の処置）
+### D4: 実行中の scan と失敗した scan を区別する（F3 / R4 の処置）
 
-**帰属: agent 仮決め**（falsifier も同結論を推奨）
+**帰属: ユーザー確認済み**（R4 の反証結果を提示のうえ「直近 tick 失敗を区別して gate」を選択）
 
-`isHealthy()` をそのまま使わず、`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures` の 3 集合が空であることを条件とする。`recoveryScanHealthy` と `heartbeatHealthy` の 2 flag は見ない。
+`recoveryScanHealthy` は 2 つの異なる意味に使われている。呼び出し 11 箇所のうち、**tick 冒頭の 1 箇所だけが「正常な scan の実行中」を表し、残り 10 箇所はすべて実障害を表す**。
 
-**理由**: `LlmExecutionRecoveryService.tick()` は tick 開始時に無条件で `setRecoveryScanHealthy(false)` し、成功時に true へ戻す（`LlmExecutionClaimSupervisor.kt:181-190`）。tick は既定 28.5 秒間隔で回り、実行時間の分だけ `recoveryScanHealthy` が false になる。submission は run ごとに 1 回の一点イベントなので、この窓に当たると正常な run の decision が誤拒否される。
+| 呼び出し元 | 意味 |
+|---|---|
+| `LlmExecutionClaimSupervisor.kt:182`（tick 冒頭の無条件 false） | **正常な実行中** |
+| `:216` scan 失敗 / `:268` `:291` recovery mutation 失敗 / `:321` blocker read 失敗 / `:367` audit append 失敗 / `:434` outcome unknown | 実障害 |
+| `LlmExecutionRecoveryWorker.kt:71` tick 例外 | 実障害 |
+| `Application.kt:925,992` startup recovery 失敗 | 実障害 |
 
-一方 issue の実害シナリオ（UNCERTAIN 終端）は `recoveryBlockers` に表現される。`recoveryScanHealthy` を条件から外しても捕捉率は落ちない。`heartbeatHealthy` は production の setter が存在せず（定義は `LlmExecutionAdmissionHealth.kt:39` のみ）、実働の heartbeat failure は `heartbeatFailures` 集合に入る。
+初版の D4（3 集合のみを見る）は、この 2 つをまとめて無視していた。誤拒否は消えるが、**recovery が stale claim を発見できない状態でも risk-increasing submission を通す**。これは fail-closed の目的に反する。
 
-この判定用に `LlmExecutionAdmissionHealth` へ専用の read API を追加する。既存の `isHealthy()` は新規起動と `/health/ready` の意味論を保つため変更しない。
+そこで「scan が現在実行中である」ことを表す状態を分離する。`LlmExecutionAdmissionHealth` に scan の実行中フラグを追加し、tick 冒頭ではそれを立てる。tick 成功時に下ろす。実障害の 10 箇所は従来どおり `recoveryScanHealthy` を false にする。
 
-**受容するコスト**: submission gate と新規起動 gate で条件が異なる。ただし両者は目的が違う（前者は「この invocation が信頼できるか」、後者は「新しい起動を許してよいか」）ので、条件の差は spec に明記して意味を確定させる。
+submission gate の条件は次のとおり。
+
+- 3 集合（`ambiguousClaims` / `recoveryBlockers` / `heartbeatFailures`）が空
+- かつ `recoveryScanHealthy` が true（実障害が無い）
+- 「scan 実行中」フラグは無視する
+
+これにより F3 の誤拒否（正常 tick 窓）を避けつつ、R4 の実障害を取りこぼさない。`heartbeatHealthy` は production の setter が存在せず（定義は `LlmExecutionAdmissionHealth.kt:39` のみ）、実働の heartbeat failure は `heartbeatFailures` 集合に入るため、条件に含めない。
+
+既存の `isHealthy()` は変更しない。新規起動と `/health/ready` は従来どおり scan 実行中も fail-closed になる。新規起動は頻度が低く、数百ミリ秒の待ちが実害にならないためである。
+
+**受容するコスト**: submission gate と新規起動 gate で条件が 1 つ異なる（scan 実行中の扱い）。両者は目的が違う（前者は「この結論を確定してよいか」、後者は「新しい起動を許してよいか」）ので、差は spec に明記して意味を確定させる。
 
 ### D5: TOCTOU race は commit 直前検査で縮小し、残余を明示する（F2 の処置）
 
