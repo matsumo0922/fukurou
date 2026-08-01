@@ -42,6 +42,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPreFilterDecision
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
@@ -2820,6 +2821,32 @@ class OneShotLlmRunnerTest {
             assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
             assertFalse(LlmExecutionAdmissionHealth.isHealthy())
             assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        } finally {
+            resetProcessRecoveryState(invocationId)
+        }
+    }
+
+    @Test
+    fun preFilterSkippedRun_releasesProcessTreeProof() = runBlocking {
+        // pre-filter は履歴を run 終了まで保持する。SKIP で full run へ進まない経路でも
+        // 解放されなければ、process-global registry に entry が残り続ける。
+        val invocationId = "prefilter-skip-releases-proof"
+        resetProcessRecoveryState(invocationId)
+        val fixture = runnerFixture { cleanExit() }
+
+        try {
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+            LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+
+            val result = fixture.runOneShot(
+                defaultRequest().copy(
+                    invocationId = invocationId,
+                    preFilter = { LlmDaemonPreFilterDecision.SKIP_NO_CHANGE },
+                ),
+            ).getOrThrow()
+
+            assertEquals(OneShotRunnerStatus.PRE_FILTER_SKIPPED, result.status)
+            assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
         } finally {
             resetProcessRecoveryState(invocationId)
         }
