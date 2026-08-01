@@ -1,36 +1,36 @@
 ## ADDED Requirements
 
-### Requirement: UNCERTAIN 終端は phase 境界で admission blocker として登録される
+### Requirement: 完了済み child の UNCERTAIN 履歴が後続の terminal submission を止める
 
 **Trace:** Issue #352 受け入れ条件「admission の意味が経路によって異なる状態を解消する」
 
-LLM invocation の 1 phase が終了した時点で、その invocation の process tree termination proof が `UNCERTAIN` であるとき、system は当該 invocation と claimant token に対する recovery blocker を登録しなければならない (SHALL)。登録は同じ invocation の次の phase が起動するより前に完了しなければならない (SHALL)。
+process tree termination registry は、ある invocation において**完了した child の少なくとも 1 つが `UNCERTAIN` proof で終端したか**を照会できる read API を提供しなければならない (SHALL)。この照会は、現在実行中で未終了の child の存在を `UNCERTAIN` として扱ってはならない (MUST NOT)。
 
-登録の判定は、child process の終了時に記録された proof に基づかなければならない (SHALL)。phase の途中で proof が未確定であること（child が起動して未終了であること）を理由に blocker を登録してはならない (MUST NOT)。同一 invocation と claimant token に対する重複登録は冪等でなければならない (SHALL)。
+app-owned submission gateway は、terminal submission の可否判定にこの照会結果を用いなければならない (SHALL)。照会が true を返すとき、当該 invocation の後続の terminal submission は admission blocker の有無に関わらず拒否対象となる (SHALL)。
 
-one-shot 実行全体の終了時に行われる既存の blocker 登録は維持しなければならない (SHALL)。phase 境界での登録は、それを前倒しするものであって置き換えるものではない。
+この判定は process-local admission health の状態を読み書きしてはならない (MUST NOT)。新規 LLM 起動 gate、`/health/ready`、runner の execution admission 検証の意味論は不変でなければならない (SHALL)。
 
-#### Scenario: PROPOSER の UNCERTAIN 終端が FALSIFIER 起動前に blocker を登録する
+#### Scenario: PROPOSER の UNCERTAIN 終端が後続 FALSIFIER の承認を止める
 
-- **WHEN** PROPOSER phase の child process が `UNCERTAIN` proof で終端し、同じ one-shot が続けて FALSIFIER phase を起動しようとする
-- **THEN** FALSIFIER phase の起動より前に当該 invocation の recovery blocker が登録されており、admission は blocker を保持した状態になる
+- **WHEN** PROPOSER phase が intent を保存したあと child が `UNCERTAIN` proof で終端し、後続の FALSIFIER phase が `SUBMIT_FALSIFICATION` を gateway へ送る
+- **THEN** その submission は拒否され、falsification repository へ到達しない
 
-#### Scenario: UNCERTAIN 終端後の falsification submission が拒否される
+#### Scenario: 実行中の child は UNCERTAIN 扱いされない
 
-- **WHEN** PROPOSER phase が intent を保存したあと `UNCERTAIN` proof で終端し、後続の FALSIFIER phase が `SUBMIT_FALSIFICATION` を gateway へ送る
-- **THEN** その submission は admission blocker により拒否され、falsification repository へ到達しない
+- **WHEN** 最初の PROPOSER phase の child が起動済みでまだ終了しておらず、その child が `SUBMIT_DECISION` を gateway へ送る
+- **THEN** その submission は UNCERTAIN 履歴を理由に拒否されない
 
-#### Scenario: PROVEN_EXITED 終端では blocker を登録しない
+#### Scenario: PROVEN_EXITED 終端は後続を止めない
 
-- **WHEN** phase の child process が `PROVEN_EXITED` proof で終端する
-- **THEN** その phase 境界では recovery blocker を登録せず、後続 phase の submission は admission を理由に拒否されない
+- **WHEN** PROPOSER phase の child が `PROVEN_EXITED` proof で終端し、後続の FALSIFIER phase が submission を送る
+- **THEN** その submission は UNCERTAIN 履歴を理由に拒否されない
 
-#### Scenario: phase 実行中の未確定 proof では blocker を登録しない
+#### Scenario: UNCERTAIN 履歴は後続 phase の実行中も保持される
 
-- **WHEN** phase の child process が起動済みでまだ終了していない
-- **THEN** その時点では recovery blocker を登録せず、当該 phase 自身の submission は admission を理由に拒否されない
+- **WHEN** PROPOSER が `UNCERTAIN` で終端したあと FALSIFIER phase の child が起動し、実行中になる
+- **THEN** 照会は引き続き true を返し、FALSIFIER の submission は拒否される
 
-#### Scenario: 重複登録が冪等である
+#### Scenario: 判定は admission health を変更しない
 
-- **WHEN** phase 境界で登録された blocker と同じ invocation と claimant token に対し、one-shot 全体の終了時に再度登録が行われる
-- **THEN** blocker 集合の状態は 1 回の登録と同一であり、解除は 1 回の解除操作で成立する
+- **WHEN** UNCERTAIN 履歴により submission が拒否される
+- **THEN** admission health の blocker 集合と flag はその拒否によって変化せず、新規起動 gate と `/health/ready` の判定も変化しない

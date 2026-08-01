@@ -29,8 +29,8 @@
 
 **Goals:**
 
-- UNCERTAIN 終端した phase の直後から admission health が unhealthy になるようにし、次 phase の terminal submission を止める。
-- admission health が unhealthy のとき、risk を増やす terminal submission が確定しないようにする。
+- UNCERTAIN 終端した phase より後の terminal submission を、同一 invocation 内で止める。
+- admission blocker があるとき、risk を増やす terminal submission が確定しないようにする。
 - 拒否点を既存の閉じた rejection code 語彙に合流させ、監査から admission 起因の拒否を特定できるようにする。
 - 「admission health が何を gate するか」を spec 上で確定させる。
 
@@ -44,20 +44,31 @@
 
 ## Decisions
 
-### D1: phase 境界で UNCERTAIN を admission へ反映する（F1 の処置）
+### D1: 完了済み child の historical uncertainty を gate 条件に加える（F1 の処置）
 
-**帰属: ユーザー確認済み**（反証結果を提示のうえ「F1 を直す scope 拡大へ」を選択）
+**帰属: ユーザー確認済み**（2 度の反証結果を提示のうえ「historical uncertainty API 案へ」を選択）
 
-`LlmInvocationAuditor.invokeAndAudit` が `llmInvoker.invoke(request)` から戻った直後（`LlmInvocationAuditor.kt:96` の後）に、当該 invocation の termination proof を確認し、UNCERTAIN なら `registerRecoveryBlocker` を呼ぶ。
+`LlmProcessTreeTerminationRegistry` に、**完了済み child の UNCERTAIN 履歴だけ**を返す read API を追加する（例: `hasCompletedUncertainChild(invocationId)` = `proofs[id]?.anyUncertain == true`）。gateway の precondition はこれを admission blocker と並ぶ第 2 の条件として見る。
 
-**成立の根拠**: `LlmInvoker.invoke()` は返る時点で必ず `record()` を済ませている（正常系 `:115`、cancellation `:146`、その他 `:157`）。したがって auditor に制御が戻った時点で proof は確定しており、次 phase 起動より前に admission へ反映する隙間が存在する。
+**成立の根拠**: `anyUncertain` は `record()` でのみ立つ（`LlmInvoker.kt:209`）。`record()` は child 終了時に呼ばれるため、この flag は「完了した child のうち少なくとも 1 つが UNCERTAIN だった」を意味する。`markChildStarted` は `copy(childUnresolved = true)` するだけで `anyUncertain` を消さない（`:197-200`）ので、後続 phase の実行中も履歴が保持される。
 
-`runOneShot` の `finally` にある既存の登録はそのまま残す。phase 境界で登録済みなら二重登録になるが、`recoveryBlockers` は `ConcurrentHashMap.newKeySet` なので同一 key の再追加は冪等である。
+状態遷移で確認すると意図通りに働く。
+
+| 時点 | `childUnresolved` | `anyUncertain` | gate |
+|---|---|---|---|
+| 正常な最初の PROPOSER 実行中 | true | false | 許可 |
+| PROPOSER が UNCERTAIN で完了 | false | **true** | 以降拒否 |
+| 続く FALSIFIER 実行中 | true | **true** | 拒否 |
+| PROPOSER が PROVEN_EXITED で完了 | false | false | 許可 |
+
+registry entry は UNCERTAIN でない場合のみ `resolve()` される（`OneShotLlmRunner.kt:637-640`）ので、UNCERTAIN の履歴は run 終了まで残る。
 
 **却下した代替**:
 
-- **`LlmProcessTreeTerminationRegistry` を gate の判定に直接使う**。gateway が `find(invocationId)` を見る案。`find()` は `childUnresolved`（子が起動して未終了）でも UNCERTAIN を返す（`LlmInvoker.kt:219-220`）ため、**FALSIFIER 自身が実行中はその FALSIFIER の子が未解決で UNCERTAIN になり、FALSIFIER の正当な submission まで拒否する**。registry が invocationId 単位で phase を区別しないので成立しない。
-- **`runOneShot` の phase 呼び出し間に明示的なチェックを挟む**。auditor 側に置くより呼び出し箇所が増え、将来 phase が追加されたときに漏れる。
+- **phase 境界で `registerRecoveryBlocker` を呼ぶ**（初版改訂案）。**自己ロックアウトを起こすため成立しない**。`invokePhase` 直後の `requireLiveClaimForInvocation`（`OneShotLlmRunner.kt:1377`）は `requireLiveClaim`（`:647`）→ `validateExecutionAdmission` → `withHealthyAdmission`（`ExposedLlmLaunchReservationRepository.kt:317`）と辿り、`check(isHealthyLocked())` で throw する。PROPOSER 終了直後に blocker を登録すると、その直後の自分自身の claim 確認が自分の blocker で落ち、decision を読む前に run 全体が死ぬ。さらに `handleNonEnterDecision`（`:1398`）も同じ経路を通るため、D2 で守ったはずの risk-reducing action が別経路で実行不能になる。加えて blocker は reservation terminal 後さらに hardTimeout + processTerminationGrace 経過まで解除されない（`LlmExecutionClaimSupervisor.kt:311-340`）ので、影響範囲も広い。
+- **`LlmProcessTreeTerminationRegistry.find()` を gate 条件に使う**。`find()` は `childUnresolved` でも UNCERTAIN を返す（`LlmInvoker.kt:219-220`）ため、**実行中の child 自身が UNCERTAIN と見え、正常な PROPOSER submission を 100% 拒否する**。`anyUncertain` のみを見る新 API はこの偽陽性を持たない。
+
+**この判定は admission health を変更しない**ため、`isHealthy()` の意味論、新規起動 gate、`/health/ready`、runner の `validateExecutionAdmission` はいずれも不変である。gate は gateway の中だけで閉じる。
 
 ### D2: gate は risk を増やす submission に限定する（F5 の処置）
 
@@ -111,7 +122,8 @@ precondition の検査位置を repository 呼び出しの直前に置く（D3�
 ## Risks / Trade-offs
 
 - **[誤拒否された run の回復は保証されない]**（F4） → D2 と D4 により誤拒否の主要因を除いたが、正当な拒否のあと LLM が再提出する保証はない。tool call budget は拒否でも 1 消費し（`McpToolCallLimiter.kt:81`）、manifest 有効期限は phase timeout そのもの、auditor は invoke 終了後すぐ gateway を close する。**再提出可能性を保証として使わない**。拒否された run は NO_TRADE として終端する前提で設計する。
-- **[phase 境界登録による fail-closed の前倒し]** → D1 により、UNCERTAIN が出た時点で新規起動も止まる。これは意図した挙動だが、従来より早く止まるため `/health/ready` が false になる頻度が上がりうる。PR #351 の blocker 自己解除（DB が terminal を確認したら解除）が回復経路として働く。
+- **[gate 条件が 2 系統になる]** → D1 の historical uncertainty は invocation-local、admission blocker は process-global で、意味も生存期間も異なる。gateway はこの 2 つを OR で見る。spec に両者の役割を明記して混同を防ぐ。
+- **[historical uncertainty は run 終了まで解除されない]** → registry entry は UNCERTAIN でない場合のみ `resolve()` される（`OneShotLlmRunner.kt:637-640`）。一度 UNCERTAIN が出た run では、以降の terminal submission がすべて拒否される。これは意図した挙動で、当該 run は NO_TRADE として終端する。
 - **[submission gate と新規起動 gate で条件が異なる]** → D4 の通り意図的。spec に両者の条件を明記する。
 - **[残余 TOCTOU race]** → D5 の通り受容して明記する。
 - **[test 間の singleton 汚染]** → `LlmExecutionAdmissionHealthTestFixture.reset()` を必ず使う。

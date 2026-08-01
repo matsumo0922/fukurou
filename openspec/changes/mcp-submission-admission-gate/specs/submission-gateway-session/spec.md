@@ -1,8 +1,10 @@
 ## ADDED Requirements
 
-### Requirement: Gateway は risk を増やす submission を admission blocker が無いときだけ処理する
+### Requirement: Gateway は risk を増やす submission を gate 条件が満たされるときだけ処理する
 
-app-owned submission gateway は、terminal submission を repository へ渡す前に LLM execution admission blocker の有無を検査しなければならない (SHALL)。blocker が存在するとき、`SUBMIT_FALSIFICATION` と、risk を増やす action の `SUBMIT_DECISION` を拒否しなければならず (SHALL)、対応する repository へ到達させてはならない (MUST NOT)。
+app-owned submission gateway は、terminal submission を repository へ渡す前に次の 2 つを検査しなければならない (SHALL)。(1) LLM execution admission blocker の有無 (2) 当該 invocation における完了済み child の `UNCERTAIN` 履歴の有無。いずれかが該当するとき、`SUBMIT_FALSIFICATION` と、risk を増やす action の `SUBMIT_DECISION` を拒否しなければならず (SHALL)、対応する repository へ到達させてはならない (MUST NOT)。
+
+2 つの条件は役割が異なる。admission blocker は process-global で、別 invocation の異常も含めて admission 全体の健全性を表す。`UNCERTAIN` 履歴は invocation-local で、同一 run 内の過去 phase が終了を証明できなかったことを表す。
 
 risk を減らす action（`EXIT` / `REDUCE` / `ADJUST_PROTECTION`）と `NO_TRADE` の decision submission は、blocker が存在しても処理しなければならない (SHALL)。admission が不健全な状態でこれらを止めることは、既にあるリスクを減らせなくする点で fail-closed の目的に反する。
 
