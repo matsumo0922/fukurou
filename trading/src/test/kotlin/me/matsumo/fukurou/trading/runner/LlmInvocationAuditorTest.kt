@@ -17,6 +17,7 @@ import me.matsumo.fukurou.trading.audit.InMemoryLlmInputManifestRepository
 import me.matsumo.fukurou.trading.audit.LlmInputManifestRepository
 import me.matsumo.fukurou.trading.audit.LlmPhaseManifestRecorder
 import me.matsumo.fukurou.trading.audit.LlmPhaseObservation
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealthTestFixture
 import me.matsumo.fukurou.trading.evaluation.LlmModelUsage
 import me.matsumo.fukurou.trading.evaluation.LlmTokenUsage
 import me.matsumo.fukurou.trading.evaluation.LlmUsageDetails
@@ -40,6 +41,7 @@ import me.matsumo.fukurou.trading.invoker.ProcessRunResult
 import me.matsumo.fukurou.trading.invoker.ProcessRunStatus
 import me.matsumo.fukurou.trading.invoker.ProcessRunner
 import me.matsumo.fukurou.trading.invoker.ProcessStartAwareRunner
+import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProvenCancellationException
 import me.matsumo.fukurou.trading.invoker.REFRESH_TOKEN_FAILURE_STDERR
 import me.matsumo.fukurou.trading.invoker.RenderedLlmCommand
@@ -53,6 +55,8 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -66,6 +70,18 @@ import kotlin.time.Duration.Companion.milliseconds
  * LlmInvocationAuditor の phase audit payload を検証するテスト。
  */
 class LlmInvocationAuditorTest {
+
+    @BeforeTest
+    fun setUpAdmissionState() {
+        LlmExecutionAdmissionHealthTestFixture.reset()
+        LlmProcessTreeTerminationRegistry.resolve("audit-run")
+    }
+
+    @AfterTest
+    fun tearDownAdmissionState() {
+        LlmExecutionAdmissionHealthTestFixture.reset()
+        LlmProcessTreeTerminationRegistry.resolve("audit-run")
+    }
 
     @Test
     fun invokeAndAudit_appendsRedactedPhasePayloadWithClaudeUsage() = runBlocking {
@@ -920,6 +936,40 @@ class LlmInvocationAuditorTest {
             expectedCoverage = me.matsumo.fukurou.trading.audit.LlmIdentityCoverageStatus.NOT_OBSERVABLE_BEFORE_START,
             expectedProcessExit = "NOT_STARTED",
         )
+    }
+
+    @Test
+    fun invokeAndAudit_releasesProcessTreeProofForSinglePhaseCaller() = runBlocking {
+        LlmProcessTreeTerminationRegistry.markChildStarted("audit-run")
+        LlmProcessTreeTerminationRegistry.record("audit-run", ProcessTreeTerminationProof.UNCERTAIN)
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = InMemoryCommandEventLog(),
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+            retainsProcessTreeProof = false,
+        )
+        val request = auditRequest(LlmProvider.CLAUDE)
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, StaticAuditLlmInvoker("{}"))
+
+        assertFalse(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild("audit-run"))
+    }
+
+    @Test
+    fun invokeAndAudit_retainsProcessTreeProofByDefault() = runBlocking {
+        // 既定は保持側。解放しすぎると後続 phase の gate が素通りするため、安全側を既定にする。
+        LlmProcessTreeTerminationRegistry.markChildStarted("audit-run")
+        LlmProcessTreeTerminationRegistry.record("audit-run", ProcessTreeTerminationProof.UNCERTAIN)
+        val auditor = LlmInvocationAuditor(
+            commandEventLog = InMemoryCommandEventLog(),
+            redactor = SecretRedactor(emptySet()),
+            clock = Clock.fixed(Instant.parse("2026-07-02T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val request = auditRequest(LlmProvider.CLAUDE)
+
+        auditor.invokeAndAudit("proposer", request.decisionRunContext, request, StaticAuditLlmInvoker("{}"))
+
+        assertTrue(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild("audit-run"))
     }
 
     @Test

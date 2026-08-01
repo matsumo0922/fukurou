@@ -460,6 +460,9 @@ private fun createLlmDaemonPreFilter(
                     commandRendererConfig = commandRendererConfig.copy(claudeModel = HAIKU_PRE_FILTER_MODEL),
                 ),
                 authEvidenceState = inputs.authEvidenceState,
+                // 既定どおり履歴を保持する。pre-filter は one-shot と同じ invocation ID で動き、
+                // 失敗時は fail-open して同じ run の PROPOSER / FALSIFIER へ進むため、ここで
+                // 解放すると後続 phase の gate へ UNCERTAIN が伝わらない。
             ),
         ),
         parentEnvironment = inputs.environment,

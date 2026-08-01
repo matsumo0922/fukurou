@@ -533,6 +533,8 @@ private fun createEvaluationRouteDependencies(
                     commandRendererConfig = commandRendererConfig,
                 ),
                 authEvidenceState = runtime.authEvidenceState,
+                // 単一 phase で完結し、同じ invocation の後続 phase へ制御を渡さない。
+                retainsProcessTreeProof = false,
             )
         },
         environment = databaseResources.environment,

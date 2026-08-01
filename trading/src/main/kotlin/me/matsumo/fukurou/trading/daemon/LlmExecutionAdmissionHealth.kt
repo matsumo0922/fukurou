@@ -15,9 +15,35 @@ object LlmExecutionAdmissionHealth {
     private val heartbeatFailures = ConcurrentHashMap.newKeySet<ClaimHealthKey>()
     private val heartbeatHealthy = AtomicBoolean(true)
     private val recoveryScanHealthy = AtomicBoolean(true)
+    private val recoveryScanInProgress = AtomicBoolean(false)
 
     /** new admission と readiness を許可できるか返す。 */
     fun isHealthy(): Boolean = admissionLock.read { isHealthyLocked() }
+
+    /**
+     * terminal submission を確定させてよいか返す。
+     *
+     * 実行中の recovery scan は無視し、最後に完了した scan の成否だけを見る。scan は
+     * 周期的に走るため、正常な実行中まで fail-closed にすると、run ごとに 1 回だけ
+     * 起きる submission がその窓に当たって失われる。一方 scan の実障害は stale claim
+     * を発見できない状態を意味するので fail-closed のままにする。
+     */
+    fun allowsTerminalSubmission(): Boolean = admissionLock.read {
+        recoveryScanHealthy.get() && noBlockersLocked()
+    }
+
+    /** recovery scan の開始を記録する。直前の scan の成否はそのまま保つ。 */
+    fun beginRecoveryScan() {
+        admissionLock.write { recoveryScanInProgress.set(true) }
+    }
+
+    /** recovery scan の終了を成否とともに記録する。成否によらず実行中 flag を下ろす。 */
+    fun completeRecoveryScan(successful: Boolean) {
+        admissionLock.write {
+            recoveryScanHealthy.set(successful)
+            recoveryScanInProgress.set(false)
+        }
+    }
 
     /** health 判定と admission の永続化境界を blocker transition に対して atomic にする。 */
     fun <T> withHealthyAdmission(block: () -> T): T = admissionLock.read {
@@ -96,12 +122,16 @@ object LlmExecutionAdmissionHealth {
             heartbeatFailures.clear()
             heartbeatHealthy.set(true)
             recoveryScanHealthy.set(true)
+            recoveryScanInProgress.set(false)
         }
     }
 
     private fun isHealthyLocked(): Boolean = heartbeatHealthy.get() &&
         recoveryScanHealthy.get() &&
-        ambiguousClaims.isEmpty() &&
+        !recoveryScanInProgress.get() &&
+        noBlockersLocked()
+
+    private fun noBlockersLocked(): Boolean = ambiguousClaims.isEmpty() &&
         recoveryBlockers.isEmpty() &&
         heartbeatFailures.isEmpty()
 }

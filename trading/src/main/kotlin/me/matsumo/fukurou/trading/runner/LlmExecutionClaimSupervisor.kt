@@ -179,15 +179,22 @@ class LlmExecutionRecoveryService(
 
     /** 1 bounded scan を実行し、競合安全に stale claim を回収する。 */
     suspend fun tick(): Result<Int> {
-        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+        LlmExecutionAdmissionHealth.beginRecoveryScan()
         val deadline = LlmExecutionRecoveryDeadline.start(EXECUTION_RECOVERY_TICK_TIMEOUT, nanoTime)
 
-        val result = runCatching {
-            withTimeout(EXECUTION_RECOVERY_TICK_TIMEOUT.toMillis()) { tickWithinBudget(deadline) }
-        }
-        if (result.isSuccess) LlmExecutionAdmissionHealth.setRecoveryScanHealthy(true)
+        var successful = false
+        try {
+            // runCatching は timeout と cancellation も Result.failure として捕捉する。
+            val result = runCatching {
+                withTimeout(EXECUTION_RECOVERY_TICK_TIMEOUT.toMillis()) { tickWithinBudget(deadline) }
+            }
+            successful = result.isSuccess
 
-        return result
+            return result
+        } finally {
+            // 実行中 flag を残したまま抜けると、submission gate が scan の完了を永久に待つ。
+            LlmExecutionAdmissionHealth.completeRecoveryScan(successful)
+        }
     }
 
     private suspend fun tickWithinBudget(deadline: LlmExecutionRecoveryDeadline): Int {

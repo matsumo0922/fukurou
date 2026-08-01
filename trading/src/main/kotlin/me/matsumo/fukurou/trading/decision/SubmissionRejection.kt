@@ -73,6 +73,10 @@ enum class SubmissionRejectionCode(
         wireValue = "submission_unknown",
         message = "Decision submission result is unknown.",
     ),
+    EXECUTION_ADMISSION_UNAVAILABLE(
+        wireValue = "execution_admission_unavailable",
+        message = "LLM execution admission does not allow terminal submission.",
+    ),
     UNCLASSIFIED(
         wireValue = "unclassified",
         message = "Submission gateway rejected the request.",

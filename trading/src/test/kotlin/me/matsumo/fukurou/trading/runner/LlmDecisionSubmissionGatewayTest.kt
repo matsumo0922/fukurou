@@ -6,6 +6,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import me.matsumo.fukurou.trading.audit.TerminalToolEvidenceBundle
 import me.matsumo.fukurou.trading.audit.requiresCompleteTerminalEvidence
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealthTestFixture
 import me.matsumo.fukurou.trading.decision.DecisionAction
 import me.matsumo.fukurou.trading.decision.DecisionRepository
 import me.matsumo.fukurou.trading.decision.DecisionSubmission
@@ -16,7 +18,9 @@ import me.matsumo.fukurou.trading.decision.InMemoryDecisionRepository
 import me.matsumo.fukurou.trading.decision.SubmissionRejectedException
 import me.matsumo.fukurou.trading.decision.SubmissionRejectionCode
 import me.matsumo.fukurou.trading.invoker.LlmInvocationPhase
+import me.matsumo.fukurou.trading.invoker.LlmProcessTreeTerminationRegistry
 import me.matsumo.fukurou.trading.invoker.LlmSemanticSubmissionState
+import me.matsumo.fukurou.trading.invoker.ProcessTreeTerminationProof
 import java.io.IOException
 import java.math.BigDecimal
 import java.net.StandardProtocolFamily
@@ -30,6 +34,8 @@ import java.nio.file.attribute.PosixFilePermission
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -37,6 +43,18 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class LlmDecisionSubmissionGatewayTest {
+    @BeforeTest
+    fun setUpAdmissionState() {
+        LlmExecutionAdmissionHealthTestFixture.reset()
+        LlmProcessTreeTerminationRegistry.resolve(INVOCATION_ID)
+    }
+
+    @AfterTest
+    fun tearDownAdmissionState() {
+        LlmExecutionAdmissionHealthTestFixture.reset()
+        LlmProcessTreeTerminationRegistry.resolve(INVOCATION_ID)
+    }
+
     @Test
     fun `incomplete evidence risk matrix covers every action and verdict`() {
         DecisionAction.entries.forEach { action ->
@@ -58,6 +76,7 @@ class LlmDecisionSubmissionGatewayTest {
             wireValues.mapNotNull(SubmissionRejectionCode::fromWireValue).toSet(),
         )
         assertEquals(null, SubmissionRejectionCode.fromWireValue("outside_vocabulary"))
+        assertTrue(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE in SubmissionRejectionCode.entries)
     }
 
     @Test
@@ -740,9 +759,245 @@ class LlmDecisionSubmissionGatewayTest {
         }
     }
 
+    @Test
+    fun `admission blocker rejects falsification before repository call`() {
+        val repository = CountingDecisionRepository()
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("blocked", "token")
+
+        val response = exchangeRequest(
+            repository = repository,
+            phase = LlmInvocationPhase.FALSIFIER,
+            request = falsificationRequest(LlmInvocationPhase.FALSIFIER),
+        )
+
+        assertEquals("false", response.getValue("accepted").toString())
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(0, repository.falsificationSubmissions)
+    }
+
+    @Test
+    fun `admission blocker rejects risk increasing decision before repository call`() {
+        val repository = CountingDecisionRepository()
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("blocked", "token")
+
+        val response = exchangeRequest(
+            repository = repository,
+            phase = LlmInvocationPhase.PROPOSER,
+            request = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ENTER)),
+        )
+
+        assertEquals("false", response.getValue("accepted").toString())
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(0, repository.decisionSubmissions)
+    }
+
+    @Test
+    fun `admission blocker permits exit reduce and no trade decisions`() = runBlocking {
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("blocked", "token")
+
+        listOf(DecisionAction.EXIT, DecisionAction.REDUCE, DecisionAction.NO_TRADE).forEach { action ->
+            val repository = InMemoryDecisionRepository()
+            val response = exchangeRequest(
+                repository = repository,
+                phase = LlmInvocationPhase.PROPOSER,
+                request = request(LlmInvocationPhase.PROPOSER, decision(action)),
+            )
+
+            assertEquals("true", response.getValue("accepted").toString(), action.name)
+            assertEquals(action, repository.latestDecisionByInvocationId(INVOCATION_ID).getOrThrow()?.decision?.submission?.action)
+        }
+    }
+
+    @Test
+    fun `admission blocker rejects adjust protection`() {
+        val repository = CountingDecisionRepository()
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("blocked", "token")
+
+        val response = exchangeRequest(
+            repository = repository,
+            phase = LlmInvocationPhase.PROPOSER,
+            request = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(0, repository.decisionSubmissions)
+    }
+
+    @Test
+    fun `binding mismatch wins over admission rejection`() {
+        LlmExecutionAdmissionHealth.registerRecoveryBlocker("blocked", "token")
+        val mismatched = request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ENTER))
+            .withField("effectiveInvocationHash", JsonPrimitive("mismatch"))
+
+        val response = exchangeRequest(InMemoryDecisionRepository(), LlmInvocationPhase.PROPOSER, mismatched)
+
+        assertEquals(SubmissionRejectionCode.EFFECTIVE_HASH_MISMATCH.wireValue, response.reason())
+    }
+
+    @Test
+    fun `admission rejection after commit preserves committed semantic state`() {
+        val repository = InMemoryDecisionRepository()
+        val path = Path.of("/tmp/fukurou-gateway-admission-committed-${System.nanoTime()}.sock")
+        val gateway = gateway(path, repository, LlmInvocationPhase.PROPOSER)
+
+        connect(path).use { channel ->
+            assertEquals(
+                "true",
+                exchangeFrame(channel, request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.NO_TRADE)))
+                    .getValue("accepted").toString(),
+            )
+            LlmExecutionAdmissionHealth.registerRecoveryBlocker("blocked", "token")
+            val rejected = exchangeFrame(
+                channel,
+                request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+            )
+            assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, rejected.reason())
+        }
+
+        assertEquals(LlmSemanticSubmissionState.COMMITTED, gateway.semanticSubmissionState())
+        gateway.close()
+    }
+
+    @Test
+    fun `normal recovery scan in progress permits terminal submission but keeps launch health closed`() {
+        LlmExecutionAdmissionHealth.beginRecoveryScan()
+
+        val response = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals("true", response.getValue("accepted").toString())
+        assertTrue(LlmExecutionAdmissionHealth.allowsTerminalSubmission())
+        assertFalse(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
+    @Test
+    fun `failed recovery scan rejects risk increasing submission without blockers`() {
+        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+
+        val response = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertTrue(LlmExecutionAdmissionHealth.unresolvedBlockers().isEmpty())
+    }
+
+    @Test
+    fun `first successful recovery scan opens risk increasing submission`() {
+        LlmExecutionAdmissionHealth.setRecoveryScanHealthy(false)
+        val rejected = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+        LlmExecutionAdmissionHealth.beginRecoveryScan()
+        LlmExecutionAdmissionHealth.completeRecoveryScan(successful = true)
+        val accepted = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, rejected.reason())
+        assertEquals("true", accepted.getValue("accepted").toString())
+    }
+
+    @Test
+    fun `completed uncertain proposer rejects falsifier through registry and gateway wiring`() {
+        LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
+        LlmProcessTreeTerminationRegistry.record(INVOCATION_ID, ProcessTreeTerminationProof.UNCERTAIN)
+        val repository = CountingDecisionRepository()
+
+        val response = exchangeRequest(
+            repository,
+            LlmInvocationPhase.FALSIFIER,
+            falsificationRequest(LlmInvocationPhase.FALSIFIER),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(0, repository.falsificationSubmissions)
+    }
+
+    @Test
+    fun `completed uncertain pre-filter rejects the proposer entry of the same run`() {
+        // pre-filter は one-shot と同じ invocation ID で動き、失敗しても fail-open で full run へ進む。
+        // その child が UNCERTAIN で終端したなら、後続 PROPOSER の ENTER は止まらなければならない。
+        LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
+        LlmProcessTreeTerminationRegistry.record(INVOCATION_ID, ProcessTreeTerminationProof.UNCERTAIN)
+        val repository = CountingDecisionRepository()
+
+        val response = exchangeRequest(
+            repository,
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ENTER)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(0, repository.decisionSubmissions)
+    }
+
+    @Test
+    fun `resolved uncertain history does not reject a new gateway with the same invocation id`() {
+        LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
+        LlmProcessTreeTerminationRegistry.record(INVOCATION_ID, ProcessTreeTerminationProof.UNCERTAIN)
+        val rejected = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+        LlmProcessTreeTerminationRegistry.resolve(INVOCATION_ID)
+
+        val accepted = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, rejected.reason())
+        assertEquals("true", accepted.getValue("accepted").toString())
+    }
+
+    @Test
+    fun `running proposer is not rejected through registry and gateway wiring`() {
+        LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
+
+        val response = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals("true", response.getValue("accepted").toString())
+        assertFalse(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild(INVOCATION_ID))
+    }
+
+    @Test
+    fun `uncertain history rejection does not mutate admission health`() {
+        val blockersBefore = LlmExecutionAdmissionHealth.unresolvedBlockers()
+        val submissionHealthBefore = LlmExecutionAdmissionHealth.allowsTerminalSubmission()
+        LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
+        LlmProcessTreeTerminationRegistry.record(INVOCATION_ID, ProcessTreeTerminationProof.UNCERTAIN)
+
+        val response = exchangeRequest(
+            InMemoryDecisionRepository(),
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ADJUST_PROTECTION)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(blockersBefore, LlmExecutionAdmissionHealth.unresolvedBlockers())
+        assertEquals(submissionHealthBefore, LlmExecutionAdmissionHealth.allowsTerminalSubmission())
+        assertTrue(LlmExecutionAdmissionHealth.isHealthy())
+    }
+
     private fun gateway(
         path: Path,
-        repository: InMemoryDecisionRepository,
+        repository: DecisionRepository,
         phase: LlmInvocationPhase,
     ) = LlmDecisionSubmissionGateway.start(
         socketPath = path,
@@ -794,7 +1049,7 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     private fun exchangeRequest(
-        repository: InMemoryDecisionRepository,
+        repository: DecisionRepository,
         phase: LlmInvocationPhase,
         request: JsonObject,
     ): JsonObject {
@@ -907,6 +1162,28 @@ private fun JsonObject.withoutField(name: String): JsonObject {
 }
 
 private fun JsonObject.reason(): String = getValue("reason").jsonPrimitive.content
+
+private class CountingDecisionRepository(
+    private val delegate: InMemoryDecisionRepository = InMemoryDecisionRepository(),
+) : DecisionRepository by delegate {
+    var decisionSubmissions = 0
+    var falsificationSubmissions = 0
+
+    override suspend fun submitDecision(
+        authority: DecisionSubmissionAuthority,
+        submission: DecisionSubmission,
+    ): Result<me.matsumo.fukurou.trading.decision.DecisionSubmissionResult> {
+        decisionSubmissions += 1
+        return delegate.submitDecision(authority, submission)
+    }
+
+    override suspend fun submitFalsification(
+        submission: FalsificationSubmission,
+    ): Result<me.matsumo.fukurou.trading.decision.FalsificationRecord> {
+        falsificationSubmissions += 1
+        return delegate.submitFalsification(submission)
+    }
+}
 
 private const val INVOCATION_ID = "gateway-test-invocation"
 private const val PHASE_MANIFEST_ID = "gateway-test-invocation:PROPOSER"

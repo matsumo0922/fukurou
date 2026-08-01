@@ -4,9 +4,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealthTestFixture
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -19,6 +22,16 @@ import kotlin.time.toDuration
  * ShellProcessRunner の process tree timeout contract を検証するテスト。
  */
 class ShellProcessRunnerTest {
+
+    @BeforeTest
+    fun setUpAdmissionHealth() {
+        LlmExecutionAdmissionHealthTestFixture.reset()
+    }
+
+    @AfterTest
+    fun tearDownAdmissionHealth() {
+        LlmExecutionAdmissionHealthTestFixture.reset()
+    }
 
     @Test
     fun processTreeProofRegistry_ignoresProofWithoutUnresolvedChild() {
@@ -72,6 +85,58 @@ class ShellProcessRunnerTest {
             LlmProcessTreeTerminationRegistry.find(invocationId),
         )
         LlmProcessTreeTerminationRegistry.resolve(invocationId)
+    }
+
+    @Test
+    fun processTreeProofRegistry_reportsCompletedUncertainty() {
+        val invocationId = "completed-uncertain-history"
+        try {
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+            LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+
+            assertTrue(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild(invocationId))
+        } finally {
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
+        }
+    }
+
+    @Test
+    fun processTreeProofRegistry_doesNotTreatRunningChildAsCompletedUncertainty() {
+        val invocationId = "running-child-history"
+        try {
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+
+            assertFalse(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild(invocationId))
+        } finally {
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
+        }
+    }
+
+    @Test
+    fun processTreeProofRegistry_doesNotTreatProvenExitAsUncertainty() {
+        val invocationId = "proven-exit-history"
+        try {
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+            LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.PROVEN_EXITED)
+
+            assertFalse(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild(invocationId))
+        } finally {
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
+        }
+    }
+
+    @Test
+    fun processTreeProofRegistry_retainsUncertaintyWhenNextChildStarts() {
+        val invocationId = "uncertain-then-running-history"
+        try {
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+            LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+
+            assertTrue(LlmProcessTreeTerminationRegistry.hasCompletedUncertainChild(invocationId))
+        } finally {
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
+        }
     }
 
     @Test

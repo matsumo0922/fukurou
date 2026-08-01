@@ -367,6 +367,8 @@ class OneShotLlmRunner(
         ),
         decisionRepository = tradingRuntime.decisionRepository,
         authEvidenceState = authEvidenceState,
+        // 既定どおり履歴を保持する。PROPOSER の UNCERTAIN 履歴を後続 FALSIFIER の gate 判定へ
+        // 渡す必要があり、解放は run 全体の finally が行う。
     )
     private val decisionExecutionLifecycle = DecisionExecutionLifecycle(
         tradingRuntime = tradingRuntime,
@@ -620,6 +622,11 @@ class OneShotLlmRunner(
                     LlmExecutionAdmissionHealth.registerRecoveryBlocker(invocationId, claimantToken)
                 null -> Unit
             }
+            // proof を上で読み終え、UNCERTAIN なら recovery blocker へ引き継いだので、履歴の
+            // 役割はここで尽きる。この run の全 phase gateway は auditor が既に閉じており、
+            // 参照する側もいない。terminal persistence は throw しうるため、その前に解放して
+            // DB 障害時の entry 残留を防ぐ。
+            LlmProcessTreeTerminationRegistry.resolve(invocationId)
             withContext(NonCancellable) {
                 withTimeout(executionPolicy.persistenceTerminalTimeout.toMillis()) {
                     if (llmRunStarted) requireTerminalLlmRun(invocationId)
@@ -637,7 +644,6 @@ class OneShotLlmRunner(
             if (processTreeTerminationProof != ProcessTreeTerminationProof.UNCERTAIN) {
                 LlmExecutionAdmissionHealth.resolveClaim(invocationId, claimantToken)
                 LlmExecutionTerminationFenceRegistry.resolve(invocationId, claimantToken)
-                LlmProcessTreeTerminationRegistry.resolve(invocationId)
             }
             activeClaimantTokens.remove(invocationId, claimantToken)
         }

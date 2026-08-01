@@ -42,6 +42,7 @@ import me.matsumo.fukurou.trading.config.RuntimeConfigAuditSnapshot
 import me.matsumo.fukurou.trading.config.TradingBotConfig
 import me.matsumo.fukurou.trading.daemon.LlmDaemonEntryFillReader
 import me.matsumo.fukurou.trading.daemon.LlmDaemonPositionsReader
+import me.matsumo.fukurou.trading.daemon.LlmDaemonPreFilterDecision
 import me.matsumo.fukurou.trading.daemon.LlmDaemonScheduler
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerDependencies
 import me.matsumo.fukurou.trading.daemon.LlmDaemonSchedulerRuntime
@@ -49,6 +50,7 @@ import me.matsumo.fukurou.trading.daemon.LlmDaemonTickResult
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTickerSnapshot
 import me.matsumo.fukurou.trading.daemon.LlmDaemonTriggerKind
 import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealth
+import me.matsumo.fukurou.trading.daemon.LlmExecutionAdmissionHealthTestFixture
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimOutcome
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRejectionReason
 import me.matsumo.fukurou.trading.daemon.LlmExecutionClaimRequest
@@ -166,12 +168,12 @@ import kotlin.test.assertTrue
 class OneShotLlmRunnerTest {
     @BeforeTest
     fun setUpAdmissionHealth() {
-        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionAdmissionHealthTestFixture.reset()
     }
 
     @AfterTest
     fun tearDownAdmissionHealth() {
-        LlmExecutionAdmissionHealth.resetForTest()
+        LlmExecutionAdmissionHealthTestFixture.reset()
     }
 
     @Test
@@ -2700,7 +2702,7 @@ class OneShotLlmRunnerTest {
             assertEquals(expectedActiveSince, claimRepository.requests[1].activeSince)
             assertTrue(fixture.processRunner.launches.isEmpty())
         } finally {
-            LlmExecutionAdmissionHealth.resetForTest()
+            LlmExecutionAdmissionHealthTestFixture.reset()
             LlmExecutionTerminationFenceRegistry.resetForTest()
         }
     }
@@ -2815,12 +2817,63 @@ class OneShotLlmRunnerTest {
         try {
             fixture.runOneShot(defaultRequest().copy(invocationId = invocationId))
 
-            assertEquals(
-                ProcessTreeTerminationProof.UNCERTAIN,
-                LlmProcessTreeTerminationRegistry.find(invocationId),
-            )
+            // proof entry は run 終了時に解放され、UNCERTAIN の意味は recovery blocker が引き継ぐ。
+            assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
             assertFalse(LlmExecutionAdmissionHealth.isHealthy())
             assertEquals(0, LlmExecutionTerminationFenceRegistry.fenceCountForTest())
+        } finally {
+            resetProcessRecoveryState(invocationId)
+        }
+    }
+
+    @Test
+    fun preFilterSkippedRun_releasesProcessTreeProof() = runBlocking {
+        // pre-filter は履歴を run 終了まで保持する。SKIP で full run へ進まない経路でも
+        // 解放されなければ、process-global registry に entry が残り続ける。
+        val invocationId = "prefilter-skip-releases-proof"
+        resetProcessRecoveryState(invocationId)
+        val fixture = runnerFixture { cleanExit() }
+
+        try {
+            LlmProcessTreeTerminationRegistry.markChildStarted(invocationId)
+            LlmProcessTreeTerminationRegistry.record(invocationId, ProcessTreeTerminationProof.UNCERTAIN)
+
+            val result = fixture.runOneShot(
+                defaultRequest().copy(
+                    invocationId = invocationId,
+                    preFilter = { LlmDaemonPreFilterDecision.SKIP_NO_CHANGE },
+                ),
+            ).getOrThrow()
+
+            assertEquals(OneShotRunnerStatus.PRE_FILTER_SKIPPED, result.status)
+            assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
+        } finally {
+            resetProcessRecoveryState(invocationId)
+        }
+    }
+
+    @Test
+    fun terminalPersistenceFailureStillReleasesUncertainProcessProof() = runBlocking {
+        val invocationId = "uncertain-terminal-persistence-failure"
+        resetProcessRecoveryState(invocationId)
+        val fixture = runnerFixture(
+            runtimeTransform = { runtime ->
+                runtime.copy(
+                    llmRunRepository = FindFailingLlmRunRepository(runtime.llmRunRepository),
+                )
+            },
+        ) {
+            timeoutExit().copy(processTreeTerminationProof = ProcessTreeTerminationProof.UNCERTAIN)
+        }
+
+        try {
+            val failure = runCatching {
+                fixture.runOneShot(defaultRequest().copy(invocationId = invocationId)).getOrThrow()
+            }.exceptionOrNull()
+
+            assertTrue(failure != null)
+            assertNull(LlmProcessTreeTerminationRegistry.find(invocationId))
+            assertFalse(LlmExecutionAdmissionHealth.isHealthy())
         } finally {
             resetProcessRecoveryState(invocationId)
         }
@@ -3112,7 +3165,7 @@ private fun processRecoveryFixture(
 
 private fun resetProcessRecoveryState(invocationId: String) {
     LlmProcessTreeTerminationRegistry.resolve(invocationId)
-    LlmExecutionAdmissionHealth.resetForTest()
+    LlmExecutionAdmissionHealthTestFixture.reset()
     LlmExecutionTerminationFenceRegistry.resetForTest()
 }
 
@@ -3520,6 +3573,14 @@ private class RequestCapturingLlmInvoker(
                 authEvidenceObserved = false,
             ),
         )
+    }
+}
+
+private class FindFailingLlmRunRepository(
+    private val delegate: LlmRunRepository,
+) : LlmRunRepository by delegate {
+    override suspend fun findByInvocationId(invocationId: String): Result<LlmRunRecord?> {
+        return Result.failure(IllegalStateException("llm run terminal read failed"))
     }
 }
 
