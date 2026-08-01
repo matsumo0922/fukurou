@@ -182,19 +182,19 @@ class LlmExecutionRecoveryService(
         LlmExecutionAdmissionHealth.beginRecoveryScan()
         val deadline = LlmExecutionRecoveryDeadline.start(EXECUTION_RECOVERY_TICK_TIMEOUT, nanoTime)
 
-        val result = try {
-            runCatching {
+        var successful = false
+        try {
+            // runCatching は timeout と cancellation も Result.failure として捕捉する。
+            val result = runCatching {
                 withTimeout(EXECUTION_RECOVERY_TICK_TIMEOUT.toMillis()) { tickWithinBudget(deadline) }
             }
-        } catch (throwable: Throwable) {
-            // timeout や外側からの cancellation で runCatching を素通りする経路でも、
-            // 実行中 flag を残したまま抜けると submission gate の意味が壊れる。
-            LlmExecutionAdmissionHealth.completeRecoveryScan(successful = false)
-            throw throwable
-        }
-        LlmExecutionAdmissionHealth.completeRecoveryScan(successful = result.isSuccess)
+            successful = result.isSuccess
 
-        return result
+            return result
+        } finally {
+            // 実行中 flag を残したまま抜けると、submission gate が scan の完了を永久に待つ。
+            LlmExecutionAdmissionHealth.completeRecoveryScan(successful)
+        }
     }
 
     private suspend fun tickWithinBudget(deadline: LlmExecutionRecoveryDeadline): Int {
