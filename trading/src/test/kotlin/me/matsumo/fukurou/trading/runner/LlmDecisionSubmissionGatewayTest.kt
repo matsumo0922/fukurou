@@ -924,6 +924,24 @@ class LlmDecisionSubmissionGatewayTest {
     }
 
     @Test
+    fun `completed uncertain pre-filter rejects the proposer entry of the same run`() {
+        // pre-filter は one-shot と同じ invocation ID で動き、失敗しても fail-open で full run へ進む。
+        // その child が UNCERTAIN で終端したなら、後続 PROPOSER の ENTER は止まらなければならない。
+        LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
+        LlmProcessTreeTerminationRegistry.record(INVOCATION_ID, ProcessTreeTerminationProof.UNCERTAIN)
+        val repository = CountingDecisionRepository()
+
+        val response = exchangeRequest(
+            repository,
+            LlmInvocationPhase.PROPOSER,
+            request(LlmInvocationPhase.PROPOSER, decision(DecisionAction.ENTER)),
+        )
+
+        assertEquals(SubmissionRejectionCode.EXECUTION_ADMISSION_UNAVAILABLE.wireValue, response.reason())
+        assertEquals(0, repository.decisionSubmissions)
+    }
+
+    @Test
     fun `resolved uncertain history does not reject a new gateway with the same invocation id`() {
         LlmProcessTreeTerminationRegistry.markChildStarted(INVOCATION_ID)
         LlmProcessTreeTerminationRegistry.record(INVOCATION_ID, ProcessTreeTerminationProof.UNCERTAIN)
