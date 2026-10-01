@@ -1,1 +1,0 @@
-../../../.codex/skills/openspec-archive-change/SKILL.md

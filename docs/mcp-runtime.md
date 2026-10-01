@@ -264,7 +264,7 @@ Cloudflare Access は `/app/*` と `/ops/*` を保護し、runtime config draft 
 
 `McpApplicationDatabaseRoleIntegrationTest` は disposable PostgreSQL のapplication roleで `McpLaunchBootstrap`、`TradingRuntimeFactory.postgresForMcp`、実 `FukurouMcpServer` tool handler、submission gatewayを通し、Proposer/Falsifier union の15 required callを全件実行する。GMO tickerはlocalhost fixture HTTP serverに固定し、外部APIや実credentialを使わない。`submit_decision` / `submit_falsification` のgateway stateが `COMMITTED` となり、decision/falsificationがrepositoryへ永続化されることを検証する。
 
-CLI/provider compatibility の acceptance canary（pinned Claude/Codex tool 呼び出しの smoke）は `CliAcceptanceCanaryMain` と fixture MCP server `fukurou-cli-canary-mcp.mjs` に実装がある。詳細は `openspec/specs/pinned-cli-acceptance-canary/spec.md` を正本とする。
+CLI/provider compatibility の acceptance canary（pinned Claude/Codex tool 呼び出しの smoke）は `CliAcceptanceCanaryMain` と fixture MCP server `fukurou-cli-canary-mcp.mjs` に実装がある。
 
 ## paper / live の構造的乖離
 

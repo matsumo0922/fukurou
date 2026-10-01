@@ -9,7 +9,6 @@ single-owner の hobby / 実験プロジェクト。暗号資産 BTC 現物ト�
 - Ktor/JVM backend。主要 module は `:fukurou`、package root は `me.matsumo.fukurou`。
 - 標準 DoD は「動く、関連回帰テスト 1 本、資金と paper truth を壊さない」とする。
 - 1 PR は human-authored diff 1,000 行を目安とし、超える場合は分割を先に検討する。
-- OpenSpec（propose→specs→tasks）は schema、ledger、order lifecycle、cross-module contract の変更に限定する。分析・実験はスクリプト + 小 PR で直行する。
 - property test、chaos 注入、coverage 数値目標は、資金・ledger・order lifecycle に直接関係する変更だけに要求する。
 - レビューで block する基準は「資金が漏れる、paper truth が歪む、production が落ちる」に限定し、その他は suggestion とする。
 - issue には背景・現状のコード位置・scope 外（やらないこと）を省略せず書く。軽くするのは受け入れ条件であって、実装 agent が迷わないための文脈ではない。
