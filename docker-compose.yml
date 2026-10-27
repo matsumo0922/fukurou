@@ -71,7 +71,7 @@ services:
   # Cloudflare Tunnel コネクタ。外向き outbound のみで、ルータのポート開放は不要。
   # ingress（Public Hostname -> http://ktor:8080）は Cloudflare ダッシュボードで設定する。
   cloudflared:
-    image: cloudflare/cloudflared:2026.6.1
+    image: cloudflare/cloudflared:2026.10.4
     container_name: fukurou-cloudflared
     restart: unless-stopped
     command: tunnel --no-autoupdate run
