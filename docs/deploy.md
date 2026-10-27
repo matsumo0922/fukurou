@@ -878,7 +878,7 @@ watchdog は job 名 `Deploy on NAS` を直接参照するため、`deploy.yml` 
 
 ## 補足
 
-- `cloudflared` は `cloudflare/cloudflared:2026.6.1` に tag pin している。
+- `cloudflared` は `cloudflare/cloudflared:2026.10.4` に tag pin している。
 - `--no-autoupdate` のため cloudflared 更新は compose file の明示更新で行う。
 - Claude Code の version を更新する PR では、merge 前に実 CLI で `--tools "ToolSearch"` が built-in tool を隠したまま MCP tool call へ進むことを確認する。
 - production compose と deploy workflow は本番権限境界に影響するため、必ず review してから merge する。
